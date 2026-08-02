@@ -14,8 +14,8 @@ Two ranked tracks are registered in `benchmark.json`:
 
 | Track ID | Model | Device |
 |---|---|---|
-| `laguna-s-2.1-nvfp4-gb10-v1` | Poolside/Laguna-S-2.1-NVFP4 | DGX Spark GB10 |
-| `laguna-xs-2.1-nvfp4-gb10-v1` | Poolside/Laguna-XS-2.1-NVFP4 | DGX Spark GB10 |
+| `laguna-s-2.1-nvfp4-gb10-v1` | poolside/Laguna-S-2.1-NVFP4 | DGX Spark GB10 |
+| `laguna-xs-2.1-nvfp4-gb10-v1` | poolside/Laguna-XS-2.1-NVFP4 | DGX Spark GB10 |
 
 Each track rewards faster decode, prefill, and time-to-first-token against a
 paired on-box baseline measured in the same session:
@@ -57,14 +57,13 @@ directional only and never publishes to the leaderboard.
 Anything else — fixtures, tests, workflows, `benchmark.json`, `tools/` — is
 frozen. Changing frozen paths causes automatic rejection.
 
-## Hard Rules
+## Rules
 
 - Correctness before timing, always. A greedy output mismatch means no score.
 - One coherent optimization per submission. Do not bundle unrelated changes.
-- Never claim local timing as official.
-- Never attempt to mark your own submission `verified`; only the trusted
-  runner can transition submission status.
-- Never touch other workloads on the runner machine.
+- Local timing is directional; official results come from the trusted runner.
+- Serve deterministically: greedy vLLM output is only reproducible with
+  `VLLM_BATCH_INVARIANT=1`, and nondeterministic engines are ineligible.
 - Do not add network calls, telemetry, or background processes to benchmark
   paths.
 

@@ -1,7 +1,14 @@
 {
   "trackId": "laguna-xs-2.1-nvfp4-gb10-v1",
-  "promptTokens": 512,
-  "decodeTokens": 128,
+  "prompt": "List the prime numbers below fifty, then explain in two sentences why there are infinitely many primes. ",
+  "maxTokens": 128,
+  "temperature": 0,
+  "goldenSha256": "4e02ae65ed1b60f187d0924b9526e6fb62cf907946ff2c249b7d91a587db0ea4",
+  "reference": {
+    "engine": "vllm/vllm-openai:v0.25.1",
+    "serving": "VLLM_BATCH_INVARIANT=1, --max-model-len 8192, greedy (temperature 0)",
+    "hardware": "NVIDIA DGX Spark GB10 (sm_121, unified memory)"
+  },
   "description": "Public correctness drift tripwire for Laguna XS 2.1 NVFP4",
-  "note": "Hidden ranked correctness fixtures are not committed. The trusted runner uses private prompts."
+  "note": "Golden generated on the trusted GB10 runner under deterministic (batch-invariant) serving. Hidden ranked correctness fixtures are not committed; the trusted runner uses private prompts. Other GPUs or kernel builds may flip near-tie greedy argmaxes; the ranked GB10 result is authoritative."
 }

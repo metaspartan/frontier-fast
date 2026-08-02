@@ -20,6 +20,7 @@ export interface BenchmarkResult {
   prefill: { tokens: number; secondsPerToken: number; tokensPerSecond: number };
   decode: { tokens: number; secondsPerToken: number; tokensPerSecond: number };
   ttft?: { seconds: number };
+  outputSha256?: string;
   telemetry: {
     gpuName: string;
     computeCapability?: string;

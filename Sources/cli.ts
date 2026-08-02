@@ -1,3 +1,4 @@
+import { readFileSync } from "node:fs";
 import { TRACKS } from "./contracts";
 import { VllmRunner } from "./runner";
 import { score } from "./scoring";
@@ -14,44 +15,72 @@ function getTrack(): Contract {
   return track;
 }
 
+function readGolden(trackId: string): { goldenSha256?: string | null } | undefined {
+  try { return JSON.parse(readFileSync(`correctness_prompts/${trackId.replace(/-gb10-v\d+$/, "")}/public_prompt.json`, "utf8")); }
+  catch { return undefined; }
+}
+
 if (command === "benchmark") {
-  const track = getTrack();
-  const mode = args[1] ?? "--local-iterate";
+  const baseTrack = getTrack();
+  const mode = args.includes("--local-submit") ? "--local-submit" : args.includes("--baseline") ? "--baseline" : "--local-iterate";
+  // Local iterate keeps the loop fast; local submit uses the full contract window.
+  const track: Contract = mode === "--local-iterate" ? { ...baseTrack, warmupRuns: 1, measuredRuns: 2 } : baseTrack;
+
   console.log(`Track: ${track.id}`);
   console.log(`Model: ${track.model} (${track.quantization})`);
   console.log(`Device: ${track.machine}`);
-  console.log(`Window: ${track.promptTokens}-token prefill + ${track.decodeTokens}-token decode`);
+  console.log(`Window: ${track.promptTokens}-token prefill + ${track.decodeTokens}-token decode · ${track.warmupRuns} warmup / ${track.measuredRuns} measured`);
   console.log("");
 
   const vllmUrl = process.env.VLLM_BASE_URL ?? "http://127.0.0.1:8000/v1";
   const runner = new VllmRunner(vllmUrl, track.model);
 
-  console.log("Running baseline...");
-  runner.benchmark(track).then(async (baseline) => {
-    console.log("Baseline:", JSON.stringify({ prefill_tps: baseline.prefill.tokensPerSecond.toFixed(1), decode_tps: baseline.decode.tokensPerSecond.toFixed(1), ttft: baseline.ttft?.seconds.toFixed(3) }));
+  const main = async () => {
+    console.log("Measuring baseline...");
+    const baseline = await runner.benchmark(track);
+    console.log("Baseline:", JSON.stringify({
+      prefill_tps: baseline.prefill.tokensPerSecond.toFixed(1),
+      decode_tps: baseline.decode.tokensPerSecond.toFixed(1),
+      ttft_s: baseline.ttft?.seconds.toFixed(4),
+      output_sha256: baseline.outputSha256?.slice(0, 16),
+      deterministic: baseline.correctness.passed,
+    }));
 
-    console.log("\nRunning candidate (same config for local estimate)...");
+    const golden = readGolden(track.id);
+    if (golden?.goldenSha256 && baseline.outputSha256) {
+      const match = golden.goldenSha256 === baseline.outputSha256;
+      console.log(match
+        ? "Public drift tripwire: output matches the committed GB10 golden."
+        : "Public drift tripwire: output DIFFERS from the committed GB10 golden. Local hardware/kernels may reorder near-tie argmaxes; the ranked GB10 result is authoritative.");
+    }
+
+    if (mode === "--baseline") return;
+
+    console.log("\nMeasuring candidate (current working tree serving config)...");
     const candidate = await runner.benchmark(track);
+    if (baseline.outputSha256 && candidate.outputSha256 && baseline.outputSha256 !== candidate.outputSha256) {
+      candidate.correctness = { passed: false, mismatches: candidate.correctness.mismatches + 1 };
+    }
     const result = score(candidate, baseline);
 
     console.log("Score:", JSON.stringify({
-      score: result.score?.toFixed(4),
+      score: result.score?.toFixed(4) ?? null,
       decode_speedup: result.decodeSpeedup?.toFixed(4),
       prefill_speedup: result.prefillSpeedup?.toFixed(4),
       ttft_speedup: result.ttftSpeedup?.toFixed(4),
       eligible: result.eligible,
     }));
+    if (!result.eligible && candidate.failure) console.log(`Ineligible: ${candidate.failure}`);
+    console.log("\nLocal timing is directional only. Official results come from the trusted GB10 runner.");
+  };
 
-    if (!result.eligible) {
-      console.log("\nNOTE: Local timing is directional only. Official results come from the trusted runner.");
-    }
-  }).catch((err) => {
+  main().catch((err) => {
     console.error("Benchmark failed:", err.message);
-    console.error("\nMake sure vLLM is running at the configured URL.");
-    console.error("Set VLLM_BASE_URL to point to your vLLM server.");
+    console.error("\nMake sure a vLLM server is running (VLLM_BASE_URL, VLLM_API_KEY).");
+    console.error("Deterministic serving requires VLLM_BATCH_INVARIANT=1.");
     process.exit(1);
   });
 } else {
-  console.log("Usage: bun run Sources/cli.ts benchmark --track <id>");
+  console.log("Usage: bun run Sources/cli.ts benchmark --track <id> [--local-iterate|--local-submit|--baseline]");
   console.log("Tracks:", Object.keys(TRACKS).join(", "));
 }

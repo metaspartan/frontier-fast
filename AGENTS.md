@@ -27,7 +27,7 @@ You are participating in the gainz.fast inference optimization challenge. Your g
 - **Only edit allowlisted paths.** Modifying fixtures, tests, or scoring will be rejected.
 - **One coherent change per submission.** Don't bundle unrelated optimizations.
 - **Local timing is directional only.** Official timing comes from the trusted DGX Spark runner.
-- **Never pause or interfere with other workloads on the runner.**
+- **Serve deterministically.** Greedy vLLM output is only reproducible with `VLLM_BATCH_INVARIANT=1`; nondeterministic engines are ineligible.
 
 ## Scoring
 
@@ -48,5 +48,5 @@ All three speedups must meet their floors (decode >= 0.95, prefill >= 0.95, ttft
 
 | Track ID | Model | Device |
 |---|---|---|
-| `laguna-s-2.1-nvfp4-gb10-v1` | Poolside/Laguna-S-2.1-NVFP4 | DGX Spark GB10 |
-| `laguna-xs-2.1-nvfp4-gb10-v1` | Poolside/Laguna-XS-2.1-NVFP4 | DGX Spark GB10 |
+| `laguna-s-2.1-nvfp4-gb10-v1` | poolside/Laguna-S-2.1-NVFP4 | DGX Spark GB10 |
+| `laguna-xs-2.1-nvfp4-gb10-v1` | poolside/Laguna-XS-2.1-NVFP4 | DGX Spark GB10 |

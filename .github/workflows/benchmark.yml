@@ -1,25 +1,39 @@
 name: benchmark
+# Trusted GB10 verification. Runs only on push to main or manual dispatch —
+# never on pull_request — so fork code cannot execute on the trusted runner
+# without maintainer review and merge.
 on:
   push:
     branches: [main]
+  workflow_dispatch:
+    inputs:
+      track:
+        description: "Track id to benchmark"
+        default: "laguna-xs-2.1-nvfp4-gb10-v1"
 jobs:
   verify:
-    runs-on: self-hosted
+    runs-on: [self-hosted, dgx-spark, gb10]
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
-      - name: Verify modifiable surface
+        with:
+          fetch-depth: 2
+      - name: Enforce modifiable surface
+        env:
+          GAINZ_ALLOW_INFRA: "1"
+        run: bash tools/enforce-modifiable-surface.sh
+      - name: Install dependencies
+        run: ~/.bun/bin/bun install
+      - name: Unit tests
+        run: ~/.bun/bin/bun test
+      - name: Trusted hardware benchmark (paired, deterministic serving)
+        env:
+          VLLM_BASE_URL: ${{ secrets.VLLM_BASE_URL }}
+          VLLM_API_KEY: ${{ secrets.VLLM_API_KEY }}
+          GAINZ_TRACK: ${{ inputs.track || 'laguna-xs-2.1-nvfp4-gb10-v1' }}
         run: |
-          # Ensure only editable paths were changed
-          CHANGED=$(git diff --name-only HEAD~1 HEAD)
-          for f in $CHANGED; do
-            case "$f" in
-              Sources/runner/*|Sources/transforms/*|Sources/model/*|Sources/scoring/*) ;;
-              benchmark.json|correctness_prompts/*|.github/*) ;;
-              *) echo "ERROR: non-editable file changed: $f"; exit 1 ;;
-            esac
-          done
-      - name: Run trusted benchmark
-        run: |
-          echo "Trusted runner verification triggered."
-          echo "The coordinator at gainz.fast will process this submission."
-          echo "Results appear at https://gainz.fast"
+          if [ -z "$VLLM_BASE_URL" ]; then
+            echo "VLLM_BASE_URL secret not configured; skipping hardware benchmark."
+            exit 0
+          fi
+          ~/.bun/bin/bun run Sources/cli.ts benchmark --track "$GAINZ_TRACK" --local-submit
