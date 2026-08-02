@@ -1,0 +1,6 @@
+{
+  "permissions": {
+    "allow": ["Bash(./setup.sh)", "Bash(./benchmark.sh *)", "Bash(bun *)", "Bash(git *)"],
+    "deny": ["Bash(rm -rf *)", "Bash(sudo *)"]
+  }
+}

@@ -1,0 +1,7 @@
+{
+  "trackId": "laguna-s-2.1-nvfp4-gb10-v1",
+  "promptTokens": 512,
+  "decodeTokens": 128,
+  "description": "Public correctness drift tripwire for Laguna S 2.1 NVFP4",
+  "note": "Hidden ranked correctness fixtures are not committed. The trusted runner uses private prompts."
+}

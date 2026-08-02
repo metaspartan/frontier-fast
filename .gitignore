@@ -1,0 +1,7 @@
+node_modules/
+.bun/
+weights/
+results/
+.env
+.env.*
+*.sqlite

@@ -1,0 +1,14 @@
+{
+  "name": "gainz-fast-challenge",
+  "version": "0.1.0",
+  "description": "gainz.fast inference optimization challenge for DGX Spark",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "benchmark": "bun run Sources/cli.ts benchmark",
+    "test": "bun test"
+  },
+  "devDependencies": {
+    "@types/bun": "latest"
+  }
+}

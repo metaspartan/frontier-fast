@@ -1,0 +1,23 @@
+{
+  "schemaVersion": 1,
+  "name": "gainz-fast-challenge",
+  "tracks": [
+    "laguna-xs-2.1-nvfp4-gb10-v1",
+    "laguna-s-2.1-nvfp4-gb10-v1"
+  ],
+  "defaultTrack": "laguna-xs-2.1-nvfp4-gb10-v1",
+  "scoring": {
+    "formula": "decode_speedup^0.65 * prefill_speedup^0.20 * ttft_speedup^0.15",
+    "decodeFloor": 0.95,
+    "prefillFloor": 0.95,
+    "ttftFloor": 0.90,
+    "maxSingleSubmissionGain": 1.053
+  },
+  "editablePaths": [
+    "Sources/runner/",
+    "Sources/transforms/",
+    "Sources/model/",
+    "Sources/scoring/"
+  ],
+  "correctnessPrompts": "correctness_prompts/"
+}
