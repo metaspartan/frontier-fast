@@ -1,0 +1,14 @@
+# >>> gainz trace hook (managed) >>>
+[[hooks.SessionStart]]
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "sh \"$(git rev-parse --show-toplevel)/.gainz/hooks/gainz-trace.sh\" codex session"
+[[hooks.UserPromptSubmit]]
+[[hooks.UserPromptSubmit.hooks]]
+type = "command"
+command = "sh \"$(git rev-parse --show-toplevel)/.gainz/hooks/gainz-trace.sh\" codex capture"
+[[hooks.Stop]]
+[[hooks.Stop.hooks]]
+type = "command"
+command = "sh \"$(git rev-parse --show-toplevel)/.gainz/hooks/gainz-trace.sh\" codex stop"
+# <<< gainz trace hook (managed) <<<

@@ -2,5 +2,37 @@
   "permissions": {
     "allow": ["Bash(./setup.sh)", "Bash(./benchmark.sh *)", "Bash(bun *)", "Bash(git *)"],
     "deny": ["Bash(rm -rf *)", "Bash(sudo *)"]
+  },
+  "hooks": {
+    "SessionStart": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.gainz/hooks/gainz-trace.sh\" claude session"
+          }
+        ]
+      }
+    ],
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.gainz/hooks/gainz-trace.sh\" claude capture"
+          }
+        ]
+      }
+    ],
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "sh \"$CLAUDE_PROJECT_DIR/.gainz/hooks/gainz-trace.sh\" claude stop"
+          }
+        ]
+      }
+    ]
   }
 }

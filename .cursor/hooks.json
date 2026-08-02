@@ -1,0 +1,25 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "command": "sh \".gainz/hooks/gainz-trace.sh\" cursor session"
+      }
+    ],
+    "beforeSubmitPrompt": [
+      {
+        "command": "sh \".gainz/hooks/gainz-trace.sh\" cursor capture"
+      }
+    ],
+    "stop": [
+      {
+        "command": "sh \".gainz/hooks/gainz-trace.sh\" cursor stop"
+      }
+    ],
+    "sessionEnd": [
+      {
+        "command": "sh \".gainz/hooks/gainz-trace.sh\" cursor stop"
+      }
+    ]
+  }
+}
