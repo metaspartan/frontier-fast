@@ -1,7 +1,9 @@
 name: benchmark
 # Trusted GB10 verification. Runs only on push to main or manual dispatch —
 # never on pull_request — so fork code cannot execute on the trusted runner
-# without maintainer review and merge.
+# without maintainer review and merge. PRs get ubuntu CI only; the ranked
+# lifecycle (submitted → running → verified/rejected) starts when a change
+# lands on main.
 on:
   push:
     branches: [main]
@@ -13,7 +15,9 @@ on:
 jobs:
   verify:
     runs-on: [self-hosted, dgx-spark, gb10]
-    timeout-minutes: 30
+    timeout-minutes: 45
+    env:
+      GAINZ_TRACK: ${{ inputs.track || 'laguna-xs-2.1-nvfp4-gb10-v1' }}
     steps:
       - uses: actions/checkout@v4
         with:
@@ -26,14 +30,50 @@ jobs:
         run: ~/.bun/bin/bun install
       - name: Unit tests
         run: ~/.bun/bin/bun test
-      - name: Trusted hardware benchmark (paired, deterministic serving)
+      - name: Local hardware estimate (drift tripwire + timing signal)
         env:
           VLLM_BASE_URL: ${{ secrets.VLLM_BASE_URL }}
           VLLM_API_KEY: ${{ secrets.VLLM_API_KEY }}
-          GAINZ_TRACK: ${{ inputs.track || 'laguna-xs-2.1-nvfp4-gb10-v1' }}
         run: |
           if [ -z "$VLLM_BASE_URL" ]; then
-            echo "VLLM_BASE_URL secret not configured; skipping hardware benchmark."
+            echo "VLLM_BASE_URL secret not configured; skipping hardware estimate."
             exit 0
           fi
-          ~/.bun/bin/bun run Sources/cli.ts benchmark --track "$GAINZ_TRACK" --local-submit
+          ~/.bun/bin/bun run Sources/cli.ts benchmark --track "$GAINZ_TRACK" --local-iterate
+      - name: Ranked submission (submitted → running → verified/rejected)
+        env:
+          GAINZFAST_TOKEN: ${{ secrets.GAINZFAST_TOKEN }}
+        run: |
+          if [ -z "$GAINZFAST_TOKEN" ]; then
+            echo "GAINZFAST_TOKEN secret not configured; skipping ranked submission."
+            echo "Mint a durable token on https://gainz.fast (Participate → For agents) and:"
+            echo "  gh secret set GAINZFAST_TOKEN --repo metaspartan/gainz-fast"
+            exit 0
+          fi
+          curl -fsSL https://gainz.fast/install.sh | sh
+          export PATH="$HOME/.local/bin:$PATH"
+          gainzfast login "$GAINZFAST_TOKEN"
+          OUT=$(gainzfast submit \
+            --name "main @ ${GITHUB_SHA:0:7}" \
+            --track "$GAINZ_TRACK" \
+            --agent "GitHub Actions (trusted GB10)" \
+            --notes "$(git log -1 --pretty=%s)")
+          echo "$OUT"
+          SUB_ID=$(echo "$OUT" | sed -n 's/^Submitted \([^ ]*\).*/\1/p')
+          [ -n "$SUB_ID" ] || { echo "submission failed"; exit 1; }
+          echo "Waiting for trusted verification of $SUB_ID…"
+          for i in $(seq 1 60); do
+            STATUS=$(curl -s "https://gainz.fast/api/submissions" | python3 -c "import json,sys
+subs=[s for s in json.load(sys.stdin) if s['id']=='$SUB_ID']
+print(subs[0].get('status','submitted') if subs else 'unknown')")
+            REASON=$(curl -s "https://gainz.fast/api/submissions" | python3 -c "import json,sys
+subs=[s for s in json.load(sys.stdin) if s['id']=='$SUB_ID']
+print((subs[0].get('statusReason') or '') if subs else '')")
+            echo "  [$i] $STATUS $REASON"
+            case "$STATUS" in
+              verified) echo "VERIFIED — result published to the leaderboard."; exit 0 ;;
+              rejected) echo "REJECTED: $REASON"; exit 1 ;;
+            esac
+            sleep 15
+          done
+          echo "Timed out waiting for verification."; exit 1

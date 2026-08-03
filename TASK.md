@@ -61,6 +61,26 @@ scheduler batching, request shaping, offline weight/layout transforms, and
 speculative decoding (DFlash draft models) — measured end to end over the
 frozen window.
 
+## Submission lifecycle
+
+Every ranked submission moves through four states, visible live on the
+leaderboard site and via `gainzfast status`:
+
+```text
+submitted -> running -> verified | rejected
+```
+
+- **submitted** — the coordinator accepted the submission (pending pickup).
+- **running** — the trusted GB10 runner claimed it and is benchmarking.
+- **verified** — every gate passed; the score is published and immutable.
+- **rejected** — a gate failed; the status reason says which (correctness
+  mismatch, nondeterministic engine, floor miss, or calibration band). Fix
+  or revert, then submit again under a new submission id.
+
+Only the trusted runner can transition states; participant tokens are
+submit-only. Pushes to `main` also flow through this lifecycle
+automatically via `.github/workflows/benchmark.yml`.
+
 ## Local modes
 
 `./benchmark.sh --local-iterate` (short) and `--local-submit` (full window)
