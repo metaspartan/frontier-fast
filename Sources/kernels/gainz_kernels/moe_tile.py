@@ -76,6 +76,15 @@ logger = init_logger("gainz_kernels.moe_tile")
 _SMALL_M_MAX = 16
 _SUB_BLOCK_M = 16
 
+# The sub-tile's bitwise evidence was gathered at Laguna-XS-2.1 GEMM shapes
+# only, and the ranked runner measured 2/128 teacher-forced divergence when
+# the same tile ran at Laguna-S shapes (finding `s-moe-m-subtile-port`).
+# Gate the fast path to the exact XS (N, K) pairs — w13: (2*512, 2048),
+# w2: (2048, 512) — so any other model (e.g. Laguna-S, whose pairs are
+# (2048, 3072) and (3072, 1024)) provably falls through to the stock
+# launcher untouched.
+_XS_GEMM_SHAPES = frozenset({(1024, 2048), (2048, 512)})
+
 _orig_try_get_optimal_moe_config = _emu.try_get_optimal_moe_config
 _orig_invoke = _emu.invoke_fused_moe_nvfp4_emulation_kernel
 
@@ -276,6 +285,7 @@ def _subtile_invoke(
         block_stride_m <= _SUB_BLOCK_M
         or _current_tokens <= 0
         or _current_tokens > _SMALL_M_MAX
+        or (B.size(1), A.size(1)) not in _XS_GEMM_SHAPES
     ):
         return _orig_invoke(
             A,

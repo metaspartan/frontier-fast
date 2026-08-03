@@ -1,0 +1,119 @@
+diff --git a/vllm/model_executor/models/laguna.py b/vllm/model_executor/models/laguna.py
+index c79e8d4..c562d52 100644
+--- a/vllm/model_executor/models/laguna.py
++++ b/vllm/model_executor/models/laguna.py
+@@ -352,6 +352,12 @@ class LagunaAttention(nn.Module):
+             self.g_proj = None
+             self.gate_per_head = False
+ 
++        # Fused [qkv; g] projection weight. Built once after weight loading
++        # (see LagunaModel.load_weights -> fuse_qkvg_weights); stays None
++        # until then, and forward falls back to the two separate projections.
++        self._qkvg_fused_weight: torch.Tensor | None = None
++        self._qkvg_split: tuple[int, int] = (0, 0)
++
+         # Attention sinks (learnable per-head bias for SWA layers)
+         sinks = None
+         if attention_sink:
+@@ -426,12 +432,69 @@ class LagunaAttention(nn.Module):
+         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+ 
++    def fuse_qkvg_weights(self) -> None:
++        """Concatenate the qkv_proj and g_proj weights into one matrix.
++
++        Both projections are unquantized linears over the SAME
++        ``hidden_states`` (Laguna's NVFP4 recipe exempts every attention
++        projection), so one GEMM over the row-concatenated weight computes
++        exactly the same set of output elements as the two separate GEMMs.
++        Row-concatenating ``[num_out, K]`` weights preserves each output
++        row's memory layout and K-reduction chain bit for bit -- rows are
++        merely dispatched from one launch grid instead of two.  At serial
++        decode (M=1) the separate ``g_proj`` GEMV is launch-wave-bound
++        (its N is 48/72), so folding it into the qkv launch removes an
++        essentially fixed ~0.05-0.06 ms per layer per step on GB10.
++
++        The originals' storage is released by rebinding their parameters
++        to views of the fused buffer, keeping weight memory flat.  The
++        fused row count is padded to a multiple of 16; padding rows are
++        zero, their outputs are sliced off and never read.
++        """
++        if self.g_proj is None or self._qkvg_fused_weight is not None:
++            return
++        wq = self.qkv_proj.weight
++        wg = self.g_proj.weight
++        if (
++            wq.dtype != wg.dtype
++            or wq.device != wg.device
++            or wq.dim() != 2
++            or wg.dim() != 2
++            or wq.shape[1] != wg.shape[1]
++            or not wq.is_contiguous()
++            or not wg.is_contiguous()
++            or getattr(self.qkv_proj, "bias", None) is not None
++            or getattr(self.g_proj, "bias", None) is not None
++        ):
++            return
++        n_qkv, n_g = wq.shape[0], wg.shape[0]
++        pad = -(n_qkv + n_g) % 16
++        fused = torch.empty(
++            n_qkv + n_g + pad, wq.shape[1], dtype=wq.dtype, device=wq.device
++        )
++        fused[:n_qkv].copy_(wq.data)
++        fused[n_qkv : n_qkv + n_g].copy_(wg.data)
++        if pad:
++            fused[n_qkv + n_g :].zero_()
++        self.qkv_proj.weight.data = fused[:n_qkv]
++        self.g_proj.weight.data = fused[n_qkv : n_qkv + n_g]
++        self._qkvg_split = (n_qkv, n_g)
++        self._qkvg_fused_weight = fused
++
+     def forward(
+         self,
+         positions: torch.Tensor,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor:
+-        qkv, _ = self.qkv_proj(hidden_states)
++        fused_w = self._qkvg_fused_weight
++        if fused_w is not None:
++            n_qkv, n_g = self._qkvg_split
++            qkvg = F.linear(hidden_states, fused_w)
++            qkv = qkvg[..., :n_qkv]
++            gate_lin: torch.Tensor | None = qkvg[..., n_qkv : n_qkv + n_g]
++        else:
++            qkv, _ = self.qkv_proj(hidden_states)
++            gate_lin = None
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+ 
+         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+@@ -447,8 +510,9 @@ class LagunaAttention(nn.Module):
+ 
+         # Apply gating if enabled (compute softplus in float32 for precision)
+         if self.gating and self.g_proj is not None:
+-            gate, _ = self.g_proj(hidden_states)
+-            gate = F.softplus(gate.float()).type_as(attn_output)
++            if gate_lin is None:
++                gate_lin, _ = self.g_proj(hidden_states)
++            gate = F.softplus(gate_lin.float()).type_as(attn_output)
+             if self.gate_per_head:
+                 # gate: [..., num_heads]; broadcast across head_dim
+                 attn_shape = attn_output.shape
+@@ -835,6 +899,18 @@ class LagunaModel(nn.Module, EagleModelMixin):
+                     weight_loader(param, loaded_weight)
+                     loaded_params.add(name)
+ 
++        # Fold each attention's g_proj into its qkv launch. Runs after all
++        # weights are loaded and before the first forward / torch.compile
++        # trace, so the compiled graph sees a single stable fused GEMM.
++        # (UnquantizedLinearMethod.process_weights_after_loading is a no-op
++        # on CUDA, so rebinding the weights here is final.)
++        for layer in self.layers:
++            if isinstance(layer, PPMissingLayer):
++                continue
++            self_attn = getattr(layer, "self_attn", None)
++            if self_attn is not None and hasattr(self_attn, "fuse_qkvg_weights"):
++                self_attn.fuse_qkvg_weights()
++
+         return loaded_params
+ 
+ 
