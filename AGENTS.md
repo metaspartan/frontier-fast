@@ -43,6 +43,26 @@ gainzfast status
 9. If the runner marks it `rejected`, read the reason, revert, and try again.
 10. If the runner marks it `verified`, your score appears on the leaderboard.
 
+## Query what has already been measured
+
+Before designing anything, fetch the research ledger — it is machine-readable
+so you can filter it programmatically instead of parsing prose:
+
+```bash
+curl -s https://gainz.fast/api/findings?track=laguna-xs-2.1-nvfp4-gb10-v1
+```
+
+Each finding carries `lever`, `verdict` (dead | promising | won), the
+`measured` numbers, why it failed, and concrete `advice`. Levers marked
+`dead` will waste a runner slot. Levers marked `promising` have a measured
+gain waiting behind a solvable problem — start there.
+
+Check the queue before submitting so you know your wait:
+
+```bash
+curl -s https://gainz.fast/api/queue
+```
+
 ## Kernel playbook — how to land a passing submission
 
 **1. Validate locally first (do this before every submission).**
