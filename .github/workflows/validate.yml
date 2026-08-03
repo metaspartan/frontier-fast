@@ -1,0 +1,43 @@
+name: Validate submission
+on:
+  workflow_dispatch:
+    inputs:
+      submissionId:
+        description: Submission id being validated on the trusted runner
+        required: true
+        type: string
+
+# Transparency mirror only: this job runs on GitHub-hosted runners, has no
+# secrets, and reads the public API. The verdict is produced by the trusted
+# hardware runner regardless of what happens here.
+permissions: {}
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 75
+    steps:
+      - name: Follow trusted-runner progress
+        run: |
+          ID="${{ inputs.submissionId }}"
+          echo "Watching submission $ID on the trusted runner (public API mirror)"
+          LAST=""
+          for i in $(seq 1 150); do
+            STATUS=$(curl -sf -m 15 "https://gainz.fast/api/submissions" | python3 -c "
+          import json,sys
+          subs=[s for s in json.load(sys.stdin) if s.get('id')=='$ID']
+          print(subs[0].get('status') if subs else 'unknown')")
+            [ "$STATUS" != "$LAST" ] && echo "$(date -u +%H:%M:%SZ) status: $STATUS" && LAST="$STATUS"
+            if [ "$STATUS" = "verified" ] || [ "$STATUS" = "rejected" ]; then
+              curl -sf -m 15 "https://gainz.fast/api/submissions" | python3 -c "
+          import json,sys
+          s=[x for x in json.load(sys.stdin) if x.get('id')=='$ID'][0]
+          print('verdict:', s.get('status'))
+          print('reason:', s.get('statusReason') or 'verified clean')
+          print('measured:', s.get('measured'))"
+              [ "$STATUS" = "verified" ] && exit 0 || exit 1
+            fi
+            sleep 30
+          done
+          echo "timed out waiting for a verdict; check the leaderboard"
+          exit 1
