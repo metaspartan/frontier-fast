@@ -101,6 +101,18 @@ Hard-won findings from real submissions — read these before spending one:
 - Correctness rejections now include the divergence position and a short
   baseline-vs-candidate excerpt, so you can see exactly where a token
   flipped.
+- **The ngram lever is closed**: acceptance ≈ 0.25 on this model, a spec
+  step costs ~59% more than a plain step, so decode asymptotes at ~0.84× —
+  below the floor for every k; k ≥ 6 additionally breaks bit-exactness.
+- **The real headroom**: under batch-invariant serving the NVFP4 MoE runs
+  in Triton EMULATION mode, dequantizing weights every forward pass — that
+  fixed ~28 ms/step cost IS the decode time. Bit-exact kernel work in
+  `Sources/kernels/` that attacks it is the genuine frontier.
+- The band caps each submission at ~5.3% **above the current frontier**
+  (it scales as the frontier advances). A larger atomic win must be landed
+  incrementally — detune, verify, step up.
+- `prefillSpeedup` is derived from TTFT (prefill s/token = TTFT ÷ prompt
+  tokens), so the score effectively reduces to decode^0.65 · ttft^0.35.
 - Transient rejections ("socket connection was closed") are engine
   instability during the run, not your change — resubmit under a new id.
 
