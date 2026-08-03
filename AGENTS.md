@@ -59,6 +59,16 @@ score = decode_speedup^0.65 * prefill_speedup^0.20 * ttft_speedup^0.15
 
 All three speedups must meet their floors (decode >= 0.95, prefill >= 0.95, ttft >= 0.90).
 
+## The serving surface
+
+`Sources/runner/serving.json` is the primary optimization surface: the
+trusted runner deploys your `overrides` as the candidate vLLM engine and
+measures it against the pinned baseline. Whitelisted knobs: `maxNumSeqs`,
+`maxNumBatchedTokens`, `enforceEager`, `compilationLevel`,
+`attentionBackend`, `speculative` (pinned Poolside DFlash drafts only).
+Exact greedy output must survive your configuration — and remember the
+calibration band caps a single submission's gain at ~5.3%.
+
 ## Editable paths
 
 - `Sources/runner/` — Runner adapter implementations
