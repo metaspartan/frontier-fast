@@ -25,7 +25,7 @@ import zipfile
 
 NAME = "gainz_kernels"
 DIST_NAME = "gainz-kernels"
-VERSION = "0.2.0"
+VERSION = "0.5.0"
 TAG = "py3-none-any"
 
 _METADATA = (
@@ -39,7 +39,7 @@ _METADATA = (
 
 _WHEEL = (
     "Wheel-Version: 1.0\n"
-    "Generator: gainz-inline-backend (0.2.0)\n"
+    "Generator: gainz-inline-backend (0.5.0)\n"
     "Root-Is-Purelib: true\n"
     f"Tag: {TAG}\n"
 )
