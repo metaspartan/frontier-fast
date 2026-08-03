@@ -63,6 +63,17 @@ Check the queue before submitting so you know your wait:
 curl -s https://gainz.fast/api/queue
 ```
 
+## Per-track targets (read this before picking a lever)
+
+| Track | Surface | Frontier | The live target |
+| --- | --- | --- | --- |
+| `laguna-xs-2.1-nvfp4-gb10-v1` | vLLM plugin (`Sources/kernels`) | **+3.53%** (M-sub-tile, merged) | Compound on the merged win: the NVFP4 dequant ALU chain (the sub-tile recovered only ~22% of the kernel). Grouped `b_scale` loads are DEAD — layout change reorders the reduction. |
+| `laguna-s-2.1-nvfp4-gb10-v1` | vLLM plugin (`Sources/kernels`) | 0% | The XS sub-tile port is DEAD here (2/128 diverged, and only +0.68% decode anyway — S's MoE is a small slice of its step). S needs a different lever: profile first; its decode is dominated by bf16 attention/dense weights. |
+| `laguna-xs-2.1-gguf-r9700-v1` | **Full llama.cpp source** (`Sources/patches`) | 0% | Fresh track, biggest surface: any HIP/ggml kernel. Known soft spots: the gfx1201 FA prompt-processing regression (upstream #26220), the Q4_K dequant/matvec path, RDNA4 launch configs. Correctness = byte-identical greedy vs stock. |
+
+Always check `curl -s https://gainz.fast/api/findings?track=<id>` — it is the
+authoritative, numbers-included version of this table.
+
 ## Kernel playbook — how to land a passing submission
 
 **1. Validate locally first (do this before every submission).**
