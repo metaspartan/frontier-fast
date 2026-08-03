@@ -1,4 +1,16 @@
-# Sources/patches — the AMD R9700 llama.cpp track surface
+# Sources/patches — the llama.cpp full-source tracks
+
+TWO tracks share this surface, both pinned to llama.cpp `b10237`
+(`2b63e0610bbc2be990ae1360d5256efcdc3f9efb`) and the same Q4_K_M GGUF:
+
+| Track | Device | Build | Baseline |
+| --- | --- | --- | --- |
+| `laguna-xs-2.1-gguf-r9700-v1` | Radeon AI PRO R9700 (HIP, gfx1201) | `GGML_HIP=ON, gfx1201` | 95.43 decode tok/s |
+| `laguna-xs-2.1-gguf-gb10cuda-v1` | DGX Spark GB10 (CUDA, sm_121) | `GGML_CUDA=ON, arch 121` | 90.62 decode tok/s |
+
+Your patch series is benchmarked on whichever track you submit to; a series
+can target both (submit twice). Vendor-specific code paths are fine as long
+as each track's build stays byte-exact vs its stock binary.
 
 Track `laguna-xs-2.1-gguf-r9700-v1` is **full-source kernel surgery**,
 mlx.fast style: your submission is a patch series against the pinned
