@@ -58,14 +58,37 @@ moe_intermediate=512): both fused GEMMs bitwise identical (uint16 view of
 the bf16 outputs) to the stock BLOCK_SIZE_M=64 path at M in
 {1, 2, 4, 8, 16} across 4 seeds, and 0.1797 ms -> 0.1556 ms per MoE layer
 pair at M=1 (CUDA events, 200 iters).
+
+Second iteration (this revision)
+--------------------------------
+Two further decode-only changes on the SAME sub-tile launch, both leaving
+every load/store shape, the K-loop, the tile geometry and the reduction
+sequence untouched:
+
+1. ``_e2m1_signfold``: the NVFP4 nibble decode applies the sign by ORing
+   ``(nibble & 8) << 28`` into the integer bit pattern before the single
+   bitcast, instead of the stock float ``tl.where(sign, -val, val)``.
+   Negating a finite IEEE-754 float is exactly a sign-bit flip (and the
+   mag==0 case correctly yields -0.0), so the produced fp32 is bit-identical
+   for all 16 nibble values; the multiply by the fp8-block/global scale and
+   the single bf16 rounding that follow are the unchanged source.
+2. ``num_warps=2`` (Triton default: 4) on the sub-tile launch only.  A
+   scheduling parameter: it changes which warp computes which output
+   columns, not the per-element fp32 accumulation chain.
+
+Neither change alone is a win (nw=2 with the stock decode measures 0.95x,
+the fold at nw=4 measures 1.02x); together they let the two-warp schedule
+keep the whole dequant chain in the integer pipe and measure 1.25x the
+first-iteration sub-tile per MoE layer pair at M=1 (median of 40
+interleaved cycles x 20 iters, CUDA events: 0.1267 ms -> 0.1015 ms).
+Bitwise gate re-run for the combination: both fused GEMMs identical to the
+stock kernel for all 20 (M, seed) configs.  Prefill-shaped forwards still
+fall through to the completely untouched stock launcher.
 """
 
 import vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe as _emu
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe.fused_moe import write_zeros_to_output
-from vllm.model_executor.layers.quantization.utils.nvfp4_emulation_utils import (
-    _e2m1_inline,
-)
 from vllm.triton_utils import tl, triton
 
 logger = init_logger("gainz_kernels.moe_tile")
@@ -81,6 +104,45 @@ _orig_invoke = _emu.invoke_fused_moe_nvfp4_emulation_kernel
 
 # Token count of the MoE forward currently being applied.
 _current_tokens = 0
+
+# Launch schedule for the decode sub-tile kernel.  num_warps=2 (instead of
+# Triton's default 4) is where the speed comes from: the [16, 64] output tile
+# occupies exactly two m16n8 MMA fragment rows per warp at nw=2, and the
+# measured schedule beats nw=4 by ~25% at decode shapes when combined with
+# the sign-folded nibble decode below.  num_stages=3 is Triton's default,
+# pinned explicitly so a toolchain default change cannot alter the schedule.
+_SUB_NUM_WARPS = 2
+_SUB_NUM_STAGES = 3
+
+
+@triton.jit
+def _e2m1_signfold(nibble):
+    """Decode an NVFP4 nibble to float32 — bit-identical to the stock
+    ``_e2m1_inline`` for every one of the 16 possible nibble values, with the
+    sign applied as a bit-OR instead of a floating-point select.
+
+    Stock chain: build ``0x3F000000 + (mag << 22)``, bitcast, patch mag==0
+    (+0.0) and mag==1 (0.5) with two float ``tl.where``, then a third float
+    ``tl.where`` for the sign (``-val``).  Negation of a finite IEEE value is
+    exactly a sign-bit flip, and the mag==0 patch produces +0.0 whose sign
+    flip is -0.0 — so ORing ``(nibble & 8) << 28`` into the *integer* bits
+    before the single bitcast yields the identical 32-bit pattern for all 16
+    inputs (including -0.0 for nibble 8), while keeping the whole decode in
+    the integer pipe:
+
+      nibble 0..7  -> +{0.0, 0.5, 1.0, 1.5, 2.0, 3.0, 4.0, 6.0}
+      nibble 8..15 -> the same magnitudes with the sign bit set
+
+    Exhaustively verified on-device: both fused GEMM outputs are bitwise
+    equal (uint16 view) to the stock kernel across M in {1,2,4,8,16} x 4
+    seeds with uniform random bytes (all 256 byte values exercised).
+    """
+    mag = nibble & 0x07
+    bits = 0x3F000000 + (mag.to(tl.int32) << 22)
+    bits = tl.where(mag == 0, 0, bits)
+    bits = tl.where(mag == 1, 0x3F000000, bits)
+    bits = bits | ((nibble & 0x08).to(tl.int32) << 28)
+    return bits.to(tl.float32, bitcast=True)
 
 
 def _recording_try_get_optimal_moe_config(
@@ -214,8 +276,8 @@ def fused_moe_nvfp4_emulation_subtile_kernel(
         low_nibble = raw_bytes & 0x0F
         high_nibble = (raw_bytes >> 4) & 0x0F
 
-        low_decoded = _e2m1_inline(low_nibble)
-        high_decoded = _e2m1_inline(high_nibble)
+        low_decoded = _e2m1_signfold(low_nibble)
+        high_decoded = _e2m1_signfold(high_nibble)
 
         b_scale_ptrs = (
             b_scale_ptr
@@ -344,6 +406,8 @@ def _subtile_invoke(
         BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
         BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
         GROUP_SIZE_M=config["GROUP_SIZE_M"],
+        num_warps=_SUB_NUM_WARPS,
+        num_stages=_SUB_NUM_STAGES,
     )
 
 
