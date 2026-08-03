@@ -3,10 +3,10 @@
   "prompt": "List the prime numbers below fifty, then explain in two sentences why there are infinitely many primes. ",
   "maxTokens": 128,
   "temperature": 0,
-  "goldenSha256": "4e02ae65ed1b60f187d0924b9526e6fb62cf907946ff2c249b7d91a587db0ea4",
+  "goldenSha256": "b60c91ee48997b09878d1605898dc8b7e77e4a7adb56adbc8803855731767234",
   "reference": {
     "engine": "vllm/vllm-openai:v0.25.1",
-    "serving": "VLLM_BATCH_INVARIANT=1, --max-model-len 8192, greedy (temperature 0)",
+    "serving": "VLLM_BATCH_INVARIANT=1, --max-model-len 8192, no prefix caching, greedy (temperature 0)",
     "hardware": "NVIDIA DGX Spark GB10 (sm_121, unified memory)"
   },
   "description": "Public correctness drift tripwire for Laguna XS 2.1 NVFP4",
