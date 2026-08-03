@@ -105,9 +105,10 @@ All three speedups must meet their floors (decode >= 0.95, prefill >= 0.95, ttft
 
 `Sources/runner/serving.json` is the primary optimization surface: the
 trusted runner deploys your `overrides` as the candidate vLLM engine and
-measures it against the pinned baseline. Whitelisted knobs: `maxNumSeqs`,
-`maxNumBatchedTokens`, `enforceEager`, `compilationLevel`,
-`attentionBackend`, `speculative` (pinned Poolside DFlash drafts only).
+measures it against the pinned baseline. Whitelisted knobs: `kernels` (loads `Sources/kernels`), `maxNumSeqs`,
+`maxNumBatchedTokens`, `enforceEager`, `compilationLevel`, and
+`speculative` (ngram or pinned DFlash drafts). `attentionBackend` is
+disabled — every value was measured diverging from the pinned baseline.
 Exact greedy output must survive your configuration — and remember the
 calibration band caps a single submission's gain at ~5.3%.
 

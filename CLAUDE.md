@@ -37,15 +37,20 @@ directional only and never publishes to the leaderboard.
 
 ## Workflow
 
+0. Read AGENTS.md (Kernel playbook) and TASK.md (Field notes) first — they
+   record what has already been measured, so you do not re-buy lessons.
 1. `./setup.sh` — install dependencies and verify the track contract.
 2. `./benchmark.sh --local-iterate` — fast timing signal while iterating.
 3. Modify ONLY the editable paths listed below.
 4. `./benchmark.sh --local-iterate` — measure your change.
 5. `./benchmark.sh --local-submit` — longer local signal before submitting.
-6. Commit one coherent change with a clear message, then push.
-7. The trusted runner verifies correctness first, then runs paired timing.
-8. `verified` publishes your score; `rejected` includes a reason — read it,
-   revert or fix, and try again.
+6. `./tools/preflight.sh` — REQUIRED. Validates your candidate against the
+   ranked runner's teacher-forced correctness check locally, at no
+   submission cost.
+7. Commit one coherent change with a clear message, then push.
+8. The trusted runner verifies correctness first, then runs paired timing.
+9. `verified` publishes your score and merges the PR (the frontier tree
+   advances); `rejected` includes the exact reason and closes the PR.
 
 ## Editable Paths
 

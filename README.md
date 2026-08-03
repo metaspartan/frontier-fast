@@ -21,6 +21,10 @@ frontier — XS and S results are never compared with each other.
 
 # Longer local pre-submit signal over the full contract window.
 ./benchmark.sh --local-submit
+
+# REQUIRED before submitting: boots your candidate config/kernels beside the
+# baseline and runs the ranked runner's teacher-forced correctness check.
+BASE_URL=http://127.0.0.1:8001/v1 API_KEY=<key> ./tools/preflight.sh
 ```
 
 Local runs measure whatever vLLM server `VLLM_BASE_URL` points at (default
@@ -52,9 +56,10 @@ The trusted run enforces the modifiable surface, runs the unit tests, then
 measures a paired baseline/candidate benchmark back to back on the same
 silicon over cache-cold prompts. TTFT is the wall time of a one-token
 completion over a fresh 512-token prompt; the decode rate comes from a full
-128-token decode window minus that TTFT; each phase runs a fixed greedy
-correctness probe whose output hash must match between baseline and
-candidate. The paired ratio cancels host drift. The published score is:
+128-token decode window minus that TTFT; correctness is **teacher-forced**: the baseline's golden completion is
+replayed through the candidate and the greedy argmax must match at every
+position, so a single near-tie flip cannot cascade. The paired ratio cancels
+host drift. The published score is:
 
 ```text
 score = decode_speedup^0.65 * prefill_speedup^0.20 * ttft_speedup^0.15
@@ -67,9 +72,13 @@ score = decode_speedup^0.65 * prefill_speedup^0.20 * ttft_speedup^0.15
 | TTFT (time-to-first-token) | 15% | >= 0.90x |
 
 Floors are hard. A token mismatch, a nondeterministic engine, or invalid
-telemetry fails the run. When a track carries a calibration acceptance band,
-a single submission's gain is capped (`maxSingleSubmissionGain` in
-`benchmark.json`); larger wins are chunked across submissions.
+telemetry fails the run. A verified result must also **beat the current
+best**, or it is rejected as "score did not improve current best".
+
+Each submission may gain at most ~5.3% **above the current frontier** (the
+band scales as the frontier advances), and a verified PR is **merged into
+`main`** — so the next submission builds on top of every prior win and total
+gains compound. Land large wins as a series of banded slices.
 
 ## Why this challenge exists
 
@@ -100,7 +109,7 @@ The authoritative list is `editablePaths` in `benchmark.json`:
 | `Sources/transforms/` | Offline weight/layout transformations applied before serving. |
 | `Sources/model/` | Model-specific optimizations: engine flags, kernel backend selection, CUDA kernel patches, speculative-decoding configs. |
 | `Sources/scoring/` | Scoring helpers only — the formula itself is pinned in `benchmark.json`. |
-| `Sources/kernels/` | Custom Triton/CUDA kernels pip-installed into the candidate engine (`"kernels": true`). **Breakthrough surface.** |
+| `Sources/kernels/` | Custom Triton/CUDA kernels pip-installed into the candidate engine (`"kernels": true`). **Breakthrough surface** — see the Kernel playbook in [AGENTS.md](AGENTS.md). |
 
 Everything else — `benchmark.json`, `correctness_prompts/`, `Tests/`,
 `tools/`, `.github/`, and the shared TypeScript core — is frozen for
@@ -113,6 +122,15 @@ that touch it, and the trusted workflow runs the same check.
 |---|---|---|---|---|
 | `laguna-xs-2.1-nvfp4-gb10-v1` | Poolside Laguna XS 2.1 | DGX Spark GB10 | NVFP4 | 512 prefill + 128 decode |
 | `laguna-s-2.1-nvfp4-gb10-v1` | Poolside Laguna S 2.1 | DGX Spark GB10 | NVFP4 | 512 prefill + 128 decode |
+
+## Where the headroom is
+
+Under batch-invariant serving this build runs the NVFP4 MoE in Triton
+*emulation*: expert weights are dequantized on every forward pass, and that
+fixed cost is essentially the entire decode step. Removing redundant
+dequantization — while preserving every value exactly — is the real frontier
+on this track. Config knobs have been measured to exhaustion; see the Field
+notes in [TASK.md](TASK.md) before spending a submission.
 
 ## Local vs ranked
 
