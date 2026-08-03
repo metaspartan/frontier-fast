@@ -1,40 +1,22 @@
-From 3996fd47be615153170f55331fde79c232d1b8ab Mon Sep 17 00:00:00 2001
+From e3e251ebb72ac6108326e8de4b129921f92b6a47 Mon Sep 17 00:00:00 2001
 From: Claude Fable 5 <noreply@anthropic.com>
-Date: Mon, 3 Aug 2026 17:56:53 +0000
-Subject: [PATCH] CUDA/HIP: group independent rms_norm+mul launches into one
+Date: Mon, 3 Aug 2026 12:56:21 -0600
+Subject: [PATCH 3/4] CUDA: group independent rms_norm+mul launches into one
  kernel
 
-Decode-time QK-norm issues two independent rms_norm+mul launches per layer
-(Q and K) over disjoint tensors of the same ncols and eps. On a launch-bound
-GPU each is its own dispatch of a ~1.6us kernel.
-
-This adds a grouped rms_norm launch: up to 4 such pairs run as ONE kernel
-whose grid concatenates their row ranges. A block routes itself to its
-segment (x / mul / dst base pointer plus local row index - all integer work)
-and then performs exactly the per-row thread geometry, reduction and output
-expression of the individual rms_norm_f32<block_size, true> launch it
-replaces, so results are byte-identical by construction.
-
-Group detection runs in the eval loop before the existing fusions:
-
-- Only pairs stock would run through the rms_norm+mul fused path are
-  considered; the +add variant is left alone.
-- Only the 2D case (ne02 == ne03 == 1 for the input and the mul operand) is
-  grouped, where the stock channel/sample offsets are all zero.
-- Later members are hoisted to the first member position only when their
-  destination cannot touch memory any skipped-over node still reads or
-  writes and their inputs cannot be written in between (checked against
-  actual data ranges). Nodes already issued earlier in the pass - such as
-  the K/V matvecs a grouped mmvq launch hoisted - are excluded from that
-  scan: they have already completed at this launch point.
-- Node order is untouched, so every allocation-sensitive upstream fusion
-  decision stays identical to stock.
-
-On Laguna-XS-2.1-Q4_K_M (RDNA4, gfx1201) this removes 38 kernel launches per
-decoded token (38 of 40 layers group their Q/K norms) and improves decode
-throughput by ~1.2 percent at byte-identical output.
+Port of the R9700/HIP track patch 0005 ("CUDA/HIP: group independent
+rms_norm+mul launches into one kernel", Claude Fable 5) to the GB10 CUDA
+track, unchanged: the code is in the shared ggml-cuda sources and contains
+no architecture-gated paths. A decoder layer normalises Q and K with two
+independent rms_norm+mul pairs of the same ncols/eps over disjoint
+tensors; the grouped kernel gives every row exactly the thread geometry,
+block reduction and output expression it has in the individual launch, so
+the result is byte-identical by construction.
 
 GGML_CUDA_DISABLE_NORM_GROUP=1 disables the optimization.
+
+Verified on DGX Spark GB10 (sm_121, CUDA 13.0): greedy text and full float
+top-5 logprob hashes match the stock build on 3 prompts.
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu | 192 ++++++++++++++++++++++++++++++++
  ggml/src/ggml-cuda/norm.cu      | 148 ++++++++++++++++++++++++
@@ -42,10 +24,10 @@ GGML_CUDA_DISABLE_NORM_GROUP=1 disables the optimization.
  3 files changed, 351 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index f8c5544bd..b40fcc0d9 100644
+index 6f271d2..e46ec53 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3338,6 +3338,174 @@ static int ggml_cuda_mmvq_collect_group(const ggml_cgraph * cgraph, const int st
+@@ -3344,6 +3344,174 @@ static int ggml_cuda_mmvq_collect_group(const ggml_cgraph * cgraph, const int st
  }
  
  
@@ -220,7 +202,7 @@ index f8c5544bd..b40fcc0d9 100644
  // try and fuse nodes and return the number of nodes to skip
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
-@@ -4164,6 +4332,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4170,6 +4338,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  
              // Members of grouped mmvq launches already issued earlier in this pass.
              std::unordered_set<const ggml_tensor *> mmvq_grouped_done;
@@ -231,7 +213,7 @@ index f8c5544bd..b40fcc0d9 100644
              static const bool disable_mmvq_group = getenv("GGML_CUDA_DISABLE_MMVQ_GROUP") != nullptr &&
                                                     std::atoi(getenv("GGML_CUDA_DISABLE_MMVQ_GROUP"));
              const bool mmvq_group_enabled = !disable_mmvq_group && stream_ctx.concurrent_events.empty();
-@@ -4224,6 +4396,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4230,6 +4402,26 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      continue; // already computed as part of a grouped mmvq launch
                  }
  
@@ -259,7 +241,7 @@ index f8c5544bd..b40fcc0d9 100644
  
                  if (nodes_to_skip != 0) {
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
-index 09d9f3a7d..5ca960643 100644
+index 09d9f3a..5ca9606 100644
 --- a/ggml/src/ggml-cuda/norm.cu
 +++ b/ggml/src/ggml-cuda/norm.cu
 @@ -475,6 +475,154 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
@@ -418,7 +400,7 @@ index 09d9f3a7d..5ca960643 100644
      const ggml_tensor * src0 = dst->src[0];
      const float * src0_d = (const float *) src0->data;
 diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
-index a74f63767..820d62258 100644
+index a74f637..820d622 100644
 --- a/ggml/src/ggml-cuda/norm.cuh
 +++ b/ggml/src/ggml-cuda/norm.cuh
 @@ -4,6 +4,17 @@ void ggml_cuda_op_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
@@ -439,6 +421,3 @@ index a74f63767..820d62258 100644
  void ggml_cuda_op_rms_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
  
  void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * mul_tensor);
--- 
-2.53.0
-

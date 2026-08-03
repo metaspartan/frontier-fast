@@ -1,43 +1,21 @@
-From f0f1c4bb1956892fed15c0d814571e9266147eac Mon Sep 17 00:00:00 2001
+From 67741f55ab0af4791a6ec16bc0014ca0a299f971 Mon Sep 17 00:00:00 2001
 From: Claude Fable 5 <noreply@anthropic.com>
-Date: Mon, 3 Aug 2026 18:08:28 +0000
-Subject: [PATCH] CUDA/HIP: group independent rope launches into one kernel
+Date: Mon, 3 Aug 2026 12:56:21 -0600
+Subject: [PATCH 4/4] CUDA: group independent rope launches into one kernel
 
-A decoder layer ropes Q and K with two separate NeoX rope launches that share
-every rope parameter (identical op_params, the same position tensor and the
-same freq_factors) and differ only in the tensor they read and write. On a
-launch-bound GPU each is its own dispatch of a ~1.5us kernel.
-
-This adds a grouped rope launch: up to 4 such ops run as ONE kernel whose grid
-concatenates their row ranges. A block routes itself to its segment (src/dst
-base pointer, row strides, local row index - all integer work) and then
-performs exactly the per-element sequence of the individual
-rope_neox<forward, has_ff, T, D> launch it replaces, including the i0 >= n_dims
-pass-through and the identical rope_yarn call and output expressions, so
-results are byte-identical by construction.
-
-Group detection mirrors the grouped rms_norm pass:
-
-- plain NeoX only, F32 in and out, and only the 2D case (ne02 == ne03 == 1)
-  where the stock row decomposition reduces to i1 = row_dst, i2 = i3 = 0;
-- anything stock would fuse with VIEW+SET_ROWS is left alone;
-- members must have byte-equal op_params and the same pos / freq_factors
-  tensors and the same ne00, so every derived scalar (theta_scale, corr_dims)
-  is bit-identical to the individual launch;
-- later members are hoisted to the first member position only when their
-  destination cannot touch memory any skipped-over node still reads or writes
-  and their inputs cannot be written in between. K's rope sits behind K's
-  projection and K's norm in graph order, but both have already been issued by
-  that point - the projection as a member of a grouped mmvq launch, the norm as
-  a member of a grouped rms_norm launch - so the scan skips them;
-- node order is untouched, so allocation-sensitive upstream fusion decisions
-  stay identical to stock.
-
-On Laguna-XS-2.1-Q4_K_M (RDNA4, gfx1201) this removes 38 kernel launches per
-decoded token and improves decode throughput by ~1.3 percent at byte-identical
-output.
+Port of the R9700/HIP track patch 0006 ("CUDA/HIP: group independent rope
+launches into one kernel", Claude Fable 5) to the GB10 CUDA track,
+unchanged: the code is in the shared ggml-cuda sources and contains no
+architecture-gated paths. The Q and K rope of a decoder layer are two
+independent launches with the same mode, parameters and position tensor;
+the grouped kernel routes each block to its segment and then performs the
+stock per-element computation, so the result is byte-identical by
+construction.
 
 GGML_CUDA_DISABLE_ROPE_GROUP=1 disables the optimization.
+
+Verified on DGX Spark GB10 (sm_121, CUDA 13.0): greedy text and full float
+top-5 logprob hashes match the stock build on 3 prompts.
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu | 172 ++++++++++++++++++++++++++++--
  ggml/src/ggml-cuda/rope.cu      | 182 ++++++++++++++++++++++++++++++++
@@ -45,10 +23,10 @@ GGML_CUDA_DISABLE_ROPE_GROUP=1 disables the optimization.
  3 files changed, 358 insertions(+), 7 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index b40fcc0d9..8bb3a0a4d 100644
+index e46ec53..1b59948 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3506,6 +3506,149 @@ static int ggml_cuda_rms_norm_collect_group(const ggml_cgraph * cgraph, const in
+@@ -3512,6 +3512,149 @@ static int ggml_cuda_rms_norm_collect_group(const ggml_cgraph * cgraph, const in
      return n;
  }
  
@@ -198,7 +176,7 @@ index b40fcc0d9..8bb3a0a4d 100644
  // try and fuse nodes and return the number of nodes to skip
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
-@@ -4332,10 +4475,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4338,10 +4481,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
  
              // Members of grouped mmvq launches already issued earlier in this pass.
              std::unordered_set<const ggml_tensor *> mmvq_grouped_done;
@@ -213,7 +191,7 @@ index b40fcc0d9..8bb3a0a4d 100644
              static const bool disable_mmvq_group = getenv("GGML_CUDA_DISABLE_MMVQ_GROUP") != nullptr &&
                                                     std::atoi(getenv("GGML_CUDA_DISABLE_MMVQ_GROUP"));
              const bool mmvq_group_enabled = !disable_mmvq_group && stream_ctx.concurrent_events.empty();
-@@ -4396,26 +4541,39 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4402,26 +4547,39 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      continue; // already computed as part of a grouped mmvq launch
                  }
  
@@ -259,7 +237,7 @@ index b40fcc0d9..8bb3a0a4d 100644
  
                  if (nodes_to_skip != 0) {
 diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
-index e20a5cb6b..1ded56eca 100644
+index e20a5cb..1ded56e 100644
 --- a/ggml/src/ggml-cuda/rope.cu
 +++ b/ggml/src/ggml-cuda/rope.cu
 @@ -503,6 +503,188 @@ static void rope_vision_cuda(const T *            x,
@@ -452,7 +430,7 @@ index e20a5cb6b..1ded56eca 100644
  void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
                              ggml_tensor *               dst,
 diff --git a/ggml/src/ggml-cuda/rope.cuh b/ggml/src/ggml-cuda/rope.cuh
-index 72af086cd..59d35aa8d 100644
+index 72af086..59d35aa 100644
 --- a/ggml/src/ggml-cuda/rope.cuh
 +++ b/ggml/src/ggml-cuda/rope.cuh
 @@ -2,6 +2,17 @@
@@ -473,6 +451,3 @@ index 72af086cd..59d35aa8d 100644
  void ggml_cuda_op_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
  
  void ggml_cuda_op_rope_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
--- 
-2.53.0
-

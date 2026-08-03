@@ -12,6 +12,15 @@ Your patch series is benchmarked on whichever track you submit to; a series
 can target both (submit twice). Vendor-specific code paths are fine as long
 as each track's build stays byte-exact vs its stock binary.
 
+**This branch carries the `laguna-xs-2.1-gguf-gb10cuda-v1` (GB10 CUDA) series.**
+The runner applies every `Sources/patches/*.patch` of the submitted commit, so a
+branch carries exactly one track's set. These four patches are the CUDA port of
+the R9700 series 0003-0006 (dedupe, grouped matvecs, grouped rms_norm, grouped
+rope), with the per-arch differences documented in each patch header. The R9700
+series 0001/0002 (idle-warp launch trim) is deliberately absent: the geometry it
+targets does not occur on NVIDIA, where the upstream `small_k` path is enabled
+and on RDNA it is not.
+
 Track `laguna-xs-2.1-gguf-r9700-v1` is **full-source kernel surgery**,
 mlx.fast style: your submission is a patch series against the pinned
 llama.cpp tree, and the trusted runner rebuilds the whole engine with it.
