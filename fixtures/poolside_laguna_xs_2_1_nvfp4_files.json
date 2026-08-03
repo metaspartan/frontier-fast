@@ -1,0 +1,83 @@
+{
+  "repo": "poolside/Laguna-XS-2.1-NVFP4",
+  "revision": "d32afde8b09af1539b49ff96ff5551c674485f8e",
+  "totalBytes": 21596075520,
+  "fileCount": 17,
+  "files": [
+    {
+      "file": ".gitattributes",
+      "size": 1584
+    },
+    {
+      "file": "LICENSE.md",
+      "size": 2618
+    },
+    {
+      "file": "README.md",
+      "size": 11133
+    },
+    {
+      "file": "chat_template.jinja",
+      "size": 3874
+    },
+    {
+      "file": "config.json",
+      "size": 6365
+    },
+    {
+      "file": "configuration_laguna.py",
+      "size": 13177
+    },
+    {
+      "file": "generation_config.json",
+      "size": 483
+    },
+    {
+      "file": "model-00001-of-00005.safetensors",
+      "size": 5120635984,
+      "sha256": "5c57958ad46c9a012f08234e9587b8e7b25f4f72805228c91415455eb5900d66"
+    },
+    {
+      "file": "model-00002-of-00005.safetensors",
+      "size": 5124031544,
+      "sha256": "a5cdc16384bb24a59e342322148120705c78a5cca623e71375dd0e9a3b23e736"
+    },
+    {
+      "file": "model-00003-of-00005.safetensors",
+      "size": 5124049880,
+      "sha256": "7685bcfd4cd890e3504e10dfe7fda635c509f6d729b5245ba4b31a0dabd59575"
+    },
+    {
+      "file": "model-00004-of-00005.safetensors",
+      "size": 5124050664,
+      "sha256": "05c31a155e4b1c383397d2703b839f96dcf254609542d3560095d5adb1b29585"
+    },
+    {
+      "file": "model-00005-of-00005.safetensors",
+      "size": 1083833432,
+      "sha256": "b9944765b6d8f21de94545e95f451d359ca1f7d54015159971d948172e787bd2"
+    },
+    {
+      "file": "model.safetensors.index.json",
+      "size": 12092850,
+      "sha256": "1b210b9cd9301ce87579afa9a5e58edfed659ef68f439c952f600f509de8e8c2"
+    },
+    {
+      "file": "modeling_laguna.py",
+      "size": 41118
+    },
+    {
+      "file": "special_tokens_map.json",
+      "size": 214
+    },
+    {
+      "file": "tokenizer.json",
+      "size": 7287678
+    },
+    {
+      "file": "tokenizer_config.json",
+      "size": 12922
+    }
+  ],
+  "note": "Pinned artifact manifest from the Hugging Face API. The trusted runner serves exactly this revision; verify your local cache against these sizes/hashes before benchmarking."
+}
