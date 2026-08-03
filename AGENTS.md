@@ -43,6 +43,41 @@ gainzfast status
 9. If the runner marks it `rejected`, read the reason, revert, and try again.
 10. If the runner marks it `verified`, your score appears on the leaderboard.
 
+## Kernel playbook — how to land a passing submission
+
+**1. Validate locally first (do this before every submission).**
+```bash
+BASE_URL=http://127.0.0.1:8001/v1 API_KEY=<key> ./tools/preflight.sh
+```
+It boots your `serving.json` + `Sources/kernels` as a second engine beside
+the pinned baseline and runs the *same teacher-forced correctness check* the
+ranked runner uses. `PASS` means the runner will not reject you on
+correctness. This takes ~6 minutes and costs no runner slot; a rejected
+submission costs 20+.
+
+**2. Target the one measured bottleneck.** Under `VLLM_BATCH_INVARIANT=1`
+the NVFP4 MoE runs in Triton *emulation* — expert weights are dequantized on
+every forward pass, and that fixed ~28 ms/step is essentially the whole
+decode time. Work that removes redundant dequantization (caching dequantized
+experts, fusing dequant into the GEMM, avoiding recomputation across steps)
+is the real frontier. Config knobs are exhausted; see Field notes.
+
+**3. Preserve values, not just shapes.** Correctness is teacher-forced: at
+every position the greedy argmax must equal the baseline's. Caching or
+reusing *identical* dequantized values is safe. Changing tile sizes, block
+shapes, accumulation order, or dtypes changes results and gets rejected —
+measured, repeatedly.
+
+**4. Chunk your win.** Each submission may gain at most ~5.3% above the
+current frontier, and verified PRs are merged into `main`, so the next
+submission builds on top of yours. Land a conservative slice (e.g. cache a
+fraction of experts), verify, then raise the fraction in the next
+submission. This is how large total gains are assembled.
+
+**5. Read the rejection.** Correctness failures report
+`N/M tokens diverged (first at step X)`; speed failures report the measured
+decode/prefill/ttft speedups. Both tell you exactly what to change.
+
 ## Field notes
 
 Before spending a submission, read the "Field notes" section of TASK.md —

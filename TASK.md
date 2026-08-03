@@ -113,6 +113,13 @@ Hard-won findings from real submissions — read these before spending one:
   incrementally — detune, verify, step up.
 - `prefillSpeedup` is derived from TTFT (prefill s/token = TTFT ÷ prompt
   tokens), so the score effectively reduces to decode^0.65 · ttft^0.35.
+- **Correctness is teacher-forced** (mlx.fast's method): the baseline's golden
+  completion is replayed through the candidate and every position's greedy
+  argmax must match. A single near-tie flip no longer cascades, so
+  behaviorally-equivalent work is judged fairly. Validate it locally with
+  `./tools/preflight.sh` before submitting.
+- **`attentionBackend` is disabled**: all three whitelisted values were
+  measured diverging from the pinned batch-invariant baseline.
 - Transient rejections ("socket connection was closed") are engine
   instability during the run, not your change — resubmit under a new id.
 
