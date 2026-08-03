@@ -15,7 +15,7 @@ on:
 jobs:
   verify:
     runs-on: [self-hosted, dgx-spark, gb10]
-    timeout-minutes: 45
+    timeout-minutes: 90
     env:
       GAINZ_TRACK: ${{ inputs.track || 'laguna-xs-2.1-nvfp4-gb10-v1' }}
     steps:
