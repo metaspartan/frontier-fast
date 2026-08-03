@@ -105,6 +105,9 @@ _orig_invoke = _emu.invoke_fused_moe_nvfp4_emulation_kernel
 # Token count of the MoE forward currently being applied.
 _current_tokens = 0
 
+# Set on the first sub-tile launch; gates the one-time engagement log line.
+_engaged = False
+
 # Launch schedule for the decode sub-tile kernel.  num_warps=2 (instead of
 # Triton's default 4) is where the speed comes from: the [16, 64] output tile
 # occupies exactly two m16n8 MMA fragment rows per warp at nw=2, and the
@@ -357,6 +360,26 @@ def _subtile_invoke(
         )
 
     assert B_scale is not None and B_scale.ndim == 3
+
+    # Engagement evidence: exactly one log line the first time the sub-tile
+    # launch actually replaces a stock decode GEMM. A ranked run whose
+    # candidate logs carry the install() line but NOT this line never ran the
+    # optimized kernel (e.g. the plugin loaded but every forward fell through),
+    # and a run with neither line benchmarked a stock engine. Added after a
+    # ranked run silently scored a stock candidate as this kernel (the
+    # submission's commitSha did not exist, so serving.json — and with it
+    # kernels:true — was never fetched).
+    global _engaged
+    if not _engaged:
+        _engaged = True
+        logger.info(
+            "gainz_kernels: decode sub-tile ENGAGED (first launch: M=%d, "
+            "BLOCK_STRIDE_M=%d, sub-tile M-extent=%d, num_warps=%d)",
+            _current_tokens,
+            block_stride_m,
+            _SUB_BLOCK_M,
+            _SUB_NUM_WARPS,
+        )
 
     N = B.size(1)
     K = A.size(1)
