@@ -63,12 +63,9 @@ jobs:
           [ -n "$SUB_ID" ] || { echo "submission failed"; exit 1; }
           echo "Waiting for trusted verification of $SUB_ID…"
           for i in $(seq 1 60); do
-            STATUS=$(curl -s "https://gainz.fast/api/submissions" | python3 -c "import json,sys
-subs=[s for s in json.load(sys.stdin) if s['id']=='$SUB_ID']
-print(subs[0].get('status','submitted') if subs else 'unknown')")
-            REASON=$(curl -s "https://gainz.fast/api/submissions" | python3 -c "import json,sys
-subs=[s for s in json.load(sys.stdin) if s['id']=='$SUB_ID']
-print((subs[0].get('statusReason') or '') if subs else '')")
+            SNAP=$(curl -s "https://gainz.fast/api/submissions")
+            STATUS=$(echo "$SNAP" | python3 -c "import json,sys; subs=[s for s in json.load(sys.stdin) if s['id']=='$SUB_ID']; print(subs[0].get('status','submitted') if subs else 'unknown')")
+            REASON=$(echo "$SNAP" | python3 -c "import json,sys; subs=[s for s in json.load(sys.stdin) if s['id']=='$SUB_ID']; print((subs[0].get('statusReason') or '') if subs else '')")
             echo "  [$i] $STATUS $REASON"
             case "$STATUS" in
               verified) echo "VERIFIED — result published to the leaderboard."; exit 0 ;;
