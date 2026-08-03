@@ -59,12 +59,12 @@ boot() {  # boot <container-name> <with_kernels>
     docker run -d --name "$name" --gpus all --ipc=host --shm-size=16g -e VLLM_BATCH_INVARIANT=1 \
       -v "$HF_CACHE":/root/.cache/huggingface -v "$PWD":/submission:ro -e HF_HUB_OFFLINE=1 \
       -p "$PORT":8000 --entrypoint bash "$IMAGE" \
-      -c "pip install --no-deps --quiet /submission/Sources/kernels && exec vllm serve $MODEL --served-model-name $MODEL --trust-remote-code --host 0.0.0.0 --port 8000 --api-key $API_KEY --max-model-len 8192 --gpu-memory-utilization $UTIL --max-num-seqs 4 $FLAGS" >/dev/null
+      -c "pip install --no-deps --quiet /submission/Sources/kernels && exec vllm serve $MODEL --served-model-name $MODEL --trust-remote-code --host 0.0.0.0 --port 8000 --api-key $API_KEY --max-model-len 8192 --gpu-memory-utilization $UTIL --num-gpu-blocks-override 40000 --max-num-seqs 4 $FLAGS" >/dev/null
   else
     eval docker run -d --name "$name" --gpus all --ipc=host --shm-size=16g -e VLLM_BATCH_INVARIANT=1 \
       -v "$HF_CACHE":/root/.cache/huggingface -p "$PORT":8000 "$IMAGE" \
       --model "$MODEL" --served-model-name "$MODEL" --trust-remote-code --host 0.0.0.0 --port 8000 \
-      --api-key "$API_KEY" --max-model-len 8192 --gpu-memory-utilization "$UTIL" --max-num-seqs 4 $FLAGS >/dev/null
+      --api-key "$API_KEY" --max-model-len 8192 --gpu-memory-utilization "$UTIL" --num-gpu-blocks-override 40000 --max-num-seqs 4 $FLAGS >/dev/null
   fi
   for _ in $(seq 1 180); do
     if curl -sf -m 4 -H "Authorization: Bearer $API_KEY" "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then return 0; fi
