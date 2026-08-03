@@ -100,6 +100,7 @@ The authoritative list is `editablePaths` in `benchmark.json`:
 | `Sources/transforms/` | Offline weight/layout transformations applied before serving. |
 | `Sources/model/` | Model-specific optimizations: engine flags, kernel backend selection, CUDA kernel patches, speculative-decoding configs. |
 | `Sources/scoring/` | Scoring helpers only — the formula itself is pinned in `benchmark.json`. |
+| `Sources/kernels/` | Custom Triton/CUDA kernels pip-installed into the candidate engine (`"kernels": true`). **Breakthrough surface.** |
 
 Everything else — `benchmark.json`, `correctness_prompts/`, `Tests/`,
 `tools/`, `.github/`, and the shared TypeScript core — is frozen for

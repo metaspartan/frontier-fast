@@ -75,6 +75,7 @@ calibration band caps a single submission's gain at ~5.3%.
 - `Sources/transforms/` — Weight transformation logic
 - `Sources/model/` — Model-specific optimizations
 - `Sources/scoring/` — Scoring helpers (formula itself is pinned in benchmark.json)
+- `Sources/kernels/` — Custom Triton/CUDA kernel package loaded into the candidate engine (`"kernels": true` in serving.json)
 
 ## Tracks
 

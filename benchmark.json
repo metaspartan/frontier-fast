@@ -10,14 +10,15 @@
     "formula": "decode_speedup^0.65 * prefill_speedup^0.20 * ttft_speedup^0.15",
     "decodeFloor": 0.95,
     "prefillFloor": 0.95,
-    "ttftFloor": 0.90,
+    "ttftFloor": 0.9,
     "maxSingleSubmissionGain": 1.053
   },
   "editablePaths": [
     "Sources/runner/",
     "Sources/transforms/",
     "Sources/model/",
-    "Sources/scoring/"
+    "Sources/scoring/",
+    "Sources/kernels/"
   ],
   "correctnessPrompts": "correctness_prompts/"
 }
