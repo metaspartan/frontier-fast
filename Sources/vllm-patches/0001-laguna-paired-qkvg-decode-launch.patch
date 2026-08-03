@@ -1,0 +1,392 @@
+diff --git a/vllm/model_executor/models/laguna.py b/vllm/model_executor/models/laguna.py
+index c79e8d4..197102d 100644
+--- a/vllm/model_executor/models/laguna.py
++++ b/vllm/model_executor/models/laguna.py
+@@ -30,6 +30,7 @@ from vllm.model_executor.layers.linear import (
+     QKVParallelLinear,
+     ReplicatedLinear,
+     RowParallelLinear,
++    UnquantizedLinearMethod,
+ )
+ from vllm.model_executor.layers.logits_processor import LogitsProcessor
+ from vllm.model_executor.layers.quantization import QuantizationConfig
+@@ -61,6 +62,267 @@ from vllm.sequence import IntermediateTensors
+ 
+ logger = init_logger(__name__)
+ 
++# ---------------------------------------------------------------------------
++# Paired qkv+g decode launch (batch-invariant serving only).
++#
++# Laguna's softplus output gate is a tiny linear over the SAME hidden_states
++# as the qkv projection: N = num_heads (48/72) at per-head gating, i.e. a
++# single 128-wide output tile.  Under batch-invariant serving both
++# projections lower to `matmul_kernel_persistent` (batch_invariant.py), so at
++# single-token decode the g_proj launch is ONE program on a 48-SM part that
++# serializes after the all-SM qkv launch — a whole extra launch wave for
++# ~0.4 MB of weight.
++#
++# `_qkvg_pair_matmul_kernel` below issues both projections in ONE persistent
++# launch: the program grid first walks the qkv tile set, then the g tile set.
++# Each walk replicates `matmul_kernel_persistent` line for line at the same
++# (M, N, K) specialization the stock launch uses (same BLOCK_SIZE_M/N/K 128/
++# 128/64, GROUP_SIZE_M 8, num_stages 3, num_warps 8, same masks, same
++# sequential fp32 K-accumulation via tl.dot, same bf16 store rounding), so
++# every output element accumulates in exactly the stock order.  The g tiles
++# are assigned to the programs that would have received the tiles following
++# the qkv set — the launch-wave slack of the qkv GEMV (e.g. 88 tiles over 48
++# programs leaves 8 programs with a single tile) — so the gate rides for
++# free instead of paying its own wave.  Outputs remain two separate
++# contiguous tensors: every downstream op sees bit-identical values in
++# bit-identical layouts.
++# ---------------------------------------------------------------------------
++
++import vllm.envs as envs
++from vllm.model_executor.layers.batch_invariant import _compute_pid
++from vllm.triton_utils import tl, triton
++from vllm.utils.platform_utils import num_compute_units
++from vllm.utils.torch_utils import direct_register_custom_op
++
++
++@triton.jit
++def _qkvg_pair_matmul_kernel(
++    a_ptr,
++    b1_ptr,
++    c1_ptr,
++    b2_ptr,
++    c2_ptr,
++    M,
++    N1,
++    N2,
++    K,
++    stride_am,
++    stride_ak,
++    stride_b1k,
++    stride_b1n,
++    stride_c1m,
++    stride_c1n,
++    stride_b2k,
++    stride_b2n,
++    stride_c2m,
++    stride_c2n,
++    BLOCK_SIZE_M: tl.constexpr,
++    BLOCK_SIZE_N: tl.constexpr,
++    BLOCK_SIZE_K: tl.constexpr,
++    GROUP_SIZE_M: tl.constexpr,
++    NUM_SMS: tl.constexpr,
++):
++    start_pid = tl.program_id(axis=0)
++    num_pid_m = tl.cdiv(M, BLOCK_SIZE_M)
++    k_tiles = tl.cdiv(K, BLOCK_SIZE_K)
++    offs_k_for_mask = tl.arange(0, BLOCK_SIZE_K)
++
++    # GEMM 1 (qkv): verbatim tile walk of matmul_kernel_persistent at
++    # (M, N1, K) with the A_LARGE/B_LARGE/C_LARGE/HAS_BIAS constexprs all
++    # False — exactly the specialization the stock launch runs at these
++    # sizes (host side asserts numel < 2**31 and biases are absent).
++    num_pid_n1 = tl.cdiv(N1, BLOCK_SIZE_N)
++    num_tiles1 = num_pid_m * num_pid_n1
++    num_pid_in_group1 = GROUP_SIZE_M * num_pid_n1
++    tile_id_c1 = start_pid - NUM_SMS
++    for tile_id in tl.range(start_pid, num_tiles1, NUM_SMS, flatten=True):
++        pid_m, pid_n = _compute_pid(
++            tile_id, num_pid_in_group1, num_pid_m, GROUP_SIZE_M
++        )
++        start_m = pid_m * BLOCK_SIZE_M
++        start_n = pid_n * BLOCK_SIZE_N
++        offs_am = start_m + tl.arange(0, BLOCK_SIZE_M)
++        offs_bn = start_n + tl.arange(0, BLOCK_SIZE_N)
++        offs_am = tl.where(offs_am < M, offs_am, 0)
++        offs_bn = tl.where(offs_bn < N1, offs_bn, 0)
++        offs_am = tl.max_contiguous(
++            tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M
++        )
++        offs_bn = tl.max_contiguous(
++            tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N
++        )
++        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
++        for ki in range(k_tiles):
++            offs_k = ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
++            a_ptrs = a_ptr + (
++                offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
++            )
++            b_ptrs = b1_ptr + (
++                offs_k[:, None] * stride_b1k + offs_bn[None, :] * stride_b1n
++            )
++            a = tl.load(
++                a_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0
++            )
++            b = tl.load(
++                b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0
++            )
++            accumulator = tl.dot(a, b, accumulator)
++        tile_id_c1 += NUM_SMS
++        pid_m, pid_n = _compute_pid(
++            tile_id_c1, num_pid_in_group1, num_pid_m, GROUP_SIZE_M
++        )
++        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
++        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
++        c_ptrs = c1_ptr + stride_c1m * offs_cm[:, None] + stride_c1n * offs_cn[None, :]
++        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N1)
++        c = accumulator.to(c1_ptr.dtype.element_ty)
++        tl.store(c_ptrs, c, mask=c_mask)
++
++    # GEMM 2 (g): the same verbatim walk at (M, N2, K).  Tile j is assigned
++    # to the program that global tile (num_tiles1 + j) would map to, i.e.
++    # the least-loaded programs of the GEMM-1 wave.
++    num_pid_n2 = tl.cdiv(N2, BLOCK_SIZE_N)
++    num_tiles2 = num_pid_m * num_pid_n2
++    num_pid_in_group2 = GROUP_SIZE_M * num_pid_n2
++    start2 = (start_pid + NUM_SMS - num_tiles1 % NUM_SMS) % NUM_SMS
++    tile_id_c2 = start2 - NUM_SMS
++    for tile_id in tl.range(start2, num_tiles2, NUM_SMS, flatten=True):
++        pid_m, pid_n = _compute_pid(
++            tile_id, num_pid_in_group2, num_pid_m, GROUP_SIZE_M
++        )
++        start_m = pid_m * BLOCK_SIZE_M
++        start_n = pid_n * BLOCK_SIZE_N
++        offs_am = start_m + tl.arange(0, BLOCK_SIZE_M)
++        offs_bn = start_n + tl.arange(0, BLOCK_SIZE_N)
++        offs_am = tl.where(offs_am < M, offs_am, 0)
++        offs_bn = tl.where(offs_bn < N2, offs_bn, 0)
++        offs_am = tl.max_contiguous(
++            tl.multiple_of(offs_am, BLOCK_SIZE_M), BLOCK_SIZE_M
++        )
++        offs_bn = tl.max_contiguous(
++            tl.multiple_of(offs_bn, BLOCK_SIZE_N), BLOCK_SIZE_N
++        )
++        accumulator = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
++        for ki in range(k_tiles):
++            offs_k = ki * BLOCK_SIZE_K + tl.arange(0, BLOCK_SIZE_K)
++            a_ptrs = a_ptr + (
++                offs_am[:, None] * stride_am + offs_k[None, :] * stride_ak
++            )
++            b_ptrs = b2_ptr + (
++                offs_k[:, None] * stride_b2k + offs_bn[None, :] * stride_b2n
++            )
++            a = tl.load(
++                a_ptrs, mask=offs_k_for_mask[None, :] < K - ki * BLOCK_SIZE_K, other=0.0
++            )
++            b = tl.load(
++                b_ptrs, mask=offs_k_for_mask[:, None] < K - ki * BLOCK_SIZE_K, other=0.0
++            )
++            accumulator = tl.dot(a, b, accumulator)
++        tile_id_c2 += NUM_SMS
++        pid_m, pid_n = _compute_pid(
++            tile_id_c2, num_pid_in_group2, num_pid_m, GROUP_SIZE_M
++        )
++        offs_cm = pid_m * BLOCK_SIZE_M + tl.arange(0, BLOCK_SIZE_M)
++        offs_cn = pid_n * BLOCK_SIZE_N + tl.arange(0, BLOCK_SIZE_N)
++        c_ptrs = c2_ptr + stride_c2m * offs_cm[:, None] + stride_c2n * offs_cn[None, :]
++        c_mask = (offs_cm[:, None] < M) & (offs_cn[None, :] < N2)
++        c = accumulator.to(c2_ptr.dtype.element_ty)
++        tl.store(c_ptrs, c, mask=c_mask)
++
++
++def _qkvg_pair_launch(
++    x: torch.Tensor, wq: torch.Tensor, wg: torch.Tensor
++) -> tuple[torch.Tensor, torch.Tensor]:
++    """One persistent launch computing qkv = x @ wq.T and gate = x @ wg.T.
++
++    Mirrors ``matmul_persistent``'s bf16 launch (same grid rule per tile
++    set, same config constants) with the two outputs preallocated on the
++    current stream so the op is CUDA-graph-capture safe.
++    """
++    M, _ = x.shape
++    n1 = wq.shape[0]
++    n2 = wg.shape[0]
++    qkv = torch.empty((M, n1), device=x.device, dtype=x.dtype)
++    gate = torch.empty((M, n2), device=x.device, dtype=x.dtype)
++    b1 = wq.t()
++    b2 = wg.t()
++    num_sms = num_compute_units(x.device.index)
++
++    def grid(meta):
++        tiles = triton.cdiv(M, meta["BLOCK_SIZE_M"]) * (
++            triton.cdiv(n1, meta["BLOCK_SIZE_N"])
++            + triton.cdiv(n2, meta["BLOCK_SIZE_N"])
++        )
++        return (min(num_sms, tiles),)
++
++    _qkvg_pair_matmul_kernel[grid](
++        x,
++        b1,
++        qkv,
++        b2,
++        gate,
++        M,
++        n1,
++        n2,
++        x.shape[1],
++        x.stride(0),
++        x.stride(1),
++        b1.stride(0),
++        b1.stride(1),
++        qkv.stride(0),
++        qkv.stride(1),
++        b2.stride(0),
++        b2.stride(1),
++        gate.stride(0),
++        gate.stride(1),
++        BLOCK_SIZE_M=128,
++        BLOCK_SIZE_N=128,
++        BLOCK_SIZE_K=64,
++        GROUP_SIZE_M=8,
++        NUM_SMS=num_sms,
++        num_stages=3,
++        num_warps=8,
++    )
++    return qkv, gate
++
++
++def _laguna_qkvg_pair_impl(
++    x: torch.Tensor, wq: torch.Tensor, wg: torch.Tensor
++) -> tuple[torch.Tensor, torch.Tensor]:
++    if (
++        x.dim() == 2
++        and x.dtype == torch.bfloat16
++        and x.is_contiguous()
++        and x.numel() < 2**31
++        and wq.numel() < 2**31
++        and wg.numel() < 2**31
++        and x.shape[0] * wq.shape[0] < 2**31
++        and x.shape[0] * wg.shape[0] < 2**31
++    ):
++        return _qkvg_pair_launch(x, wq, wg)
++    # Fallback: the two stock launches, dispatched through the
++    # batch-invariant aten::linear override — bit-identical to the
++    # unpatched path by construction.
++    return F.linear(x, wq), F.linear(x, wg)
++
++
++def _laguna_qkvg_pair_fake(
++    x: torch.Tensor, wq: torch.Tensor, wg: torch.Tensor
++) -> tuple[torch.Tensor, torch.Tensor]:
++    return (
++        x.new_empty((x.shape[0], wq.shape[0])),
++        x.new_empty((x.shape[0], wg.shape[0])),
++    )
++
++
++if not hasattr(torch.ops.vllm, "laguna_qkvg_pair"):
++    direct_register_custom_op(
++        op_name="laguna_qkvg_pair",
++        op_func=_laguna_qkvg_pair_impl,
++        mutates_args=[],
++        fake_impl=_laguna_qkvg_pair_fake,
++    )
++
+ 
+ class LagunaMLP(nn.Module):
+     """Dense MLP for Laguna (used in mlp_only_layers)."""
+@@ -352,6 +614,11 @@ class LagunaAttention(nn.Module):
+             self.g_proj = None
+             self.gate_per_head = False
+ 
++        # Set by enable_qkvg_pair_launch() after weight loading when this
++        # layer qualifies for the paired qkv+g decode launch; until then
++        # forward uses the stock separate projections.
++        self._use_qkvg_pair = False
++
+         # Attention sinks (learnable per-head bias for SWA layers)
+         sinks = None
+         if attention_sink:
+@@ -426,12 +693,58 @@ class LagunaAttention(nn.Module):
+         self.q_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+         self.k_norm = RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+ 
++    def enable_qkvg_pair_launch(self) -> None:
++        """Qualify this layer for the paired qkv+g decode launch.
++
++        Enabled only when the paired launch is provably the stock math:
++        batch-invariant serving active (both projections lower to
++        ``matmul_kernel_persistent``, whose bf16 specialization the pair
++        kernel replicates), single-rank TP, both projections plain
++        unquantized bf16 linears without bias over the same
++        ``hidden_states``.  Anything else keeps the stock path.
++        """
++        if self.g_proj is None or not envs.VLLM_BATCH_INVARIANT:
++            return
++        if get_tensor_model_parallel_world_size() != 1:
++            return
++        if not isinstance(
++            getattr(self.qkv_proj, "quant_method", None), UnquantizedLinearMethod
++        ):
++            return
++        if not isinstance(
++            getattr(self.g_proj, "quant_method", None), UnquantizedLinearMethod
++        ):
++            return
++        wq = getattr(self.qkv_proj, "weight", None)
++        wg = getattr(self.g_proj, "weight", None)
++        if wq is None or wg is None:
++            return
++        if (
++            wq.dim() != 2
++            or wg.dim() != 2
++            or wq.dtype != torch.bfloat16
++            or wg.dtype != torch.bfloat16
++            or wq.shape[1] != wg.shape[1]
++            or not wq.is_contiguous()
++            or not wg.is_contiguous()
++            or getattr(self.qkv_proj, "bias", None) is not None
++            or getattr(self.g_proj, "bias", None) is not None
++        ):
++            return
++        self._use_qkvg_pair = True
++
+     def forward(
+         self,
+         positions: torch.Tensor,
+         hidden_states: torch.Tensor,
+     ) -> torch.Tensor:
+-        qkv, _ = self.qkv_proj(hidden_states)
++        if self._use_qkvg_pair and hidden_states.dim() == 2:
++            qkv, gate_lin = torch.ops.vllm.laguna_qkvg_pair(
++                hidden_states, self.qkv_proj.weight, self.g_proj.weight
++            )
++        else:
++            qkv, _ = self.qkv_proj(hidden_states)
++            gate_lin = None
+         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+ 
+         q_by_head = q.view(*q.shape[:-1], q.shape[-1] // self.head_dim, self.head_dim)
+@@ -447,8 +760,9 @@ class LagunaAttention(nn.Module):
+ 
+         # Apply gating if enabled (compute softplus in float32 for precision)
+         if self.gating and self.g_proj is not None:
+-            gate, _ = self.g_proj(hidden_states)
+-            gate = F.softplus(gate.float()).type_as(attn_output)
++            if gate_lin is None:
++                gate_lin, _ = self.g_proj(hidden_states)
++            gate = F.softplus(gate_lin.float()).type_as(attn_output)
+             if self.gate_per_head:
+                 # gate: [..., num_heads]; broadcast across head_dim
+                 attn_shape = attn_output.shape
+@@ -835,6 +1149,27 @@ class LagunaModel(nn.Module, EagleModelMixin):
+                     weight_loader(param, loaded_weight)
+                     loaded_params.add(name)
+ 
++        # Qualify each attention layer for the paired qkv+g decode launch
++        # (see _qkvg_pair_matmul_kernel).  Runs after all weights are loaded
++        # and before the first forward, so the torch.compile trace sees the
++        # final per-layer decision.
++        n_pair_layers = 0
++        for layer in self.layers:
++            if isinstance(layer, PPMissingLayer):
++                continue
++            self_attn = getattr(layer, "self_attn", None)
++            if self_attn is not None and hasattr(
++                self_attn, "enable_qkvg_pair_launch"
++            ):
++                self_attn.enable_qkvg_pair_launch()
++                if getattr(self_attn, "_use_qkvg_pair", False):
++                    n_pair_layers += 1
++        if n_pair_layers:
++            logger.info(
++                "Laguna paired qkv+g decode launch enabled on %d layers",
++                n_pair_layers,
++            )
++
+         return loaded_params
+ 
+ 
