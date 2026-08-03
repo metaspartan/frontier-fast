@@ -1,4 +1,14 @@
-"""Decode-shape M-sub-tiling for the NVFP4 MoE Triton emulation path.
+"""Decode-shape work removal for the NVFP4 MoE Triton emulation path.
+
+Two independent, strictly value-preserving cuts live here.  Both follow the
+same rule: delete work that provably contributes nothing, never re-order a
+sum.
+
+1. M-sub-tiling (merged, the current frontier) — drop the padded M rows.
+2. Grouped b_scale loads (this change) — stop materialising each weight
+   scale ``group_size_packed`` times per k-iteration.
+
+
 
 Under ``VLLM_BATCH_INVARIANT=1`` vLLM pins the MoE config to
 ``BLOCK_SIZE_M=64`` for every batch size (``get_default_config`` in
@@ -42,6 +52,41 @@ dict: that also re-runs ``moe_align_block_size`` at block_size=16, which
 rebuilds the padded block layout and the ``sorted_token_ids`` buffer.  Here
 the alignment path is left completely alone.
 
+Grouped b_scale loads
+---------------------
+Sub-tiling M shrank the ``tl.dot`` but not the per-k NVFP4 weight-dequant
+chain, which is sized by ``BLOCK_SIZE_N x BLOCK_SIZE_K`` and is independent
+of M.  Profiling the merged frontier showed the biggest pure redundancy in
+that chain is the weight-scale tile.
+
+One fp8-e4m3 scale covers ``group_size`` (16) elements of K, i.e.
+``group_size_packed`` (8) packed bytes, while a k-iteration spans
+``BLOCK_SIZE_K_PACKED`` (16) packed bytes.  So each k-iteration touches
+exactly ``16 / 8 = 2`` distinct scale columns — yet the stock kernel builds
+a full ``[BLOCK_SIZE_N, 16]`` index tile, issues that load, bitcasts all
+1024 lanes from fp8 and multiplies all 1024 by ``w_global_scale``.  Seven
+eighths of that is a duplicate of a value already in a register.
+
+Because ``BLOCK_SIZE_K_PACKED`` is an exact multiple of
+``group_size_packed``, the stock column index rewrites exactly:
+
+    (j + BLOCK_SIZE_K_PACKED * k) // group_size_packed
+      == NUM_SCALE_GROUPS * k + j // group_size_packed      for all j
+
+so the kernel loads the ``[BLOCK_SIZE_N, 2]`` tile of distinct scales,
+bitcasts and rescales those 128 lanes, and ``broadcast_to``-replicates them
+back to ``[BLOCK_SIZE_N, 16]``.  A broadcast copies a value; every element
+of the reconstructed tile is bit-for-bit the same fp32 datum the stock
+kernel computed for that element, so ``low_scaled``/``high_scaled``, the
+``tl.dot`` operands and the accumulation are unchanged.  The fold of
+``w_global_scale`` happens before the replication rather than after, which
+is the same fp32 multiply of the same two operands — replication cannot
+perturb it.
+
+The rewrite is only enabled when it is exact: unmasked K-loop,
+``BLOCK_SIZE_K_PACKED % group_size_packed == 0``, and a power-of-two group
+count.  Anything else takes the stock path verbatim.
+
 Guard
 -----
 The sub-tile is used only when the MoE forward carries at most
@@ -52,13 +97,33 @@ synchronisation.  With at most 16 tokens no expert can own more than 16
 rows.  Every other shape (all prefill-shaped batches) falls through to the
 stock launcher untouched.
 
-Measured on this GB10 in the pinned vllm/vllm-openai:v0.25.1 container at
-exact Laguna-XS-2.1 MoE shapes (E=256, top_k=8, hidden=2048,
-moe_intermediate=512): both fused GEMMs bitwise identical (uint16 view of
-the bf16 outputs) to the stock BLOCK_SIZE_M=64 path at M in
-{1, 2, 4, 8, 16} across 4 seeds, and 0.1797 ms -> 0.1556 ms per MoE layer
-pair at M=1 (CUDA events, 200 iters).
+Measured evidence
+-----------------
+On this GB10 in the pinned vllm/vllm-openai:v0.25.1 container, driving the
+stock launcher and this one from the SAME ``moe_align_block_size(bs=64)``
+output and the same random inputs.  Both fused GEMMs' bf16 outputs compared
+as uint16 bit patterns, at M in {1, 2, 4, 8, 16} x 4 seeds:
+
+  Laguna-XS-2.1  (E=256, top_k=8,  hidden=2048, moe_intermediate=512)
+      bitwise identical in every case, both GEMMs
+      M=1, CUDA events, 300 iters, per MoE layer pair:
+          stock                       0.1194 ms
+          + M-sub-tile                0.0937 ms   (1.2747x)
+          + grouped b_scale           0.0733 ms   (1.6288x; 1.278x more)
+
+  Laguna-S-2.1   (E=256, top_k=10, hidden=3072, moe_intermediate=1024)
+      bitwise identical in every case, both GEMMs
+      M=1, CUDA events, 300 iters, per MoE layer pair:
+          stock                       0.4757 ms
+          + M-sub-tile                0.4308 ms   (1.1044x)
+          + grouped b_scale           0.4175 ms   (1.1395x; 1.032x more)
+
+Both Laguna MoE K values (XS 2048/512, S 3072/1024) are multiples of
+BLOCK_SIZE_K=32, so the K-loop is unmasked and the grouped scale path is
+exact at both.
 """
+
+import os
 
 import vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe as _emu
 from vllm.logger import init_logger
@@ -75,6 +140,16 @@ logger = init_logger("gainz_kernels.moe_tile")
 # aligned block covers all of them.
 _SMALL_M_MAX = 16
 _SUB_BLOCK_M = 16
+
+# NVFP4 weight-scale group size (elements of K per fp8-e4m3 scale).  vLLM's
+# emulation launcher hardcodes the same 16, and both Laguna checkpoints
+# declare group_size=16 in their quantization_config.
+_GROUP_SIZE = 16
+
+# Collapse the 8x-redundant per-k b_scale load/bitcast/rescale.  Set
+# GAINZ_MOE_SCALE_GROUPED=0 to run the reference arm (identical results,
+# it is the A/B control for the load-collapse only).
+_SCALE_GROUPED = os.environ.get("GAINZ_MOE_SCALE_GROUPED", "1") != "0"
 
 _orig_try_get_optimal_moe_config = _emu.try_get_optimal_moe_config
 _orig_invoke = _emu.invoke_fused_moe_nvfp4_emulation_kernel
@@ -129,6 +204,7 @@ def fused_moe_nvfp4_emulation_subtile_kernel(
     top_k: tl.constexpr,
     compute_type: tl.constexpr,
     group_size: tl.constexpr,
+    SCALE_GROUPED: tl.constexpr,
 ):
     """vLLM's ``fused_moe_nvfp4_emulation_kernel`` with one change.
 
@@ -217,20 +293,55 @@ def fused_moe_nvfp4_emulation_subtile_kernel(
         low_decoded = _e2m1_inline(low_nibble)
         high_decoded = _e2m1_inline(high_nibble)
 
-        b_scale_ptrs = (
-            b_scale_ptr
-            + off_experts * stride_bse
-            + offs_bn[:, None] * stride_bsn
-            + ((offs_k_packed[None, :] + BLOCK_SIZE_K_PACKED * k) // group_size_packed)
-            * stride_bsk
-        )
-        if block_k_diviable:
-            b_scale_raw = tl.load(b_scale_ptrs)
+        if SCALE_GROUPED:
+            # The scale column index the stock kernel computes is
+            #     (j + BLOCK_SIZE_K_PACKED * k) // group_size_packed
+            # and BLOCK_SIZE_K_PACKED is an exact multiple of
+            # group_size_packed (16 and 8 in the pinned config), so it equals
+            #     NUM_SCALE_GROUPS * k + j // group_size_packed
+            # exactly, for every j in [0, BLOCK_SIZE_K_PACKED).  Only
+            # NUM_SCALE_GROUPS (=2) distinct columns therefore exist in this
+            # k-iteration; the stock kernel loads, bitcasts and rescales each
+            # of them group_size_packed (=8) times.  Load them once and
+            # replicate.  ``broadcast_to`` copies a value, so every element of
+            # the resulting tile is the identical fp32 datum the stock kernel
+            # produced for that element.
+            NUM_SCALE_GROUPS: tl.constexpr = BLOCK_SIZE_K_PACKED // group_size_packed
+            b_scale_g_ptrs = (
+                b_scale_ptr
+                + off_experts * stride_bse
+                + offs_bn[:, None] * stride_bsn
+                + (tl.arange(0, NUM_SCALE_GROUPS)[None, :] + NUM_SCALE_GROUPS * k)
+                * stride_bsk
+            )
+            b_scale_g = tl.load(b_scale_g_ptrs)
+            b_scale_g = tl.cast(b_scale_g, tl.float8e4nv, bitcast=True).to(tl.float32)
+            b_scale_g = b_scale_g * w_global_scale
+            b_scale = tl.reshape(
+                tl.broadcast_to(
+                    tl.expand_dims(b_scale_g, 2),
+                    (BLOCK_SIZE_N, NUM_SCALE_GROUPS, group_size_packed),
+                ),
+                (BLOCK_SIZE_N, BLOCK_SIZE_K_PACKED),
+            )
         else:
-            b_scale_raw = tl.load(b_scale_ptrs, mask=kp_mask, other=0.0)
+            b_scale_ptrs = (
+                b_scale_ptr
+                + off_experts * stride_bse
+                + offs_bn[:, None] * stride_bsn
+                + (
+                    (offs_k_packed[None, :] + BLOCK_SIZE_K_PACKED * k)
+                    // group_size_packed
+                )
+                * stride_bsk
+            )
+            if block_k_diviable:
+                b_scale_raw = tl.load(b_scale_ptrs)
+            else:
+                b_scale_raw = tl.load(b_scale_ptrs, mask=kp_mask, other=0.0)
 
-        b_scale = tl.cast(b_scale_raw, tl.float8e4nv, bitcast=True).to(tl.float32)
-        b_scale = b_scale * w_global_scale
+            b_scale = tl.cast(b_scale_raw, tl.float8e4nv, bitcast=True).to(tl.float32)
+            b_scale = b_scale * w_global_scale
 
         low_scaled = low_decoded * b_scale
         high_scaled = high_decoded * b_scale
@@ -310,6 +421,27 @@ def _subtile_invoke(
         triton.cdiv(EM, block_stride_m) * triton.cdiv(N, META["BLOCK_SIZE_N"]),
     )
 
+    # Collapse the redundant per-k b_scale work only when the rewrite of the
+    # scale column index is exact (see the kernel comment):
+    #   * the K-loop must be unmasked, so the stock masked path is untouched;
+    #   * BLOCK_SIZE_K_PACKED must be an exact multiple of group_size_packed,
+    #     otherwise the group index is not affine in k;
+    #   * the group count must be a power of two for ``tl.arange``.
+    # Every condition holds in the pinned config (BLOCK_SIZE_K=32,
+    # group_size=16 -> 16 packed cols over 2 groups of 8) and at both
+    # Laguna-XS and Laguna-S MoE K values, all multiples of 32.
+    block_k_diviable = K % config["BLOCK_SIZE_K"] == 0
+    packed_k = config["BLOCK_SIZE_K"] // 2
+    group_size_packed = _GROUP_SIZE // 2
+    num_scale_groups = packed_k // group_size_packed
+    scale_grouped = (
+        _SCALE_GROUPED
+        and block_k_diviable
+        and packed_k % group_size_packed == 0
+        and num_scale_groups >= 1
+        and num_scale_groups & (num_scale_groups - 1) == 0
+    )
+
     fused_moe_nvfp4_emulation_subtile_kernel[grid](
         A,
         B,
@@ -334,11 +466,12 @@ def _subtile_invoke(
         B_scale.stride(0),
         B_scale.stride(2),
         B_scale.stride(1),
-        block_k_diviable=K % config["BLOCK_SIZE_K"] == 0,
+        block_k_diviable=block_k_diviable,
         MUL_ROUTED_WEIGHT=mul_routed_weight,
         top_k=top_k,
         compute_type=compute_type,
-        group_size=16,
+        group_size=_GROUP_SIZE,
+        SCALE_GROUPED=scale_grouped,
         BLOCK_STRIDE_M=block_stride_m,
         BLOCK_SIZE_M=_SUB_BLOCK_M,
         BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
@@ -356,8 +489,9 @@ def install() -> None:
     logger.info(
         "gainz_kernels: NVFP4 MoE decode M-sub-tiling installed (GEMM M-extent "
         "-> %d inside the unchanged %d-row aligned blocks, for forwards "
-        "carrying <= %d tokens)",
+        "carrying <= %d tokens); grouped b_scale loads %s",
         _SUB_BLOCK_M,
         64,
         _SMALL_M_MAX,
+        "enabled" if _SCALE_GROUPED else "disabled",
     )
