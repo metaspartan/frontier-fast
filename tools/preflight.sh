@@ -18,7 +18,7 @@ PORT="${PREFLIGHT_PORT:-8004}"
 NAME="gainz-preflight-$$"
 PROMPT="List the prime numbers below fifty, then explain in two sentences why there are infinitely many primes. "
 
-cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; }
+cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; docker rm -f "${CONTROL:-}" >/dev/null 2>&1 || true; }
 trap cleanup EXIT
 
 echo "==> reading Sources/runner/serving.json"
@@ -51,27 +51,8 @@ GOLDEN=$(curl -s -m 300 -H "Authorization: Bearer $API_KEY" -H "content-type: ap
 echo "    golden captured ($(printf %s "$GOLDEN" | wc -c) chars)"
 
 KERNELS=$(python3 -c "import json;print('1' if json.load(open('Sources/runner/serving.json')).get('overrides',{}).get('kernels') else '')")
-echo "==> booting candidate on :$PORT (alongside the baseline)"
-if [ -n "$KERNELS" ]; then
-  docker run -d --name "$NAME" --gpus all --ipc=host --shm-size=16g -e VLLM_BATCH_INVARIANT=1 \
-    -v "$HF_CACHE":/root/.cache/huggingface -v "$PWD":/submission:ro -e HF_HUB_OFFLINE=1 \
-    -p "$PORT":8000 --entrypoint bash "$IMAGE" \
-    -c "pip install --no-deps --quiet /submission/Sources/kernels && exec vllm serve $MODEL --served-model-name $MODEL --trust-remote-code --host 0.0.0.0 --port 8000 --api-key $API_KEY --max-model-len 8192 --gpu-memory-utilization 0.40 --max-num-seqs 4 $FLAGS" >/dev/null
-else
-  eval docker run -d --name "$NAME" --gpus all --ipc=host --shm-size=16g -e VLLM_BATCH_INVARIANT=1 \
-    -v "$HF_CACHE":/root/.cache/huggingface -p "$PORT":8000 "$IMAGE" \
-    --model "$MODEL" --served-model-name "$MODEL" --trust-remote-code --host 0.0.0.0 --port 8000 \
-    --api-key "$API_KEY" --max-model-len 8192 --gpu-memory-utilization 0.40 --max-num-seqs 4 $FLAGS >/dev/null
-fi
-
-for i in $(seq 1 180); do
-  if curl -sf -m 4 -H "Authorization: Bearer $API_KEY" "http://127.0.0.1:$PORT/v1/models" >/dev/null 2>&1; then READY=1; break; fi
-  if [ "$(docker inspect "$NAME" --format '{{.State.Status}}' 2>/dev/null)" = "exited" ]; then
-    echo "FAIL: candidate exited during boot:"; docker logs "$NAME" --tail 8 2>&1 | grep -iE "error|usage:" | tail -3; exit 1
-  fi
-  sleep 10
-done
-[ -n "${READY:-}" ] || { echo "FAIL: candidate never became ready"; exit 1; }
+echo "==> booting CANDIDATE (your patch) on :$PORT"
+boot_engine "$NAME" "$FLAGS" "$KERNELS" || exit 1
 echo "    candidate ready"
 
 echo "==> teacher-forced correctness (same method as the ranked runner)"
@@ -92,6 +73,6 @@ for i, slot in enumerate(pl):
         mism += 1; first = first or checked
 print(f"    checked_steps={checked} mismatches={mism}" + (f" first_at={first}" if first else ""))
 print("PASS: bit-exact under teacher forcing — safe to submit." if mism == 0
-      else f"FAIL: {mism}/{checked} tokens diverge — the ranked runner will reject this.")
+      else f"FAIL: {mism}/{checked} tokens diverge from the control — the ranked runner will reject this.")
 sys.exit(0 if mism == 0 else 2)
 PY
