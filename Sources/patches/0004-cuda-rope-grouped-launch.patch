@@ -1,7 +1,7 @@
-From 67741f55ab0af4791a6ec16bc0014ca0a299f971 Mon Sep 17 00:00:00 2001
+From a18c6bd1e1ce8cd918de100b6d99dd42d474bc8d Mon Sep 17 00:00:00 2001
 From: Claude Fable 5 <noreply@anthropic.com>
-Date: Mon, 3 Aug 2026 12:56:21 -0600
-Subject: [PATCH 4/9] CUDA: group independent rope launches into one kernel
+Date: Mon, 3 Aug 2026 13:31:56 -0600
+Subject: [PATCH 04/10] CUDA: group independent rope launches into one kernel
 
 Port of the R9700/HIP track patch 0006 ("CUDA/HIP: group independent rope
 launches into one kernel", Claude Fable 5) to the GB10 CUDA track,

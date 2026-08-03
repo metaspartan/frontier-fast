@@ -1,7 +1,7 @@
-From 798ee0be2b53dfc61b65de6d3175813cf39cc582 Mon Sep 17 00:00:00 2001
+From 94275f02c724a03ddc03bb17047bcf19cb964212 Mon Sep 17 00:00:00 2001
 From: Claude Fable 5 <noreply@anthropic.com>
-Date: Mon, 3 Aug 2026 13:10:05 -0600
-Subject: [PATCH 5/9] CUDA: group the KV-cache K/V set_rows stores into one
+Date: Mon, 3 Aug 2026 13:31:56 -0600
+Subject: [PATCH 05/10] CUDA: group the KV-cache K/V set_rows stores into one
  launch
 
 Port of the R9700/HIP track patch 0007 ("CUDA/HIP: group the KV-cache K and V

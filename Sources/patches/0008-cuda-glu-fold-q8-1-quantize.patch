@@ -1,8 +1,8 @@
-From dbd4a3496edbf00fc4c37fb5e05d85e42ade7538 Mon Sep 17 00:00:00 2001
+From a65c94897969522a5b568e4ff772da21631cb635 Mon Sep 17 00:00:00 2001
 From: Claude Fable 5 <noreply@anthropic.com>
-Date: Mon, 3 Aug 2026 13:10:05 -0600
-Subject: [PATCH 8/9] CUDA: fold the q8_1 quantization of a GLU result into the
- GLU
+Date: Mon, 3 Aug 2026 13:31:56 -0600
+Subject: [PATCH 08/10] CUDA: fold the q8_1 quantization of a GLU result into
+ the GLU
 
 Port of the R9700/HIP track patch 0010 ("CUDA/HIP: fold the q8_1
 quantization of a glu result into that glu", Claude Fable 5), unchanged:

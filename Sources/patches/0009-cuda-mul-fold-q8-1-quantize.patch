@@ -1,7 +1,7 @@
-From 6eb911129991127f8ed615253f741209b2ae56ba Mon Sep 17 00:00:00 2001
+From d0ea1a9d4536c7068687197c7c436e6ffb8663eb Mon Sep 17 00:00:00 2001
 From: Claude Fable 5 <noreply@anthropic.com>
-Date: Mon, 3 Aug 2026 13:10:05 -0600
-Subject: [PATCH 9/9] CUDA: fold the q8_1 quantization of a broadcast-mul
+Date: Mon, 3 Aug 2026 13:31:56 -0600
+Subject: [PATCH 09/10] CUDA: fold the q8_1 quantization of a broadcast-mul
  result into that mul
 
 Port of the R9700/HIP track patch 0011 ("CUDA/HIP: fold the q8_1

@@ -1,7 +1,7 @@
-From e3e251ebb72ac6108326e8de4b129921f92b6a47 Mon Sep 17 00:00:00 2001
+From b271f5ab3a46b543e904c11f4fb866393499c5db Mon Sep 17 00:00:00 2001
 From: Claude Fable 5 <noreply@anthropic.com>
-Date: Mon, 3 Aug 2026 12:56:21 -0600
-Subject: [PATCH 3/9] CUDA: group independent rms_norm+mul launches into one
+Date: Mon, 3 Aug 2026 13:31:56 -0600
+Subject: [PATCH 03/10] CUDA: group independent rms_norm+mul launches into one
  kernel
 
 Port of the R9700/HIP track patch 0005 ("CUDA/HIP: group independent

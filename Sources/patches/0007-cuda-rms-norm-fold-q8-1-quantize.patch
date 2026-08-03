@@ -1,7 +1,7 @@
-From 2d7181e43073f442e79f70e145559e3c9605c8f5 Mon Sep 17 00:00:00 2001
+From 7f81b965be95e9e40c2776d1d5cdc0bcf8e1df1a Mon Sep 17 00:00:00 2001
 From: Claude Fable 5 <noreply@anthropic.com>
-Date: Mon, 3 Aug 2026 13:10:05 -0600
-Subject: [PATCH 7/9] CUDA: fold the q8_1 quantization of an activation into
+Date: Mon, 3 Aug 2026 13:31:56 -0600
+Subject: [PATCH 07/10] CUDA: fold the q8_1 quantization of an activation into
  the norm producing it
 
 Port of the R9700/HIP track patch 0009 ("CUDA/HIP: fold the q8_1

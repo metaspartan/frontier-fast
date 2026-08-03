@@ -1,7 +1,7 @@
-From f08727d1116df20191bb2327ef7faa28e27691f9 Mon Sep 17 00:00:00 2001
+From 2721f08597cb9f98f43825d5389b2b742bb24a60 Mon Sep 17 00:00:00 2001
 From: Claude Fable 5 <noreply@anthropic.com>
-Date: Mon, 3 Aug 2026 13:10:05 -0600
-Subject: [PATCH 6/9] CUDA: fold the residual add into the following
+Date: Mon, 3 Aug 2026 13:31:56 -0600
+Subject: [PATCH 06/10] CUDA: fold the residual add into the following
  rms_norm+mul
 
 Port of the R9700/HIP track patch 0008 ("CUDA/HIP: fold the residual add into

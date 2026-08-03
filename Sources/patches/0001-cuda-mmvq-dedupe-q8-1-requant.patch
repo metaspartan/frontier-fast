@@ -1,7 +1,7 @@
-From e07d018c19ca0b682d17ff0220ccc93713cb9f88 Mon Sep 17 00:00:00 2001
+From d295457bb43caa2574f53debf9b9c4bcafe19e0e Mon Sep 17 00:00:00 2001
 From: Claude Fable 5 <noreply@anthropic.com>
-Date: Mon, 3 Aug 2026 12:56:21 -0600
-Subject: [PATCH 1/9] CUDA: dedupe q8_1 re-quantization of shared mmvq
+Date: Mon, 3 Aug 2026 13:31:56 -0600
+Subject: [PATCH 01/10] CUDA: dedupe q8_1 re-quantization of shared mmvq
  activations
 
 Port of the R9700/HIP track patch 0003 ("CUDA/HIP: dedupe q8_1

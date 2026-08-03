@@ -1,7 +1,7 @@
-From 570bb1711124924f1c14fa73c8e1740128890c7e Mon Sep 17 00:00:00 2001
+From d29564184fda8c2a17727fd654bc833b4d999bcf Mon Sep 17 00:00:00 2001
 From: Claude Fable 5 <noreply@anthropic.com>
-Date: Mon, 3 Aug 2026 12:56:21 -0600
-Subject: [PATCH 2/9] CUDA: group same-activation quantized matvecs into one
+Date: Mon, 3 Aug 2026 13:31:56 -0600
+Subject: [PATCH 02/10] CUDA: group same-activation quantized matvecs into one
  launch
 
 Port of the R9700/HIP track patch 0004 ("CUDA/HIP: group same-activation
@@ -52,6 +52,9 @@ falls back to a scoped allocation on a slab-full miss.
 
 Verified on DGX Spark GB10 (sm_121, CUDA 13.0): greedy text and full float
 top-5 logprob hashes match the stock build on 3 prompts.
+
+On GB10 this lever turns out to be a loss and the next patch in this series
+disables it by default; see that patch for the measurements.
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu | 228 ++++++++++++++++++++++
  ggml/src/ggml-cuda/mmvq.cu      | 322 ++++++++++++++++++++++++++++++++
