@@ -11,7 +11,7 @@ backend-path = ["_build"]
 
 [project]
 name = "gainz-kernels"
-version = "0.3.1"
+version = "0.4.0"
 description = "Participant CUDA/Triton kernels loaded into the candidate vLLM engine by the trusted gainz.fast runner."
 requires-python = ">=3.10"
 

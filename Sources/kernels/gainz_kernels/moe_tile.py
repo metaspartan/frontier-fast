@@ -82,8 +82,20 @@ keep the whole dequant chain in the integer pipe and measure 1.25x the
 first-iteration sub-tile per MoE layer pair at M=1 (median of 40
 interleaved cycles x 20 iters, CUDA events: 0.1267 ms -> 0.1015 ms).
 Bitwise gate re-run for the combination: both fused GEMMs identical to the
-stock kernel for all 20 (M, seed) configs.  Prefill-shaped forwards still
-fall through to the completely untouched stock launcher.
+stock kernel for all 20 (M, seed) configs.
+
+Third iteration (this revision)
+-------------------------------
+Prefill-shaped forwards no longer fall through to the stock launcher: they
+run the same kernel at the STOCK geometry — BLOCK_SIZE_M equal to the
+config's aligned block stride, Triton-default num_warps=4, num_stages=3 —
+which makes its body exactly the stock kernel's with ``_e2m1_signfold``
+substituted for ``_e2m1_inline``.  The fold is a per-element integer
+rewrite of the nibble -> fp32 decode, exhaustively bit-identical for all
+16 nibble values and independent of M, so no output bit can change at any
+shape; the fold at nw=4 measured 1.02x the stock kernel per launch
+(offline, decode-shaped; the prefill-shaped fraction saved is smaller
+because MMA work grows with M while the B-decode ALU cost is fixed).
 """
 
 import vllm.model_executor.layers.fused_moe.experts.nvfp4_emulation_moe as _emu
@@ -105,8 +117,15 @@ _orig_invoke = _emu.invoke_fused_moe_nvfp4_emulation_kernel
 # Token count of the MoE forward currently being applied.
 _current_tokens = 0
 
-# Set on the first sub-tile launch; gates the one-time engagement log line.
+# Set on the first sub-tile / stock-geometry launch respectively; each gates
+# a one-time engagement log line.
 _engaged = False
+_engaged_stock_shape = False
+
+# Triton's default warp count, pinned explicitly for the stock-geometry
+# signfold launch so a toolchain default change cannot alter the schedule
+# away from the stock kernel's.
+_STOCK_NUM_WARPS = 4
 
 # Launch schedule for the decode sub-tile kernel.  num_warps=2 (instead of
 # Triton's default 4) is where the speed comes from: the [16, 64] output tile
@@ -335,42 +354,34 @@ def _subtile_invoke(
     config,
     compute_type,
 ):
-    """Launch the sub-tiled kernel for decode shapes, else the stock one."""
+    """Launch the signfold kernel: 16-row sub-tile at nw=2 for decode shapes,
+    stock geometry (full BLOCK_SIZE_M rows, Triton-default nw=4) otherwise.
+
+    Both cases run ``fused_moe_nvfp4_emulation_subtile_kernel``; at
+    ``BLOCK_SIZE_M == BLOCK_STRIDE_M`` and nw=4/ns=3 its body is exactly the
+    stock kernel's with the (bit-identical, per-nibble exhaustively verified)
+    ``_e2m1_signfold`` decode in place of ``_e2m1_inline``. No shape, layout,
+    tile geometry, K-loop or reduction changes at any M.
+    """
     block_stride_m = config["BLOCK_SIZE_M"]
-    if (
-        block_stride_m <= _SUB_BLOCK_M
-        or _current_tokens <= 0
-        or _current_tokens > _SMALL_M_MAX
-    ):
-        return _orig_invoke(
-            A,
-            B,
-            C,
-            B_scale,
-            act_global_scale,
-            w_global_scale,
-            topk_weights,
-            sorted_token_ids,
-            expert_ids,
-            num_tokens_post_padded,
-            mul_routed_weight,
-            top_k,
-            config,
-            compute_type,
-        )
+    decode_shaped = (
+        block_stride_m > _SUB_BLOCK_M
+        and 0 < _current_tokens <= _SMALL_M_MAX
+    )
+    sub_m = _SUB_BLOCK_M if decode_shaped else block_stride_m
+    launch_warps = _SUB_NUM_WARPS if decode_shaped else _STOCK_NUM_WARPS
 
     assert B_scale is not None and B_scale.ndim == 3
 
-    # Engagement evidence: exactly one log line the first time the sub-tile
-    # launch actually replaces a stock decode GEMM. A ranked run whose
-    # candidate logs carry the install() line but NOT this line never ran the
-    # optimized kernel (e.g. the plugin loaded but every forward fell through),
-    # and a run with neither line benchmarked a stock engine. Added after a
-    # ranked run silently scored a stock candidate as this kernel (the
-    # submission's commitSha did not exist, so serving.json — and with it
-    # kernels:true — was never fetched).
-    global _engaged
-    if not _engaged:
+    # Engagement evidence: exactly one log line per path the first time it
+    # actually replaces a stock GEMM launch. A ranked run whose candidate logs
+    # carry the install() line but NOT these lines never ran the optimized
+    # kernels (plugin loaded but never took effect), and a run with neither
+    # benchmarked a stock engine. Added after a ranked run silently scored a
+    # stock candidate as this kernel (the submission's commitSha did not
+    # exist, so serving.json — and with it kernels:true — was never fetched).
+    global _engaged, _engaged_stock_shape
+    if decode_shaped and not _engaged:
         _engaged = True
         logger.info(
             "gainz_kernels: decode sub-tile ENGAGED (first launch: M=%d, "
@@ -379,6 +390,15 @@ def _subtile_invoke(
             block_stride_m,
             _SUB_BLOCK_M,
             _SUB_NUM_WARPS,
+        )
+    elif not decode_shaped and not _engaged_stock_shape:
+        _engaged_stock_shape = True
+        logger.info(
+            "gainz_kernels: stock-geometry signfold ENGAGED (first launch: "
+            "M=%d, BLOCK_SIZE_M=%d, num_warps=%d)",
+            _current_tokens,
+            block_stride_m,
+            _STOCK_NUM_WARPS,
         )
 
     N = B.size(1)
@@ -425,11 +445,11 @@ def _subtile_invoke(
         compute_type=compute_type,
         group_size=16,
         BLOCK_STRIDE_M=block_stride_m,
-        BLOCK_SIZE_M=_SUB_BLOCK_M,
+        BLOCK_SIZE_M=sub_m,
         BLOCK_SIZE_N=config["BLOCK_SIZE_N"],
         BLOCK_SIZE_K=config["BLOCK_SIZE_K"],
         GROUP_SIZE_M=config["GROUP_SIZE_M"],
-        num_warps=_SUB_NUM_WARPS,
+        num_warps=launch_warps,
         num_stages=_SUB_NUM_STAGES,
     )
 
