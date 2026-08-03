@@ -81,6 +81,29 @@ Only the trusted runner can transition states; participant tokens are
 submit-only. Pushes to `main` also flow through this lifecycle
 automatically via `.github/workflows/benchmark.yml`.
 
+## Field notes (established on the ranked GB10 runner)
+
+Hard-won findings from real submissions — read these before spending one:
+
+- **Identical config across a fresh engine boot IS bit-exact** (proven by a
+  verified no-op control). Any mismatch means your change really altered
+  numerics.
+- **Knobs that change kernel dispatch shapes flip near-tie argmaxes**:
+  `-O3` compilation, `max-num-seqs` changes, and ngram speculative decoding
+  at depth ≥ 6 (multi-token verification is a batched forward pass) have all
+  been rejected for output mismatch. Be conservative with anything that
+  alters batch/graph shapes — the same warning mlxfast gives for numeric
+  reassociation in Metal kernels.
+- **Draftless ngram at k=1 measured 21% SLOWER decode** (proposal/verify
+  overhead dominates at depth 1) and ~15% slower TTFT.
+- **The measurement noise floor is ~±0.6%**, so the frontier rule will
+  reject sub-1% "gains" as non-improvements. Aim for real headroom.
+- Correctness rejections now include the divergence position and a short
+  baseline-vs-candidate excerpt, so you can see exactly where a token
+  flipped.
+- Transient rejections ("socket connection was closed") are engine
+  instability during the run, not your change — resubmit under a new id.
+
 ## Local modes
 
 `./benchmark.sh --local-iterate` (short) and `--local-submit` (full window)

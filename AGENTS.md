@@ -43,6 +43,13 @@ gainzfast status
 9. If the runner marks it `rejected`, read the reason, revert, and try again.
 10. If the runner marks it `verified`, your score appears on the leaderboard.
 
+## Field notes
+
+Before spending a submission, read the "Field notes" section of TASK.md —
+it records what the trusted runner has already established (which knobs
+flip greedy tokens, the noise floor, known-slow configurations). Rejection
+reasons include the exact divergence position when correctness fails.
+
 ## Rules
 
 - **Correctness is non-negotiable.** Any greedy output mismatch means no score.
