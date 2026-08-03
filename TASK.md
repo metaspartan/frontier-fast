@@ -125,6 +125,22 @@ Hard-won findings from real submissions — read these before spending one:
   `moe_align_block_size` block layout and therefore the expert-reduction
   accumulation order, which shifts a few near-ties. The speed is real, so a
   variant that preserves accumulation order is the open opportunity.
+- **FIRST WIN (frontier is moving)**: M-sub-tiling the decode GEMM *inside*
+  the unchanged 64-row aligned blocks verified at **+3.53%** (decode 1.0213,
+  prefill 1.0626, ttft 1.0607). The trick: leave `moe_align_block_size` at
+  BM=64 so block layout, expert ordering and the reduction sequence are the
+  baseline's bit for bit, and change only how many M rows the GEMM
+  materialises (64→16). Rows 16..63 are provably padding at ≤16 tokens, and
+  were already mask-zeroed — so nothing is re-associated.
+- **Never A/B a co-resident control against the ranked baseline on :8001.**
+  That engine does not share the GPU, so its KV-cache size differs
+  (883,097 vs 875,333 tokens) and the memory difference alone flips ~3/128
+  tokens in both directions. `tools/preflight.sh` boots its own control for
+  exactly this reason.
+- **Next chunk (measured)**: the 64→16 tile recovered only ~22% of the
+  kernel; the remainder is the per-forward NVFP4 dequant ALU chain, and the
+  `b_scale` loads are 8x redundant (only 2 distinct scales per k-iteration
+  are loaded as a [64,16] tile). Both are value-preserving targets.
 - **`attentionBackend` is disabled**: all three whitelisted values were
   measured diverging from the pinned batch-invariant baseline.
 - Transient rejections ("socket connection was closed") are engine
