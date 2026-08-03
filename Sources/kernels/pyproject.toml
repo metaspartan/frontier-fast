@@ -1,6 +1,17 @@
+# The trusted runner installs this package with
+#   pip install --no-deps /submission/Sources/kernels
+# from a READ-ONLY mount. The default setuptools backend fails there (its
+# egg_info step writes into the source tree), so we ship a stdlib-only
+# in-tree PEP 517 backend (_build/gainz_backend.py) that assembles the
+# wheel in pip's temp directories: no source-tree writes, no network.
+[build-system]
+requires = []
+build-backend = "gainz_backend"
+backend-path = ["_build"]
+
 [project]
 name = "gainz-kernels"
-version = "0.1.0"
+version = "0.2.0"
 description = "Participant CUDA/Triton kernels loaded into the candidate vLLM engine by the trusted gainz.fast runner."
 requires-python = ">=3.10"
 
