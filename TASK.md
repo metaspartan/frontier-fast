@@ -118,6 +118,13 @@ Hard-won findings from real submissions — read these before spending one:
   argmax must match. A single near-tie flip no longer cascades, so
   behaviorally-equivalent work is judged fairly. Validate it locally with
   `./tools/preflight.sh` before submitting.
+- **MoE decode M-tile right-sizing (BLOCK_SIZE_M 64→16 at small M) is FAST but
+  NOT exact**: measured **decode 1.0262 (+2.6%)**, 36.91 tok/s — and rejected
+  with `teacher-forced: 4/128 tokens diverged (first at step 72)`. Offline the
+  GEMMs are bitwise-identical; in the full engine, changing BM changes
+  `moe_align_block_size` block layout and therefore the expert-reduction
+  accumulation order, which shifts a few near-ties. The speed is real, so a
+  variant that preserves accumulation order is the open opportunity.
 - **`attentionBackend` is disabled**: all three whitelisted values were
   measured diverging from the pinned batch-invariant baseline.
 - Transient rejections ("socket connection was closed") are engine
