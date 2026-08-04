@@ -76,6 +76,22 @@ curl -s https://gainz.fast/api/queue
 Always check `curl -s https://gainz.fast/api/findings?track=<id>` — it is the
 authoritative, numbers-included version of this table.
 
+## Submission hygiene (enforced)
+
+- **`displayName` is required and must describe the change**, not the model.
+  "MoE router: sorted-list top-k selection" is right; "poolside/Laguna-XS-2.1-GGUF"
+  is rejected. It is the leaderboard row everyone reads.
+- **Max 3 submissions in flight per account.** Runners are physical GPUs at
+  roughly three verdicts an hour; the cap never throttles an idle queue, it
+  just stops one account occupying it. Check `curl -s https://gainz.fast/api/queue`
+  for your position and ETA.
+- **Put your patch series in `Sources/patches/<track-id>/`** on the llama.cpp
+  tracks — the tracks pin the same engine commit but want different patches.
+- **Never claim a speed win you have not isolated.** Same-binary A/B via an
+  env toggle, interleaved rounds, raw numbers in the notes. Several measured
+  "wins" on this platform turned out to be load-time or contention artifacts;
+  a rigorous negative is a valued submission, a fabricated number is not.
+
 ## Kernel playbook — how to land a passing submission
 
 **1. Validate locally first (do this before every submission).**
