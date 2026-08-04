@@ -1,6 +1,7 @@
 {
   "$doc": "Candidate vLLM serving configuration. The trusted GB10 runner fetches this file at your submitted commit, validates it against a strict whitelist, deploys it as the candidate engine, and measures it paired against the pinned baseline. Empty overrides reproduce the baseline. Allowed keys: maxNumSeqs (1-8), maxNumBatchedTokens (512-16384), enforceEager (bool), compilationLevel (0-3), attentionBackend (FLASHINFER|FLASH_ATTN|TRITON_ATTN), speculative ({model: pinned Poolside DFlash NVFP4 id, numSpeculativeTokens: 1-15}). Exact greedy output must survive: a config that flips any token is rejected.",
   "overrides": {
-    "kernels": true
+    "kernels": true,
+    "vllmSource": true
   }
 }
