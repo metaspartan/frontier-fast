@@ -18,7 +18,7 @@ submission.
 
 ## Ranked contract
 
-`benchmark.json` registers two tracks; `laguna-xs-2.1-nvfp4-gb10-v1` is the
+`benchmark.json` registers every live track; `laguna-xs-2.1-nvfp4-gb10-v1` is the
 default. A ranked run on the trusted self-hosted GB10 runner:
 
 1. Enforces the modifiable surface (`tools/enforce-modifiable-surface.sh`)
@@ -60,8 +60,8 @@ ttft_speedup    vs pinned calibration: [0.900, 1.100]
 
 The upper bound caps how much a single submission may gain (about 5%): a
 larger measured win is either a lucky reading or too big to trust in one
-shot, so chunk it across submissions — the cap is per submission, not
-cumulative.
+Bring your full verified gain in one submission — there is no per-submission
+cap, and verified PRs merge so later work compounds on top.
 
 ## Approach space
 

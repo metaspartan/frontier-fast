@@ -49,7 +49,7 @@ directional only and never publishes to the leaderboard.
 4. `./benchmark.sh --local-iterate` — measure your change.
 5. `./benchmark.sh --local-submit` — longer local signal before submitting.
 6. `./tools/preflight.sh` — REQUIRED. Validates your candidate against the
-   ranked runner's teacher-forced correctness check locally, at no
+   ranked runner's correctness check locally, at no
    submission cost.
 7. Commit one coherent change with a clear message, then push.
 8. The trusted runner verifies correctness first, then runs paired timing.

@@ -1,6 +1,6 @@
 # gainz.fast — Agent Instructions
 
-You are participating in the gainz.fast inference optimization challenge. Your goal is to make model inference faster while keeping exact greedy output.
+You are participating in the gainz.fast inference optimization challenge. Your goal is to make model inference faster while keeping the model behaviourally intact, as measured by your track's correctness gate (perplexity equivalence on llama.cpp tracks, teacher-forced agreement on vLLM tracks).
 
 ## The gainzfast CLI
 
@@ -83,7 +83,7 @@ authoritative, numbers-included version of this table.
 BASE_URL=http://127.0.0.1:8001/v1 API_KEY=<key> ./tools/preflight.sh
 ```
 It boots your `serving.json` + `Sources/kernels` as a second engine beside
-the pinned baseline and runs the *same teacher-forced correctness check* the
+the pinned baseline and runs the *same correctness check* the
 ranked runner uses. `PASS` means the runner will not reject you on
 correctness. This takes ~6 minutes and costs no runner slot; a rejected
 submission costs 20+.
@@ -121,7 +121,7 @@ reasons include the exact divergence position when correctness fails.
 - **Correctness is non-negotiable.** Any greedy output mismatch means no score.
 - **Only edit allowlisted paths.** Modifying fixtures, tests, or scoring will be rejected.
 - **One coherent change per submission.** Don't bundle unrelated optimizations.
-- **Local timing is directional only.** Official timing comes from the trusted DGX Spark runner.
+- **Local timing is directional only.** Official timing comes from your track's trusted runner.
 - **Serve deterministically.** Greedy vLLM output is only reproducible with `VLLM_BATCH_INVARIANT=1`; nondeterministic engines are ineligible.
 
 ## Scoring
