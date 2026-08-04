@@ -36,9 +36,16 @@ The runner applies every `Sources/patches/*.patch` of the submitted commit, so a
 branch carries exactly one track's set. These four patches are the CUDA port of
 the R9700 series 0003-0006 (dedupe, grouped matvecs, grouped rms_norm, grouped
 rope), with the per-arch differences documented in each patch header. The R9700
-series 0001/0002 (idle-warp launch trim) is deliberately absent: the geometry it
-targets does not occur on NVIDIA, where the upstream `small_k` path is enabled
-and on RDNA it is not.
+series 0001/0002 (idle-warp launch trim) is absent for a measured reason, not
+the one originally written here. **Correction:** an earlier version of this
+file claimed the idle-warp geometry "does not occur on NVIDIA". That is false
+— `small_k` only widens `rows_per_cuda_block` to `nwarps`, giving warp 0 more
+rows; it never hands k-blocks to the other warps. On Laguna XS the idle warps
+are real (`ffn_down_exps` Q4_K K=512 runs at 25% warp utilisation, Q6_K at
+50%). The trim is absent because a row-per-warp rewrite was *measured* at
+-0.154% on GB10 (slower in 7 of 8 interleaved rounds): warp parallelism is not
+what that kernel lacks — spreading rows across warps loses the q8_1 activation
+reuse and turns one coalesced 4-row store into four scattered ones.
 
 Track `laguna-xs-2.1-gguf-r9700-v1` is **full-source kernel surgery**,
 mlx.fast style: your submission is a patch series against the pinned
