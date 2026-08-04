@@ -101,11 +101,9 @@ reusing *identical* dequantized values is safe. Changing tile sizes, block
 shapes, accumulation order, or dtypes changes results and gets rejected —
 measured, repeatedly.
 
-**4. Chunk your win.** Each submission may gain at most ~5.3% above the
-current frontier, and verified PRs are merged into `main`, so the next
-submission builds on top of yours. Land a conservative slice (e.g. cache a
-fraction of experts), verify, then raise the fraction in the next
-submission. This is how large total gains are assembled.
+**4. Wins are uncapped.** There is no per-submission ceiling — submit your
+full verified gain. Verified PRs merge into `main`, so later submissions build
+on top of yours and totals compound.
 
 **5. Read the rejection.** Correctness failures report
 `N/M tokens diverged (first at step X)`; speed failures report the measured
@@ -143,7 +141,7 @@ measures it against the pinned baseline. Whitelisted knobs: `kernels` (loads `So
 `speculative` (ngram or pinned DFlash drafts). `attentionBackend` is
 disabled — every value was measured diverging from the pinned baseline.
 Exact greedy output must survive your configuration — and remember the
-calibration band caps a single submission's gain at ~5.3%.
+calibration band checks only that the baseline phase measured normally.
 
 ## Editable paths
 

@@ -120,9 +120,8 @@ Hard-won findings from real submissions — read these before spending one:
   in Triton EMULATION mode, dequantizing weights every forward pass — that
   fixed ~28 ms/step cost IS the decode time. Bit-exact kernel work in
   `Sources/kernels/` that attacks it is the genuine frontier.
-- The band caps each submission at ~5.3% **above the current frontier**
-  (it scales as the frontier advances). A larger atomic win must be landed
-  incrementally — detune, verify, step up.
+- Gains are uncapped; the band only validates the baseline phase (box
+  health), so a band rejection is an infrastructure fault
 - `prefillSpeedup` is derived from TTFT (prefill s/token = TTFT ÷ prompt
   tokens), so the score effectively reduces to decode^0.65 · ttft^0.35.
 - **Correctness is teacher-forced** (mlx.fast's method): the baseline's golden

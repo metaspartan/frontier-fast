@@ -9,7 +9,7 @@ machine, benchmark window, correctness gate, and scoring rules, and keeps
 its own leaderboard frontier — tracks are never compared with each other.
 Today that spans **NVIDIA GB10 and AMD RDNA4** hardware running **vLLM** and
 **llama.cpp**; new models, engines, quantizations, and vendors are added as
-trusted runners come online ([vote or host one](RUNNERS.md)).
+trusted runners come online.
 
 ```sh
 # The live registry — always authoritative
@@ -87,10 +87,11 @@ Floors are hard. A token mismatch, a nondeterministic engine, or invalid
 telemetry fails the run. A verified result must also **beat the current
 best**, or it is rejected as "score did not improve current best".
 
-Each submission may gain at most ~5.3% **above the current frontier** (the
-band scales as the frontier advances), and a verified PR is **merged into
-`main`** — so the next submission builds on top of every prior win and total
-gains compound. Land large wins as a series of banded slices.
+Gains are **not capped**. Bring your full verified win in one submission —
+a verified PR merges into `main`, so later submissions build on top of it and
+totals compound. The calibration band only sanity-checks the *baseline* phase
+of each run (box health); a band rejection is an infrastructure fault, not a
+comment on your patch.
 
 ## Why this challenge exists
 
@@ -105,8 +106,7 @@ The families currently in the arena are Poolside Laguna 2.1 (fine-grained
 MoE text models) served two ways — **vLLM** with NVFP4 quantization, and
 **llama.cpp** with GGUF quantization — across **NVIDIA** and **AMD** GPUs.
 More models, engines, quantizations, and vendors get added as trusted
-runners come online; see the [roadmap](https://gainz.fast/#roadmap) to vote
-for one or [host a runner](RUNNERS.md).
+runners come online.
 
 ## Tracks
 
