@@ -1,12 +1,11 @@
 name: benchmark
-# Trusted GB10 verification. Runs only on push to main or manual dispatch —
-# never on pull_request — so fork code cannot execute on the trusted runner
-# without maintainer review and merge. PRs get ubuntu CI only; the ranked
-# lifecycle (submitted → running → verified/rejected) starts when a change
-# lands on main.
+# Manual trusted-hardware verification. Deliberately NOT triggered on push:
+# ranked results come from the trusted runners, which poll the coordinator
+# directly, and every merge to main is not a submission — auto-running would
+# both queue junk and collide with a runner that has parked the engine for
+# its own benchmark. Never runs on pull_request, so fork code cannot execute
+# on trusted hardware.
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
     inputs:
       track:
@@ -19,7 +18,7 @@ jobs:
     env:
       GAINZ_TRACK: ${{ inputs.track || 'laguna-xs-2.1-nvfp4-gb10-v1' }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 2
       - name: Enforce modifiable surface
@@ -37,6 +36,10 @@ jobs:
         run: |
           if [ -z "$VLLM_BASE_URL" ]; then
             echo "VLLM_BASE_URL secret not configured; skipping hardware estimate."
+            exit 0
+          fi
+          if ! curl -sf -m 10 -H "Authorization: Bearer $VLLM_API_KEY" "$VLLM_BASE_URL/models" >/dev/null; then
+            echo "Engine at VLLM_BASE_URL is not serving right now (a trusted runner may have it parked); skipping estimate."
             exit 0
           fi
           ~/.bun/bin/bun run Sources/cli.ts benchmark --track "$GAINZ_TRACK" --local-iterate
