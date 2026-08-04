@@ -1,5 +1,5 @@
 diff --git a/vllm/model_executor/layers/batch_invariant.py b/vllm/model_executor/layers/batch_invariant.py
-index 917c72d..320639f 100644
+index 917c72d..90885ed 100644
 --- a/vllm/model_executor/layers/batch_invariant.py
 +++ b/vllm/model_executor/layers/batch_invariant.py
 @@ -1,5 +1,6 @@
@@ -21,7 +21,7 @@ index 917c72d..320639f 100644
  
  
  def _matmul_launch_metadata(
-@@ -129,16 +133,45 @@ def matmul_kernel_persistent(
+@@ -129,16 +133,64 @@ def matmul_kernel_persistent(
          tl.store(c_ptrs, c, mask=c_mask)
  
  
@@ -39,15 +39,34 @@ index 917c72d..320639f 100644
 +# under both the stock BLOCK_SIZE_M=128 and the decode BLOCK_SIZE_M=16, so
 +# num_pid_m, _compute_pid and the pid -> tile map are unchanged.  16 is the
 +# smallest M extent that still lowers to the tensor-core tl.dot path.  The
-+# 16x64 tile over 4 stages needs 40 KiB of shared memory and so fits every
++# 16x64 tile over 5 stages needs 50 KiB of shared memory and so fits every
 +# supported device; a wider N-tile does not (BLOCK_SIZE_N=256 at 4 stages
 +# needs 108544 bytes against GB10's 101376-byte limit when B is a transposed
 +# weight view).
++#
++# num_warps and num_stages are tuned over BOTH Laguna shape sets.  Neither
++# touches BLOCK_SIZE_K=64, so the k_tiles loop keeps its iteration count and
++# order and every output element keeps its exact accumulation sequence --
++# they change only how that fixed reduction is scheduled across warps and
++# pipeline buffers.  Every config quoted below was verified bit-exact
++# (torch.equal against the stock tile) at all 12 Laguna-S and all 10
++# Laguna-XS decode shapes, benchmarked with the engine's real operand
++# strides (b = weight.t(), stride (1, K)).
++#
++# Laguna-S issues 336 of these launches per decode step and Laguna-XS 163
++# (profiler-verified: 2016 launches over 6 steps on S).  Measured in-engine
++# on Laguna-S/GB10, three 120-token runs per build, against a 14.458 tok/s
++# stock baseline averaged over three separate boots:
++#   num_warps=4, num_stages=4 -> 15.922 tok/s (1.1013x), run spread 1.0%
++#   num_warps=8, num_stages=5 -> 16.046 tok/s (1.1098x), run spread 0.08%
++# The isolated per-shape sweep agrees that 8/5 also dominates on the XS
++# shape set (weighted 1.4165 -> 1.4450), so this retune does not regress the
++# XS track, which shares this patch series.
 +_DECODE_M_MAX = 16
 +_DECODE_BLOCK_M = 16
 +_DECODE_BLOCK_N = 64
-+_DECODE_NUM_WARPS = 4
-+_DECODE_NUM_STAGES = 4
++_DECODE_NUM_WARPS = 8
++_DECODE_NUM_STAGES = 5
 +
 +
 +@functools.lru_cache(maxsize=8)
@@ -70,7 +89,7 @@ index 917c72d..320639f 100644
      M, K = a.shape
      K, N = b.shape
      dtype = a.dtype
-@@ -181,6 +214,22 @@ def matmul_persistent(
+@@ -181,6 +233,22 @@ def matmul_persistent(
              "num_warps": 8,
          },
      }
@@ -93,7 +112,7 @@ index 917c72d..320639f 100644
      matmul_kernel_persistent[grid](
          a,
          b,
-@@ -200,11 +249,47 @@ def matmul_persistent(
+@@ -200,11 +268,47 @@ def matmul_persistent(
          B_LARGE=b.numel() > 2**31,
          C_LARGE=c.numel() > 2**31,
          HAS_BIAS=bias is not None,
