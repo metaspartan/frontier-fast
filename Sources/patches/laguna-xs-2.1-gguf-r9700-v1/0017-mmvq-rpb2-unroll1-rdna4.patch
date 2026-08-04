@@ -1,0 +1,52 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 32ecf21e8..410b614b7 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -478,6 +478,11 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
+                 return 1;
+         }
+     }
++    // RDNA4: widen to 2 rows per block for ncols_dst=1 to halve dispatch count.
++    // #pragma unroll 1 on the accumulation loop prevents cross-row FMA contraction.
++    if (table_id == MMVQ_PARAMETERS_RDNA4 && ncols_dst == 1) {
++        return 2;
++    }
+     return 1;
+ }
+ 
+@@ -608,7 +613,7 @@ static __global__ void mul_mat_vec_q(
+ 
+ #pragma unroll
+         for (int j = 0; j < ncols_dst; ++j) {
+-#pragma unroll
++#pragma unroll 1
+             for (int i = 0; i < rows_per_cuda_block; ++i) {
+                 tmp[j][i] += vec_dot_q_cuda(
+                     vx, &y[j*stride_col_y + kby], kbx_offset + i*stride_row_x + kbx, kqs);
+@@ -649,7 +654,7 @@ static __global__ void mul_mat_vec_q(
+     if (threadIdx.y > 0) {
+ #pragma unroll
+         for (int j = 0; j < ncols_dst; ++j) {
+-#pragma unroll
++#pragma unroll 1
+             for (int i = 0; i < rows_per_cuda_block; ++i) {
+                 tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+                 if constexpr (has_fusion) {
+@@ -961,7 +966,7 @@ static __global__ void mul_mat_vec_q_grouped(
+ 
+ #pragma unroll
+         for (int j = 0; j < ncols_dst; ++j) {
+-#pragma unroll
++#pragma unroll 1
+             for (int i = 0; i < rows_per_cuda_block; ++i) {
+                 tmp[j][i] += vec_dot_q_cuda(
+                     vx, &y[kby], kbx_offset + i*stride_row_x + kbx, kqs);
+@@ -989,7 +994,7 @@ static __global__ void mul_mat_vec_q_grouped(
+     if (threadIdx.y > 0) {
+ #pragma unroll
+         for (int j = 0; j < ncols_dst; ++j) {
+-#pragma unroll
++#pragma unroll 1
+             for (int i = 0; i < rows_per_cuda_block; ++i) {
+                 tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+             }
