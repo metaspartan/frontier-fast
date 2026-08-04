@@ -1,5 +1,5 @@
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 32ecf21e8..410b614b7 100644
+index 32ecf21e8..b76b97d96 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
 @@ -478,6 +478,11 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
@@ -32,6 +32,15 @@ index 32ecf21e8..410b614b7 100644
              for (int i = 0; i < rows_per_cuda_block; ++i) {
                  tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
                  if constexpr (has_fusion) {
+@@ -911,7 +916,7 @@ static __global__ void mul_mat_vec_q_grouped(
+     constexpr int vdr = get_vdr_mmvq(type);
+     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
+-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, /*small_k=*/false, nwarps);
++    constexpr int rows_per_cuda_block = 1; // grouped mmvq: block index IS the row index
+     static_assert(rows_per_cuda_block == 1, "grouped mmvq requires the block index to be the row index");
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+ 
 @@ -961,7 +966,7 @@ static __global__ void mul_mat_vec_q_grouped(
  
  #pragma unroll
@@ -50,3 +59,12 @@ index 32ecf21e8..410b614b7 100644
              for (int i = 0; i < rows_per_cuda_block; ++i) {
                  tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
              }
+@@ -1030,7 +1035,7 @@ static void mul_mat_vec_q_grouped_launch(
+     const mmvq_parameter_table_id table_id = get_device_table_id(cc);
+ 
+     const int nwarps = calc_nwarps(type, 1, table_id);
+-    GGML_ASSERT(calc_rows_per_block(1, table_id, /*small_k=*/false, nwarps) == 1);
++    // Grouped mmvq kernel hardcodes rows_per_cuda_block=1; no runtime check needed.
+ 
+     // Same block shape (including the idle-warp trim, which depends only on the
+     // shared ncols_x) as each individual launch would use.
