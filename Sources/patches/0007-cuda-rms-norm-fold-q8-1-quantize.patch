@@ -1,44 +1,20 @@
-From 490bdaadac19bdad7a07bc2001b21def7daac20c Mon Sep 17 00:00:00 2001
+From 7f81b965be95e9e40c2776d1d5cdc0bcf8e1df1a Mon Sep 17 00:00:00 2001
 From: Claude Fable 5 <noreply@anthropic.com>
-Date: Mon, 3 Aug 2026 18:37:54 +0000
-Subject: [PATCH] CUDA/HIP: fold the q8_1 quantization of an activation into
+Date: Mon, 3 Aug 2026 13:31:56 -0600
+Subject: [PATCH 07/10] CUDA: fold the q8_1 quantization of an activation into
  the norm producing it
 
-The activation a decoder layer feeds to its projections is produced by an
-rms_norm+mul and then quantized to q8_1 by the first mul_mat_vec_q that
-consumes it. The norm kernel has that value in a register the instant before
-the quantize kernel would load it back from memory, and its blocks already
-cover whole rows, so the norm can produce the quantization itself.
+Port of the R9700/HIP track patch 0009 ("CUDA/HIP: fold the q8_1
+quantization of an activation into the norm producing it", Claude Fable 5).
+The norm kernel registers the quantization in the per-graph cache under
+exactly the tuple ggml_cuda_mul_mat_vec_q would use, so consumers skip their
+own quantize launch.
 
-The result is registered in the per-graph quantized-src1 cache under exactly
-the parameter tuple ggml_cuda_mul_mat_vec_q would use, so every consumer - the
-direct ones and the ones reached through a reshape view, such as the MoE
-expert matvecs - finds it and skips its own quantize launch.
-
-Byte-identical by construction:
-
-- the value quantized is the very float just stored to dst, which is what the
-  separate quantize kernel would have loaded back;
-- each warp of the norm block covers exactly one 32-element q8_1 block of one
-  row (the caller checks ncols % block_size == 0, block_size % 32 == 0 and
-  ncols % QK8_1 == 0), so the amax and sum warp reductions see the same 32
-  values in the same lanes as quantize_q8_1;
-- d = amax/127.0f, q = amax == 0 ? 0 : roundf(xi/d) and the (d, sum) ds write
-  are the stock quantize_q8_1 statements, unchanged;
-- rows with a padding tail are excluded (GGML_PAD(ncols, MATRIX_ROW_PADDING)
-  must equal ncols), so there is no zero-fill region to reproduce.
-
-A mismatch in the registered tuple can only cost a cache miss - the consumer
-then quantizes exactly as before - never a wrong result.
-
-The same kernel now covers the plain rms_norm+mul and the residual-add-folding
-variant from the previous patch, so both of a layer's activations are covered.
-
-On Laguna-XS-2.1-Q4_K_M (RDNA4, gfx1201) this removes 81 quantize launches per
-decoded token (1000 -> 595 over a 4-token trace) and improves decode throughput
-by ~2.4 percent at byte-identical output.
-
-GGML_CUDA_DISABLE_NORM_QUANT=1 disables the optimization.
+CUDA-specific change: the cache's insert() takes no pool here, because cached
+buffers come from the graph-scoped slab introduced by this track's dedupe
+patch (the CUDA VMM pool is a strict LIFO stack). The registration helper
+already treats a nullptr return as "do not fold", which is exactly what a
+slab-full miss produces, so the fallback path is unchanged.
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu | 176 +++++++++++++++++++++++++++++-
  ggml/src/ggml-cuda/norm.cu      | 188 ++++++++++++++++++++++++++++++--
@@ -46,10 +22,10 @@ GGML_CUDA_DISABLE_NORM_QUANT=1 disables the optimization.
  3 files changed, 361 insertions(+), 12 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 7f6056728..db197454b 100644
+index 59754fb..ce6428c 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3850,6 +3850,157 @@ static int ggml_cuda_rms_norm_pre_add_detect(const ggml_cgraph * cgraph, const i
+@@ -3856,6 +3856,157 @@ static int ggml_cuda_rms_norm_pre_add_detect(const ggml_cgraph * cgraph, const i
      return n_adds;
  }
  
@@ -164,7 +140,7 @@ index 7f6056728..db197454b 100644
 +    }
 +
 +    const size_t size_q8_1 = t->ne[3]*t->ne[2] * t->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
-+    return ctx->quantized_src1_cache.insert(ctx->pool(), t, stream, ne10, s11, s12, s13,
++    return ctx->quantized_src1_cache.insert(t, stream, ne10, s11, s12, s13,
 +        ne10_padded, t->ne[1], t->ne[2], t->ne[3], size_q8_1);
 +}
 +
@@ -207,7 +183,7 @@ index 7f6056728..db197454b 100644
  // try and fuse nodes and return the number of nodes to skip
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
-@@ -4686,6 +4837,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4692,6 +4843,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                                     std::atoi(getenv("GGML_CUDA_DISABLE_SET_ROWS_GROUP"));
              static const bool disable_pre_add_norm = getenv("GGML_CUDA_DISABLE_PRE_ADD_NORM") != nullptr &&
                                                     std::atoi(getenv("GGML_CUDA_DISABLE_PRE_ADD_NORM"));
@@ -216,7 +192,7 @@ index 7f6056728..db197454b 100644
              static const bool disable_mmvq_group = getenv("GGML_CUDA_DISABLE_MMVQ_GROUP") != nullptr &&
                                                     std::atoi(getenv("GGML_CUDA_DISABLE_MMVQ_GROUP"));
              const bool mmvq_group_enabled = !disable_mmvq_group && stream_ctx.concurrent_events.empty();
-@@ -4792,6 +4945,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4798,6 +4951,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      }
                  }
  
@@ -234,7 +210,7 @@ index 7f6056728..db197454b 100644
                  if (!disable_pre_add_norm && stream_ctx.concurrent_events.empty() && node->op == GGML_OP_ADD) {
                      const int n_adds = ggml_cuda_rms_norm_pre_add_detect(cgraph, i);
                      if (n_adds > 0) {
-@@ -4799,8 +4963,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4805,8 +4969,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                          for (int k = 0; k < n_adds; ++k) {
                              adds[k] = cgraph->nodes[i + k];
                          }
@@ -254,7 +230,7 @@ index 7f6056728..db197454b 100644
                          continue;
                      }
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
-index d48854696..fc0c65b3c 100644
+index d488546..fc0c65b 100644
 --- a/ggml/src/ggml-cuda/norm.cu
 +++ b/ggml/src/ggml-cuda/norm.cu
 @@ -648,7 +648,14 @@ struct rms_norm_pre_add_args {
@@ -489,7 +465,7 @@ index d48854696..fc0c65b3c 100644
  }
  
 diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
-index 9526c6ab8..2ad318919 100644
+index 9526c6a..2ad3189 100644
 --- a/ggml/src/ggml-cuda/norm.cuh
 +++ b/ggml/src/ggml-cuda/norm.cuh
 @@ -24,6 +24,15 @@ void ggml_cuda_op_rms_norm_fused_pre_add(ggml_backend_cuda_context & ctx,
@@ -508,6 +484,3 @@ index 9526c6ab8..2ad318919 100644
  void ggml_cuda_op_rms_norm_grouped(ggml_backend_cuda_context & ctx,
                                     ggml_tensor * const * norms, ggml_tensor * const * muls, int n_nodes);
  
--- 
-2.53.0
-

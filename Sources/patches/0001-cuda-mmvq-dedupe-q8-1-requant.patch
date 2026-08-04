@@ -1,83 +1,62 @@
-From b23575344fc16e5383c15558a6519ec7789f6e5a Mon Sep 17 00:00:00 2001
+From d295457bb43caa2574f53debf9b9c4bcafe19e0e Mon Sep 17 00:00:00 2001
 From: Claude Fable 5 <noreply@anthropic.com>
-Date: Mon, 3 Aug 2026 13:19:54 +0000
-Subject: [PATCH] CUDA/HIP: dedupe q8_1 re-quantization of shared mmvq
+Date: Mon, 3 Aug 2026 13:31:56 -0600
+Subject: [PATCH 01/10] CUDA: dedupe q8_1 re-quantization of shared mmvq
  activations
 
-During decode, several matrix-vector ops consume the same activation
-tensor: attention Q/K/V take the same normed hidden state, and the MoE
-expert gate/up matvecs take (a reshaped view of) the same tensor as the
-shared expert's gate/up. ggml_cuda_mul_mat_vec_q re-runs quantize_q8_1
-on that identical input once per op - on Laguna-XS-2.1 (30B.A3B) that is
-~10 quantize dispatches per layer per token over ~4-5 distinct vectors,
-6.93% of decode kernel time (rocprofv3, 102,286 dispatches at 1.21 us).
+Port of the R9700/HIP track patch 0003 ("CUDA/HIP: dedupe q8_1
+re-quantization of shared mmvq activations", Claude Fable 5) to the GB10
+CUDA track, with one CUDA-specific change described below. The dedupe
+itself is unchanged: ggml_cuda_mul_mat_vec_q re-runs quantize_q8_1 on the
+same activation once per consuming op (attention Q/K/V take the same
+normed hidden state; the MoE expert matvecs take a reshaped view of the
+same tensor as the shared expert), so a per-graph cache keyed on
+(view-chain root, data pointer, stream, full quantize parameter tuple)
+computes each distinct quantization once. A hit returns exactly the bytes
+the skipped kernel would have written, so output is bit-identical by
+construction; the mmvq kernels themselves are untouched.
 
-This adds a small per-context cache of q8_1-quantized src1 copies so an
-identical quantization is computed once per graph evaluation and reused.
+CUDA-specific change: buffer lifetime must respect the VMM pool.
 
-Bit-exact by construction: quantize_row_q8_1_cuda's output bytes are a
-pure function of (input data, ne00, s01, s02, s03, ne0, ne1, ne2, ne3) -
-type_src0 and ids are unused - and the cache only hits when that entire
-parameter tuple matches AND the source contents are provably unchanged.
-A hit therefore returns exactly the bytes the skipped kernel would have
-written; the mmvq kernels themselves are untouched.
+ggml_backend_cuda_context::pool() returns ggml_cuda_pool_vmm whenever the
+device reports virtual-memory support, which is the case on GB10 (and on
+NVIDIA generally); the HIP build falls back to ggml_cuda_pool_leg. The VMM
+pool is a strict stack - ggml_cuda_pool_vmm::free asserts that the pointer
+being freed is the most recent allocation - while the leg pool is a
+free-list that accepts frees in any order. A cache entry outlives the op
+that created it by design, so the upstream (HIP) form of this patch, which
+gives every entry its own ggml_cuda_pool_alloc, aborts on CUDA the first
+time an entry is evicted or an evaluation ends with an allocation on top:
 
-Contents-identity and lifetime rules:
-- Entries are keyed on the root tensor of src1's view chain (view_src is
-  always the root in ggml). Within one backend graph evaluation a node
-  is computed exactly once, and the graph allocator cannot recycle its
-  buffer while consumers remain, so the same root implies the same bytes.
-- Ops that write through a view (CPY / SET_ROWS / *_inplace - precisely
-  the ops with view_src set that are not view no-ops) invalidate
-  matching entries from the evaluation loop, including nodes consumed by
-  kernel fusion (handled after the fused compute, when their writes are
-  issued).
-- Nothing survives an evaluation: the cache is cleared on entry to
-  ggml_backend_cuda_graph_compute, so graph splits with CPU ops between
-  them, new tokens, and re-captures always start empty. Reuse of a
-  pointer with changed contents can therefore never hit.
-- The stream is part of the key, so a cached result is only reused where
-  in-stream ordering proves the producing kernel precedes the consumer.
-- Entries hold their pool allocation until eviction (16-deep FIFO) or
-  clear(), so the cached buffer cannot be handed to another op's pool
-  alloc while a consumer may still be issued. Eviction frees into
-  per-stream pools, so an evicted buffer is only re-issued to later ops
-  on the same stream - after all previously issued reads, under both
-  direct execution and CUDA/HIP graph capture (stock already relies on
-  this for its scoped src1_q8_1 alloc/free per op).
-- The multi-GPU split path (ggml_cuda_op_mul_mat_vec_q) is untouched.
+  ggml-cuda.cu:681: GGML_ASSERT(ptr == (char *)pool_addr + pool_used) failed
+  #4 std::vector<std::unique_ptr<ggml_cuda_quantized_src1_entry>>::_M_erase
+  #5 ggml_cuda_mul_mat_vec_q
 
-Verification on Radeon AI PRO R9700 (gfx1201, ROCm 7.14):
+The cached buffers therefore live in a single slab allocated on entry to
+ggml_backend_cuda_graph_compute - before any op has allocated - and
+released on exit, after every op has freed. Being the bottom of the stack,
+that allocation is always legal, under either pool. Entries bump-allocate
+128-byte-aligned slices of the slab; an entry dropped by invalidation or
+by the 16-entry lookup cap simply stops being findable, and no free
+happens mid-evaluation. If a request does not fit, insert() returns
+nullptr and the caller quantizes into its own scoped allocation exactly as
+stock does - a miss is never a correctness difference - and the slab grows
+for the next evaluation (1 MiB initially, capped at 64 MiB).
 
-- Dispatch counts (rocprofv3 --kernel-trace, llama-bench tg32):
-  quantize_q8_1 13,134 -> 6,600 dispatches (49.7% removed); total
-  kernels 50,461 -> 43,927 - the delta is exactly the removed quantize
-  launches, nothing else changed.
-- Byte-compare, temp 0 / top_k 1 / cache_prompt false, 128 tokens,
-  3 prompts, hashing greedy text and the full float top-5 logprobs per
-  position (~22 KB/seed). Stock-vs-stock control established first (same
-  process, and again across a fresh boot); this series then matched it
-  exactly on all three seeds at -ngl 99, and also matched a stock -ngl 18
-  control 3/3 - the partial-offload case splits the graph into multiple
-  backend computes per token with CPU ops in between, exercising the
-  clear-on-entry staleness rule directly.
-- test-backend-ops -b ROCm0 -o MUL_MAT and -o MUL_MAT_ID: pass.
-- Speed, 9 cache-cold runs per arm, interleaved across 3 server
-  restarts, medians, full series (0001+0002+0003) vs stock b10237:
-  decode 92.417 -> 105.443 t/s (1.1409), prefill 2706.3 -> 2702.5 t/s
-  (0.9986, noise). Incremental over the already-merged 0001+0002
-  (decode 1.0794): ~+5.7% decode.
+Verified on DGX Spark GB10 (sm_121, CUDA 13.0) against the stock build of
+the same commit: greedy text and full float top-5 logprobs hash-match on
+3 prompts, after a stock-vs-stock control (same process and fresh boot).
 ---
- ggml/src/ggml-cuda/common.cuh   | 100 ++++++++++++++++++++++++++++++++
- ggml/src/ggml-cuda/ggml-cuda.cu |  22 +++++++
- ggml/src/ggml-cuda/mmvq.cu      |  21 ++++++-
- 3 files changed, 140 insertions(+), 3 deletions(-)
+ ggml/src/ggml-cuda/common.cuh   | 148 ++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu |  28 ++++++
+ ggml/src/ggml-cuda/mmvq.cu      |  25 +++++-
+ 3 files changed, 198 insertions(+), 3 deletions(-)
 
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
-index 33be16dc5..3c86cb8aa 100644
+index 33be16d..178ff58 100644
 --- a/ggml/src/ggml-cuda/common.cuh
 +++ b/ggml/src/ggml-cuda/common.cuh
-@@ -1215,6 +1215,102 @@ struct ggml_cuda_pool_alloc {
+@@ -1215,6 +1215,150 @@ struct ggml_cuda_pool_alloc {
  };
  
  
@@ -117,15 +96,50 @@ index 33be16dc5..3c86cb8aa 100644
 +    const void *        data   = nullptr; // src1->data actually quantized
 +    cudaStream_t        stream = nullptr;
 +    int64_t             key[8] = {0};     // ne00, s01, s02, s03, ne0, ne1, ne2, ne3
-+    ggml_cuda_pool_alloc<char> buf;
-+
-+    ggml_cuda_quantized_src1_entry(ggml_cuda_pool & pool, size_t size) : buf(pool, size) {}
++    char *              buf    = nullptr; // slice of the cache's graph-scoped slab
 +};
 +
++// Cached buffers live in ONE pool allocation taken at the very start of a graph
++// evaluation and released at its very end. The CUDA VMM pool (used whenever the
++// device reports virtual-memory support, i.e. normally on NVIDIA, while HIP
++// falls back to the free-list pool) is a strict stack: every free must be the
++// most recent allocation. Per-entry pool allocations cannot satisfy that,
++// because an entry outlives by design the op that created it. A single slab
++// allocated before any op and freed after all of them is always the bottom of
++// the stack, so it is legal under both pool implementations.
 +struct ggml_cuda_quantized_src1_cache {
-+    static constexpr size_t max_entries = 16;
++    static constexpr size_t max_entries    = 16;
++    static constexpr size_t slab_alignment = 128;
++    static constexpr size_t slab_initial   = 1024*1024;
++    static constexpr size_t slab_max       = 64*1024*1024;
 +
 +    std::vector<std::unique_ptr<ggml_cuda_quantized_src1_entry>> entries;
++
++    std::unique_ptr<ggml_cuda_pool_alloc<char>> slab;
++    size_t slab_size = 0;
++    size_t slab_used = 0;
++    size_t slab_want = slab_initial;
++
++    // Called on entry to a graph evaluation, before any op has allocated.
++    void begin_graph(ggml_cuda_pool & pool) {
++        entries.clear();
++        slab.reset();
++        slab_used = 0;
++        slab_size = 0;
++        if (slab_want == 0) {
++            return;
++        }
++        slab      = std::make_unique<ggml_cuda_pool_alloc<char>>(pool, slab_want);
++        slab_size = slab_want;
++    }
++
++    // Called on exit from a graph evaluation, after every op has freed.
++    void end_graph() {
++        entries.clear();
++        slab.reset();
++        slab_used = 0;
++        slab_size = 0;
++    }
 +
 +    void clear() {
 +        entries.clear();
@@ -153,26 +167,39 @@ index 33be16dc5..3c86cb8aa 100644
 +        for (const auto & e : entries) {
 +            if (e->origin == origin && e->data == src1->data && e->stream == stream &&
 +                    std::equal(std::begin(key), std::end(key), std::begin(e->key))) {
-+                return e->buf.ptr;
++                return e->buf;
 +            }
 +        }
 +        return nullptr;
 +    }
 +
-+    char * insert(ggml_cuda_pool & pool, const ggml_tensor * src1, cudaStream_t stream,
++    // Returns nullptr when the slab cannot hold the request; the caller then
++    // quantizes into its own scoped allocation exactly as stock does (a miss is
++    // never a correctness difference). The slab grows for the next graph.
++    char * insert(const ggml_tensor * src1, cudaStream_t stream,
 +            const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
 +            const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, const size_t size) {
++        const size_t need = (size + slab_alignment - 1) / slab_alignment * slab_alignment;
++        if (slab == nullptr || need > slab_size - slab_used) {
++            if (slab_want < slab_max) {
++                const size_t grow = need > slab_want ? need*2 : slab_want*2;
++                slab_want = grow < slab_max ? grow : slab_max;
++            }
++            return nullptr;
++        }
 +        if (entries.size() >= max_entries) {
 +            entries.erase(entries.begin());
 +        }
-+        auto e = std::make_unique<ggml_cuda_quantized_src1_entry>(pool, size);
++        auto e = std::make_unique<ggml_cuda_quantized_src1_entry>();
++        e->buf = slab->get() + slab_used;
++        slab_used += need;
 +        e->origin = src1->view_src != nullptr ? src1->view_src : src1;
 +        e->data   = src1->data;
 +        e->stream = stream;
 +        const int64_t key[8] = {ne00, s01, s02, s03, ne0, ne1, ne2, ne3};
 +        std::copy(std::begin(key), std::end(key), e->key);
 +        entries.push_back(std::move(e));
-+        return entries.back()->buf.ptr;
++        return entries.back()->buf;
 +    }
 +};
 +
@@ -180,7 +207,7 @@ index 33be16dc5..3c86cb8aa 100644
  // backend interface
  
  struct ggml_tensor_extra_gpu {
-@@ -1480,6 +1576,10 @@ struct ggml_backend_cuda_context {
+@@ -1480,6 +1624,10 @@ struct ggml_backend_cuda_context {
  
      ggml_cuda_stream_context concurrent_stream_context;
  
@@ -192,7 +219,7 @@ index 33be16dc5..3c86cb8aa 100644
  
      cudaStream_t stream(int device, int stream) {
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 561ab7ac5..d43d2d2d9 100644
+index 561ab7a..04d0301 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
 @@ -3980,6 +3980,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
@@ -226,23 +253,29 @@ index 561ab7ac5..d43d2d2d9 100644
                      i += nodes_to_skip;
                      continue;
                  }
-@@ -4116,6 +4133,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+@@ -4116,6 +4133,17 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
  
      ggml_cuda_set_device(cuda_ctx->device);
  
 +    // Quantized-src1 reuse is only valid within a single graph evaluation: start
 +    // empty so nothing computed before this call (another graph split, CPU ops,
-+    // a previous token) can alias a cached entry.
-+    cuda_ctx->quantized_src1_cache.clear();
++    // a previous token) can alias a cached entry. The slab backing the cache is
++    // taken here, before any op allocates, and released after all of them have
++    // (see ggml_cuda_quantized_src1_cache in common.cuh).
++    cuda_ctx->quantized_src1_cache.begin_graph(cuda_ctx->pool());
++    struct quantized_src1_cache_scope {
++        ggml_backend_cuda_context * ctx;
++        ~quantized_src1_cache_scope() { ctx->quantized_src1_cache.end_graph(); }
++    } quantized_src1_cache_scope_guard{cuda_ctx};
 +
      bool use_cuda_graph             = false;
      bool cuda_graph_update_required = false;
      const void * graph_key = nullptr;
 diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
-index 38bbfc212..712651d01 100644
+index 0589e65..826d752 100644
 --- a/ggml/src/ggml-cuda/mmvq.cu
 +++ b/ggml/src/ggml-cuda/mmvq.cu
-@@ -1294,12 +1294,27 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1228,12 +1228,31 @@ void ggml_cuda_mul_mat_vec_q(
      }
  
      const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
@@ -256,6 +289,7 @@ index 38bbfc212..712651d01 100644
 +    // so the cached bytes equal what the skipped kernel would have written.
 +    // See ggml_cuda_quantized_src1_cache in common.cuh for the lifetime rules.
 +    const char * src1_q8_1 = nullptr;
++    ggml_cuda_pool_alloc<char> src1_q8_1_scoped(ctx.pool());
      {
          const int64_t s11 = src1->nb[1] / ts_src1;
          const int64_t s12 = src1->nb[2] / ts_src1;
@@ -265,14 +299,17 @@ index 38bbfc212..712651d01 100644
 +        if (src1_q8_1 == nullptr) {
 +            const size_t size_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
 +            char * dst_q8_1 = ctx.quantized_src1_cache.insert(
-+                ctx.pool(), src1, stream, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, size_q8_1);
++                src1, stream, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, size_q8_1);
++            if (dst_q8_1 == nullptr) { // slab full: stock behaviour, own scoped allocation
++                dst_q8_1 = src1_q8_1_scoped.alloc(size_q8_1);
++            }
 +            quantize_row_q8_1_cuda(src1_d, nullptr, dst_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
 +            src1_q8_1 = dst_q8_1;
 +        }
      }
  
      const int64_t s01 = src0->nb[1] / ts_src0;
-@@ -1325,7 +1340,7 @@ void ggml_cuda_mul_mat_vec_q(
+@@ -1259,7 +1278,7 @@ void ggml_cuda_mul_mat_vec_q(
      const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
  
      mul_mat_vec_q_switch_type(
@@ -281,6 +318,3 @@ index 38bbfc212..712651d01 100644
          ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
          ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
          ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
--- 
-2.53.0
-

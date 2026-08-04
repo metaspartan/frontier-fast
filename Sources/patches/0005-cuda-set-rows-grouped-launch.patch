@@ -1,35 +1,16 @@
-From a46b1d8c6f41d0ddedd99eeb151a1fe32bac3b8e Mon Sep 17 00:00:00 2001
+From 94275f02c724a03ddc03bb17047bcf19cb964212 Mon Sep 17 00:00:00 2001
 From: Claude Fable 5 <noreply@anthropic.com>
-Date: Mon, 3 Aug 2026 18:15:47 +0000
-Subject: [PATCH] CUDA/HIP: group the KV-cache K/V set_rows stores into one
- kernel
+Date: Mon, 3 Aug 2026 13:31:56 -0600
+Subject: [PATCH 05/10] CUDA: group the KV-cache K/V set_rows stores into one
+ launch
 
-A decode step stores the new K row and the new V row into the KV cache with two
-independent set_rows launches over disjoint tensors, emitted back to back by
-build_attn with only view nodes in between. On a launch-bound GPU each is its
-own dispatch of a ~1.3us kernel.
-
-This adds a grouped set_rows launch: up to 4 such single-row stores run as ONE
-kernel whose grid concatenates their element ranges. A thread routes itself to
-its segment (src / idx / dst base pointer and row stride - all integer work)
-and then performs exactly the read, cast and store of the individual
-k_set_rows<float, int64_t, half> launch it replaces.
-
-There is no arithmetic beyond the float -> half conversion, which is the same
-ggml_cuda_cast<half> applied to the same value. Restricting to the single-row
-case (ne01 == ne02 == ne03 == 1) folds the stock index decomposition to
-i00 = i, i01 = i02 = i03 = 0, so the destination row is src1[0] and the
-destination address dst + dst_row*s1 + i00, identical to stock; the pdl_sync /
-pdl_lc placement around the index load is preserved.
-
-Guards: F32 source, I64 index, F16 destination, contiguous source rows, and
-anything stock would run as part of a ROPE+VIEW+SET_ROWS fusion is left alone.
-Hoisting uses the same legality scan as the grouped rope pass, with nodes
-already issued earlier in the pass skipped.
-
-On Laguna-XS-2.1-Q4_K_M (RDNA4, gfx1201) this removes 40 kernel launches per
-decoded token (all 40 layers group) and improves decode throughput by ~1.3
-percent at byte-identical output.
+Port of the R9700/HIP track patch 0007 ("CUDA/HIP: group the KV-cache K and V
+set_rows stores into one launch", Claude Fable 5), unchanged: shared
+ggml-cuda code with no architecture-gated paths. A decode step stores the new
+K row and the new V row with two independent set_rows launches; the grouped
+kernel routes each block to its segment and keeps every element's source,
+cast and destination address, so the result is byte-identical by
+construction.
 
 GGML_CUDA_DISABLE_SET_ROWS_GROUP=1 disables the optimization.
 ---
@@ -39,10 +20,10 @@ GGML_CUDA_DISABLE_SET_ROWS_GROUP=1 disables the optimization.
  3 files changed, 203 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 8bb3a0a4d..8a56bfa71 100644
+index 1b59948..d70a0e7 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3649,6 +3649,92 @@ static int ggml_cuda_rope_collect_group(const ggml_cgraph * cgraph, const int st
+@@ -3655,6 +3655,92 @@ static int ggml_cuda_rope_collect_group(const ggml_cgraph * cgraph, const int st
      return n;
  }
  
@@ -135,7 +116,7 @@ index 8bb3a0a4d..8a56bfa71 100644
  // try and fuse nodes and return the number of nodes to skip
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
-@@ -4481,6 +4567,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4487,6 +4573,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                                     std::atoi(getenv("GGML_CUDA_DISABLE_NORM_GROUP"));
              static const bool disable_rope_group = getenv("GGML_CUDA_DISABLE_ROPE_GROUP") != nullptr &&
                                                     std::atoi(getenv("GGML_CUDA_DISABLE_ROPE_GROUP"));
@@ -144,7 +125,7 @@ index 8bb3a0a4d..8a56bfa71 100644
              static const bool disable_mmvq_group = getenv("GGML_CUDA_DISABLE_MMVQ_GROUP") != nullptr &&
                                                     std::atoi(getenv("GGML_CUDA_DISABLE_MMVQ_GROUP"));
              const bool mmvq_group_enabled = !disable_mmvq_group && stream_ctx.concurrent_events.empty();
-@@ -4574,6 +4662,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4580,6 +4668,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      }
                  }
  
@@ -165,7 +146,7 @@ index 8bb3a0a4d..8a56bfa71 100644
  
                  if (nodes_to_skip != 0) {
 diff --git a/ggml/src/ggml-cuda/set-rows.cu b/ggml/src/ggml-cuda/set-rows.cu
-index 465997065..15f8534c2 100644
+index 4659970..15f8534 100644
 --- a/ggml/src/ggml-cuda/set-rows.cu
 +++ b/ggml/src/ggml-cuda/set-rows.cu
 @@ -373,6 +373,98 @@ void set_rows_cuda<half, int64_t>(ggml_backend_cuda_context & ctx, const ggml_te
@@ -268,7 +249,7 @@ index 465997065..15f8534c2 100644
      const ggml_tensor * src0 = dst->src[0];
      const ggml_tensor * src1 = dst->src[1];
 diff --git a/ggml/src/ggml-cuda/set-rows.cuh b/ggml/src/ggml-cuda/set-rows.cuh
-index c140c0873..892a64787 100644
+index c140c08..892a647 100644
 --- a/ggml/src/ggml-cuda/set-rows.cuh
 +++ b/ggml/src/ggml-cuda/set-rows.cuh
 @@ -4,4 +4,14 @@
@@ -286,6 +267,3 @@ index c140c0873..892a64787 100644
 +void ggml_cuda_op_set_rows_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes);
 +
  void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
--- 
-2.53.0
-

@@ -1,40 +1,14 @@
-From 363185017447d53b494086a0b381d8650144f91b Mon Sep 17 00:00:00 2001
+From 2721f08597cb9f98f43825d5389b2b742bb24a60 Mon Sep 17 00:00:00 2001
 From: Claude Fable 5 <noreply@anthropic.com>
-Date: Mon, 3 Aug 2026 18:23:31 +0000
-Subject: [PATCH] CUDA/HIP: fold the residual add into the following
+Date: Mon, 3 Aug 2026 13:31:56 -0600
+Subject: [PATCH 06/10] CUDA: fold the residual add into the following
  rms_norm+mul
 
-Every decoder layer feeds a residual add straight into the next pre-norm:
-
-    ffn_inp = add(attn_out, inpSA);  cur = rms_norm(ffn_inp) * ffn_norm_w
-
-Stock runs that as two dispatches - one k_bin_bcast (possibly an n-ary fused
-add) and one rms_norm_f32<block_size, true> - even though the rms_norm block
-already covers the whole row.
-
-This runs both in one kernel. The block produces its row's add result, stores
-it to the add's destination exactly as the (possibly multi-add fused) add would
-- other nodes still consume it - and then normalises the values it just wrote.
-
-Byte-identical by construction:
-
-- the add chain is exactly the one the upstream multi-(add|mul) fusion would
-  build: same operand set, same left-to-right order (src0 of the first add,
-  then each add's src1), same single destination, each step a separate rounded
-  float add;
-- the sum-of-squares loop, the block_reduce, rsqrtf(mean + eps) and the
-  dst[col] = scale * x[col] * mul[mul_col] output expression are the stock
-  rms_norm_f32<block_size, true> ones, unchanged, reading the same float values
-  back from the same addresses.
-
-Detection requires the stock rms_norm+mul fusion to fire on the pair (the +add
-variant is left alone), 2D non-broadcast F32 add operands all of the
-destination's shape, contiguous rows, and the norm output to be disjoint from
-the stored add result (the kernel reads that result back after writing it).
-
-On Laguna-XS-2.1-Q4_K_M (RDNA4, gfx1201) this folds 39 adds per decoded token
-and improves decode throughput by ~1.6 percent at byte-identical output. It
-also removes a full store/load round trip of the residual per fold.
+Port of the R9700/HIP track patch 0008 ("CUDA/HIP: fold the residual add into
+the following rms_norm+mul", Claude Fable 5), unchanged: shared ggml-cuda
+code with no architecture-gated paths. One kernel produces the add result,
+stores it exactly as the (possibly multi-add fused) add would, and then
+normalises the values it just wrote with the stock rms_norm_f32 statements.
 
 GGML_CUDA_DISABLE_PRE_ADD_NORM=1 disables the optimization.
 ---
@@ -44,10 +18,10 @@ GGML_CUDA_DISABLE_PRE_ADD_NORM=1 disables the optimization.
  3 files changed, 317 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 8a56bfa71..7f6056728 100644
+index d70a0e7..59754fb 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3735,6 +3735,121 @@ static int ggml_cuda_set_rows_collect_group(const ggml_cgraph * cgraph, const in
+@@ -3741,6 +3741,121 @@ static int ggml_cuda_set_rows_collect_group(const ggml_cgraph * cgraph, const in
      return n;
  }
  
@@ -169,7 +143,7 @@ index 8a56bfa71..7f6056728 100644
  // try and fuse nodes and return the number of nodes to skip
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
-@@ -4569,6 +4684,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4575,6 +4690,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                                     std::atoi(getenv("GGML_CUDA_DISABLE_ROPE_GROUP"));
              static const bool disable_set_rows_group = getenv("GGML_CUDA_DISABLE_SET_ROWS_GROUP") != nullptr &&
                                                     std::atoi(getenv("GGML_CUDA_DISABLE_SET_ROWS_GROUP"));
@@ -178,7 +152,7 @@ index 8a56bfa71..7f6056728 100644
              static const bool disable_mmvq_group = getenv("GGML_CUDA_DISABLE_MMVQ_GROUP") != nullptr &&
                                                     std::atoi(getenv("GGML_CUDA_DISABLE_MMVQ_GROUP"));
              const bool mmvq_group_enabled = !disable_mmvq_group && stream_ctx.concurrent_events.empty();
-@@ -4675,6 +4792,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4681,6 +4798,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      }
                  }
  
@@ -200,7 +174,7 @@ index 8a56bfa71..7f6056728 100644
  
                  if (nodes_to_skip != 0) {
 diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
-index 5ca960643..d48854696 100644
+index 5ca9606..d488546 100644
 --- a/ggml/src/ggml-cuda/norm.cu
 +++ b/ggml/src/ggml-cuda/norm.cu
 @@ -623,6 +623,180 @@ void ggml_cuda_op_rms_norm_grouped(ggml_backend_cuda_context & ctx,
@@ -385,7 +359,7 @@ index 5ca960643..d48854696 100644
      const ggml_tensor * src0 = dst->src[0];
      const float * src0_d = (const float *) src0->data;
 diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
-index 820d62258..9526c6ab8 100644
+index 820d622..9526c6a 100644
 --- a/ggml/src/ggml-cuda/norm.cuh
 +++ b/ggml/src/ggml-cuda/norm.cuh
 @@ -12,6 +12,18 @@ void ggml_cuda_op_group_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
@@ -407,6 +381,3 @@ index 820d62258..9526c6ab8 100644
  void ggml_cuda_op_rms_norm_grouped(ggml_backend_cuda_context & ctx,
                                     ggml_tensor * const * norms, ggml_tensor * const * muls, int n_nodes);
  
--- 
-2.53.0
-
