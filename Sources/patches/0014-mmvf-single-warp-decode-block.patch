@@ -1,0 +1,208 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Tue, 4 Aug 2026 00:55:00 +0000
+Subject: [PATCH] CUDA/HIP: give mul_mat_vec_f a single-warp decode block and
+ batched k-loads
+
+mul_mat_vec_f is the kernel that runs an unquantized matvec. On this model it
+is the MoE router (ffn_gate_inp, F32 2048x256 per layer), and it was the worst
+kernel in the decode profile by a wide margin: 39 launches per token, 11.48 us
+each, 447.8 us/token to read 2.10 MiB per launch. That is 183 GB/s on a part
+that sustains 500-530 GB/s on the neighbouring quantized matvecs in the very
+same token.
+
+Two things were wrong, and they compound.
+
+The launch heuristic picks the largest block that reduces the k-loop iteration
+count, so a 2048-wide row gets 256 threads. Past one warp that turns on the
+two-stage reduction: every warp stages its partial into LDS, everyone meets at
+a __syncthreads, warp 0 re-reduces, and they meet at a second barrier - per dst
+column. A 256-thread block on RDNA is eight wave32s doing four loads each and
+then queueing at a barrier, so the tail costs more than the k-loop it bought.
+Dropping to one warp deletes the LDS round-trip and both barriers outright.
+
+The k-loop itself never had more than one load in flight. It reloads into the
+same registers every iteration, so the compiler emits load -> s_waitcnt -> FMA
+-> load and the wave eats a full memory round-trip per k-step; the kernel was
+built with 16 VGPRs, which is the tell. Issuing NUNROLL strided steps up front
+gives the wave several outstanding loads instead of one.
+
+Neither change touches the arithmetic. The batched loop accumulates u ascending,
+which is the same sequence as the original col2 += block_size loop, so every
+sum is formed from the same values in the same order; the reduction change only
+removes a staging path that is not taken when the block is one warp. Results are
+bit-identical, which is what the measurement shows: greedy output hashes match
+and perplexity over the fixed corpus is unchanged to every digit printed
+(1.0213 +/- 0.00576 on stock and on this build).
+
+The block change is restricted to ncols_dst == 1 (single-token decode) on RDNA,
+so batched and prefill shapes keep the upstream heuristic. Measured on gfx1201
+(Radeon AI PRO R9700), llama-bench tg128 over three interleaved passes:
+142.14 -> 149.14 tok/s, +4.92%. Prefill is unchanged (pp512 ~3300 both arms).
+Splitting the two halves: the block change alone is 141.12 -> 147.56, the load
+batching alone leaves the 256-thread kernel flat (448.1 vs 447.8 us/token) -
+it only pays once the block is narrow enough that the k-loop is long.
+---
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index d7dbc8b99..d6170701b 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -4,6 +4,19 @@
+ #include "mmvf.cuh"
+ #include "convert.cuh"
+ 
++// Number of strided k-steps whose loads are issued back-to-back before the FMAs that
++// consume them.  Scaled down as the per-step register footprint grows (one float2 of y
++// per dst column per step, plus one float2 of x, doubled when a gate is fused) so the
++// kernel keeps full occupancy.
++#define GGML_CUDA_MMVF_NUNROLL 4
++
++template <int ncols_dst, bool has_fusion>
++static constexpr int mmvf_nunroll() {
++    return ncols_dst > 2 ? 1
++         : ncols_dst > 1 ? (has_fusion ? 1 : 2)
++         : (has_fusion ? 2 : GGML_CUDA_MMVF_NUNROLL);
++}
++
+ template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
+ static __global__ void mul_mat_vec_f(
+         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+@@ -133,7 +146,56 @@ static __global__ void mul_mat_vec_f(
+             }
+         }
+ 
+-        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
++        // Issue MMVF_NUNROLL strided k-steps before the dependent FMAs.  The original
++        // loop reloads into the same registers every iteration, so a wave stalls on one
++        // full memory round-trip per k-step (16 VGPRs, zero loads in flight).  Batching
++        // the loads only changes *when* values arrive: the accumulation sequence into
++        // sumf[]/sumf_gate[] is identical (u ascending == the original col2 += block_size
++        // order), so every result is bit-for-bit unchanged.
++        constexpr int nunroll = mmvf_nunroll<ncols_dst, has_fusion>();
++        int col2 = tid;
++        for (; col2 + (nunroll - 1)*block_size < ncols2; col2 += nunroll*block_size) {
++            float2 tmpx[nunroll];
++            float2 tmpy[nunroll][ncols_dst];
++            [[maybe_unused]] float2 tmpx_gate[has_fusion ? nunroll : 1];
++
++#pragma unroll
++            for (int u = 0; u < nunroll; ++u) {
++                tmpx[u] = x2[col2 + u*block_size];
++            }
++            if constexpr (has_fusion) {
++                if (use_gate) {
++#pragma unroll
++                    for (int u = 0; u < nunroll; ++u) {
++                        tmpx_gate[u] = gate_x2[col2 + u*block_size];
++                    }
++                }
++            }
++#pragma unroll
++            for (int u = 0; u < nunroll; ++u) {
++#pragma unroll
++                for (int j = 0; j < ncols_dst; ++j) {
++                    tmpy[u][j] = y2[j*stride_col_y2 + col2 + u*block_size];
++                }
++            }
++
++#pragma unroll
++            for (int u = 0; u < nunroll; ++u) {
++#pragma unroll
++                for (int j = 0; j < ncols_dst; ++j) {
++                    ggml_cuda_mad(sumf[j], tmpx[u].x, tmpy[u][j].x);
++                    ggml_cuda_mad(sumf[j], tmpx[u].y, tmpy[u][j].y);
++
++                    if constexpr (has_fusion) {
++                        if (use_gate) {
++                            ggml_cuda_mad(sumf_gate[j], tmpx_gate[u].x, tmpy[u][j].x);
++                            ggml_cuda_mad(sumf_gate[j], tmpx_gate[u].y, tmpy[u][j].y);
++                        }
++                    }
++                }
++            }
++        }
++        for (; col2 < ncols2; col2 += block_size) {
+             const float2 tmpx = x2[col2];
+             float2 tmpx_gate = make_float2(0.0f, 0.0f);
+             if constexpr (has_fusion) {
+@@ -166,7 +228,58 @@ static __global__ void mul_mat_vec_f(
+         }
+ 
+         if (std::is_same_v<type_acc, float>) {
+-            for (int col2 = tid; col2 < ncols2; col2 += block_size) {
++            // Same load batching as the f32 path above; accumulation order unchanged.
++            constexpr int nunroll = mmvf_nunroll<ncols_dst, has_fusion>();
++            int col2 = tid;
++            for (; col2 + (nunroll - 1)*block_size < ncols2; col2 += nunroll*block_size) {
++                half2 rawx[nunroll];
++                float2 tmpy[nunroll][ncols_dst];
++                [[maybe_unused]] half2 rawx_gate[has_fusion ? nunroll : 1];
++
++#pragma unroll
++                for (int u = 0; u < nunroll; ++u) {
++                    rawx[u] = x2[col2 + u*block_size];
++                }
++                if constexpr (has_fusion) {
++                    if (use_gate) {
++#pragma unroll
++                        for (int u = 0; u < nunroll; ++u) {
++                            rawx_gate[u] = gate_x2[col2 + u*block_size];
++                        }
++                    }
++                }
++#pragma unroll
++                for (int u = 0; u < nunroll; ++u) {
++#pragma unroll
++                    for (int j = 0; j < ncols_dst; ++j) {
++                        tmpy[u][j] = y2[j*stride_col_y2 + col2 + u*block_size];
++                    }
++                }
++
++#pragma unroll
++                for (int u = 0; u < nunroll; ++u) {
++                    const float2 tmpx = __half22float2(rawx[u]);
++                    float2 tmpx_gate = make_float2(0.0f, 0.0f);
++                    if constexpr (has_fusion) {
++                        if (use_gate) {
++                            tmpx_gate = __half22float2(rawx_gate[u]);
++                        }
++                    }
++#pragma unroll
++                    for (int j = 0; j < ncols_dst; ++j) {
++                        ggml_cuda_mad(sumf[j], tmpx.x, tmpy[u][j].x);
++                        ggml_cuda_mad(sumf[j], tmpx.y, tmpy[u][j].y);
++
++                        if constexpr (has_fusion) {
++                            if (use_gate) {
++                                ggml_cuda_mad(sumf_gate[j], tmpx_gate.x, tmpy[u][j].x);
++                                ggml_cuda_mad(sumf_gate[j], tmpx_gate.y, tmpy[u][j].y);
++                            }
++                        }
++                    }
++                }
++            }
++            for (; col2 < ncols2; col2 += block_size) {
+                 const float2 tmpx = __half22float2(x2[col2]);
+                 float2 tmpx_gate = make_float2(0.0f, 0.0f);
+                 if constexpr (has_fusion) {
+@@ -444,6 +557,17 @@ void launch_mul_mat_vec_f_cuda(
+         }
+     }
+ 
++    // Single-token decode on RDNA: a block wider than one warp forces the two-stage
++    // reduction (LDS staging + two __syncthreads per dst column).  On RDNA that tail is
++    // more expensive than the k-loop it shortens, because a 256-thread block is 8 wave32s
++    // that all have to meet at the barrier after only a handful of loads each.  Keeping the
++    // block at one warp removes the LDS round-trip and both barriers; the per-thread k-loop
++    // grows, which the batched loads above already cover.  Restricted to ncols_dst == 1 so
++    // the batched/prefill shapes keep the upstream heuristic.
++    if (ncols_dst == 1 && GGML_CUDA_CC_IS_RDNA(ggml_cuda_info().devices[device].cc)) {
++        block_size_best = warp_size;
++    }
++
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr;
+ 
+     const int nbytes_shared = warp_size*sizeof(float) + (has_fusion ? warp_size*sizeof(float) : 0);
+-- 
+2.43.0
+
