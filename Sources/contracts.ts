@@ -25,6 +25,18 @@ export const TRACKS: Record<string, Contract> = {
     warmupRuns: 2,
     measuredRuns: 9,
   },
+  "lfm2.5-2.6b-gguf-r9700-v1": {
+    id: "lfm2.5-2.6b-gguf-r9700-v1",
+    family: "lfm2.5-2.6b",
+    model: "LiquidAI/LFM2.5-2.6B-GGUF",
+    revision: "main",
+    quantization: "gguf-q4_k_m",
+    machine: "r9700-rdna4-gfx1201",
+    promptTokens: 512,
+    decodeTokens: 128,
+    warmupRuns: 2,
+    measuredRuns: 9,
+  },
   "laguna-xs-2.1-gguf-r9700-v1": {
     id: "laguna-xs-2.1-gguf-r9700-v1",
     family: "laguna-xs-2.1",

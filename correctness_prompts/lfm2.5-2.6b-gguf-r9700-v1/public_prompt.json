@@ -1,0 +1,14 @@
+{
+  "trackId": "lfm2.5-2.6b-gguf-r9700-v1",
+  "prompt": "List the prime numbers below fifty, then explain in two sentences why there are infinitely many primes. ",
+  "maxTokens": 128,
+  "temperature": 0,
+  "goldenSha256": null,
+  "reference": {
+    "engine": "llama.cpp b10237 (HIP, gfx1201)",
+    "serving": "-ngl 99 -c 8192 --parallel 1, greedy (temperature 0, top_k 1)",
+    "hardware": "AMD Radeon AI PRO R9700 (RDNA4); patches expected to stay portable across RDNA2/3/3.5/4"
+  },
+  "description": "Public correctness drift tripwire for lfm2.5-2.6b-gguf-r9700-v1",
+  "note": "Public tripwire for LFM2.5 2.6B Q4_K_M on llama.cpp HIP. The ranked gate is perplexity equivalence over a fixed corpus (<=0.5% relative delta) measured by the trusted runner; the golden hash is null because greedy text is not the ranked criterion and a hash copied from another model would be a false claim."
+}
