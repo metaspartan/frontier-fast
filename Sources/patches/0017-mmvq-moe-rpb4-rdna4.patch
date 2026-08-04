@@ -1,0 +1,13 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 32ecf21e8..805d4becf 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1117,7 +1117,7 @@ static void mul_mat_vec_q_moe_launch(
+         const uint32_t ncols_dst, const uint32_t ids_stride,
+         const int warp_size, const int nchannels_dst, cudaStream_t stream) {
+ 
+-    constexpr int rows_per_block = 2; // 2 gives best perf based on tuning
++    constexpr int rows_per_block = 4; // 4 halves block count on launch-bound RDNA4
+     const int64_t nblocks_rows = (nrows_x + rows_per_block - 1) / rows_per_block;
+     const dim3 block_nums(nblocks_rows, nchannels_dst);
+     const dim3 block_dims(warp_size, ncols_dst);
