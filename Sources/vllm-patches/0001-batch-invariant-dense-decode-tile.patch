@@ -1,0 +1,144 @@
+diff --git a/vllm/model_executor/layers/batch_invariant.py b/vllm/model_executor/layers/batch_invariant.py
+index 917c72d..320639f 100644
+--- a/vllm/model_executor/layers/batch_invariant.py
++++ b/vllm/model_executor/layers/batch_invariant.py
+@@ -1,5 +1,6 @@
+ # SPDX-License-Identifier: Apache-2.0
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++import functools
+ import math
+ import os
+ from collections.abc import Callable
+@@ -12,7 +13,10 @@ from vllm.platforms import current_platform
+ from vllm.triton_utils import tl, triton
+ from vllm.utils.mem_utils import get_max_shared_memory_bytes
+ from vllm.utils.platform_utils import num_compute_units
+-from vllm.utils.torch_utils import is_torch_equal_or_newer
++from vllm.utils.torch_utils import (
++    direct_register_custom_op,
++    is_torch_equal_or_newer,
++)
+ 
+ 
+ def _matmul_launch_metadata(
+@@ -129,16 +133,45 @@ def matmul_kernel_persistent(
+         tl.store(c_ptrs, c, mask=c_mask)
+ 
+ 
+-def matmul_persistent(
++# Decode-shape launch geometry for matmul_kernel_persistent.
++#
++# The config table below is keyed only on dtype, so a serial decode (M=1) runs
++# the prefill tile: BLOCK_SIZE_M=128 clamps all 128 M-rows onto row 0
++# (offs_am = tl.where(offs_am < M, offs_am, 0)), computes row 0 128 times and
++# masks 127 copies off at the store, and the tile count collapses to
++# cdiv(N, BLOCK_SIZE_N) -- 16 CTAs for a 2048-wide projection on a 48-SM GB10,
++# 1 CTA for a 48-wide one.
++#
++# A forward carrying at most _DECODE_M_MAX rows produces exactly one M-tile
++# under both the stock BLOCK_SIZE_M=128 and the decode BLOCK_SIZE_M=16, so
++# num_pid_m, _compute_pid and the pid -> tile map are unchanged.  16 is the
++# smallest M extent that still lowers to the tensor-core tl.dot path.  The
++# 16x64 tile over 4 stages needs 40 KiB of shared memory and so fits every
++# supported device; a wider N-tile does not (BLOCK_SIZE_N=256 at 4 stages
++# needs 108544 bytes against GB10's 101376-byte limit when B is a transposed
++# weight view).
++_DECODE_M_MAX = 16
++_DECODE_BLOCK_M = 16
++_DECODE_BLOCK_N = 64
++_DECODE_NUM_WARPS = 4
++_DECODE_NUM_STAGES = 4
++
++
++@functools.lru_cache(maxsize=8)
++def _cached_num_compute_units(device_index: int | None) -> int:
++    return num_compute_units(device_index)
++
++
++def _matmul_persistent_impl(
+     a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
+-):
++) -> torch.Tensor:
+     # Check constraints.
+     assert a.shape[1] == b.shape[0], "Incompatible dimensions"
+     assert a.dtype == b.dtype, "Incompatible dtypes"
+     assert bias is None or bias.dim() == 1, (
+         "Currently assuming bias is 1D, let Horace know if you run into this"
+     )
+-    NUM_SMS = num_compute_units(a.device.index)
++    NUM_SMS = _cached_num_compute_units(a.device.index)
+     M, K = a.shape
+     K, N = b.shape
+     dtype = a.dtype
+@@ -181,6 +214,22 @@ def matmul_persistent(
+             "num_warps": 8,
+         },
+     }
++    cfg = configs[dtype]
++    if dtype == torch.bfloat16 and M <= _DECODE_M_MAX:
++        # Decode-shaped launch geometry.
++        #
++        # Only BLOCK_SIZE_M (provably dead rows) and BLOCK_SIZE_N (independent
++        # output columns) move.  BLOCK_SIZE_K stays 64: it is the K-reduction
++        # chunk, so the k_tiles loop runs the same iterations in the same
++        # order into the same fp32 accumulator, and every output element keeps
++        # its exact accumulation sequence.
++        cfg = dict(
++            cfg,
++            BLOCK_SIZE_M=_DECODE_BLOCK_M,
++            BLOCK_SIZE_N=_DECODE_BLOCK_N,
++            num_warps=_DECODE_NUM_WARPS,
++            num_stages=_DECODE_NUM_STAGES,
++        )
+     matmul_kernel_persistent[grid](
+         a,
+         b,
+@@ -200,11 +249,47 @@ def matmul_persistent(
+         B_LARGE=b.numel() > 2**31,
+         C_LARGE=c.numel() > 2**31,
+         HAS_BIAS=bias is not None,
+-        **configs[dtype],
++        **cfg,
+     )
+     return c
+ 
+ 
++def _matmul_persistent_fake(
++    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
++) -> torch.Tensor:
++    return torch.empty((a.shape[0], b.shape[1]), device=a.device, dtype=a.dtype)
++
++
++# Register the launcher as an opaque custom op.
++#
++# UnquantizedLinearMethod.apply calls linear_batch_invariant() as a plain
++# Python function, so Dynamo INLINES this launcher into the compiled region.
++# The engine traces exactly once (the torch.compile wrapper sets self.compiled
++# after the first call) against a single symbolic num_tokens whose range is
++# [1, max_num_batched_tokens], and vLLM runs that graph with guards disabled --
++# so any `M <= k` test evaluated during tracing is frozen at whatever the
++# warmup hint made it, and a decode-only branch inside the launcher is dead
++# code no matter how the compile ranges or compile sizes are configured
++# (compile ranges re-run Inductor on the SAME traced FX graph; Dynamo runs once).
++#
++# Behind a custom op the launcher is opaque to Dynamo and is called at runtime
++# with the real M, exactly like the NVFP4 MoE emulation launcher.  Decode is
++# replayed from a full CUDA graph captured at sizes 1/2/4/8, so the Python body
++# runs once per capture and costs nothing at replay.
++direct_register_custom_op(
++    op_name="batch_invariant_matmul_persistent",
++    op_func=_matmul_persistent_impl,
++    mutates_args=[],
++    fake_impl=_matmul_persistent_fake,
++)
++
++
++def matmul_persistent(
++    a: torch.Tensor, b: torch.Tensor, bias: torch.Tensor | None = None
++) -> torch.Tensor:
++    return torch.ops.vllm.batch_invariant_matmul_persistent(a, b, bias)
++
++
+ @triton.jit
+ def bmm_kernel(
+     a_ptr,  # (*, ) pointer to A, (B, M, K)
