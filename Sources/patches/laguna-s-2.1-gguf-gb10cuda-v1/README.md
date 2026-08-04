@@ -10,7 +10,7 @@ Model: `laguna-s-2.1-Q4_K_M.gguf` (89.4 GiB), `-ngl 99 -c 8192 --parallel 1`.
 
 | # | patch | default | status |
 | --- | --- | --- | --- |
-| 0001 | `cuda-mmvq-wide-decode-block` | `GGML_CUDA_MMVQ_NW=6` | correctness-proven; **speed unproven, see the artifact below** |
+| 0012 | `cuda-mmvq-wide-decode-block` | `GGML_CUDA_MMVQ_NW=6` | correctness-proven; **speed unproven, see the artifact below** |
 
 ## READ THIS FIRST: the local harness cannot resolve <10% on this track
 
@@ -76,7 +76,7 @@ here, and that independently explains why the earlier "CUDA graphs for
 MUL_MAT_ID" attempt regressed decode to 0.9455: there are no gaps to recover,
 only overhead to add.
 
-## What 0001 does
+## What 0012 does
 
 `mul_mat_vec_q` strides the k loop by `blocks_per_iter = vdr*nwarps*warp_size/qi`
 and a thread runs an iteration only when `tid/(qi/vdr)` lands below
@@ -125,7 +125,7 @@ control. Real decode streams ~7.5 GB/token cold. This is
 the working-set residency, not only the strides.
 
 **2. The shared XS GB10 series does not transfer to S.** Applying
-`Sources/patches/0001-0011,0015,0016` (13 of 16 apply; 0012-0014 conflict) to
+this track's own series in `Sources/patches/laguna-s-2.1-gguf-gb10cuda-v1/` (0001-0011) to
 Laguna-S measured **+0.64% decode** — inside the noise floor, and inside the
 artifact above. Those patches are dispatch-count and small-kernel folds, and S
 is not launch-gap-bound. Concrete case for `per-track-patch-series`.
