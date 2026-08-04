@@ -1,0 +1,841 @@
+From 0017a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c Mon Sep 17 00:00:00 2001
+From: Claude Opus 5 <noreply@anthropic.com>
+Date: Tue, 4 Aug 2026 18:00:00 +0000
+Subject: [PATCH] CUDA/HIP: run the MoE shared expert as a ninth channel of the
+ routed expert down projection
+
+Laguna-XS-2.1 pairs 256 top-8 routed experts with an always-on shared expert.
+At batch 1 the shared expert's down projection is its own launch over a
+[512 -> 2048] Q6_K slab: 2048 workgroups moving 0.86 MB. Measured on gfx1201
+that takes 8.43 us, about 102 GB/s, while the routed down projection - the
+identical per-row work at eight times the channel count - sustains ~601 GB/s
+in 11.44 us. The launch is memory LATENCY bound, not bandwidth bound:
+effective bandwidth tracks resident wave count almost linearly, so no thread
+geometry fixes it (the GGML_MMVQ_UNTRIM_BLOCKS sweep is flat, 5.371 vs 5.422
+ms/token at 0 vs 4096). The only fix is more concurrent work in one launch.
+
+The two projections read equally shaped, equally quantized weight slabs and
+differ only in weight/activation/output base pointers, so the shared expert
+becomes one extra channel appended to the routed mul_mat_id grid:
+
+  - mmvq_extra_channel carries the three base pointers; mul_mat_vec_q gains a
+    compile-time has_extra flag, so every existing instantiation folds the
+    branch away and keeps its stock instruction sequence.
+  - The extra channel is not id-selected: it takes channel_x = channel_y = 0
+    and writes at the start of its own output tensor.
+  - Every row keeps the thread geometry, k-block assignment, vec_dot sequence
+    and reduction order it has in the separate launch, so the result is
+    bit-identical, not merely equivalent.
+
+Making the two nodes adjacent has to happen at graph construction. ggml-alloc
+assigns buffers from node order, so a shared expert emitted after the routed
+reduction gets its output aliased with one of that reduction's temporaries and
+the backend-side hoist is correctly refused. build_moe_ffn therefore emits the
+shared expert's down projection immediately after the routed one, and
+laguna.cpp builds its gate/up/SwiGLU beforehand - a pure reordering of
+independent work that reads only the layer input.
+
+That reordering alone would cost more than it saves: it moves the shared
+expert's gate/up pair onto llama.cpp's gate+up+GLU fused mmvq (512 workgroups
+x 256 threads, 11.49 us) and off the grouped launch (1024 x 128, 4.33 us),
+because try_fuse fires at the gate node before the GLU+quantize fold is ever
+consulted. Since these launches are latency bound, halving the workgroup count
+to double the threads is the wrong trade. ggml_cuda_prefer_group_over_glu_fuse
+declines that fusion for a batch-1 dense gate/up pair over a shared activation,
+and is consulted by BOTH the fusion decision and the grouping guard so the two
+agree and the pair cannot fall through to two separate launches.
+
+Measured on the R9700 (gfx1201), llama-bench tg128, five interleaved whole
+process launches per arm with rotating order, median of per-round ratios:
+
+  candidate vs series 0001-0016   1.03950  (+3.95 pct, min 1.03832 max 1.04343)
+  no-op control vs series         0.99734  (-0.27 pct, min 0.99333 max 0.99901)
+
+The control is the same binary with GGML_MOE_SHEXP_FUSE=0, which restores both
+the stock graph layout and the stock fusion choice; it lands on the reference
+within noise, which is what isolates the change.
+
+Kernel level (rocprofv3, per decoded token): 5.419 -> 5.182 ms of kernel time
+(-4.36 pct) and 897 -> 858 dispatches, exactly one removed per MoE layer. The
+Q/K grouped launch (27/token) and the shared expert's grouped gate/up (39/token
+at 4.98 us) are both intact - dispatch counts were checked per kernel group,
+not only in aggregate, because an earlier arrangement looked neutral in kernel
+time while silently costing 75 dispatches per token.
+
+Perplexity over the fixed corpus is unchanged at 5.2611 for the reference, the
+candidate and the control.
+
+GGML_MOE_SHEXP_FUSE=0 disables graph layout and fusion together, for A/B on a
+single binary.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  170 ++++++++++++++++++++++++++++++++++++++++--
+ ggml/src/ggml-cuda/mmvq.cu      |  149 ++++++++++++++++++++++++++++++++++++++++--------------------
+ ggml/src/ggml-cuda/mmvq.cuh     |   33 ++++++++++++++++++++++++++++++++-
+ src/llama-graph.cpp             |   35 ++++++++++++++++++++++++++++++++---
+ src/llama-graph.h               |   10 ++++++++--
+ src/models/laguna.cpp           |   48 +++++++++++++++++++++++++++++++++++++++---------
+ 6 files changed, 391 insertions(+), 54 deletions(-)
+
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3266,7 +3266,54 @@
+ // two plain matvec launches in stock, and grouping those changes no arithmetic.
+ // Anything whose result reaches a GLU through a shape not tested here (e.g.
+ // the scale/bias fusion variants) is rejected conservatively.
++// A batch-1 dense gate/up pair is faster as the grouped mmvq launch than as the
++// gate+up+GLU fused mmvq on this device: grouping keeps one workgroup per output
++// row (1024 workgroups x 128 threads) while the fused form halves the workgroup
++// count and doubles the threads (512 x 256). These launches are memory LATENCY
++// bound, not bandwidth bound, so workgroup count is what covers the latency -
++// measured on gfx1201 for the 512-row shared expert: grouped 4.33 us vs fused
++// 11.49 us for the same 1.18 MB, a 2.65x difference.
++//
++// Used by BOTH the fusion decision and the grouping guard so the two agree; if
++// only one side changed, the pair would fall through to two separate launches.
++static bool ggml_cuda_prefer_group_over_glu_fuse(const ggml_cgraph * cgraph, const int i) {
++    if (i < 0 || i + 2 >= cgraph->n_nodes) {
++        return false;
++    }
++    const ggml_tensor * a = cgraph->nodes[i];
++    const ggml_tensor * b = cgraph->nodes[i + 1];
++    if (a->op != GGML_OP_MUL_MAT || b->op != GGML_OP_MUL_MAT) {
++        return false;
++    }
++    if (cgraph->nodes[i + 2]->op != GGML_OP_GLU) {
++        return false;
++    }
++    if (a->src[2] != nullptr || b->src[2] != nullptr) {
++        return false; // MUL_MAT_ID: the routed experts, leave them fused
++    }
++    if (a->src[1] == nullptr || a->src[1] != b->src[1]) {
++        return false; // the grouped launch requires a shared activation
++    }
++    if (a->ne[1] != 1 || b->ne[1] != 1) {
++        return false; // batch-1 decode only
++    }
++    const ggml_tensor * wa = a->src[0];
++    const ggml_tensor * wb = b->src[0];
++    if (wa == nullptr || wb == nullptr || !ggml_is_quantized(wa->type) || wa->type != wb->type) {
++        return false;
++    }
++    if (wa->ne[0] != wb->ne[0] || wa->nb[1] != wb->nb[1]) {
++        return false; // grouped launch needs matching K and row stride
++    }
++    return true;
++}
++
+ static bool ggml_cuda_mmvq_would_glu_fuse(const ggml_cgraph * cgraph, const int j) {
++    // the pair will be grouped instead of fused, so it does not block grouping
++    if (ggml_cuda_prefer_group_over_glu_fuse(cgraph, j) ||
++            ggml_cuda_prefer_group_over_glu_fuse(cgraph, j - 1)) {
++        return false;
++    }
+     const auto fires = [&](const int p, std::initializer_list<enum ggml_op> ops) {
+         return p >= 0 && ggml_cuda_can_fuse(cgraph, p, ops, {});
+     };
+@@ -3310,6 +3357,101 @@
+     return false;
+ }
+ 
++// ----- MoE shared expert folded into the routed-expert launch ----------------
++//
++// A MoE layer's routed down projection is MUL_MAT_ID(down_exps, h_routed, ids)
++// and the shared expert's is MUL_MAT(down_shexp, h_shexp) over an equally shaped,
++// equally quantized weight slab. src/models/laguna.cpp emits the shared expert's
++// gate/up/SwiGLU ahead of the routed experts precisely so h_shexp is ready here.
++//
++// Returns the graph index of the shared-expert matvec that may be issued as an
++// extra channel of the routed launch, or -1.
++static int ggml_cuda_moe_shexp_find_down(const ggml_cgraph * cgraph, const int i, const int cc) {
++    const ggml_tensor * routed = cgraph->nodes[i];
++    if (routed->op != GGML_OP_MUL_MAT_ID || routed->src[2] == nullptr) {
++        return -1;
++    }
++    const ggml_tensor * w = routed->src[0];
++    const ggml_tensor * a = routed->src[1];
++    if (!ggml_is_quantized(w->type) || w->ne[2] <= 1) {
++        return -1;
++    }
++    // must be the batch-1 mmvq route of ggml_cuda_mul_mat_id: one dst column per
++    // selected expert, ne2 within this type's MUL_MAT_ID mmvq batch limit
++    if (routed->ne[2] != 1 || a->type != GGML_TYPE_F32 || routed->type != GGML_TYPE_F32) {
++        return -1;
++    }
++    // same gate as ggml_cuda_mul_mat_id
++    if (routed->ne[2] > MMVQ_MAX_BATCH_SIZE || routed->ne[2] > get_mmvq_mmid_max_batch(w->type, cc)) {
++        return -1;
++    }
++    if (routed->ne[1] > MMVQ_MAX_BATCH_SIZE) {
++        return -1;
++    }
++    // Only the down projection. The gate and up matvecs of the same layer match
++    // structurally too, but they are the first two nodes of llama.cpp's
++    // gate+up+GLU fusion; pairing them would split that pattern and cost far more
++    // than the pairing saves (measured: tg4 91 -> 84 tok/s).
++    if (ggml_cuda_mmvq_would_glu_fuse(cgraph, i)) {
++        return -1;
++    }
++
++    constexpr int scan_window = 64;
++    const int end = std::min(cgraph->n_nodes, i + 1 + scan_window);
++    for (int j = i + 1; j < end; ++j) {
++        ggml_tensor * cand = cgraph->nodes[j];
++        if (ggml_cuda_is_view_or_noop(cand)) {
++            continue;
++        }
++        if (cand->op != GGML_OP_MUL_MAT || cand->src[2] != nullptr) {
++            continue;
++        }
++        if ((cand->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++            continue;
++        }
++        const ggml_tensor * sw = cand->src[0];
++        const ggml_tensor * sa = cand->src[1];
++        // same K, same row count, same type and row stride -> the extra channel
++        // gets exactly the geometry its own launch would have used
++        if (sw->type != w->type || sw->ne[0] != w->ne[0] || sw->ne[1] != w->ne[1] || sw->ne[2] != 1 || sw->ne[3] != 1) {
++            continue;
++        }
++        if (sw->nb[1] != w->nb[1] || sw->nb[0] != w->nb[0]) {
++            continue;
++        }
++        // single dense column, F32 operands, contiguous rows: the plain mmvq route
++        if (sa->type != GGML_TYPE_F32 || cand->type != GGML_TYPE_F32) {
++            continue;
++        }
++        if (cand->ne[1] != 1 || cand->ne[2] != 1 || cand->ne[3] != 1) {
++            continue;
++        }
++        if (sa->ne[1] != 1 || sa->ne[2] != 1 || sa->ne[3] != 1) {
++            continue;
++        }
++        if (sa->nb[0] != ggml_type_size(sa->type) || cand->nb[0] != ggml_type_size(cand->type)) {
++            continue;
++        }
++        if (ggml_get_op_params_i32(cand, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
++            continue;
++        }
++        if (ggml_cuda_mmvq_would_glu_fuse(cgraph, j)) {
++            continue; // shared expert's own gate/up: leave its GLU fusion alone
++        }
++        if (ggml_backend_buffer_get_usage(sw->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++            continue; // padding-clear case, keep the stock route
++        }
++        // the shared-expert matvec is hoisted to the routed matvec's position:
++        // its write must not alias anything the skipped nodes touch, and they
++        // must not write its inputs
++        if (!ggml_cuda_mmvq_hoist_legal(cgraph, i, j)) {
++            continue;
++        }
++        return j;
++    }
++    return -1;
++}
++
+ static int ggml_cuda_mmvq_collect_group(const ggml_cgraph * cgraph, const int start, ggml_tensor ** members) {
+     ggml_tensor * first = cgraph->nodes[start];
+     const ggml_tensor * src1 = first->src[1];
+@@ -3463,7 +3605,7 @@
+     muls[0]  = cgraph->nodes[start + 1];
+     int n    = 1;
+ 
+-    constexpr int scan_window = 12;
++    constexpr int scan_window = 64;
+     const int end = std::min(cgraph->n_nodes - 1, start + 2 + scan_window);
+ 
+     for (int j = start + 2; j < end && n < RMS_NORM_MAX_GROUP_SIZE; ++j) {
+@@ -4677,7 +4819,8 @@
+                 fused_node_count  = 5;
+                 break;
+             }
+-        } else if (ggml_cuda_can_fuse(cgraph, i, { op, op, GGML_OP_GLU }, {})) {
++        } else if (ggml_cuda_can_fuse(cgraph, i, { op, op, GGML_OP_GLU }, {}) &&
++                   !ggml_cuda_prefer_group_over_glu_fuse(cgraph, i)) {
+             ggml_tensor * glu  = cgraph->nodes[i + 2];
+             ggml_tensor * gate = glu->src[0];
+             ggml_tensor * up   = glu->src[1];
+@@ -5030,6 +5173,14 @@
+             static const bool disable_softplus_mul = getenv("GGML_CUDA_DISABLE_SOFTPLUS_MUL") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_SOFTPLUS_MUL"));
+             const bool mmvq_group_enabled = !disable_mmvq_group && stream_ctx.concurrent_events.empty();
++            // Fold the MoE shared expert into the routed-expert launch. Env toggle
++            // so the same binary can be A/B'd against the unfused path.
++            static const bool disable_moe_shexp_fuse = [] {
++                const char * e = getenv("GGML_MOE_SHEXP_FUSE");
++                return e != nullptr && atoi(e) == 0;
++            }();
++            const bool moe_shexp_fuse_enabled = !disable_moe_shexp_fuse && stream_ctx.concurrent_events.empty();
++            const int cc_for_shexp = ggml_cuda_info().devices[cuda_ctx->device].cc;
+             static const bool log_mmvq_group_stats = getenv("GGML_MMVQ_GROUP_STATS") != nullptr;
+             int64_t mmvq_group_stats_buf[2] = {0, 0};
+             int64_t * mmvq_group_stats = log_mmvq_group_stats ? mmvq_group_stats_buf : nullptr;
+@@ -5229,6 +5380,21 @@
+                     continue;
+                 }
+ 
++                if (moe_shexp_fuse_enabled && node->op == GGML_OP_MUL_MAT_ID) {
++                    const int j = ggml_cuda_moe_shexp_find_down(cgraph, i, cc_for_shexp);
++                    if (j > 0) {
++                        ggml_tensor * shexp_node = cgraph->nodes[j];
++                        ggml_cuda_mmvq_shexp shexp_args;
++                        shexp_args.src0 = shexp_node->src[0];
++                        shexp_args.src1 = shexp_node->src[1];
++                        shexp_args.dst  = shexp_node;
++                        ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], node->src[2], node,
++                                                /*fusion=*/nullptr, &shexp_args);
++                        mmvq_grouped_done.insert(shexp_node);
++                        continue;
++                    }
++                }
++
+                 if (mmvq_group_enabled && ggml_cuda_mmvq_can_group(node)) {
+                     ggml_tensor * members[MMVQ_MAX_GROUP_SIZE];
+                     const int n_members = ggml_cuda_mmvq_collect_group(cgraph, i, members);
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -481,7 +481,7 @@
+     return 1;
+ }
+ 
+-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false>
++template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool has_extra = false>
+ __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+@@ -489,11 +489,17 @@
+         const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+-        const uint32_t ids_stride) {
+-    const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+-    const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
++        const uint32_t ids_stride, const mmvq_extra_channel extra) {
++    // The always-on MoE shared expert rides along as the last channel of the grid
++    // (see mmvq_extra_channel). has_extra is a compile-time flag, so every
++    // instantiation that does not use it folds is_extra to false and keeps the
++    // stock instruction sequence.
++    const bool is_extra = has_extra && (blockIdx.y == gridDim.y - 1);
++
++    const void    * GGML_CUDA_RESTRICT vx  = is_extra ? extra.vx  : vx_ptr;
++    const void    * GGML_CUDA_RESTRICT vy  = is_extra ? extra.vy  : vy_ptr;
+     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+-    float         * GGML_CUDA_RESTRICT dst = dst_ptr;
++    float         * GGML_CUDA_RESTRICT dst = is_extra ? extra.dst : dst_ptr;
+ 
+     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+@@ -522,8 +528,15 @@
+     uint32_t sample_dst;
+ 
+     ggml_cuda_pdl_sync();
+-    channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
+-    channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
++    if (is_extra) {
++        // one weight slab, one activation column, its own output tensor: no id
++        // lookup (ids has only the routed experts) and no channel offsets
++        channel_x = 0;
++        channel_y = 0;
++    } else {
++        channel_x  = ncols_dst == 1 && ids ? ids[channel_dst]                     : fastdiv(channel_dst, channel_ratio);
++        channel_y  = ncols_dst == 1 && ids ? fastmodulo(channel_dst, nchannels_y) : channel_dst;
++    }
+     sample_dst = blockIdx.z;
+ 
+     const uint32_t sample_x    = fastdiv(sample_dst, sample_ratio);
+@@ -665,7 +678,7 @@
+         return;
+     }
+ 
+-    dst += sample_dst*stride_sample_dst + channel_dst*stride_channel_dst + row0;
++    dst += sample_dst*stride_sample_dst + (is_extra ? 0 : channel_dst)*stride_channel_dst + row0;
+ 
+     // sum up partial sums and write back result
+ #pragma unroll
+@@ -1094,7 +1107,7 @@
+             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k>, launch_params,
+                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
++                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_extra_channel{});
+             return;
+         }
+     }
+@@ -1105,7 +1118,7 @@
+     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k>, launch_params,
+         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
++        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_extra_channel{});
+ }
+ 
+ template <ggml_type type>
+@@ -1138,7 +1151,7 @@
+         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
+         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+-        const int ids_stride, cudaStream_t stream) {
++        const int ids_stride, cudaStream_t stream, const mmvq_extra_channel * extra = nullptr) {
+ 
+     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
+     GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
+@@ -1210,6 +1223,24 @@
+         case 1: {
+             constexpr int c_ncols_dst = 1;
+ 
++            if (extra != nullptr) {
++                // Routed experts + the always-on shared expert in one launch.
++                // Geometry is exactly the routed-only launch with one more
++                // channel, so every routed row keeps its stock thread mapping
++                // and the shared expert's rows get the mapping they would have
++                // had in their own launch.
++                GGML_ASSERT(has_ids);
++                const std::pair<dim3, dim3> dims = calc_launch_params<type>(
++                    c_ncols_dst, ncols_x, nrows_x, nchannels_dst + 1, nsamples_dst, warp_size, table_id);
++                const ggml_cuda_kernel_launch_params launch_params =
++                    ggml_cuda_kernel_launch_params(dims.first, dims.second, 0, stream);
++                ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, false, true>, launch_params,
++                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++                    channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
++                    sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, *extra);
++                break;
++            }
++
+             bool use_small_k = should_use_small_k(c_ncols_dst);
+ 
+             if (use_small_k) {
+@@ -1298,145 +1329,145 @@
+         const int nchannels_x, const int nchannels_y, const int nchannels_dst,
+         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+-        const int ids_stride, cudaStream_t stream) {
++        const int ids_stride, cudaStream_t stream, const mmvq_extra_channel * extra = nullptr) {
+     switch (type_x) {
+         case GGML_TYPE_Q1_0:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q1_0>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_Q2_0:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_0>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_Q4_0:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q4_0>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_Q4_1:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q4_1>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_Q5_0:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q5_0>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_Q5_1:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q5_1>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_Q8_0:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_MXFP4:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_MXFP4>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_NVFP4:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_NVFP4>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_Q2_K:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_K>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_Q3_K:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q3_K>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_Q4_K:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q4_K>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_Q5_K:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q5_K>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_Q6_K:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q6_K>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_IQ2_XXS:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ2_XXS>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_IQ2_XS:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ2_XS>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_IQ2_S:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ2_S>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_IQ3_XXS:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ3_XXS>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_IQ1_S:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ1_S>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_IQ1_M:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ1_M>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_IQ4_NL:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ4_NL>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_IQ4_XS:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ4_XS>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         case GGML_TYPE_IQ3_S:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ3_S>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
++                 nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream, extra);
+             break;
+         default:
+             GGML_ABORT("fatal error");
+@@ -1446,7 +1477,7 @@
+ 
+ void ggml_cuda_mul_mat_vec_q(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+-        const ggml_cuda_mm_fusion_args_host * fusion) {
++        const ggml_cuda_mm_fusion_args_host * fusion, const ggml_cuda_mmvq_shexp * shexp) {
+     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+@@ -1567,11 +1598,55 @@
+ 
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
++    // Fold the always-on shared expert in as one extra channel. Its per-row work
++    // is identical to its own launch - same weights, same activation, same
++    // k-blocks, same reduction - it just runs inside a grid that is already large
++    // enough to cover memory latency.
++    mmvq_extra_channel extra{};
++    const mmvq_extra_channel * extra_p = nullptr;
++    if (shexp != nullptr) {
++        GGML_ASSERT(ids != nullptr && ncols_dst == 1);
++        GGML_ASSERT(shexp->src0->type == src0->type);
++        GGML_ASSERT(shexp->src0->ne[0] == ne00 && shexp->src0->ne[1] == ne01);
++        GGML_ASSERT(shexp->src0->nb[1] / ts_src0 == (size_t) s01);
++        GGML_ASSERT(shexp->src1->type == GGML_TYPE_F32 && shexp->dst->type == GGML_TYPE_F32);
++        GGML_ASSERT(shexp->dst->nb[0] == ggml_type_size(shexp->dst->type));
++
++        // Quantize the shared expert's activation with exactly the parameters its
++        // own launch would use, through the same per-graph cache, so the q8_1
++        // bytes are the ones the skipped kernel would have produced.
++        const ggml_tensor * s1 = shexp->src1;
++        const int64_t s_ne10 = s1->ne[0];
++        const int64_t s_ne11 = s1->ne[1];
++        const int64_t s_ne12 = s1->ne[2];
++        const int64_t s_ne13 = s1->ne[3];
++        const int64_t s_ne10_padded = GGML_PAD(s_ne10, MATRIX_ROW_PADDING);
++        const int64_t s_s11 = s1->nb[1] / ts_src1;
++        const int64_t s_s12 = s1->nb[2] / ts_src1;
++        const int64_t s_s13 = s1->nb[3] / ts_src1;
++
++        const char * s_q8_1 = ctx.quantized_src1_cache.find(
++            s1, stream, s_ne10, s_s11, s_s12, s_s13, s_ne10_padded, s_ne11, s_ne12, s_ne13);
++        if (s_q8_1 == nullptr) {
++            const size_t size_q8_1 = s_ne13*s_ne12 * s_ne11*s_ne10_padded * sizeof(block_q8_1)/QK8_1;
++            char * d_q8_1 = ctx.quantized_src1_cache.insert(
++                ctx.pool(), s1, stream, s_ne10, s_s11, s_s12, s_s13, s_ne10_padded, s_ne11, s_ne12, s_ne13, size_q8_1);
++            quantize_row_q8_1_cuda((const float *) s1->data, nullptr, d_q8_1, shexp->src0->type,
++                s_ne10, s_s11, s_s12, s_s13, s_ne10_padded, s_ne11, s_ne12, s_ne13, stream);
++            s_q8_1 = d_q8_1;
++        }
++
++        extra.vx  = shexp->src0->data;
++        extra.vy  = s_q8_1;
++        extra.dst = (float *) shexp->dst->data;
++        extra_p   = &extra;
++    }
++
+     mul_mat_vec_q_switch_type(
+         src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+-        ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
++        ne03,              ne3,           s03, s13,              s3,               ids_stride, stream, extra_p);
+ }
+ 
+ void ggml_cuda_op_mul_mat_vec_q(
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -20,8 +20,39 @@
+ // index depend on the group segment, and both are integer-only.
+ void ggml_cuda_mul_mat_vec_q_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes);
+ 
++// ----- MoE shared expert folded into the routed-expert launch ----------------
++//
++// A Laguna MoE layer runs top-k routed experts through MUL_MAT_ID and an
++// always-on shared expert through a plain MUL_MAT of the same K, row count and
++// quantization type. At batch 1 the shared expert's own launch is far too small
++// to cover memory latency: its 2048-row / K=512 Q6_K down projection moves
++// 0.86 MB in 8.4 us (~102 GB/s) while the routed down projection - the identical
++// per-row work, just eight times more of it - sustains ~600 GB/s. The launch is
++// latency bound, not bandwidth bound, so the fix is more concurrent work in the
++// same launch rather than a different thread geometry.
++//
++// mmvq_extra_channel describes one extra, non-id-selected channel appended to
++// the end of a MUL_MAT_ID mmvq grid. The shared expert becomes that channel: it
++// keeps its own weight, activation and output bases while every row keeps the
++// thread geometry, k-block assignment, vec_dot sequence and reduction order it
++// has in the separate launch, so the result is bit-identical.
++struct mmvq_extra_channel {
++    const void * vx  = nullptr; // weight base (2D slab, no id indirection)
++    const void * vy  = nullptr; // q8_1 activation base
++    float      * dst = nullptr; // output base
++};
++
++// Shared-expert operands for ggml_cuda_mul_mat_vec_q. Shape/type/stride
++// compatibility with the routed op is checked by the caller in ggml-cuda.cu.
++struct ggml_cuda_mmvq_shexp {
++    const ggml_tensor * src0 = nullptr;
++    const ggml_tensor * src1 = nullptr;
++    ggml_tensor       * dst  = nullptr;
++};
++
+ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
+-    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
++    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr,
++    const ggml_cuda_mmvq_shexp * shexp = nullptr);
+ 
+ void ggml_cuda_op_mul_mat_vec_q(
+     ggml_backend_cuda_context & ctx,
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1851,7 +1851,10 @@
+          ggml_tensor * up_exps_s,
+          ggml_tensor * gate_exps_s,
+          ggml_tensor * down_exps_s,
+-         ggml_tensor * selected_experts_in) const {
++         ggml_tensor * selected_experts_in,
++         ggml_tensor * shexp_down_w,
++         ggml_tensor * shexp_h,
++         ggml_tensor ** shexp_out) const {
+     return build_moe_ffn(
+         cur,
+         gate_inp,  /* gate_inp_b  */ nullptr,
+@@ -1872,7 +1875,10 @@
+         up_exps_s,
+         gate_exps_s,
+         down_exps_s,
+-        selected_experts_in
++        selected_experts_in,
++        shexp_down_w,
++        shexp_h,
++        shexp_out
+     );
+ }
+ 
+@@ -1900,7 +1906,11 @@
+          ggml_tensor * up_exps_s,
+          ggml_tensor * gate_exps_s,
+          ggml_tensor * down_exps_s,
+-         ggml_tensor * selected_experts_in) const {
++         ggml_tensor * selected_experts_in,
++         ggml_tensor * shexp_down_w,
++         ggml_tensor * shexp_h,
++         ggml_tensor ** shexp_out) const {
++    const bool fold_shexp = shexp_down_w != nullptr && shexp_h != nullptr && shexp_out != nullptr;
+     const int64_t n_embd   = cur->ne[0];
+     const int64_t n_tokens = cur->ne[1];
+     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+@@ -2178,6 +2188,25 @@
+     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+     cb(experts, "ffn_moe_down", il);
+ 
++    // The always-on shared expert's down projection, emitted ADJACENT to the routed
++    // one so the backend can issue both as a SINGLE matvec launch. They read equally
++    // shaped, equally quantized weight slabs and differ only in activation/output
++    // buffers. At batch 1 the shared expert's own 2048-row launch cannot cover memory
++    // latency (measured gfx1201: 0.86 MB in 8.4 us = ~102 GB/s) while the routed one,
++    // identical per-row work at 8x the channel count, sustains ~600 GB/s.
++    //
++    // Adjacency must be established here: ggml-alloc assigns buffers from this node
++    // order, so emitting the shared expert after the routed reduction makes the
++    // backend-side hoist illegal (its output gets aliased with a reduction temporary).
++    // ggml_build_forward_expand decides position, so the routed node is pinned first.
++    // The caller builds shexp_h before this call.
++    if (fold_shexp) {
++        ggml_build_forward_expand(gf, experts);
++        *shexp_out = build_lora_mm(shexp_down_w, shexp_h);
++        cb(*shexp_out, "ffn_shexp", il);
++        ggml_build_forward_expand(gf, *shexp_out);
++    }
++
+     if (down_exps_s) {
+         cb(experts, "ffn_moe_down_scaled", il);
+     }
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1060,7 +1060,10 @@
+              ggml_tensor * up_exps_s = nullptr,
+              ggml_tensor * gate_exps_s = nullptr,
+              ggml_tensor * down_exps_s = nullptr,
+-             ggml_tensor * selected_experts_in = nullptr) const;
++             ggml_tensor * selected_experts_in = nullptr,
++             ggml_tensor * shexp_down_w = nullptr,
++             ggml_tensor * shexp_h = nullptr,
++             ggml_tensor ** shexp_out = nullptr) const;
+ 
+     ggml_tensor * build_moe_ffn(
+              ggml_tensor * cur,
+@@ -1086,7 +1089,10 @@
+              ggml_tensor * up_exps_s = nullptr,
+              ggml_tensor * gate_exps_s = nullptr,
+              ggml_tensor * down_exps_s = nullptr,
+-             ggml_tensor * selected_experts_in = nullptr) const;
++             ggml_tensor * selected_experts_in = nullptr,
++             ggml_tensor * shexp_down_w = nullptr,
++             ggml_tensor * shexp_h = nullptr,
++             ggml_tensor ** shexp_out = nullptr) const;
+ 
+     //
+     // inputs
+--- a/src/models/laguna.cpp
++++ b/src/models/laguna.cpp
+@@ -276,6 +276,30 @@
+         if ((uint32_t)il >= hparams.n_layer_dense_lead) {
+             // MoE: sigmoid routing + score-correction bias + sum-norm +
+             // routed_scaling_factor (all handled by build_moe_ffn).
++            // Always-on shared expert. Its gate/up/SwiGLU are emitted BEFORE the
++            // routed experts so its hidden activation already exists when the routed
++            // down projection runs; build_moe_ffn then emits the shared expert's own
++            // down projection adjacent to the routed one, and the CUDA backend issues
++            // both as one launch. Pure reordering of independent work - the shared
++            // expert reads only `cur`, and the ops/operands/shapes are unchanged.
++            static const bool shexp_fold_enabled = [] {
++                const char * e = getenv("GGML_MOE_SHEXP_FUSE");
++                return e == nullptr || atoi(e) != 0;
++            }();
++
++            ggml_tensor * ffn_shexp = nullptr;
++            ggml_tensor * shexp_h   = nullptr;
++            if (shexp_fold_enabled) {
++                shexp_h = build_ffn(cur,
++                        model.layers[il].ffn_up_shexp,   NULL, NULL,
++                        model.layers[il].ffn_gate_shexp, NULL, NULL,
++                        NULL,                            NULL, NULL,
++                        NULL,
++                        LLM_FFN_SILU, LLM_FFN_PAR, il);
++                cb(shexp_h, "ffn_shexp_h", il);
++                ggml_build_forward_expand(gf, shexp_h);
++            }
++
+             ggml_tensor * moe_out = build_moe_ffn(cur,
+                     model.layers[il].ffn_gate_inp,
+                     model.layers[il].ffn_up_exps,
+@@ -287,17 +311,23 @@
+                     hparams.expert_weights_norm,
+                     hparams.expert_weights_scale,
+                     (llama_expert_gating_func_type) hparams.expert_gating_func,
+-                    il);
++                    il,
++                    /* probs_in */ nullptr, /* gate_up_exps */ nullptr,
++                    /* up_exps_s */ nullptr, /* gate_exps_s */ nullptr,
++                    /* down_exps_s */ nullptr, /* selected_experts_in */ nullptr,
++                    shexp_fold_enabled ? model.layers[il].ffn_down_shexp : nullptr,
++                    shexp_h, &ffn_shexp);
+             cb(moe_out, "ffn_moe_out", il);
+ 
+-            // Always-on shared expert, summed in parallel.
+-            ggml_tensor * ffn_shexp = build_ffn(cur,
+-                    model.layers[il].ffn_up_shexp,   NULL, NULL,
+-                    model.layers[il].ffn_gate_shexp, NULL, NULL,
+-                    model.layers[il].ffn_down_shexp, NULL, NULL,
+-                    NULL,
+-                    LLM_FFN_SILU, LLM_FFN_PAR, il);
+-            cb(ffn_shexp, "ffn_shexp", il);
++            if (ffn_shexp == nullptr) {
++                ffn_shexp = build_ffn(cur,
++                        model.layers[il].ffn_up_shexp,   NULL, NULL,
++                        model.layers[il].ffn_gate_shexp, NULL, NULL,
++                        model.layers[il].ffn_down_shexp, NULL, NULL,
++                        NULL,
++                        LLM_FFN_SILU, LLM_FFN_PAR, il);
++                cb(ffn_shexp, "ffn_shexp", il);
++            }
+ 
+             cur = ggml_add(ctx0, moe_out, ffn_shexp);
+             cb(cur, "ffn_out", il);
