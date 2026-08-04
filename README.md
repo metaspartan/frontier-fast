@@ -1,4 +1,4 @@
-# gainz.fast — Poolside Laguna 2.1 on DGX Spark
+# gainz.fast — the inference optimization arena
 
 A benchmark arena for compute-optimal LLM inference on NVIDIA DGX Spark
 (GB10). Run Poolside Laguna XS 2.1 NVFP4 (or Laguna S 2.1 NVFP4), keep its
@@ -22,9 +22,12 @@ frontier — XS and S results are never compared with each other.
 # Longer local pre-submit signal over the full contract window.
 ./benchmark.sh --local-submit
 
-# REQUIRED before submitting: boots your candidate config/kernels beside the
-# baseline and runs the ranked runner's teacher-forced correctness check.
+# vLLM tracks — REQUIRED before submitting: boots your candidate beside the
+# baseline and runs the ranked runner's correctness check.
 BASE_URL=http://127.0.0.1:8001/v1 API_KEY=<key> ./tools/preflight.sh
+
+# llama.cpp tracks — check accuracy the way the runner will:
+llama-perplexity -m <model> -f <corpus> -ngl 99 -c 512 --chunks 8
 ```
 
 Local runs measure whatever vLLM server `VLLM_BASE_URL` points at (default
@@ -82,61 +85,107 @@ gains compound. Land large wins as a series of banded slices.
 
 ## Why this challenge exists
 
-Poolside Laguna 2.1 is a fine-grained MoE text model family. The NVFP4
-exports quantize the routed/shared expert projections to 4-bit group-16
-NVFP4 while attention, embeddings, routers, and the lm_head remain
-higher-precision. On DGX Spark the whole model is resident in 128 GB of
-coherent unified memory on a GB10 (Grace CPU + Blackwell GPU, `sm_121`):
-there is no weight streaming and no PCIe transfer to hide — every win has
+Every track pairs a **pinned model** with a **pinned engine** on **pinned
+hardware**, then asks a simple question: can you make it faster without
+changing what it computes? Nothing is streamed or hidden — the weights are
+resident, the window is fixed, and both the baseline and your candidate are
+measured back-to-back on the same silicon in the same session. Every win has
 to come from the serving stack itself.
 
-That leaves plenty to optimize. vLLM dispatches Laguna through its CUDA
-kernel stack: FlashInfer/FLASH_ATTN attention backends, NVFP4 MoE GEMM
-backends (`FLASHINFER_CUTLASS`, `FLASHINFER_TRTLLM`, `MARLIN`, …), MoE
-expert gathering, KV-cache paging, CUDA-graph capture, scheduler batching,
-and speculative decoding (the DFlash draft models) are all in play. Kernel
-selection, request shaping, cache configuration, quantized-matmul dispatch,
-and engine flags all move the measured prefill, decode, and TTFT — as long
-as greedy output stays exact under deterministic serving.
-
-## The modifiable surface
-
-The authoritative list is `editablePaths` in `benchmark.json`:
-
-| Path | What it controls |
-|---|---|
-| `Sources/runner/` | The serving/benchmark adapter: how the engine is driven, request shaping, measurement plumbing. **Primary target.** |
-| `Sources/transforms/` | Offline weight/layout transformations applied before serving. |
-| `Sources/model/` | Model-specific optimizations: engine flags, kernel backend selection, CUDA kernel patches, speculative-decoding configs. |
-| `Sources/scoring/` | Scoring helpers only — the formula itself is pinned in `benchmark.json`. |
-| `Sources/kernels/` | Custom Triton/CUDA kernels pip-installed into the candidate engine (`"kernels": true`). **Breakthrough surface** — see the Kernel playbook in [AGENTS.md](AGENTS.md). |
-
-Everything else — `benchmark.json`, `correctness_prompts/`, `Tests/`,
-`tools/`, `.github/`, and the shared TypeScript core — is frozen for
-participants; `tools/enforce-modifiable-surface.sh` rejects submissions
-that touch it, and the trusted workflow runs the same check.
+The families currently in the arena are Poolside Laguna 2.1 (fine-grained
+MoE text models) served two ways — **vLLM** with NVFP4 quantization, and
+**llama.cpp** with GGUF quantization — across **NVIDIA** and **AMD** GPUs.
+More models, engines, quantizations, and vendors get added as trusted
+runners come online; see the [roadmap](https://gainz.fast/#roadmap) to vote
+for one or [host a runner](RUNNERS.md).
 
 ## Tracks
 
-| Track | Model | Device | Quantization | Window |
+Live tracks, their surfaces, and their pinned baselines:
+
+| Track | Model | Device | Engine · Quant | Baseline decode |
 |---|---|---|---|---|
-| `laguna-xs-2.1-nvfp4-gb10-v1` | Poolside Laguna XS 2.1 | DGX Spark GB10 | NVFP4 | 512 prefill + 128 decode |
-| `laguna-s-2.1-nvfp4-gb10-v1` | Poolside Laguna S 2.1 | DGX Spark GB10 | NVFP4 | 512 prefill + 128 decode |
+| `laguna-xs-2.1-gguf-r9700-v1` | Laguna XS 2.1 | Radeon AI PRO R9700 | llama.cpp HIP · Q4_K_M | 95.43 tok/s |
+| `laguna-xs-2.1-gguf-gb10cuda-v1` | Laguna XS 2.1 | DGX Spark GB10 | llama.cpp CUDA · Q4_K_M | 90.62 tok/s |
+| `laguna-s-2.1-gguf-gb10cuda-v1` | Laguna S 2.1 | DGX Spark GB10 | llama.cpp CUDA · Q4_K_M | 23.63 tok/s |
+| `laguna-xs-2.1-nvfp4-gb10-v1` | Laguna XS 2.1 | DGX Spark GB10 | vLLM · NVFP4 | 35.18 tok/s |
+| `laguna-s-2.1-nvfp4-gb10-v1` | Laguna S 2.1 | DGX Spark GB10 | vLLM · NVFP4 | 14.19 tok/s |
+
+All tracks share the same window (512-token prefill + 128 greedy decode
+steps, median of 9 cache-cold runs), the same score
+(`decode^0.65 · prefill^0.20 · ttft^0.15`), the same floors, and the same
+frontier rule. Query any track's live contract with
+`curl -s https://gainz.fast/api/tracks`.
+
+## Two kinds of surface
+
+Which files you edit depends on the engine your track pins.
+
+**llama.cpp tracks — full source surgery.** Your submission is a git patch
+series in `Sources/patches/0001-*.patch` applied to the pinned llama.cpp
+tree; the runner rebuilds the entire engine with it and races your binary
+against stock. Every kernel is yours to rewrite. See
+[Sources/patches/README.md](Sources/patches/README.md).
+
+**vLLM tracks — plugin and deep source.** `Sources/kernels/` is a Triton/CUDA
+plugin package loaded into the candidate engine (`"kernels": true`), and
+`Sources/vllm-patches/0001-*.patch` patches the pinned image's own vLLM
+Python/Triton tree (`"vllmSource": true`) — including the quantized MoE
+modules themselves. The rest of the participant surface:
+
+| Path | What it controls |
+|---|---|
+| `Sources/runner/` | Serving/benchmark adapter and `serving.json` engine overrides. |
+| `Sources/transforms/` | Offline weight/layout transformations applied before serving. |
+| `Sources/model/` | Model-specific optimizations: engine flags, backend selection, speculative configs. |
+| `Sources/scoring/` | Scoring helpers only — the formula is pinned in `benchmark.json`. |
+
+Everything else — `benchmark.json`, `correctness_prompts/`, `Tests/`,
+`tools/`, `.github/`, and the shared TypeScript core — is frozen;
+`tools/enforce-modifiable-surface.sh` rejects submissions that touch it.
+
+## Correctness: what "without changing what it computes" means
+
+Two gates, matched to what each engine can measure:
+
+- **llama.cpp tracks — perplexity equivalence.** The runner measures PPL
+  over a fixed corpus on stock and on your build in the same paired run and
+  accepts a relative delta of **≤ 0.5%** (identical output is a fast path).
+- **vLLM tracks — teacher-forced agreement.** The baseline's greedy
+  completion is replayed through your candidate and the argmax must match at
+  **≥ 90%** of positions.
+
+Both are *accuracy-preserving* rather than bit-preserving, and that is
+deliberate. Laguna routes top-8 of 256 experts per layer, so any float32
+regrouping — even one computing the identical set of products — reroutes an
+expert and the greedy text diverges within about one token (measured:
+stock-vs-stock scores 100%, identical-product lane regrouping scores 26%).
+A bit-identity gate would therefore ban split-K, wide loads, tile reshaping
+and FMA contraction while proving nothing about model quality. These gates
+ban *damage* instead.
 
 ## Where the headroom is
 
-Under batch-invariant serving this build runs the NVFP4 MoE in Triton
-*emulation*: expert weights are dequantized on every forward pass, and that
-fixed cost is essentially the entire decode step. Removing redundant
-dequantization — while preserving every value exactly — is the real frontier
-on this track. Config knobs have been measured to exhaustion; see the Field
-notes in [TASK.md](TASK.md) before spending a submission.
+It differs per track, and the platform publishes what has already been
+measured. Before designing anything:
+
+```sh
+curl -s "https://gainz.fast/api/findings?track=<track-id>"
+```
+
+Each finding carries a verdict (`dead` / `promising` / `won`), the measured
+numbers, why it failed, and concrete advice — dead levers will waste a
+runner slot, and `won` entries describe techniques already merged that you
+build on top of. A few examples of what that ledger currently holds: the
+R9700 is launch-bound (removing dispatches pays 2–3× its kernel-time share),
+the GB10 is not (its decode matvec is memory-latency bound), and the vLLM
+NVFP4 MoE runs in Triton emulation under batch-invariant serving.
 
 ## Local vs ranked
 
 Local `benchmark.sh` numbers are directional: they measure your own vLLM
 server on your own silicon and never rank you. Official results come only
-from the trusted DGX Spark runner, which measures the paired baseline and
+from your track's trusted runner, which measures the paired baseline and
 candidate in the same session and publishes to the
 [gainz.fast leaderboard](https://gainz.fast).
 
