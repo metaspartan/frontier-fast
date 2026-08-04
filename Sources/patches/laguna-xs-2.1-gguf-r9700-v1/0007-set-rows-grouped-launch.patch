@@ -1,0 +1,291 @@
+From a46b1d8c6f41d0ddedd99eeb151a1fe32bac3b8e Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Mon, 3 Aug 2026 18:15:47 +0000
+Subject: [PATCH] CUDA/HIP: group the KV-cache K/V set_rows stores into one
+ kernel
+
+A decode step stores the new K row and the new V row into the KV cache with two
+independent set_rows launches over disjoint tensors, emitted back to back by
+build_attn with only view nodes in between. On a launch-bound GPU each is its
+own dispatch of a ~1.3us kernel.
+
+This adds a grouped set_rows launch: up to 4 such single-row stores run as ONE
+kernel whose grid concatenates their element ranges. A thread routes itself to
+its segment (src / idx / dst base pointer and row stride - all integer work)
+and then performs exactly the read, cast and store of the individual
+k_set_rows<float, int64_t, half> launch it replaces.
+
+There is no arithmetic beyond the float -> half conversion, which is the same
+ggml_cuda_cast<half> applied to the same value. Restricting to the single-row
+case (ne01 == ne02 == ne03 == 1) folds the stock index decomposition to
+i00 = i, i01 = i02 = i03 = 0, so the destination row is src1[0] and the
+destination address dst + dst_row*s1 + i00, identical to stock; the pdl_sync /
+pdl_lc placement around the index load is preserved.
+
+Guards: F32 source, I64 index, F16 destination, contiguous source rows, and
+anything stock would run as part of a ROPE+VIEW+SET_ROWS fusion is left alone.
+Hoisting uses the same legality scan as the grouped rope pass, with nodes
+already issued earlier in the pass skipped.
+
+On Laguna-XS-2.1-Q4_K_M (RDNA4, gfx1201) this removes 40 kernel launches per
+decoded token (all 40 layers group) and improves decode throughput by ~1.3
+percent at byte-identical output.
+
+GGML_CUDA_DISABLE_SET_ROWS_GROUP=1 disables the optimization.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 101 ++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/set-rows.cu  |  92 +++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/set-rows.cuh |  10 ++++
+ 3 files changed, 203 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 8bb3a0a4d..8a56bfa71 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3649,6 +3649,92 @@ static int ggml_cuda_rope_collect_group(const ggml_cgraph * cgraph, const int st
+     return n;
+ }
+ 
++
++// ----- grouped set_rows (KV-cache K/V store) launch detection -----------------
++//
++// A decode step stores the new K row and the new V row into the KV cache with
++// two independent set_rows launches. Merging them into one launch removes a
++// dispatch without touching any value: each element keeps its source, its cast
++// and its destination address (see k_set_rows_grouped in set-rows.cu).
++
++static bool ggml_cuda_set_rows_groupable(const ggml_cgraph * cgraph, const int i) {
++    const ggml_tensor * node = cgraph->nodes[i];
++
++    if (node->op != GGML_OP_SET_ROWS) {
++        return false;
++    }
++    // leave anything stock would run as part of a ROPE+VIEW+SET_ROWS fusion alone
++    if (i >= 2 && ggml_cuda_can_fuse(cgraph, i - 2, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
++        return false;
++    }
++
++    const ggml_tensor * src0 = node->src[0];
++    const ggml_tensor * src1 = node->src[1];
++    if (src0 == nullptr || src1 == nullptr) {
++        return false;
++    }
++    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_I64 || node->type != GGML_TYPE_F16) {
++        return false;
++    }
++    // single-row store only: the grouped kernel constant-folds the index
++    // decomposition to i00 = i, i01 = i02 = i03 = 0
++    if (src0->ne[1] != 1 || src0->ne[2] != 1 || src0->ne[3] != 1) {
++        return false;
++    }
++    if (src1->ne[0] < 1) {
++        return false;
++    }
++    if (src0->nb[0] != ggml_type_size(src0->type) || node->nb[0] != ggml_type_size(node->type)) {
++        return false;
++    }
++    if (!ggml_is_contiguous(src0)) {
++        return false;
++    }
++    return true;
++}
++
++static int ggml_cuda_set_rows_collect_group(const ggml_cgraph * cgraph, const int start, ggml_tensor ** members,
++                                            const std::unordered_set<const ggml_tensor *> & done,
++                                            const std::unordered_set<const ggml_tensor *> & done2) {
++    members[0] = cgraph->nodes[start];
++    int n = 1;
++
++    constexpr int scan_window = 8;
++    const int end = std::min(cgraph->n_nodes, start + 1 + scan_window);
++
++    for (int j = start + 1; j < end && n < SET_ROWS_MAX_GROUP_SIZE; ++j) {
++        ggml_tensor * cand = cgraph->nodes[j];
++        if (ggml_cuda_is_view_or_noop(cand) || done.count(cand) != 0 || done2.count(cand) != 0) {
++            continue;
++        }
++        if (cand->op != GGML_OP_SET_ROWS) {
++            continue;
++        }
++        if (!ggml_cuda_set_rows_groupable(cgraph, j)) {
++            continue;
++        }
++        // reuse the rope hoist scan: identical requirements (the hoisted write
++        // must not touch what a skipped-over node reads or writes, the hoisted
++        // inputs must not be written in between, and nothing in between may
++        // consume the hoisted result)
++        if (!ggml_cuda_rope_hoist_legal(cgraph, start, j, done, done2)) {
++            continue;
++        }
++        bool overlap = false;
++        for (int m = 0; m < n; ++m) {
++            if (!ggml_cuda_mmvq_ranges_disjoint(members[m], cand)) {
++                overlap = true;
++                break;
++            }
++        }
++        if (overlap) {
++            continue;
++        }
++        members[n++] = cand;
++    }
++    return n;
++}
++
+ // try and fuse nodes and return the number of nodes to skip
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+@@ -4481,6 +4567,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_NORM_GROUP"));
+             static const bool disable_rope_group = getenv("GGML_CUDA_DISABLE_ROPE_GROUP") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_ROPE_GROUP"));
++            static const bool disable_set_rows_group = getenv("GGML_CUDA_DISABLE_SET_ROWS_GROUP") != nullptr &&
++                                                   std::atoi(getenv("GGML_CUDA_DISABLE_SET_ROWS_GROUP"));
+             static const bool disable_mmvq_group = getenv("GGML_CUDA_DISABLE_MMVQ_GROUP") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_MMVQ_GROUP"));
+             const bool mmvq_group_enabled = !disable_mmvq_group && stream_ctx.concurrent_events.empty();
+@@ -4574,6 +4662,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     }
+                 }
+ 
++                if (!disable_set_rows_group && stream_ctx.concurrent_events.empty() &&
++                        node->op == GGML_OP_SET_ROWS && ggml_cuda_set_rows_groupable(cgraph, i)) {
++                    ggml_tensor * members[SET_ROWS_MAX_GROUP_SIZE];
++                    const int n_members = ggml_cuda_set_rows_collect_group(cgraph, i, members, grouped_done, mmvq_grouped_done);
++                    if (n_members >= 2) {
++                        ggml_cuda_op_set_rows_grouped(*cuda_ctx, members, n_members);
++                        for (int m = 1; m < n_members; ++m) {
++                            grouped_done.insert(members[m]);
++                        }
++                        continue;
++                    }
++                }
++
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
+                 if (nodes_to_skip != 0) {
+diff --git a/ggml/src/ggml-cuda/set-rows.cu b/ggml/src/ggml-cuda/set-rows.cu
+index 465997065..15f8534c2 100644
+--- a/ggml/src/ggml-cuda/set-rows.cu
++++ b/ggml/src/ggml-cuda/set-rows.cu
+@@ -373,6 +373,98 @@ void set_rows_cuda<half, int64_t>(ggml_backend_cuda_context & ctx, const ggml_te
+ }
+ 
+ 
++
++// ----- grouped set_rows launch: the K and V cache stores in one kernel -------
++//
++// A decode step stores one new K row and one new V row into the KV cache with
++// two separate set_rows launches over disjoint tensors. Each element of each op
++// is independent, so the element ranges of several such ops can be
++// concatenated into ONE grid: a thread first routes itself to its segment
++// (src / idx / dst base pointer and row stride - all integer work), then
++// performs exactly the read, cast and store of the individual
++// k_set_rows<float, int64_t, half> launch it replaces.
++//
++// Only the single-row case (ne01 == ne02 == ne03 == 1) is provided, which is
++// the shape the graph-side detector groups; there the stock index
++// decomposition reduces to i00 = i, i01 = i02 = i03 = 0, so the destination row
++// is src1[0] exactly as in stock.
++
++struct set_rows_grouped_args {
++    const float *   src0[SET_ROWS_MAX_GROUP_SIZE];
++    const int64_t * src1[SET_ROWS_MAX_GROUP_SIZE];
++    half *          dst[SET_ROWS_MAX_GROUP_SIZE];
++    int64_t         s1[SET_ROWS_MAX_GROUP_SIZE];
++    // exclusive prefix sums of per-segment element counts; entries past the
++    // actual group size are padded with the total so the scan ignores them
++    uint32_t        seg_end[SET_ROWS_MAX_GROUP_SIZE];
++};
++
++static __global__ void k_set_rows_grouped(const set_rows_grouped_args args, const int64_t ne_total) {
++    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
++
++    if (i >= ne_total) {
++        return;
++    }
++
++    uint32_t seg       = 0;
++    uint32_t seg_start = 0;
++#pragma unroll
++    for (int s = 0; s < SET_ROWS_MAX_GROUP_SIZE - 1; ++s) {
++        if ((uint32_t) i >= args.seg_end[s]) {
++            seg       = s + 1;
++            seg_start = args.seg_end[s];
++        }
++    }
++
++    const int64_t i00 = i - (int64_t) seg_start;
++
++    ggml_cuda_pdl_sync();
++    const int64_t dst_row = args.src1[seg][0];
++    ggml_cuda_pdl_lc();
++
++    const float * src0_row    = args.src0[seg];
++    half *        dst_row_ptr = args.dst[seg] + dst_row * args.s1[seg];
++
++    dst_row_ptr[i00] = ggml_cuda_cast<half>(src0_row[i00]);
++}
++
++void ggml_cuda_op_set_rows_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes) {
++    GGML_ASSERT(n_nodes >= 2 && n_nodes <= SET_ROWS_MAX_GROUP_SIZE);
++
++    cudaStream_t stream = ctx.stream();
++
++    set_rows_grouped_args args = {};
++    uint32_t total = 0;
++
++    for (int m = 0; m < n_nodes; ++m) {
++        const ggml_tensor * dst  = nodes[m];
++        const ggml_tensor * src0 = dst->src[0];
++        const ggml_tensor * src1 = dst->src[1];
++
++        GGML_ASSERT(dst->op == GGML_OP_SET_ROWS);
++        GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I64 && dst->type == GGML_TYPE_F16);
++        GGML_ASSERT(src0->ne[1] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1);
++        GGML_ASSERT(src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(half));
++
++        args.src0[m]  = (const float *) src0->data;
++        args.src1[m]  = (const int64_t *) src1->data;
++        args.dst[m]   = (half *) dst->data;
++        args.s1[m]    = dst->nb[1] / sizeof(half);
++        total        += (uint32_t) src0->ne[0];
++        args.seg_end[m] = total;
++    }
++    for (int m = n_nodes; m < SET_ROWS_MAX_GROUP_SIZE; ++m) {
++        args.seg_end[m] = total; // padding: the segment scan never selects these
++    }
++
++    const int  num_blocks = ((int) total + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE;
++    const dim3 block_size(CUDA_SET_ROWS_BLOCK_SIZE);
++    const dim3 grid_size(num_blocks);
++
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_size, block_size, 0, stream);
++    ggml_cuda_kernel_launch(k_set_rows_grouped, launch_params, args, (int64_t) total);
++}
++
+ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+diff --git a/ggml/src/ggml-cuda/set-rows.cuh b/ggml/src/ggml-cuda/set-rows.cuh
+index c140c0873..892a64787 100644
+--- a/ggml/src/ggml-cuda/set-rows.cuh
++++ b/ggml/src/ggml-cuda/set-rows.cuh
+@@ -4,4 +4,14 @@
+ 
+ #define CUDA_SET_ROWS_BLOCK_SIZE 256
+ 
++// Maximum number of independent single-row set_rows ops that may merge into a
++// single grouped launch.
++#define SET_ROWS_MAX_GROUP_SIZE 4
++
++// Launch several independent single-row F32 -> F16 set_rows ops (the KV-cache
++// K and V stores of one decode step) as ONE kernel. Each element keeps the
++// exact source value, cast and destination address it has in the individual
++// launch; only the segment routing is new, and it is integer-only.
++void ggml_cuda_op_set_rows_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes);
++
+ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+-- 
+2.53.0
+

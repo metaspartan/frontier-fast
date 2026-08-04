@@ -1,3 +1,25 @@
+## One series per track
+
+Each track keeps its accumulated wins in its own directory:
+
+- `laguna-xs-2.1-gguf-r9700-v1/` — RDNA4 (Radeon AI PRO R9700)
+- `laguna-xs-2.1-gguf-gb10cuda-v1/` — GB10 sm_121
+- `laguna-s-2.1-gguf-gb10cuda-v1/` — GB10 sm_121
+
+A track's series **is** its stock build: the runner applies it to the pinned
+llama.cpp tree, then applies your patch on top and times the pair. Add your
+patch to your track's directory with the next free number, and never edit or
+renumber a patch that is already there — later patches were authored against
+the tree those earlier ones produce.
+
+These directories exist because a shared series could not stay coherent across
+architectures. A launch-geometry change that wins on RDNA4 measurably regresses
+on sm_121, so a GB10 port deleted two RDNA4 patches and renumbered the rest —
+which silently orphaned three later patches that depended on them (one of them
+literally un-does a change that no longer existed). Every llama.cpp submission
+on every track then failed with `patch does not apply`. CI now applies each
+track's series to the pinned tree on every PR, so this cannot recur silently.
+
 # Sources/patches — the llama.cpp full-source tracks
 
 TWO tracks share this surface, both pinned to llama.cpp `b10237`
