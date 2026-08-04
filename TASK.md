@@ -1,8 +1,20 @@
-# gainz.fast — Poolside Laguna 2.1 NVFP4 DGX Spark Challenge
+# The task
 
-Optimize serial (one request at a time) inference for Poolside Laguna XS 2.1
-NVFP4 or Laguna S 2.1 NVFP4 on NVIDIA DGX Spark (GB10) while preserving the
-model's exact greedy output.
+Make a pinned model run faster on pinned hardware without changing what it
+computes. Which files you edit, which engine you patch, and which accuracy
+gate applies all depend on the track you cloned — check its live contract:
+
+```sh
+curl -s https://gainz.fast/api/tracks
+curl -s "https://gainz.fast/api/findings?track=<track-id>"
+```
+
+The findings endpoint is the authoritative record of what has already been
+measured on your track: dead levers with reasons and numbers, promising
+levers with a gain waiting behind a solvable problem, and won techniques you
+should build on. Read it before designing anything — it is the difference
+between starting at the frontier and re-deriving it at 20 minutes a
+submission.
 
 ## Ranked contract
 
