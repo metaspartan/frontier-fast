@@ -1,0 +1,425 @@
+From 0018b1c2d3e4f5061728394a5b6c7d8e9f0a1b2c3 Mon Sep 17 00:00:00 2001
+From: Claude Opus 5 <noreply@anthropic.com>
+Date: Tue, 4 Aug 2026 22:00:00 +0000
+Subject: [PATCH] CUDA/HIP: run the MoE shared expert's gate/up as a ninth
+ channel of the routed gate+up+GLU fusion
+
+Patch 0017 folds the shared expert's DOWN projection into the routed down
+launch. Its gate/up pair is the same opportunity one step earlier. On
+Laguna-XS-2.1 the routed and the shared gate/up are both a [2048 -> 512] Q4_K
+matvec, they read the SAME activation (laguna.cpp hands one `cur` to both), and
+the routed pair already runs eight channels of exactly that work as llama.cpp's
+fused gate+up+GLU mmvq. The shared pair becomes channel nine of that launch,
+which also applies its SwiGLU in-kernel.
+
+Measured on gfx1201 (rocprofv3, per MoE layer, batch 1):
+
+  routed gate+up+GLU, 8 channels          19.44 us
+  routed gate+up+GLU, 9 channels          21.56 us   +2.12
+  shared gate/up as its own grouped mmvq   4.74 us   removed
+  shared SwiGLU + q8_1 fold (patch 0010)   1.39 us   removed
+  q8_1 of the shared hidden, now separate   1.36 us   added
+                                                    -------
+                                                     -2.45 us/layer
+
+The ninth channel costs about an eighth of the routed launch, while the pair's
+own launch costs twice that, for the same reason patch 0017 recorded on the down
+projection: these matvecs are memory LATENCY bound, so a launch large enough to
+keep waves in flight absorbs more work almost for free while a small one cannot.
+The shared expert's SwiGLU disappears into the fused kernel, but its hidden
+activation then has to be quantized to q8_1 for the down projection on its own,
+which is why one launch comes back; the net is one fewer dispatch per MoE layer.
+
+The shared triple is emitted BEFORE the routed one - patch 0017 put it there so
+the down fold finds the hidden activation ready - and a tensor must not be
+written before ggml-alloc considers it live. So the triple is not moved. It is
+DEFERRED: skipped at its own position and issued by the routed launch further
+down the graph. Its output buffer is live across that whole span (allocated at
+its own node, freed only after the shared down projection reads it) and nothing
+in between reads it, so moving the write later is safe. Moving it earlier is not,
+and that asymmetry is why no graph reordering is needed here at all: this patch
+touches only the CUDA backend. Both graph arrangements tried for the down fold
+cost more than they saved, one of them by silently breaking patch 0004's Q/K
+grouped launch; that launch is verified still intact at 27 dispatches/token.
+
+The skip and the fold are one decision, taken once at the shared triple and
+recorded, rather than two predicates that could disagree and leave the shared
+expert uncomputed. The fold runs ahead of every "already issued" check and ahead
+of ggml_cuda_try_fuse, so nothing else can claim the routed node first.
+
+Every row keeps the thread geometry, k-block assignment, vec_dot sequence and
+reduction order it has in its own launch, so the result is bit-identical rather
+than merely equivalent. Restricted to RDNA because the extra-channel launch
+bypasses mul_mat_vec_q's small_k selection, which is unconditionally off there;
+where it can be on, taking this path could move the ROUTED rows between two
+thread geometries and change their bit pattern.
+
+Measured on the R9700 (gfx1201), llama-bench tg128, five interleaved whole
+process launches per arm with rotating order, median of per-round ratios:
+
+  candidate vs series 0001-0017   1.02067  (+2.07 pct, min 1.01948 max 1.02217)
+  no-op control vs series         1.00138  (+0.14 pct, min 1.00048 max 1.00583)
+  candidate vs its own control    1.01866  (+1.87 pct, min 1.01624 max 1.02016)
+  prefill pp512 vs series         0.99783  (-0.22 pct, min 0.99715 max 1.01110)
+
+The control is the same binary with GGML_MOE_SHEXP_GU_FUSE=0; it lands on the
+reference within the 0.6 pct noise floor, which is what isolates the change. An
+independent five-round repeat before the final rebuild gave 1.02144 / 1.00156 /
+1.01810 - the same result. Prefill cannot be affected: the pairing requires a
+single dst column, so it never fires above batch 1.
+
+Kernel level (rocprofv3, per decoded token): 5.1154 -> 5.0351 ms of kernel time
+(-1.57 pct) and 858.1 -> 819.1 dispatches, exactly one removed per MoE layer.
+Dispatch counts were checked per kernel group, not only in aggregate.
+
+Perplexity over the fixed corpus is unchanged at 5.2611 for the reference, the
+candidate and the control.
+
+GGML_MOE_SHEXP_GU_FUSE=0 disables the fold, for A/B on a single binary.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  195 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu      |   56 +++++++++++++++--
+ ggml/src/ggml-cuda/mmvq.cuh     |    8 ++
+ 3 files changed, 252 insertions(+), 7 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 0b3283757..b20e4d66d 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4329,6 +4329,132 @@ static int ggml_cuda_softplus_mul_fold_target(const ggml_cgraph * cgraph, const
+     return j;
+ }
+ 
++// ----- MoE shared expert gate/up as a ninth channel --------------------------
++//
++// The shared expert's down projection already rides the routed down launch. Its
++// gate/up pair is the same opportunity one step earlier: for this model both are
++// a [2048 -> 512] Q4_K matvec over the SAME activation, so the shared pair is one
++// more channel of the routed gate+up+GLU fusion, which is already running eight
++// channels of exactly that work. Riding along also applies the GLU in-kernel, so
++// the shared expert's separate launch and its separate GLU both disappear.
++//
++// The shared triple is emitted BEFORE the routed one (laguna.cpp builds the shared
++// hidden first so the down fold finds it ready) and a tensor must not be written
++// before ggml-alloc considers it live, so the triple is not moved - it is
++// DEFERRED. It is skipped at its own position and issued by the routed launch
++// further down the graph. Its output buffer is live across that whole span
++// (allocated at its own node, freed only after the shared down projection reads
++// it) and nothing in between reads it, so moving the write later is safe. Moving
++// it EARLIER would not be: that is the aliasing the down fold had to avoid.
++//
++// One decision, taken once at the shared triple and recorded, so the skip and the
++// fold cannot disagree and leave the shared expert uncomputed.
++static bool ggml_cuda_moe_shexp_gate_up_pair(const ggml_cgraph * cgraph, const int is, const int ir, const int cc) {
++    if (is < 0 || ir < 0 || is + 3 > ir || ir + 2 >= cgraph->n_nodes) {
++        return false;
++    }
++    // The extra-channel launch bypasses mul_mat_vec_q's small_k selection, which is
++    // unconditionally off on RDNA. Where it can be on, taking this path could move
++    // the ROUTED rows between two thread geometries and change their bit pattern.
++    if (!GGML_CUDA_CC_IS_RDNA(cc)) {
++        return false;
++    }
++    // whole triples, no outside consumer of the gate/up intermediates, matching
++    // types/shapes/strides within each pair, a supported GLU op, not swapped
++    if (!ggml_cuda_can_fuse(cgraph, is, { GGML_OP_MUL_MAT,    GGML_OP_MUL_MAT,    GGML_OP_GLU }, {})) {
++        return false;
++    }
++    if (!ggml_cuda_can_fuse(cgraph, ir, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU }, {})) {
++        return false;
++    }
++
++    const ggml_tensor * sglu = cgraph->nodes[is + 2];
++    const ggml_tensor * rglu = cgraph->nodes[ir + 2];
++
++    for (int k = 0; k < 3; ++k) {
++        if ((cgraph->nodes[is + k]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++            return false;
++        }
++        if ((cgraph->nodes[ir + k]->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++            return false;
++        }
++    }
++
++    // gate/up assignment, same convention as ggml_cuda_try_fuse
++    const ggml_tensor * s_gate = sglu->src[0];
++    const ggml_tensor * s_up   = sglu->src[1];
++    const ggml_tensor * r_gate = rglu->src[0];
++    const ggml_tensor * r_up   = rglu->src[1];
++    if (!((s_gate == cgraph->nodes[is] && s_up == cgraph->nodes[is + 1]) ||
++          (s_gate == cgraph->nodes[is + 1] && s_up == cgraph->nodes[is]))) {
++        return false;
++    }
++    if (!((r_gate == cgraph->nodes[ir] && r_up == cgraph->nodes[ir + 1]) ||
++          (r_gate == cgraph->nodes[ir + 1] && r_up == cgraph->nodes[ir]))) {
++        return false;
++    }
++    if (ggml_get_glu_op(sglu) != ggml_get_glu_op(rglu)) {
++        return false;
++    }
++    if (s_up->src[2] != nullptr || s_gate->src[2] != nullptr || r_up->src[2] == nullptr) {
++        return false;
++    }
++    // the routed op must be the batch-1 mmvq route: one dst column per selected expert
++    if (!ggml_cuda_should_fuse_mul_mat_vec_q(r_up) || rglu->ne[2] != 1) {
++        return false;
++    }
++    if (rglu->type != GGML_TYPE_F32 || sglu->type != GGML_TYPE_F32) {
++        return false;
++    }
++    // the shared pair is a single dense column with a contiguous output
++    if (sglu->ne[1] != 1 || sglu->ne[2] != 1 || sglu->ne[3] != 1) {
++        return false;
++    }
++    if (!ggml_is_contiguous(sglu) || sglu->nb[0] != ggml_type_size(sglu->type)) {
++        return false;
++    }
++
++    // identical per-row work: same K, same row count, same type, same row stride,
++    // so every row keeps the thread geometry and reduction order of its own launch
++    const ggml_tensor * sw = s_up->src[0];
++    const ggml_tensor * rw = r_up->src[0];
++    if (!ggml_is_quantized(rw->type) || rw->ne[2] <= 1 || sw->type != rw->type) {
++        return false;
++    }
++    if (sw->ne[0] != rw->ne[0] || sw->ne[1] != rw->ne[1] || sw->ne[2] != 1 || sw->ne[3] != 1) {
++        return false;
++    }
++    if (sw->nb[0] != rw->nb[0] || sw->nb[1] != rw->nb[1]) {
++        return false;
++    }
++
++    // one activation for both, so the extra channel reuses the routed q8_1 bytes
++    // and no second quantize is issued
++    if (s_up->src[1]->type != GGML_TYPE_F32 || r_up->src[1]->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (s_up->src[1]->data != r_up->src[1]->data || s_up->src[1]->ne[0] != r_up->src[1]->ne[0]) {
++        return false;
++    }
++    return true;
++}
++
++// Forward scan from a deferred shared triple for the routed launch that will
++// issue it. Bounded, and the first match wins.
++static int ggml_cuda_moe_shexp_find_routed_gate_up(const ggml_cgraph * cgraph, const int is, const int cc) {
++    constexpr int scan_window = 64;
++    const int end = std::min(cgraph->n_nodes - 2, is + 3 + scan_window);
++    for (int ir = is + 3; ir < end; ++ir) {
++        if (cgraph->nodes[ir]->op != GGML_OP_MUL_MAT_ID) {
++            continue;
++        }
++        if (ggml_cuda_moe_shexp_gate_up_pair(cgraph, is, ir, cc)) {
++            return ir;
++        }
++    }
++    return -1;
++}
++
+ // try and fuse nodes and return the number of nodes to skip
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+@@ -5180,6 +5306,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 return e != nullptr && atoi(e) == 0;
+             }();
+             const bool moe_shexp_fuse_enabled = !disable_moe_shexp_fuse && stream_ctx.concurrent_events.empty();
++            // Fold the shared expert's gate/up into the routed gate+up+GLU launch.
++            // Separate toggle from the down fold so either can be A/B'd alone.
++            static const bool disable_moe_shexp_gu_fuse = [] {
++                const char * e = getenv("GGML_MOE_SHEXP_GU_FUSE");
++                return e != nullptr && atoi(e) == 0;
++            }();
++            const bool moe_shexp_gu_enabled = !disable_moe_shexp_gu_fuse && stream_ctx.concurrent_events.empty();
++            // The one deferred shared triple awaiting its routed launch. At most one
++            // is ever outstanding (the routed launch is a few nodes after the shared
++            // triple, the next layer far beyond it); a second is simply not deferred.
++            const ggml_tensor * shexp_gu_routed = nullptr;
++            int                 shexp_gu_shared = -1;
+             const int cc_for_shexp = ggml_cuda_info().devices[cuda_ctx->device].cc;
+             static const bool log_mmvq_group_stats = getenv("GGML_MMVQ_GROUP_STATS") != nullptr;
+             int64_t mmvq_group_stats_buf[2] = {0, 0};
+@@ -5234,6 +5372,45 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
++                // Issue the routed gate+up+GLU with the deferred shared expert as its
++                // ninth channel. Deliberately ahead of the "already issued" checks and
++                // of ggml_cuda_try_fuse: this node's execution is taken over here, so
++                // the deferred triple cannot be stranded by another path claiming it.
++                if (node == shexp_gu_routed) {
++                    ggml_tensor * rglu   = cgraph->nodes[i + 2];
++                    ggml_tensor * sglu   = cgraph->nodes[shexp_gu_shared + 2];
++                    ggml_tensor * r_gate = rglu->src[0];
++                    ggml_tensor * r_up   = rglu->src[1];
++                    ggml_tensor * s_gate = sglu->src[0];
++                    ggml_tensor * s_up   = sglu->src[1];
++
++                    ggml_cuda_mm_fusion_args_host fusion_data{};
++                    fusion_data.gate   = r_gate->src[0];
++                    fusion_data.glu_op = ggml_get_glu_op(rglu);
++
++                    ggml_cuda_mmvq_shexp shexp_args;
++                    shexp_args.src0 = s_up->src[0];
++                    shexp_args.src1 = s_up->src[1];
++                    shexp_args.dst  = sglu;
++                    shexp_args.gate = s_gate->src[0];
++
++                    ggml_cuda_mul_mat_vec_q(*cuda_ctx, r_up->src[0], r_up->src[1], r_up->src[2],
++                                            rglu, &fusion_data, &shexp_args);
++
++                    // the same view-write invalidation the other fused paths run for
++                    // the nodes they consume
++                    for (int k = 1; k <= 2; ++k) {
++                        const ggml_tensor * skipped = cgraph->nodes[i + k];
++                        if (skipped->view_src != nullptr && !ggml_cuda_is_view_or_noop(skipped)) {
++                            cuda_ctx->quantized_src1_cache.invalidate_views_of(skipped);
++                        }
++                    }
++                    shexp_gu_routed = nullptr;
++                    shexp_gu_shared = -1;
++                    i += 2;
++                    continue;
++                }
++
+                 if (mmvq_grouped_done.count(node) != 0) {
+                     continue; // already computed as part of a grouped mmvq launch
+                 }
+@@ -5357,6 +5534,24 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     }
+                 }
+ 
++                // Defer the shared expert's gate/up/GLU triple to the routed launch
++                // that will carry it. Nothing reads its output before then.
++                if (moe_shexp_gu_enabled && node->op == GGML_OP_MUL_MAT && shexp_gu_routed == nullptr) {
++                    const int ir = ggml_cuda_moe_shexp_find_routed_gate_up(cgraph, i, cc_for_shexp);
++                    if (ir > i) {
++                        shexp_gu_routed = cgraph->nodes[ir];
++                        shexp_gu_shared = i;
++                        for (int k = 1; k <= 2; ++k) {
++                            const ggml_tensor * skipped = cgraph->nodes[i + k];
++                            if (skipped->view_src != nullptr && !ggml_cuda_is_view_or_noop(skipped)) {
++                                cuda_ctx->quantized_src1_cache.invalidate_views_of(skipped);
++                            }
++                        }
++                        i += 2;
++                        continue;
++                    }
++                }
++
+                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
+ 
+                 if (nodes_to_skip != 0) {
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index a29608f21..d345e6d6a 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -558,7 +558,9 @@ static __global__ void mul_mat_vec_q(
+         use_gate      = fusion.gate      != nullptr;
+         use_bias      = fusion.x_bias    != nullptr;
+         use_gate_bias = fusion.gate_bias != nullptr && use_gate;
+-        vgate         = fusion.gate;
++        // is_extra folds to a compile-time false whenever has_extra is false, so
++        // every stock instantiation keeps loading fusion.gate unconditionally.
++        vgate         = is_extra ? extra.gate : fusion.gate;
+         x_bias        = (const float *) fusion.x_bias;
+         gate_bias     = (const float *) fusion.gate_bias;
+         active_glu    = fusion.glu_op;
+@@ -1234,10 +1236,23 @@ static void mul_mat_vec_q_switch_ncols_dst(
+                     c_ncols_dst, ncols_x, nrows_x, nchannels_dst + 1, nsamples_dst, warp_size, table_id);
+                 const ggml_cuda_kernel_launch_params launch_params =
+                     ggml_cuda_kernel_launch_params(dims.first, dims.second, 0, stream);
+-                ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, false, true>, launch_params,
+-                    vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+-                    channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                    sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, *extra);
++                const bool extra_has_fusion =
++                    fusion.gate != nullptr || fusion.x_bias  != nullptr || fusion.gate_bias  != nullptr ||
++                    fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
++                if (extra_has_fusion) {
++                    // Routed gate+up+GLU. The extra channel supplies its own gate
++                    // base and gets the same GLU applied, so it produces the shared
++                    // expert's hidden activation directly.
++                    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, false, true>, launch_params,
++                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
++                        sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, *extra);
++                } else {
++                    ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, false, true>, launch_params,
++                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
++                        sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, *extra);
++                }
+                 break;
+             }
+ 
+@@ -1625,8 +1640,22 @@ void ggml_cuda_mul_mat_vec_q(
+         const int64_t s_s12 = s1->nb[2] / ts_src1;
+         const int64_t s_s13 = s1->nb[3] / ts_src1;
+ 
+-        const char * s_q8_1 = ctx.quantized_src1_cache.find(
+-            s1, stream, s_ne10, s_s11, s_s12, s_s13, s_ne10_padded, s_ne11, s_ne12, s_ne13);
++        // The MoE shared expert's gate/up read the very activation the routed
++        // experts read - laguna.cpp hands one `cur` to both - and the routed launch
++        // quantized it a few lines above. Point the extra channel at those bytes
++        // directly: same tensor, same parameter tuple, so this is the same buffer
++        // the cache lookup would return, without depending on the lookup hitting.
++        const char * s_q8_1 = nullptr;
++        if (s1->data == src1->data &&
++                s_ne10 == ne10 && s_ne11 == ne11 && s_ne12 == ne12 && s_ne13 == ne13 &&
++                s_s11 == src1->nb[1] / ts_src1 && s_s12 == src1->nb[2] / ts_src1 &&
++                s_s13 == src1->nb[3] / ts_src1) {
++            s_q8_1 = src1_q8_1;
++        }
++        if (s_q8_1 == nullptr) {
++            s_q8_1 = ctx.quantized_src1_cache.find(
++                s1, stream, s_ne10, s_s11, s_s12, s_s13, s_ne10_padded, s_ne11, s_ne12, s_ne13);
++        }
+         if (s_q8_1 == nullptr) {
+             const size_t size_q8_1 = s_ne13*s_ne12 * s_ne11*s_ne10_padded * sizeof(block_q8_1)/QK8_1;
+             char * d_q8_1 = ctx.quantized_src1_cache.insert(
+@@ -1636,6 +1665,19 @@ void ggml_cuda_mul_mat_vec_q(
+             s_q8_1 = d_q8_1;
+         }
+ 
++        // A gate is required exactly when the routed op carries one: the kernel
++        // applies the GLU to every channel of the grid, so an extra channel without
++        // its own gate weight would read the routed experts'.
++        if (shexp->gate != nullptr) {
++            GGML_ASSERT(fusion != nullptr && fusion->gate != nullptr);
++            GGML_ASSERT(shexp->gate->type == shexp->src0->type);
++            GGML_ASSERT(ggml_are_same_shape (shexp->gate, shexp->src0));
++            GGML_ASSERT(ggml_are_same_stride(shexp->gate, shexp->src0));
++            extra.gate = shexp->gate->data;
++        } else {
++            GGML_ASSERT(fusion == nullptr || fusion->gate == nullptr);
++        }
++
+         extra.vx  = shexp->src0->data;
+         extra.vy  = s_q8_1;
+         extra.dst = (float *) shexp->dst->data;
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index ecae9aa99..36f3404d0 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -40,6 +40,11 @@ struct mmvq_extra_channel {
+     const void * vx  = nullptr; // weight base (2D slab, no id indirection)
+     const void * vy  = nullptr; // q8_1 activation base
+     float      * dst = nullptr; // output base
++    // Gate weight base, set only when the routed launch is llama.cpp's fused
++    // gate+up+GLU mmvq. The extra channel then computes the shared expert's own
++    // gate and up projections and applies the same GLU, so the shared expert's
++    // separate gate/up launch and its GLU both disappear.
++    const void * gate = nullptr;
+ };
+ 
+ // Shared-expert operands for ggml_cuda_mul_mat_vec_q. Shape/type/stride
+@@ -48,6 +53,9 @@ struct ggml_cuda_mmvq_shexp {
+     const ggml_tensor * src0 = nullptr;
+     const ggml_tensor * src1 = nullptr;
+     ggml_tensor       * dst  = nullptr;
++    // Shared-expert gate weight; required exactly when the routed op is fused
++    // with a gate, forbidden otherwise (asserted in ggml_cuda_mul_mat_vec_q).
++    const ggml_tensor * gate = nullptr;
+ };
+ 
+ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,

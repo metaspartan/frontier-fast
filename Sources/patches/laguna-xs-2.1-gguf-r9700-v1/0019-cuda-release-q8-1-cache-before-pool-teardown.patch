@@ -1,0 +1,54 @@
+From 0019c2d3e4f50617283949a5b6c7d8e9f0a1b2c3 Mon Sep 17 00:00:00 2001
+From: Claude Opus 5 <noreply@anthropic.com>
+Date: Tue, 4 Aug 2026 22:05:00 +0000
+Subject: [PATCH] CUDA/HIP: release the q8_1 reuse cache before the pools are
+ destroyed
+
+The series aborts at CUDA context teardown with GGML_ASSERT(pool_size == 0).
+Patch 0003's q8_1 reuse cache owns pool allocations, and it is declared ahead of
+`pools` in ggml_backend_cuda_context. Members are destroyed in reverse
+declaration order, so the pools go first and the cache then returns its buffers
+to a destroyed pool; ggml_cuda_pool_leg's destructor catches the leftover bytes
+and aborts the process.
+
+The destructor BODY runs before any member is destroyed, so clearing the cache
+there is what puts the two back in order.
+
+No effect on anything that is measured: the cache is already cleared on entry to
+every graph evaluation, and this only runs when a context is freed. llama-server
+never frees one, which is why the trusted runner never saw this. llama-bench
+frees one per configuration and aborted between them, so anyone reproducing the
+frontier with llama-bench hit it - including a plain -p 512 -n 128 run, which is
+the obvious way to check both halves of the score at once.
+
+Verified on gfx1201: llama-bench with -ngl 99 -p 512 -n 128 completes and prints
+both rows with this patch applied, and aborts with the pool assert without it.
+Perplexity is unchanged at 5.2611.
+
+Wins no score; it makes the series reproducible.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |   11 +++++++++++
+ 1 file changed, 11 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 0b3283757..30d275767 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -701,6 +701,17 @@ static std::condition_variable ggml_cuda_lock_cv;
+ static std::atomic<int> ggml_cuda_lock_counter;
+ 
+ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
++    // The q8_1 reuse cache owns pool allocations, and it is declared ahead of
++    // `pools` in the context. Members are destroyed in reverse declaration order,
++    // so on teardown the pools would go first and the cache would then return its
++    // buffers to a destroyed pool - ggml_cuda_pool_leg's destructor catches that
++    // as GGML_ASSERT(pool_size == 0) and aborts the process. The destructor BODY
++    // runs before any member is destroyed, so releasing the cache here is what
++    // keeps the two in order. Only reached at context teardown; a server that
++    // never frees its context never saw it, but llama-bench frees one per
++    // configuration and aborted between them.
++    quantized_src1_cache.clear();
++
+     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+ 
