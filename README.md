@@ -1,14 +1,20 @@
 # gainz.fast — the inference optimization arena
 
-A benchmark arena for compute-optimal LLM inference on NVIDIA DGX Spark
-(GB10). Run Poolside Laguna XS 2.1 NVFP4 (or Laguna S 2.1 NVFP4), keep its
-exact greedy output, and make prefill, decode, and time-to-first-token
-faster.
+A benchmark arena for compute-optimal LLM inference across GPUs, engines,
+and model families. Take a pinned model on pinned hardware, keep what it
+computes intact, and make prefill, decode, and time-to-first-token faster.
 
-Two tracks are registered in `benchmark.json`; `laguna-xs-2.1-nvfp4-gb10-v1`
-is the default. Each track freezes its model revision, quantization,
-machine, benchmark window, and scoring rules, and keeps its own leaderboard
-frontier — XS and S results are never compared with each other.
+Every track freezes its own model revision, quantization, engine build,
+machine, benchmark window, correctness gate, and scoring rules, and keeps
+its own leaderboard frontier — tracks are never compared with each other.
+Today that spans **NVIDIA GB10 and AMD RDNA4** hardware running **vLLM** and
+**llama.cpp**; new models, engines, quantizations, and vendors are added as
+trusted runners come online ([vote or host one](RUNNERS.md)).
+
+```sh
+# The live registry — always authoritative
+curl -s https://gainz.fast/api/tracks
+```
 
 ## Quickstart
 
@@ -30,28 +36,31 @@ BASE_URL=http://127.0.0.1:8001/v1 API_KEY=<key> ./tools/preflight.sh
 llama-perplexity -m <model> -f <corpus> -ngl 99 -c 512 --chunks 8
 ```
 
-Local runs measure whatever vLLM server `VLLM_BASE_URL` points at (default
-`http://127.0.0.1:8000/v1`; set `VLLM_API_KEY` if your server requires one).
-The reference checkpoint is `poolside/Laguna-XS-2.1-NVFP4` (~21.6 GB across
-safetensors shards), downloaded once into the Hugging Face cache by whatever
-serves it. Laguna S 2.1 NVFP4 is ~93 GiB and fills most of a 128 GB GB10.
+What a local run measures depends on your track's engine. **vLLM tracks**
+drive whatever server `VLLM_BASE_URL` points at (default
+`http://127.0.0.1:8000/v1`; set `VLLM_API_KEY` if required). **llama.cpp
+tracks** build the pinned tree with your patch series and drive
+`llama-server`. Both download their pinned checkpoint once — sizes range
+from ~20 GB (Laguna XS, 4-bit) to ~96 GB (Laguna S), so check your track's
+`recommendedVramGiB` before starting.
 
-> **Deterministic serving is mandatory.** Greedy (temperature 0) decoding in
-> vLLM is not reproducible across requests under default batch-variant
-> kernels — identical prompts can return different completions. Serve with
-> `VLLM_BATCH_INVARIANT=1` (batch-invariant kernels). The benchmark runs a
-> greedy self-consistency probe first and marks the result ineligible if the
-> engine cannot reproduce its own output.
+> **Deterministic serving is mandatory.** A track's engine must reproduce
+> its own greedy output, or nothing can be measured against it. On vLLM this
+> requires `VLLM_BATCH_INVARIANT=1` — default batch-variant kernels return
+> different completions for identical prompts. llama.cpp is deterministic as
+> built (verified per track at commissioning). Every ranked run probes this
+> first and marks the result ineligible if the engine fails its own probe.
 
-> **Correctness goldens are GB10-generated.** The committed tripwire hash in
-> `correctness_prompts/` comes from the trusted DGX Spark runner under
-> deterministic serving. Other GPUs or kernel builds can flip near-tie
-> greedy argmaxes; the ranked GB10 result is authoritative.
+> **Goldens and calibration are runner-generated.** Correctness references
+> and calibration numbers come from each track's own trusted runner. Other
+> GPUs or kernel builds legitimately flip near-tie argmaxes; the ranked
+> result on the track's pinned machine is authoritative.
 
 ### Ranked workflow
 
 `.github/workflows/benchmark.yml` is the trusted pipeline. It executes on a
-self-hosted DGX Spark runner (labels `dgx-spark`, `gb10`) on push to `main`
+self-hosted runner for your track (e.g. labels `dgx-spark`/`gb10`, or
+`rocm`/`rdna4`) on push to `main`
 or manual dispatch — never on pull requests, so fork code cannot reach the
 trusted hardware without maintainer review.
 
@@ -183,8 +192,8 @@ NVFP4 MoE runs in Triton emulation under batch-invariant serving.
 
 ## Local vs ranked
 
-Local `benchmark.sh` numbers are directional: they measure your own vLLM
-server on your own silicon and never rank you. Official results come only
+Local `benchmark.sh` numbers are directional: they measure your own engine
+on your own silicon and never rank you. Official results come only
 from your track's trusted runner, which measures the paired baseline and
 candidate in the same session and publishes to the
 [gainz.fast leaderboard](https://gainz.fast).

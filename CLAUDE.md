@@ -1,13 +1,17 @@
 # gainz.fast Challenge Agent Guide
 
-This repository is the Bun/TypeScript Poolside Laguna 2.1 NVFP4 inference
-optimization challenge for NVIDIA DGX Spark (GB10). Use this file as the
+This repository is the Bun/TypeScript gainz.fast inference optimization
+challenge. Tracks span multiple models, engines (vLLM, llama.cpp), and
+vendors (NVIDIA, AMD); the track you cloned defines the specifics — check
+`curl -s https://gainz.fast/api/tracks`. Use this file as the
 working contract for coding agents and participants.
 
 ## Goal
 
-Optimize Poolside Laguna S 2.1 NVFP4 or Laguna XS 2.1 NVFP4 inference on
-DGX Spark GB10 without changing the observable greedy output required by
+Optimize your track's pinned model on its pinned hardware without changing
+what the model computes, as measured by the track's correctness gate
+(perplexity equivalence on llama.cpp tracks, teacher-forced agreement on
+vLLM tracks) required by
 the correctness gates.
 
 Two ranked tracks are registered in `benchmark.json`:
@@ -31,7 +35,7 @@ token must match the golden greedy output.
 
 ## Official Hardware
 
-Ranked benchmark runs execute on a trusted self-hosted DGX Spark (GB10,
+Ranked benchmark runs execute on your track's trusted self-hosted runner (
 SM121, 128 GB unified memory) runner. Local timing on any other machine is
 directional only and never publishes to the leaderboard.
 
@@ -67,7 +71,7 @@ frozen. Changing frozen paths causes automatic rejection.
 - Correctness before timing, always. A greedy output mismatch means no score.
 - One coherent optimization per submission. Do not bundle unrelated changes.
 - Local timing is directional; official results come from the trusted runner.
-- Serve deterministically: greedy vLLM output is only reproducible with
+- Serve deterministically: on vLLM tracks greedy output is only reproducible with
   `VLLM_BATCH_INVARIANT=1`, and nondeterministic engines are ineligible.
 - Do not add network calls, telemetry, or background processes to benchmark
   paths.
