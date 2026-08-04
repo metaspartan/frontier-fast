@@ -1,0 +1,155 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Tue, 4 Aug 2026 01:20:00 +0000
+Subject: [PATCH] CUDA: keep CUDA graphs for MUL_MAT_ID paths that never
+ synchronise the stream
+
+ggml_cuda_graph_check_compability() rejects CUDA graphs for the WHOLE graph as
+soon as it sees one MUL_MAT_ID node whose src0 is not quantized:
+
+    const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
+    if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
+
+The stated reason is that "the mul_mat_id operation will need to synchronize the
+stream". That is true of exactly one code path: the sorted fallback at the tail
+of ggml_cuda_mul_mat_id(), which does cudaMemcpyAsync of the id tensor into a
+std::vector followed by cudaStreamSynchronize. It is NOT true of the four fast
+paths that return before it - ggml_cuda_mul_mat_vec_q, ggml_cuda_mul_mat_vec_f,
+ggml_cuda_mul_mat_q and ggml_cuda_mul_mat_f. mmq.cu, mmf.cu, mmvq.cu and mmvf.cu
+contain no cudaStreamSynchronize and no device-to-host copy at all; the id
+handling they need is done on the device by mm_ids_helper. The predicate is
+simply coarser than the dispatch it is trying to describe: it accepts only the
+quantized mul_mat_vec_q path and rejects the other three.
+
+This replaces it with ggml_cuda_mul_mat_id_is_stream_sync_free(), which mirrors
+the early-return conditions of ggml_cuda_mul_mat_id() term for term, so graphs
+are rejected if and only if the op would really reach the synchronising
+fallback. GGML_CUDA_DISABLE_MMID_GRAPHS=1 restores the stock acceptance in the
+same binary, which is how the arms below were separated.
+
+Why this model hits it
+----------------------
+Laguna S 2.1 is not uniformly quantized. Its GGUF tensor census (read from the
+tensor directory of laguna-s-2.1-Q4_K_M.gguf, sha256 a8b55c75...83e4) is:
+
+     39x  blk.N.ffn_{gate,up,down}_exps   (3072,1024,256)   Q4_K   16.45 GiB
+      8x  blk.N.ffn_{gate,up,down}_exps   (3072,1024,256)   BF16   12.00 GiB
+
+Eight of the forty-eight blocks carry BF16 experts. ggml_is_quantized(BF16) is
+false, so those twenty-four MUL_MAT_ID nodes disable CUDA graphs for the entire
+decode graph - every one of the ~1,400 kernel launches per decoded token is
+issued individually. The sibling track laguna-xs-2.1 has Q4_K experts in every
+block and therefore keeps its graphs, which is why this only shows up here.
+
+On NVIDIA the BF16 MUL_MAT_ID at ne2 == 1 is served by ggml_cuda_mul_mat_f
+(nsys confirms: mul_mat_f<__nv_bfloat162, 32, 1, 8, true>, 24 launches per
+decoded token, 13.8% of decode kernel time). That path never touches the host,
+so the graph rejection was buying nothing.
+
+Correctness
+-----------
+Bit-identical by construction: not one kernel, launch parameter, argument or
+node ordering changes. The only thing that changes is whether the identical
+sequence of launches is replayed from a captured CUDA graph.
+
+Measured, three arms over the fixed corpus (~/gainz-ppl-corpus.txt, 29,592
+bytes, 15 chunks, n_ctx 512, -ngl 99), llama-perplexity:
+
+    stock b10237                                PPL = 5.7341 +/- 0.25780
+    this patch, graphs ENABLED                  PPL = 5.7341 +/- 0.25780
+    this patch, GGML_CUDA_DISABLE_MMID_GRAPHS=1 PPL = 5.7341 +/- 0.25780
+
+Identical to every printed digit; relative delta 0.000% against a 0.5% gate.
+The third arm is the same binary with the escape hatch on, which isolates the
+graph enablement itself as the only variable between arms one and two.
+
+Measurement (DGX Spark GB10, sm_121, CUDA 13.0, -ngl 99, solo window)
+--------------------------------------------------------------------
+llama-bench -p 512 -n 128 -r 5, interleaved, one fresh model load per arm:
+
+    stock      tg128 24.02 +/- 0.01     pp512 618.84 +/- 4.24
+    this patch tg128 24.07 +/- 0.03     pp512 617.05 +/- 3.42
+    this patch tg128 25.76 +/- 0.07     pp512 632.58 +/- 13.87   (cold-box load)
+    stock      tg128 23.72 +/- 0.04     pp512 587.47 +/- 65.12   (earlier window)
+
+Stated plainly: the two arms are within noise of each other in the paired
+hot-box rounds (+0.2% decode). The 25.76 candidate round was the first load
+after the box had been idled and is treated here as load-time variance, not as
+the patch's effect - a two-samples-per-arm local harness cannot resolve a few
+percent against that spread. The trusted runner's 9-run cache-cold paired
+protocol can, and that is what this submission asks it to do. The change is
+submitted on its correctness argument and its mechanism; the speed claim is
+explicitly NOT that it is +8%.
+---
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 561ab7a..b2f7fd1 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2507,6 +2507,55 @@ static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
+ }
+ 
+ #ifdef USE_CUDA_GRAPH
++// Mirrors the early-return dispatch of ggml_cuda_mul_mat_id() [TAG_MUL_MAT_ID_CUDA_GRAPHS].
++// Returns true when the op is served by one of the four device-only fast paths
++// (mul_mat_vec_q / mul_mat_vec_f / mul_mat_q / mul_mat_f). None of those copies the id
++// tensor to the host or synchronizes the stream; only the sorted fallback at the tail of
++// ggml_cuda_mul_mat_id() does, and that is the one CUDA graphs have to reject.
++// Keep this in lockstep with ggml_cuda_mul_mat_id().
++static bool ggml_cuda_mul_mat_id_is_stream_sync_free(const ggml_tensor * dst, const int cc) {
++    static const bool disabled = getenv("GGML_CUDA_DISABLE_MMID_GRAPHS") != nullptr;
++
++    const ggml_tensor * src0 = dst->src[0];
++    const ggml_tensor * src1 = dst->src[1];
++
++    if (src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
++        return false;
++    }
++
++    const int64_t ne2  = dst->ne[2];
++    const int64_t ne02 = src0->ne[2];
++    const int64_t ne12 = src1->ne[2];
++
++    static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
++    if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
++        if (ggml_is_quantized(src0->type)) {
++            if (ne2 <= get_mmvq_mmid_max_batch(src0->type, cc)) {
++                return true; // ggml_cuda_mul_mat_vec_q
++            }
++        } else {
++            if (GGML_CUDA_CC_IS_AMD(cc)) {
++                return true; // ggml_cuda_mul_mat_vec_f
++            }
++        }
++    }
++
++    if (disabled) {
++        // Escape hatch: restore the stock quantized-only acceptance.
++        return false;
++    }
++
++    if (ggml_cuda_should_use_mmq(src0->type, cc, ne12, /*n_experts=*/ne02)) {
++        return true; // ggml_cuda_mul_mat_q
++    }
++
++    if (ggml_cuda_should_use_mmf(src0->type, cc, WARP_SIZE, src0->ne, src0->nb, src1->ne[2], /*mul_mat_id=*/true)) {
++        return true; // ggml_cuda_mul_mat_f
++    }
++
++    return false;
++}
++
+ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+ 
+     bool use_cuda_graph = true;
+@@ -2522,10 +2571,8 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
+         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+         if (node->op == GGML_OP_MUL_MAT_ID) {
+             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+-            const int mmvq_mmid_max = get_mmvq_mmid_max_batch(node->src[0]->type, cc);
+-            if (!ggml_is_quantized(node->src[0]->type) || node->ne[2] > mmvq_mmid_max) {
++            if (!ggml_cuda_mul_mat_id_is_stream_sync_free(node, cc)) {
+                 // under these conditions, the mul_mat_id operation will need to synchronize the stream, so we cannot use CUDA graphs
+-                // TODO: figure out a way to enable for larger batch sizes, without hurting performance
+                 // ref: https://github.com/ggml-org/llama.cpp/pull/18958
+                 use_cuda_graph = false;
+ #ifndef NDEBUG

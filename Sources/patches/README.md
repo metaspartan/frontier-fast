@@ -54,3 +54,36 @@ llama.cpp tree, and the trusted runner rebuilds the whole engine with it.
 Any HIP/ggml kernel is in scope: the Q4_K dequant path, MoE expert routing,
 flash-attention (a known pp regression exists on RDNA4 at depth), graph
 scheduling. Change values → rejected; remove provably-dead work → verified.
+
+## Per-track scoping (READ BEFORE MERGING THIS BRANCH)
+
+The trusted runner globs `Sources/patches/*.patch` from the **submission's own
+commit** and applies every match, for whichever track the submission names.
+That is a single flat namespace shared by three tracks that do not run the same
+model on the same device, so a series verified on one track is applied verbatim
+to the others.
+
+Branch `s-cuda-mmid-cuda-graphs` (track `laguna-s-2.1-gguf-gb10cuda-v1`) moves
+the merged R9700/XS series into `Sources/patches/xs-r9700-merged/` so the S-track
+runner evaluates its single patch in isolation. **The move is a scoping change,
+not a rejection of that work, and merging it into `main` as-is would take those
+patches out of the XS runs too.** Reviewer: take the new `0001-*.patch` and
+decide the directory layout separately - e.g. per-track subdirectories with the
+runner globbing `Sources/patches/<trackId>/*.patch` and falling back to the flat
+directory.
+
+Two facts motivated the isolation on this track:
+
+- Laguna **S** 2.1 is not uniformly quantized: 8 of its 48 blocks carry **BF16**
+  `ffn_*_exps` (12.00 GiB per tensor family) against Q4_K in the other 39. The
+  XS model is Q4_K throughout. Kernel-selection and CUDA-graph decisions that
+  key on `ggml_is_quantized()` therefore take a different branch on S than on
+  XS, and a series tuned on XS is not automatically a no-op here.
+- Applying the merged 0001-0013 series to a CUDA build and running Laguna S
+  aborted during warmup inside `ggml_cuda_norm_quant_register` while destroying
+  the `std::vector<std::unique_ptr<ggml_cuda_quantized_src1_entry>>` q8_1 cache
+  (backtrace captured 2026-08-04T00:37Z). **Caveat, stated plainly:** that build
+  was an incremental rebuild of a relocated build tree, which is exactly the
+  setup that can produce a stale-object ODR crash, so this is a reason to
+  re-verify the series on S from a clean build - not yet proof that the series
+  is broken. It has not been reproduced from a clean tree.
