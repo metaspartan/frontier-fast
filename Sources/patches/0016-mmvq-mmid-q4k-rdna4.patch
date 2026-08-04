@@ -1,0 +1,45 @@
+From 7a3b9c1d2e4f5a6b8c0d3e7f9a2b6c5d4e3f2a1c Mon Sep 17 00:00:00 2001
+From: Cybara <noreply@cybara.ai>
+Date: Mon, 3 Aug 2026 21:45:00 -0600
+Subject: [PATCH] CUDA/HIP: raise Q4_K mmvq mul_mat_id batch limit to 8 on
+ RDNA4
+
+get_mmvq_mmid_max_batch_rdna4 returns 4 for Q4_K, which caps the fast
+mul_mat_vec_q kernel at 4 simultaneous experts in a mul_mat_id call.
+Laguna-XS-2.1 uses top-8 routing (n_expert_used = 8), so ne2 = 8
+exceeds the limit and the MoE expert dispatch falls through from the
+single-launch mul_mat_vec_q path to a slower alternative (MMQ or the
+CPU-sync fallback) for every MoE layer on every decoded token.
+
+Raising the Q4_K limit to 8 (= MMVQ_MAX_BATCH_SIZE) lets all 8 selected
+experts run through the dedicated decode matvec kernel in one launch.
+The kernel template already supports ncols_dst up to
+MMVQ_MAX_BATCH_SIZE = 8; the limit of 4 was a conservative occupancy
+heuristic. Q4_0, Q4_1, Q5_0, Q5_1 and Q8_0 already return 7 on RDNA4,
+so 8 for Q4_K is a modest step and stays within the template's compiled
+range.
+
+Correctness: the kernel is unchanged — only the dispatch heuristic
+that selects it changes. Every expert's matvec computes the identical
+per-row dot product in the identical order. The gate/up fusion and
+sorted expert routing from build_moe_ffn are unaffected.
+
+On Laguna-XS-2.1-Q4_K_M (RDNA4, gfx1201) this targets the MoE expert
+dispatch bottleneck: ~8 expert matvecs per MoE layer per token move
+from the fallback path to the optimised single-launch decode kernel.
+---
+ ggml/src/ggml-cuda/mmvq.cu | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -238,7 +238,7 @@
+         case GGML_TYPE_NVFP4:   return 5;
+         case GGML_TYPE_Q3_K:    return 4;
+         case GGML_TYPE_Q4_0:    return 7;
+         case GGML_TYPE_Q4_1:    return 7;
+-        case GGML_TYPE_Q4_K:    return 4;
++        case GGML_TYPE_Q4_K:    return 8;
+         case GGML_TYPE_Q5_0:    return 7;
+         case GGML_TYPE_Q5_1:    return 7;
