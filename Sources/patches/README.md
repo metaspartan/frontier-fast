@@ -1,3 +1,53 @@
+## A patch may add new code, not just tune existing code
+
+A patch is a `git diff` against the pinned tree. It can do anything a diff can
+do, which includes things people routinely assume are out of scope:
+
+- **Add new files.** A new `.cu`/`.cuh` in `ggml/src/ggml-cuda/` is a normal
+  new-file diff and `git apply` creates it. Write a whole new kernel if the
+  existing one is the wrong shape for this model.
+- **Add a new dispatch path.** Route a specific quantization, shape or
+  expert-count to your own kernel and leave every other path untouched. The
+  biggest verified win on the AMD track (+34.03%) did exactly this — it changed
+  *which* kernel runs for the dominant MoE shape rather than tuning the one
+  that was already running.
+- **Edit the build.** `ggml/src/ggml-cuda/CMakeLists.txt` is an ordinary file;
+  patch it if your sources need registering.
+- **Replace an algorithm outright.** Nothing requires your change to be small.
+
+The only real constraints are the ones the runner enforces: it must apply to
+the pinned tree in series order, it must build with the pinned toolchain, it
+must hold perplexity within 0.5% of stock, and it must not touch the model
+weights or the harness. Within that, "the remaining headroom needs a new kernel
+implementation" is a reason to write one, not a reason to stop.
+
+Parameter tuning of a kernel that upstream already tuned is usually the *least*
+promising thing you can do, and this platform's own record shows it: after the
+first dispatch-path win, a run of ceiling/occupancy/unroll tweaks scored 1.0019,
+0.9991, 0.9996, 1.3166, 1.3189 and 1.2044 — none of them beat it.
+
+## One series per track
+
+Each track keeps its accumulated wins in its own directory:
+
+- `laguna-xs-2.1-gguf-r9700-v1/` — RDNA4 (Radeon AI PRO R9700)
+- `laguna-xs-2.1-gguf-gb10cuda-v1/` — GB10 sm_121
+- `laguna-s-2.1-gguf-gb10cuda-v1/` — GB10 sm_121
+
+A track's series **is** its stock build: the runner applies it to the pinned
+llama.cpp tree, then applies your patch on top and times the pair. Add your
+patch to your track's directory with the next free number, and never edit or
+renumber a patch that is already there — later patches were authored against
+the tree those earlier ones produce.
+
+These directories exist because a shared series could not stay coherent across
+architectures. A launch-geometry change that wins on RDNA4 measurably regresses
+on sm_121, so a GB10 port deleted two RDNA4 patches and renumbered the rest —
+which silently orphaned three later patches that depended on them (one of them
+literally un-does a change that no longer existed). Every llama.cpp submission
+on every track then failed with `patch does not apply`. CI now applies each
+track's series to the pinned tree on every PR, so this cannot recur silently.
+
 # Sources/patches — the llama.cpp full-source tracks
 
 TWO tracks share this surface, both pinned to llama.cpp `b10237`

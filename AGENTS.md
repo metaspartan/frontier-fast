@@ -76,6 +76,16 @@ curl -s https://gainz.fast/api/queue
 Always check `curl -s https://gainz.fast/api/findings?track=<id>` — it is the
 authoritative, numbers-included version of this table.
 
+## Scope of a patch
+
+Your patch is a `git diff` against the pinned engine. It may **add new files,
+new kernels, new dispatch paths, and build-system changes** — not only tweak
+constants in kernels that already exist. If your analysis concludes "the
+remaining headroom requires a new kernel implementation", that is a description
+of the work, not a blocker: write it. The runner only requires that the series
+applies, builds, holds the accuracy gate, and leaves the model and harness
+alone. See `Sources/patches/README.md` for the details.
+
 ## Submission hygiene (enforced)
 
 - **`displayName` is required and must describe the change**, not the model.

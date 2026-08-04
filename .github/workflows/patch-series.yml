@@ -1,0 +1,42 @@
+name: patch series
+on:
+  pull_request:
+    paths: ["Sources/patches/**", ".github/workflows/patch-series.yml"]
+  push:
+    branches: [main]
+    paths: ["Sources/patches/**"]
+
+# Every track's accumulated series IS its stock build. If a patch stops
+# applying, that track cannot build at all and every submission to it fails
+# with a raw `git apply` error. This ran too late once already: a series
+# reorganisation deleted two patches that later ones depended on, and three
+# llama.cpp tracks were dead until it was found by hand.
+jobs:
+  applies:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Clone the pinned llama.cpp tree
+        run: |
+          git clone --filter=blob:none https://github.com/ggml-org/llama.cpp.git /tmp/llama
+          git -C /tmp/llama checkout 2b63e0610bbc2be990ae1360d5256efcdc3f9efb
+      - name: Every track's series must apply cleanly and in order
+        run: |
+          status=0
+          for dir in Sources/patches/*/; do
+            series=$(ls "$dir"*.patch 2>/dev/null | sort) || continue
+            [ -z "$series" ] && continue
+            echo "::group::$dir"
+            rm -rf /tmp/tree && cp -r /tmp/llama /tmp/tree
+            git -C /tmp/tree checkout -q .
+            for p in $series; do
+              if git -C /tmp/tree apply --index "$GITHUB_WORKSPACE/$p" 2>/dev/null; then
+                echo "  ok   $(basename $p)"
+              else
+                echo "  FAIL $(basename $p) does not apply to the pinned tree"
+                status=1
+              fi
+            done
+            echo "::endgroup::"
+          done
+          exit $status
