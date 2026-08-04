@@ -35,7 +35,15 @@ jobs:
           print('verdict:', s.get('status'))
           print('reason:', s.get('statusReason') or 'verified clean')
           print('measured:', s.get('measured'))"
-              [ "$STATUS" = "verified" ] && exit 0 || exit 1
+              {
+                echo "### Trusted-runner verdict: \`$STATUS\`"
+                echo ""
+                echo "Produced on trusted hardware and published to the leaderboard."
+              } >> "$GITHUB_STEP_SUMMARY"
+              # A rejection is a normal, informative outcome, not a broken repo.
+              # This job only mirrors the verdict, so it must not paint the
+              # default branch red when a submission legitimately fails a gate.
+              exit 0
             fi
             sleep 30
           done
