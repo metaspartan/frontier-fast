@@ -1,0 +1,14 @@
+{
+  "trackId": "laguna-s-2.1-gguf-gb10cuda-v1",
+  "prompt": "List the prime numbers below fifty, then explain in two sentences why there are infinitely many primes. ",
+  "maxTokens": 128,
+  "temperature": 0,
+  "goldenSha256": null,
+  "reference": {
+    "engine": "llama.cpp b10237 (CUDA, sm_121)",
+    "serving": "-ngl 99 -c 8192 --parallel 1, greedy (temperature 0, top_k 1), solo window",
+    "hardware": "NVIDIA DGX Spark GB10 (sm_121, unified memory)"
+  },
+  "description": "Public correctness drift tripwire for laguna-s-2.1-gguf-gb10cuda-v1",
+  "note": "Public tripwire for llama.cpp CUDA on DGX Spark GB10 (solo-window scheduled). This track's ranked gate is perplexity equivalence over a fixed corpus (<=0.5% relative delta), measured by the trusted runner; the golden hash is intentionally null because greedy text is not the ranked criterion here."
+}
