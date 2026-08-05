@@ -21,6 +21,14 @@ parallelism for occupancy, so it must not be applied when too few blocks remain
 to fill the device. The 512-row k/v projections regress 2.8x if you narrow them,
 which is worth 2.9 of the 17.2 points.
 
+`0002` ports the Laguna q8_1 src1 cache. Dense hybrid LFM2.5 still reuses the
+same activation across attention Q/K/V and FFN gate/up projections, so stock
+re-runs `quantize_q8_1` once per consumer. The cache is bit-exact by
+construction (parameter-tuple + root-tensor identity + clear-on-eval). On this
+small model the remaining bottleneck after 0001 is per-launch overhead, so
+removing redundant quantize dispatches is the natural next lever. Do **not**
+blindly port Laguna MoE-only patches after this.
+
 ## This track is not the Laguna AMD track
 
 LFM2.5 2.6B is a **dense hybrid**, not a mixture-of-experts. Every lever that
