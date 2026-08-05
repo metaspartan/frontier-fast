@@ -79,3 +79,31 @@
          BCx = self.in_proj(x)
          B, C, x = mx.split(BCx, 3, axis=-1)
          Bx = B * x
+@@ -191,6 +256,27 @@
+         self.w2 = nn.Linear(ff_dim, dim, bias=False)
+ 
+     def __call__(self, x) -> mx.array:
++        # Fused gate+up for decode (M=1): one quantized matmul for w1+w3.
++        # Bit-identical for M=1; prefill (L>1) uses stock to preserve exact ppl.
++        if x.shape[1] == 1:
++            if not hasattr(self, "_gu_w"):
++                self._gu_w = mx.concatenate([self.w1.weight, self.w3.weight], axis=0)
++                self._gu_s = mx.concatenate([self.w1.scales, self.w3.scales], axis=0)
++                self._gu_b = mx.concatenate([self.w1.biases, self.w3.biases], axis=0)
++                self._gu_out = self.w1.weight.shape[0]
++            gu = mx.quantized_matmul(
++                x,
++                self._gu_w,
++                scales=self._gu_s,
++                biases=self._gu_b,
++                transpose=True,
++                group_size=self.w1.group_size,
++                bits=self.w1.bits,
++                mode=self.w1.mode,
++            )
++            g = gu[..., : self._gu_out]
++            u = gu[..., self._gu_out :]
++            return self.w2(swiglu(g, u))
+         return self.w2(swiglu(self.w1(x), self.w3(x)))
+ 
+ 

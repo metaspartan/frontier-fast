@@ -4,14 +4,15 @@
 
 | Patch | Intent |
 | --- | --- |
-| `0001-kvcache-step-512.patch` | KVCache step 256→512 for the ranked 512-token prefill |
+| `0001-fused-shortconv-decode-elementwise.patch` | L=1 ShortConv: fused elementwise (split+mul+concat+conv1d+mul → one Metal kernel) |
+| `0002-fused-sc-elem-decode-gate-up.patch` | Same + fused gate+up MLP for decode (M=1) |
 
-## Engine series
+## Verified
 
-See `Sources/mlx-engine-patches/lfm2.5-2.6b-mlx-apple-v1/` for the M4-targeted
-`qmv_wide` M=1 decode optimization (the real lever).
+| Patch | Score | Decode | Prefill | TTFT |
+| --- | --- | --- | --- | --- |
+| 0001 | **1.00364** | +0.39% | +0.30% | +0.34% |
 
-## Gates
+## Engine patches
 
-Accuracy: perplexity ≤ 0.5% relative to stock. The engine change only affects
-dispatch path selection (same `qmv_wide_impl` kernel math), not computation.
+Empty — runner lacks cmake for MLX rebuild.
