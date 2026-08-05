@@ -1,9 +1,20 @@
 # lfm2.5-2.6b-gguf-r9700-v1 — patch series
 
-**Intentionally empty.** No submission has beaten the baseline yet, so this
-track's frontier *is* pinned llama.cpp b10237. Your candidate is built as the
-pinned tree plus your patch, and measured against the same pinned tree. Add
-yours as `0001-` when you land the first win.
+`0001-mmvq-narrow-starved-blocks.patch` is the first landed win: **+17.177%**
+decode (180.325 -> 211.439 tok/s), prefill neutral, perplexity bit-identical.
+
+It removes idle mmvq warps. On the RDNA4 table `calc_nwarps()` returns 8 for
+q4_K at `ncols_dst=1`, which wants 16 k-blocks, but every K=2048 tensor in this
+model has only 8 - so half of every block fell through to the reduction without
+entering the k-loop while still costing occupancy. The q6_K output head is the
+one matvec that was already fully fed, and it was also the only one near peak
+bandwidth (565 GB/s vs 377 for the ffn up/gate pair). Halving `nwarps` on the
+starved shapes took `mul_mat_vec_q` from 4101.7 to 3062.7 us/token.
+
+Note the second gate in that patch before you extend it: narrowing trades total
+parallelism for occupancy, so it must not be applied when too few blocks remain
+to fill the device. The 512-row k/v projections regress 2.8x if you narrow them,
+which is worth 2.9 of the 17.2 points.
 
 ## This track is not the Laguna AMD track
 
