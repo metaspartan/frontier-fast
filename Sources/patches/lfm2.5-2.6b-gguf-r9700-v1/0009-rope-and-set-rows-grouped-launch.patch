@@ -1,0 +1,639 @@
+From c8145c9474269b5f5c363f3a23fa92c02868fc5b Mon Sep 17 00:00:00 2001
+From: Cybara <carsenk@gmail.com>
+Date: Wed, 5 Aug 2026 01:27:02 -0600
+Subject: [PATCH] CUDA/HIP: group rope Q/K and KV set_rows (fixed collect
+ arity)
+
+collect_group(cgraph, start, members, norm_grouped_done, mmvq_grouped_done).
+Evaluate call sites match the helper signature. Full groupable/hoist helpers.
+Kill switches: GGML_CUDA_DISABLE_ROPE_GROUP, GGML_CUDA_DISABLE_SET_ROWS_GROUP.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 257 ++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/rope.cu      | 182 ++++++++++++++++++++++
+ ggml/src/ggml-cuda/rope.cuh     |  11 ++
+ ggml/src/ggml-cuda/set-rows.cu  |  92 ++++++++++++
+ ggml/src/ggml-cuda/set-rows.cuh |  10 ++
+ 5 files changed, 552 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index d5a6153..01b398a 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3891,6 +3891,236 @@ static bool ggml_cuda_mul_bcast0_quant_ok(const ggml_tensor * node) {
+     return true;
+ }
+ 
++
++// ----- grouped rope (Q/K pair) launch detection --------------------------------
++//
++// A decoder layer ropes Q and K with two independent launches that share every
++// rope parameter and differ only in the tensor they read and write. Merging
++// them into one launch removes a dispatch without touching arithmetic: the
++// grouped kernel gives every element exactly the sequence of the individual
++// launch (see rope_neox_grouped in rope.cu), so the outputs are byte-identical
++// by construction.
++//
++// K's rope sits behind K's projection and K's norm in graph order, but by the
++// time Q's rope is issued both have already run - the projection as a member of
++// a grouped mmvq launch, the norm as a member of a grouped rms_norm launch - so
++// the hoist scan skips them and the remaining legality check is against the few
++// nodes that really do execute in between.
++
++static bool ggml_cuda_rope_groupable(const ggml_cgraph * cgraph, const int i) {
++    const ggml_tensor * node = cgraph->nodes[i];
++
++    if (node->op != GGML_OP_ROPE) {
++        return false;
++    }
++    // leave anything stock would fuse with VIEW+SET_ROWS alone
++    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
++        return false;
++    }
++
++    const ggml_tensor * src0 = node->src[0];
++    const ggml_tensor * src1 = node->src[1];
++    if (src0 == nullptr || src1 == nullptr) {
++        return false;
++    }
++    if (src0->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) {
++        return false;
++    }
++
++    const int mode = ((const int32_t *) node->op_params)[2];
++    // plain NeoX only: no mrope/imrope/vision section handling in the grouped kernel
++    if (!(mode & GGML_ROPE_TYPE_NEOX) || (mode & GGML_ROPE_TYPE_MROPE) ||
++            mode == GGML_ROPE_TYPE_IMROPE || mode == GGML_ROPE_TYPE_VISION) {
++        return false;
++    }
++    if (src0->ne[0] % 2 != 0) {
++        return false;
++    }
++    // 2D only: the grouped kernel constant-folds the row decomposition
++    if (src0->ne[2] != 1 || src0->ne[3] != 1 || node->ne[2] != 1 || node->ne[3] != 1) {
++        return false;
++    }
++    if (!ggml_are_same_shape(src0, node)) {
++        return false;
++    }
++    if (src0->nb[0] != ggml_type_size(src0->type) || node->nb[0] != ggml_type_size(node->type)) {
++        return false;
++    }
++    return true;
++}
++
++static bool ggml_cuda_rope_hoist_legal(const ggml_cgraph * cgraph, const int start, const int j,
++                                       const std::unordered_set<const ggml_tensor *> & done,
++                                       const std::unordered_set<const ggml_tensor *> & done2) {
++    const ggml_tensor * cand = cgraph->nodes[j];
++
++    for (int k = start + 1; k < j; ++k) {
++        const ggml_tensor * mid = cgraph->nodes[k];
++        // Nodes already issued earlier in this pass have finished before this
++        // launch point, so neither their reads nor their writes can race the
++        // hoisted write.
++        if (ggml_cuda_is_view_or_noop(mid) || done.count(mid) != 0 || done2.count(mid) != 0) {
++            continue;
++        }
++        for (int si = 0; si < GGML_MAX_SRC; ++si) {
++            if (mid->src[si] != nullptr && !ggml_cuda_mmvq_ranges_disjoint(cand, mid->src[si])) {
++                return false;
++            }
++            // a skipped-over node must not depend on the hoisted result either
++            if (mid->src[si] == cand) {
++                return false;
++            }
++        }
++        if (!ggml_cuda_mmvq_ranges_disjoint(cand, mid)) {
++            return false;
++        }
++        for (int si = 0; si < GGML_MAX_SRC; ++si) {
++            if (cand->src[si] != nullptr && !ggml_cuda_mmvq_ranges_disjoint(mid, cand->src[si])) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
++static int ggml_cuda_rope_collect_group(const ggml_cgraph * cgraph, const int start, ggml_tensor ** members,
++                                        const std::unordered_set<const ggml_tensor *> & done,
++                                        const std::unordered_set<const ggml_tensor *> & done2) {
++    ggml_tensor * first = cgraph->nodes[start];
++    members[0] = first;
++    int n = 1;
++
++    constexpr int scan_window = 16;
++    const int end = std::min(cgraph->n_nodes, start + 1 + scan_window);
++
++    for (int j = start + 1; j < end && n < ROPE_MAX_GROUP_SIZE; ++j) {
++        ggml_tensor * cand = cgraph->nodes[j];
++        if (ggml_cuda_is_view_or_noop(cand) || done.count(cand) != 0 || done2.count(cand) != 0) {
++            continue;
++        }
++        if (cand->op != GGML_OP_ROPE) {
++            continue;
++        }
++        // every rope parameter must be identical, so that every derived scalar
++        // (theta_scale, corr_dims, ...) is bit-identical to the individual launch
++        if (cand->src[1] != first->src[1] || cand->src[2] != first->src[2]) {
++            continue;
++        }
++        if (memcmp(cand->op_params, first->op_params, GGML_MAX_OP_PARAMS) != 0) {
++            continue;
++        }
++        if (cand->src[0]->ne[0] != first->src[0]->ne[0]) {
++            continue;
++        }
++        if (!ggml_cuda_rope_groupable(cgraph, j)) {
++            continue;
++        }
++        if (!ggml_cuda_rope_hoist_legal(cgraph, start, j, done, done2)) {
++            continue;
++        }
++        // members must write disjoint destinations
++        bool overlap = false;
++        for (int m = 0; m < n; ++m) {
++            if (!ggml_cuda_mmvq_ranges_disjoint(members[m], cand)) {
++                overlap = true;
++                break;
++            }
++        }
++        if (overlap) {
++            continue;
++        }
++        members[n++] = cand;
++    }
++    return n;
++}
++
++
++// ----- grouped set_rows (KV-cache K/V store) launch detection -----------------
++//
++// A decode step stores the new K row and the new V row into the KV cache with
++// two independent set_rows launches. Merging them into one launch removes a
++// dispatch without touching any value: each element keeps its source, its cast
++// and its destination address (see k_set_rows_grouped in set-rows.cu).
++
++static bool ggml_cuda_set_rows_groupable(const ggml_cgraph * cgraph, const int i) {
++    const ggml_tensor * node = cgraph->nodes[i];
++
++    if (node->op != GGML_OP_SET_ROWS) {
++        return false;
++    }
++    // leave anything stock would run as part of a ROPE+VIEW+SET_ROWS fusion alone
++    if (i >= 2 && ggml_cuda_can_fuse(cgraph, i - 2, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
++        return false;
++    }
++
++    const ggml_tensor * src0 = node->src[0];
++    const ggml_tensor * src1 = node->src[1];
++    if (src0 == nullptr || src1 == nullptr) {
++        return false;
++    }
++    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_I64 || node->type != GGML_TYPE_F16) {
++        return false;
++    }
++    // single-row store only: the grouped kernel constant-folds the index
++    // decomposition to i00 = i, i01 = i02 = i03 = 0
++    if (src0->ne[1] != 1 || src0->ne[2] != 1 || src0->ne[3] != 1) {
++        return false;
++    }
++    if (src1->ne[0] < 1) {
++        return false;
++    }
++    if (src0->nb[0] != ggml_type_size(src0->type) || node->nb[0] != ggml_type_size(node->type)) {
++        return false;
++    }
++    if (!ggml_is_contiguous(src0)) {
++        return false;
++    }
++    return true;
++}
++
++static int ggml_cuda_set_rows_collect_group(const ggml_cgraph * cgraph, const int start, ggml_tensor ** members,
++                                            const std::unordered_set<const ggml_tensor *> & done,
++                                            const std::unordered_set<const ggml_tensor *> & done2) {
++    members[0] = cgraph->nodes[start];
++    int n = 1;
++
++    constexpr int scan_window = 8;
++    const int end = std::min(cgraph->n_nodes, start + 1 + scan_window);
++
++    for (int j = start + 1; j < end && n < SET_ROWS_MAX_GROUP_SIZE; ++j) {
++        ggml_tensor * cand = cgraph->nodes[j];
++        if (ggml_cuda_is_view_or_noop(cand) || done.count(cand) != 0 || done2.count(cand) != 0) {
++            continue;
++        }
++        if (cand->op != GGML_OP_SET_ROWS) {
++            continue;
++        }
++        if (!ggml_cuda_set_rows_groupable(cgraph, j)) {
++            continue;
++        }
++        // reuse the rope hoist scan: identical requirements (the hoisted write
++        // must not touch what a skipped-over node reads or writes, the hoisted
++        // inputs must not be written in between, and nothing in between may
++        // consume the hoisted result)
++        if (!ggml_cuda_rope_hoist_legal(cgraph, start, j, done, done2)) {
++            continue;
++        }
++        bool overlap = false;
++        for (int m = 0; m < n; ++m) {
++            if (!ggml_cuda_mmvq_ranges_disjoint(members[m], cand)) {
++                overlap = true;
++                break;
++            }
++        }
++        if (overlap) {
++            continue;
++        }
++        members[n++] = cand;
++    }
++    return n;
++}
++
++
+ // try and fuse nodes and return the number of nodes to skip
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+@@ -4734,6 +4964,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_PRE_ADD_NORM"));
+             static const bool disable_norm_quant = getenv("GGML_CUDA_DISABLE_NORM_QUANT") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_NORM_QUANT"));
++            static const bool disable_rope_group = getenv("GGML_CUDA_DISABLE_ROPE_GROUP") != nullptr &&
++                                                   std::atoi(getenv("GGML_CUDA_DISABLE_ROPE_GROUP"));
++            static const bool disable_set_rows_group = getenv("GGML_CUDA_DISABLE_SET_ROWS_GROUP") != nullptr &&
++                                                   std::atoi(getenv("GGML_CUDA_DISABLE_SET_ROWS_GROUP"));
+             static const bool disable_mmvq_group = getenv("GGML_CUDA_DISABLE_MMVQ_GROUP") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_MMVQ_GROUP"));
+             const bool mmvq_group_enabled = !disable_mmvq_group && stream_ctx.concurrent_events.empty();
+@@ -4798,6 +5032,29 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue; // already computed as part of a grouped rms_norm launch
+                 }
+ 
++
++            if (!disable_rope_group && stream_ctx.concurrent_events.empty()) {
++                ggml_tensor * members[4];
++                const int n_members = ggml_cuda_rope_collect_group(cgraph, i, members, norm_grouped_done, mmvq_grouped_done);
++                if (n_members >= 2) {
++                    ggml_cuda_op_rope_grouped(*cuda_ctx, members, n_members);
++                    for (int m = 1; m < n_members; ++m) {
++                        norm_grouped_done.insert(members[m]);
++                    }
++                    continue;
++                }
++            }
++            if (!disable_set_rows_group && stream_ctx.concurrent_events.empty()) {
++                ggml_tensor * members[4];
++                const int n_members = ggml_cuda_set_rows_collect_group(cgraph, i, members, norm_grouped_done, mmvq_grouped_done);
++                if (n_members >= 2) {
++                    ggml_cuda_op_set_rows_grouped(*cuda_ctx, members, n_members);
++                    for (int m = 1; m < n_members; ++m) {
++                        norm_grouped_done.insert(members[m]);
++                    }
++                    continue;
++                }
++            }
+                 if (!disable_norm_group && stream_ctx.concurrent_events.empty() &&
+                         node->op == GGML_OP_RMS_NORM && ggml_cuda_rms_norm_pair_groupable(cgraph, i)) {
+                     ggml_tensor * norms[RMS_NORM_MAX_GROUP_SIZE];
+diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
+index e20a5cb..1ded56e 100644
+--- a/ggml/src/ggml-cuda/rope.cu
++++ b/ggml/src/ggml-cuda/rope.cu
+@@ -503,6 +503,188 @@ static void rope_vision_cuda(const T *            x,
+     }
+ }
+ 
++
++// ----- grouped rope launch: several independent NeoX ropes in one kernel -----
++//
++// A decoder layer ropes Q and K with two separate launches that share every
++// rope parameter (identical op_params, the same position tensor and the same
++// freq_factors) and differ only in the tensor they read and write. Every
++// (row, dim-pair) is independent of every other, so the row ranges of several
++// such ops can be concatenated into ONE grid: a block first routes itself to
++// its segment (src/dst base pointer, row strides, local row index - all
++// integer work), then performs exactly the per-element sequence of the
++// individual rope_neox<forward, has_ff, T, D> launch it replaces, so results
++// are byte-identical by construction.
++//
++// Only the 2D case (ne02 == ne03 == 1) without the ROPE+VIEW+SET_ROWS fusion
++// is provided: that is the shape the graph-side detector groups, and there the
++// stock row decomposition reduces to i1 = row_dst, i2 = i3 = 0.
++
++struct rope_grouped_args {
++    const void * x[ROPE_MAX_GROUP_SIZE];
++    void *       dst[ROPE_MAX_GROUP_SIZE];
++    int          s01[ROPE_MAX_GROUP_SIZE];
++    int          s1[ROPE_MAX_GROUP_SIZE];
++    // exclusive prefix sums of segment row counts; entries past the actual
++    // group size are padded with the total so the segment scan ignores them
++    uint32_t     seg_end[ROPE_MAX_GROUP_SIZE];
++};
++
++template <bool forward, bool has_ff, typename T, typename D>
++static __global__ void rope_neox_grouped(const rope_grouped_args args,
++                                         const int               ne00,
++                                         const int               n_dims,
++                                         const int32_t *         pos,
++                                         const float             freq_scale,
++                                         const float             ext_factor,
++                                         const float             attn_factor,
++                                         const rope_corr_dims    corr_dims,
++                                         const float             theta_scale,
++                                         const float *           freq_factors) {
++    ggml_cuda_pdl_lc();
++    const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
++
++    if (i0 >= ne00) {
++        return;
++    }
++
++    // Segment routing: uniform across the block (depends only on blockIdx.x),
++    // integer-only, and the sole difference from the individual launch.
++    uint32_t seg       = 0;
++    uint32_t seg_start = 0;
++#pragma unroll
++    for (int s = 0; s < ROPE_MAX_GROUP_SIZE - 1; ++s) {
++        if (blockIdx.x >= args.seg_end[s]) {
++            seg       = s + 1;
++            seg_start = args.seg_end[s];
++        }
++    }
++
++    const T * GGML_CUDA_RESTRICT x   = (const T *) args.x[seg];
++    D * GGML_CUDA_RESTRICT       dst = (D *) args.dst[seg];
++
++    // ne02 == ne03 == 1 for every member, so the stock decomposition
++    //   i3 = row_dst/(ne01*ne02), i2 = ..., i1 = ...
++    // reduces to i1 = row_dst, i2 = i3 = 0.
++    const int i1 = (int) (blockIdx.x - seg_start);
++
++    const int idst = i0 / 2 + i1 * args.s1[seg];
++    const int ix   = i0 / 2 + i1 * args.s01[seg];
++    ggml_cuda_pdl_sync();
++
++    if (i0 >= n_dims) {
++        dst[idst + i0 / 2 + 0] = ggml_cuda_cast<D>(x[ix + i0 / 2 + 0]);
++        dst[idst + i0 / 2 + 1] = ggml_cuda_cast<D>(x[ix + i0 / 2 + 1]);
++
++        return;
++    }
++
++    const float theta_base = pos[0]*powf(theta_scale, i0/2.0f);
++
++    const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
++
++    float cos_theta;
++    float sin_theta;
++
++    rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
++
++    const float x0 = x[ix + 0];
++    const float x1 = x[ix + n_dims/2];
++
++    dst[idst + 0]          = ggml_cuda_cast<D>(x0 * cos_theta - x1 * sin_theta);
++    dst[idst + n_dims / 2] = ggml_cuda_cast<D>(x0 * sin_theta + x1 * cos_theta);
++}
++
++template <bool forward, typename T, typename D>
++static void rope_neox_grouped_cuda(const rope_grouped_args & args,
++                                   const int                 total_rows,
++                                   const int                 ne00,
++                                   const int                 n_dims,
++                                   const int32_t *           pos,
++                                   const float               freq_scale,
++                                   const float               freq_base,
++                                   const float               ext_factor,
++                                   const float               attn_factor,
++                                   const rope_corr_dims      corr_dims,
++                                   const float *             freq_factors,
++                                   cudaStream_t              stream) {
++    GGML_ASSERT(ne00 % 2 == 0);
++    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
++    const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
++    const dim3 block_nums(total_rows, n_blocks_x, 1);
++
++    // identical to the individual launches (shared freq_base and n_dims)
++    const float theta_scale = powf(freq_base, -2.0f / n_dims);
++    const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
++
++    if (freq_factors == nullptr) {
++        ggml_cuda_kernel_launch(rope_neox_grouped<forward, false, T, D>, launch_params,
++            args, ne00, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors);
++    } else {
++        ggml_cuda_kernel_launch(rope_neox_grouped<forward, true, T, D>, launch_params,
++            args, ne00, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale, freq_factors);
++    }
++}
++
++void ggml_cuda_op_rope_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes) {
++    GGML_ASSERT(n_nodes >= 2 && n_nodes <= ROPE_MAX_GROUP_SIZE);
++
++    cudaStream_t stream = ctx.stream();
++
++    const ggml_tensor * first = nodes[0];
++    const ggml_tensor * src0f = first->src[0];
++    const ggml_tensor * src1f = first->src[1];
++    const ggml_tensor * src2f = first->src[2];
++
++    const int64_t ne00 = src0f->ne[0];
++
++    const int n_dims     = ((const int32_t *) first->op_params)[1];
++    const int n_ctx_orig = ((const int32_t *) first->op_params)[4];
++
++    float freq_base, freq_scale, ext_factor, attn_factor, beta_fast, beta_slow;
++    memcpy(&freq_base,   (const int32_t *) first->op_params +  5, sizeof(float));
++    memcpy(&freq_scale,  (const int32_t *) first->op_params +  6, sizeof(float));
++    memcpy(&ext_factor,  (const int32_t *) first->op_params +  7, sizeof(float));
++    memcpy(&attn_factor, (const int32_t *) first->op_params +  8, sizeof(float));
++    memcpy(&beta_fast,   (const int32_t *) first->op_params +  9, sizeof(float));
++    memcpy(&beta_slow,   (const int32_t *) first->op_params + 10, sizeof(float));
++
++    const int32_t * pos          = (const int32_t *) src1f->data;
++    const float *   freq_factors = src2f != nullptr ? (const float *) src2f->data : nullptr;
++
++    rope_corr_dims corr_dims;
++    ggml_rope_yarn_corr_dims(n_dims, n_ctx_orig, freq_base, beta_fast, beta_slow, corr_dims.v);
++
++    rope_grouped_args args = {};
++    uint32_t total_rows = 0;
++
++    for (int m = 0; m < n_nodes; ++m) {
++        const ggml_tensor * dst  = nodes[m];
++        const ggml_tensor * src0 = dst->src[0];
++
++        GGML_ASSERT(dst->op == GGML_OP_ROPE);
++        GGML_ASSERT(src0->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++        GGML_ASSERT(src0->ne[0] == ne00 && dst->ne[0] == ne00);
++        GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
++        GGML_ASSERT(dst->ne[2] == 1 && dst->ne[3] == 1);
++        GGML_ASSERT(dst->src[1] == src1f && dst->src[2] == src2f);
++        GGML_ASSERT(memcmp(dst->op_params, first->op_params, GGML_MAX_OP_PARAMS) == 0);
++
++        args.x[m]       = src0->data;
++        args.dst[m]     = dst->data;
++        args.s01[m]     = (int) (src0->nb[1] / ggml_type_size(src0->type));
++        args.s1[m]      = (int) (dst->nb[1] / ggml_type_size(dst->type));
++        total_rows     += (uint32_t) src0->ne[1];
++        args.seg_end[m] = total_rows;
++    }
++    for (int m = n_nodes; m < ROPE_MAX_GROUP_SIZE; ++m) {
++        args.seg_end[m] = total_rows; // padding: the segment scan never selects these
++    }
++
++    rope_neox_grouped_cuda<true, float, float>(args, (int) total_rows, (int) ne00, n_dims, pos, freq_scale,
++        freq_base, ext_factor, attn_factor, corr_dims, freq_factors, stream);
++}
++
+ template <bool forward>
+ void ggml_cuda_op_rope_impl(ggml_backend_cuda_context & ctx,
+                             ggml_tensor *               dst,
+diff --git a/ggml/src/ggml-cuda/rope.cuh b/ggml/src/ggml-cuda/rope.cuh
+index 72af086..59d35aa 100644
+--- a/ggml/src/ggml-cuda/rope.cuh
++++ b/ggml/src/ggml-cuda/rope.cuh
+@@ -2,6 +2,17 @@
+ 
+ #define CUDA_ROPE_BLOCK_SIZE 256
+ 
++// Maximum number of independent rope ops that may merge into a single grouped
++// launch.
++#define ROPE_MAX_GROUP_SIZE 4
++
++// Launch several independent NeoX rope ops that share every rope parameter
++// (same op_params, same pos, same freq_factors, same ne00) as ONE kernel.
++// Per-element arithmetic is identical to the individual launches: only the
++// (src, dst) base pointers, row strides and the local row index depend on the
++// group segment, and all of those are integer-only.
++void ggml_cuda_op_rope_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes);
++
+ void ggml_cuda_op_rope(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_rope_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/set-rows.cu b/ggml/src/ggml-cuda/set-rows.cu
+index 4659970..15f8534 100644
+--- a/ggml/src/ggml-cuda/set-rows.cu
++++ b/ggml/src/ggml-cuda/set-rows.cu
+@@ -373,6 +373,98 @@ void set_rows_cuda<half, int64_t>(ggml_backend_cuda_context & ctx, const ggml_te
+ }
+ 
+ 
++
++// ----- grouped set_rows launch: the K and V cache stores in one kernel -------
++//
++// A decode step stores one new K row and one new V row into the KV cache with
++// two separate set_rows launches over disjoint tensors. Each element of each op
++// is independent, so the element ranges of several such ops can be
++// concatenated into ONE grid: a thread first routes itself to its segment
++// (src / idx / dst base pointer and row stride - all integer work), then
++// performs exactly the read, cast and store of the individual
++// k_set_rows<float, int64_t, half> launch it replaces.
++//
++// Only the single-row case (ne01 == ne02 == ne03 == 1) is provided, which is
++// the shape the graph-side detector groups; there the stock index
++// decomposition reduces to i00 = i, i01 = i02 = i03 = 0, so the destination row
++// is src1[0] exactly as in stock.
++
++struct set_rows_grouped_args {
++    const float *   src0[SET_ROWS_MAX_GROUP_SIZE];
++    const int64_t * src1[SET_ROWS_MAX_GROUP_SIZE];
++    half *          dst[SET_ROWS_MAX_GROUP_SIZE];
++    int64_t         s1[SET_ROWS_MAX_GROUP_SIZE];
++    // exclusive prefix sums of per-segment element counts; entries past the
++    // actual group size are padded with the total so the scan ignores them
++    uint32_t        seg_end[SET_ROWS_MAX_GROUP_SIZE];
++};
++
++static __global__ void k_set_rows_grouped(const set_rows_grouped_args args, const int64_t ne_total) {
++    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
++
++    if (i >= ne_total) {
++        return;
++    }
++
++    uint32_t seg       = 0;
++    uint32_t seg_start = 0;
++#pragma unroll
++    for (int s = 0; s < SET_ROWS_MAX_GROUP_SIZE - 1; ++s) {
++        if ((uint32_t) i >= args.seg_end[s]) {
++            seg       = s + 1;
++            seg_start = args.seg_end[s];
++        }
++    }
++
++    const int64_t i00 = i - (int64_t) seg_start;
++
++    ggml_cuda_pdl_sync();
++    const int64_t dst_row = args.src1[seg][0];
++    ggml_cuda_pdl_lc();
++
++    const float * src0_row    = args.src0[seg];
++    half *        dst_row_ptr = args.dst[seg] + dst_row * args.s1[seg];
++
++    dst_row_ptr[i00] = ggml_cuda_cast<half>(src0_row[i00]);
++}
++
++void ggml_cuda_op_set_rows_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes) {
++    GGML_ASSERT(n_nodes >= 2 && n_nodes <= SET_ROWS_MAX_GROUP_SIZE);
++
++    cudaStream_t stream = ctx.stream();
++
++    set_rows_grouped_args args = {};
++    uint32_t total = 0;
++
++    for (int m = 0; m < n_nodes; ++m) {
++        const ggml_tensor * dst  = nodes[m];
++        const ggml_tensor * src0 = dst->src[0];
++        const ggml_tensor * src1 = dst->src[1];
++
++        GGML_ASSERT(dst->op == GGML_OP_SET_ROWS);
++        GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_I64 && dst->type == GGML_TYPE_F16);
++        GGML_ASSERT(src0->ne[1] == 1 && src0->ne[2] == 1 && src0->ne[3] == 1);
++        GGML_ASSERT(src0->nb[0] == sizeof(float) && dst->nb[0] == sizeof(half));
++
++        args.src0[m]  = (const float *) src0->data;
++        args.src1[m]  = (const int64_t *) src1->data;
++        args.dst[m]   = (half *) dst->data;
++        args.s1[m]    = dst->nb[1] / sizeof(half);
++        total        += (uint32_t) src0->ne[0];
++        args.seg_end[m] = total;
++    }
++    for (int m = n_nodes; m < SET_ROWS_MAX_GROUP_SIZE; ++m) {
++        args.seg_end[m] = total; // padding: the segment scan never selects these
++    }
++
++    const int  num_blocks = ((int) total + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE;
++    const dim3 block_size(CUDA_SET_ROWS_BLOCK_SIZE);
++    const dim3 grid_size(num_blocks);
++
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_size, block_size, 0, stream);
++    ggml_cuda_kernel_launch(k_set_rows_grouped, launch_params, args, (int64_t) total);
++}
++
+ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+diff --git a/ggml/src/ggml-cuda/set-rows.cuh b/ggml/src/ggml-cuda/set-rows.cuh
+index c140c08..892a647 100644
+--- a/ggml/src/ggml-cuda/set-rows.cuh
++++ b/ggml/src/ggml-cuda/set-rows.cuh
+@@ -4,4 +4,14 @@
+ 
+ #define CUDA_SET_ROWS_BLOCK_SIZE 256
+ 
++// Maximum number of independent single-row set_rows ops that may merge into a
++// single grouped launch.
++#define SET_ROWS_MAX_GROUP_SIZE 4
++
++// Launch several independent single-row F32 -> F16 set_rows ops (the KV-cache
++// K and V stores of one decode step) as ONE kernel. Each element keeps the
++// exact source value, cast and destination address it has in the individual
++// launch; only the segment routing is new, and it is integer-only.
++void ggml_cuda_op_set_rows_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes);
++
+ void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+-- 
+2.49.0.windows.1
+
