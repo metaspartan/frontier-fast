@@ -4,32 +4,42 @@
 
 | Patch | Intent |
 | --- | --- |
-| `0001-greedy-decode-host-overhead-kvcache-step.patch` | Greedy `generate_step`: skip 128k logsumexp + avoid async_eval of full-vocab logprobs; defer per-token `get_peak_memory` to final yield; KVCache step 256→512 |
+| `0001-lfm2-shortconv-decode-fma.patch` | L=1 ShortConv decode: depthwise FIR as 3 float32 FMAs (skip concat + grouped conv1d) |
 
-## Why no engine patches
+## Why this lever
 
-`Sources/mlx-engine-patches/...` is empty on purpose. A non-empty engine series
-forces a full MLX rebuild; the trusted runner currently fails that path with
-`No such file or directory: 'cmake'`. This series is a pure `mlx_lm` Python
-overlay (no rebuild).
+LFM2.5-2.6B is a hybrid: **22 of 30 layers are ShortConv**, not attention.
+On the ranked decode path every token hits those 22 layers with `L=1` and
+`L_cache=3`. Stock builds a `(B,3,H)` concat and runs general grouped `conv1d`
+for what is already three multiplies and an add per channel.
 
-## What a patch targets here
+This patch keeps prefill and lengths-based cache on the stock path, and only
+rewrites the common single-token decode path.
 
-The runner copies pristine `mlx_lm`, applies this series with `git apply`, and
-selects the arm with `PYTHONPATH`.
+## Engine patches
 
-## Measured stock on the ranking runner (Apple M4, 16 GB)
+`Sources/mlx-engine-patches/...` is empty. Non-empty series force a full MLX
+rebuild; the trusted runner currently lacks `cmake` for that path.
 
-- decode **~61.6 tok/s**, prefill **~654 tok/s**
+## Correctness
 
-## Local notes (Apple M1 Ultra, directional)
+- Ranked gate: **perplexity ≤ 0.5%** relative to stock
+- Local: **exact ppl match** (61.069) on `fixtures/gainz-corpus.txt`
+- Greedy text match on same-process A/B (FMA uses float32 accumulate)
 
-- ppl stock = cand exact
-- greedy text match on interleaved process A/B
-- cooler paired ratios (3 pairs): decode **×1.015**, prefill **×1.027**,
-  ttft **×1.032** → score ≈ **1.020**
+## Local signal (Apple M1 Ultra, directional)
 
-## Gates
+Cooler interleaved process A/B (4 pairs, official `tools/mlx_bench.py`):
 
-Accuracy is **perplexity equivalence within 0.5%**. Runner scores median of
-per-round ratios on whole-process A/B.
+| | decode | prefill | ttft | score |
+| --- | ---: | ---: | ---: | ---: |
+| median paired ratio | **×1.071** | ×1.006 | ×1.006 | **~1.048** |
+
+Thermal noise on this box is large; official score is the M4 runner.
+
+## Dead ends (do not resubmit without new evidence)
+
+- Greedy logsumexp skip / peak_memory defer: noise floor on M4 (~0.9996)
+- Engine `qmv_wide` M=1: blocked by missing runner cmake
+- Custom Metal SwiGLU / residual_norm: ppl drift + slower
+- Fused gate+up `quantized_matmul`: bit-exact, slower
