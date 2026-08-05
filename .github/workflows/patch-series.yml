@@ -16,14 +16,54 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # A directory whose name is not a live track id is either a typo or a
+      # track that was renamed, and either way the runner will never read it.
+      - name: Every series directory must name a live track
+        run: |
+          status=0
+          for dir in Sources/patches/*/; do
+            id=$(basename "$dir")
+            if ! grep -q "\"$id\"" Sources/contracts.ts; then
+              echo "FAIL $id is not a track in Sources/contracts.ts"
+              status=1
+            fi
+          done
+          exit $status
+
+      # Renumbering is what broke the tracks last time. Two patches claiming
+      # the same ordinal means the apply order depends on the sort, so reject
+      # it before it can silently reorder somebody's series.
+      - name: No duplicate patch ordinals within a series
+        run: |
+          status=0
+          for dir in Sources/patches/*/; do
+            dupes=$(ls "$dir" 2>/dev/null | grep -oE '^[0-9]{4}' | sort | uniq -d || true)
+            if [ -n "$dupes" ]; then
+              echo "FAIL $dir has duplicate ordinals: $dupes"
+              status=1
+            fi
+          done
+          exit $status
+
       - name: Clone the pinned llama.cpp tree
         run: |
           git clone --filter=blob:none https://github.com/ggml-org/llama.cpp.git /tmp/llama
           git -C /tmp/llama checkout 2b63e0610bbc2be990ae1360d5256efcdc3f9efb
-      - name: Every track's series must apply cleanly and in order
+
+      # Only the GGUF tracks patch llama.cpp. The MLX track also keeps its
+      # series under Sources/patches/, but those apply to the installed
+      # mlx_lm/mlx Python trees, so applying them here would fail for a reason
+      # that says nothing about whether they are valid.
+      - name: Every llama.cpp track's series must apply cleanly and in order
         run: |
           status=0
           for dir in Sources/patches/*/; do
+            id=$(basename "$dir")
+            case "$id" in
+              *-gguf-*) ;;
+              *) echo "skip $id (not a llama.cpp track)"; continue ;;
+            esac
             series=$(ls "$dir"*.patch 2>/dev/null | sort) || continue
             [ -z "$series" ] && continue
             echo "::group::$dir"
