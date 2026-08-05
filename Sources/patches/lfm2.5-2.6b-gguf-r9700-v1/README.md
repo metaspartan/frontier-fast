@@ -6,7 +6,7 @@
 | --- | --- | --- |
 | `0001-mmvq-narrow-starved-blocks.patch` | **won** (+17.177% decode, score ~1.100) | Idle-warp narrow for starved K=2048 q4_K shapes |
 | `0002-mmvq-dedupe-q8-1-requant.patch` | **won** (score 1.1067, decode 1.170x / 211.3 tok/s) | Per-graph q8_1 activation cache |
-| `0003-mmvq-grouped-launch.patch` | candidate | Group same-activation Q/K/V (and similar) matvecs into one launch |
+| `0003-mmvq-grouped-launch.patch` | **won** (score 1.1103, decode 1.176x / 212.2 tok/s) | Group same-activation Q/K/V matvecs into one launch |
 
 `0001` is the first landed win: **+17.177%** decode (180.325 -> 211.439 tok/s),
 prefill neutral, perplexity bit-identical.
