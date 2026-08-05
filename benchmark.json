@@ -6,7 +6,10 @@
     "laguna-s-2.1-nvfp4-gb10-v1",
     "laguna-xs-2.1-gguf-r9700-v1",
     "laguna-xs-2.1-gguf-gb10cuda-v1",
-    "laguna-s-2.1-gguf-gb10cuda-v1"
+    "laguna-s-2.1-gguf-gb10cuda-v1",
+    "lfm2.5-2.6b-gguf-r9700-v1",
+    "lfm2.5-2.6b-gguf-gb10cuda-v1",
+    "lfm2.5-2.6b-mlx-apple-v1"
   ],
   "defaultTrack": "laguna-xs-2.1-nvfp4-gb10-v1",
   "scoring": {
@@ -14,7 +17,8 @@
     "decodeFloor": 0.95,
     "prefillFloor": 0.95,
     "ttftFloor": 0.9,
-    "maxSingleSubmissionGain": 1.053
+    "gainsUncapped": true,
+    "acceptanceBandAppliesTo": "baseline phase vs pinned calibration (box health), not the candidate"
   },
   "editablePaths": [
     "Sources/runner/",
@@ -23,7 +27,8 @@
     "Sources/scoring/",
     "Sources/kernels/",
     "Sources/patches/**",
-    "Sources/vllm-patches/**"
+    "Sources/vllm-patches/**",
+    "Sources/mlx-engine-patches/**"
   ],
   "correctnessPrompts": "correctness_prompts/"
 }

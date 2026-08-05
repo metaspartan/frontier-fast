@@ -1,5 +1,12 @@
 import type { Contract } from "./types";
 
+/**
+ * The eight live tracks, mirroring https://gainz.fast/api/tracks.
+ *
+ * The live registry is authoritative — this file is a local copy so the CLI
+ * and the tests can run offline. If the two disagree, the API wins; fetch it
+ * with `curl -s https://gainz.fast/api/tracks` and fix this file.
+ */
 export const TRACKS: Record<string, Contract> = {
   "laguna-xs-2.1-nvfp4-gb10-v1": {
     id: "laguna-xs-2.1-nvfp4-gb10-v1",
@@ -11,7 +18,7 @@ export const TRACKS: Record<string, Contract> = {
     promptTokens: 512,
     decodeTokens: 128,
     warmupRuns: 2,
-    measuredRuns: 5,
+    measuredRuns: 9,
   },
   "laguna-s-2.1-nvfp4-gb10-v1": {
     id: "laguna-s-2.1-nvfp4-gb10-v1",
@@ -20,6 +27,42 @@ export const TRACKS: Record<string, Contract> = {
     revision: "f8fdfcdc4e7b0c474a0102430a8cae0a3a358669",
     quantization: "nvfp4",
     machine: "dgx-spark-gb10-sm121",
+    promptTokens: 512,
+    decodeTokens: 128,
+    warmupRuns: 2,
+    measuredRuns: 9,
+  },
+  "lfm2.5-2.6b-gguf-gb10cuda-v1": {
+    id: "lfm2.5-2.6b-gguf-gb10cuda-v1",
+    family: "lfm2.5-2.6b",
+    model: "LiquidAI/LFM2.5-2.6B-GGUF",
+    revision: "main",
+    quantization: "gguf-q4_k_m",
+    machine: "gb10-cuda-sm121",
+    promptTokens: 512,
+    decodeTokens: 128,
+    warmupRuns: 2,
+    measuredRuns: 9,
+  },
+  "lfm2.5-2.6b-mlx-apple-v1": {
+    id: "lfm2.5-2.6b-mlx-apple-v1",
+    family: "lfm2.5-2.6b",
+    model: "LiquidAI/LFM2.5-2.6B-MLX",
+    revision: "main",
+    quantization: "mlx-4bit",
+    machine: "apple-m4-16gb",
+    promptTokens: 512,
+    decodeTokens: 128,
+    warmupRuns: 2,
+    measuredRuns: 5,
+  },
+  "lfm2.5-2.6b-gguf-r9700-v1": {
+    id: "lfm2.5-2.6b-gguf-r9700-v1",
+    family: "lfm2.5-2.6b",
+    model: "LiquidAI/LFM2.5-2.6B-GGUF",
+    revision: "main",
+    quantization: "gguf-q4_k_m",
+    machine: "r9700-rdna4-gfx1201",
     promptTokens: 512,
     decodeTokens: 128,
     warmupRuns: 2,

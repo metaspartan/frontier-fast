@@ -7,6 +7,10 @@ Applied in order against pinned llama.cpp **b10237**
 | --- | --- | --- |
 | 0001 | `cuda-mmvq-group-same-activation-matvecs` | **+1.868% decode** (in-process paired A/B, 12 rotated cycles, no-op floor 0.99994) |
 
+The frontier is **+1.459%** (score 1.014589, decode 24.01 tok/s) from
+`0001-cuda-mmvq-group-same-activation-matvecs.patch`, verified on the trusted
+runner. Stock baseline is 23.627 tok/s decode, 343.1 tok/s prefill, 0.66 s TTFT.
+
 The series previously held the eleven patches from the XS GB10 CUDA track.
 Those were placed here by analogy when the shared series was split per track,
 not because anything had measured them on Laguna S. They were then measured on
@@ -54,6 +58,29 @@ stack frame. **`cuobjdump -res-usage <lib> | grep -A1 <kernel>` is the check** �
 run it on any new CUDA kernel here before concluding anything from a timing.
 The earlier −15% attributed to this lever on the XS GB10 track is very likely
 the same spill, not a property of the device.
+
+## This box is NOT launch-bound — that kills a whole optimization class
+
+Kernel time is **93.4% of wall** here (45.4 ms of 48.6), versus 74% on the
+R9700. So the launch-count reduction class that carried the AMD track does
+not transfer: the q8_1 dedupe worth +8.69% there is worth about 0.6% on S.
+
+Byte census is 7.48 GB/token — 2978 MB attention, 2070 MB Q4_K experts,
+1510 MB BF16 experts, 471 MB shared expert, 328 MB head, 120 MB dense —
+running at ~177 GB/s against a ~231 GB/s achievable ceiling, i.e. 77% of
+roof. That leaves roughly 30% of decode and ~19% of score as headroom, and it
+has to come from bandwidth or from work removal, not from dispatch structure.
+
+### Dead: mmvq k-loop thread utilisation on the Q4_K expert matvecs
+
+`blocks_per_iter = vdr*nwarps*warp_size/qi`. With `nwarps=4`, Q8_0 at K=3072
+gives exactly 3.0 iterations (100% utilisation, ~280 GB/s), but Q4_K gate/up
+at K=3072 gives 1.5 padded to 2 (75%), and Q4_K down at K=1024 gives 1
+iteration where warps 2-3 never enter the k-loop (50%). That is the entire
+189-vs-280 GB/s gap — and the corresponding fix has been measured losing on
+the XS sibling in both directions (see
+`../laguna-xs-2.1-gguf-gb10cuda-v1/README.md`). Understand it as a diagnosis,
+not a lever.
 
 ## Before you trust a number on this track
 
