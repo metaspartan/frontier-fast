@@ -1,22 +1,21 @@
 # lfm2.5-2.6b-gguf-r9700-v1 — patch series
 
-## Landed
+## Landed / pending
 
-All three are verified on the trusted R9700 runner. The scores below are the
-runner's, not local ones.
+All three landed wins are verified on the trusted R9700 runner. The scores
+below are the runner's, not local ones.
 
-| Patch | Verdict | What it does |
+| Patch | Status | Notes |
 | --- | --- | --- |
-| `0001-mmvq-narrow-starved-blocks.patch` | **won** — score 1.0999 (+9.99%), decode 1.1621 | Drop idle warps on starved K=2048 q4_K shapes |
-| `0002-mmvq-dedupe-q8-1-requant.patch` | **won** — score 1.1067 (+10.67%), decode 211.3 tok/s | Per-graph q8_1 activation cache |
-| `0003-mmvq-grouped-launch.patch` | **won** — score 1.1103 (+11.03%), decode 212.2 tok/s | Group same-activation Q/K/V matvecs into one launch |
+| `0001-mmvq-narrow-starved-blocks.patch` | **won** — score 1.0999 (+9.99%), decode 1.162x / 209.7 tok/s | Drop idle warps on starved K=2048 q4_K shapes |
+| `0002-mmvq-dedupe-q8-1-requant.patch` | **won** — score 1.1067 (+10.67%), decode 1.170x / 211.3 tok/s | Per-graph q8_1 activation cache |
+| `0003-mmvq-grouped-launch.patch` | **won** — score 1.1103 (+11.03%), decode 1.176x / 212.2 tok/s | Group same-activation Q/K/V matvecs into one launch |
+| `0004-rms-norm-grouped-launch.patch` | candidate | Group independent rms_norm+mul launches (Q/K-norm class) |
 
-Read the runner's number, not your local one. `0001` measured **+17.177%**
-decode locally (180.325 -> 211.439 tok/s) and landed at **+9.99%** overall:
-decode 1.1621 (179.87 -> 209.73 tok/s), prefill 0.9957 (neutral), perplexity
-bit-identical. A clean local figure routinely lands a point or two lower once
-the runner's paired protocol and the prefill term are applied — budget for
-that before deciding a candidate is worth a runner slot.
+`0001` measured **+17.177%** decode locally (180.325 -> 211.439 tok/s) and
+landed at **+9.99%** overall on the trusted runner. A clean local figure
+routinely lands a point or two lower once the runner's paired protocol and
+the prefill term are applied.
 
 It removes idle mmvq warps. On the RDNA4 table `calc_nwarps()` returns 8 for
 q4_K at `ncols_dst=1`, which wants 16 k-blocks, but every K=2048 tensor in this
@@ -34,15 +33,17 @@ which is worth 2.9 of the 17.2 points.
 `0002` ports the Laguna q8_1 src1 cache. Dense hybrid LFM2.5 still reuses the
 same activation across attention Q/K/V and FFN gate/up projections, so stock
 re-runs `quantize_q8_1` once per consumer. The cache is bit-exact by
-construction (parameter-tuple + root-tensor identity + clear-on-eval). On this
-small model the remaining bottleneck after 0001 is per-launch overhead, so
-removing redundant quantize dispatches is the natural next lever.
+construction (parameter-tuple + root-tensor identity + clear-on-eval).
 
 `0003` ports the Laguna grouped mmvq launch: same-activation plain matvecs
 (Q/K/V class) become one kernel with concatenated row ranges. Warp launch
 count mirrors 0001 (trim starved K, keep full warps when the group's total
 rows would not fill the device). Compile-time nwarps stays at the table value
-and trimmed slots pad +0, so results stay bit-identical. Do **not** blindly
+and trimmed slots pad +0, so results stay bit-identical.
+
+`0004` ports the Laguna grouped rms_norm launch: independent rms_norm+mul pairs
+(Q/K-norm class and similar) share one kernel with concatenated row ranges.
+Per-row work matches stock so results are bit-identical. Do **not** blindly
 port Laguna MoE-only patches after this.
 
 ## This track is not the Laguna AMD track
