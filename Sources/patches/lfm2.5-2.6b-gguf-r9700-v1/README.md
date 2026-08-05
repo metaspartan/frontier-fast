@@ -10,8 +10,10 @@ below are the runner's, not local ones.
 | `0001-mmvq-narrow-starved-blocks.patch` | **won** — score 1.0999 (+9.99%), decode 1.162x / 209.7 tok/s | Drop idle warps on starved K=2048 q4_K shapes |
 | `0002-mmvq-dedupe-q8-1-requant.patch` | **won** — score 1.1067 (+10.67%), decode 1.170x / 211.3 tok/s | Per-graph q8_1 activation cache |
 | `0003-mmvq-grouped-launch.patch` | **won** — score 1.1103 (+11.03%), decode 1.176x / 212.2 tok/s | Group same-activation Q/K/V matvecs into one launch |
-| `0004-rms-norm-grouped-launch.patch` | candidate | Group independent rms_norm+mul launches (Q/K-norm class) |
-| `0005-rms-norm-fold-residual-and-q8-1-quant.patch` | candidate (compile-fixed) | Fold residual add + q8_1 quant into rms_norm |
+| `0004-rms-norm-grouped-launch.patch` | **won** (score 1.1117, decode 1.180x / 212.8 tok/s) | Group independent rms_norm+mul launches |
+| `0005-rms-norm-fold-residual-and-q8-1-quant.patch` | **won** (score 1.1519, decode 1.228x / 222.1 tok/s) | Fold residual add + q8_1 quant into rms_norm |
+| `0006-glu-fold-q8-1-quantize.patch` | candidate | Fold q8_1 quantize of GLU into GLU kernel |
+| `0007-mmvf-single-warp-decode-block.patch` | candidate | mmvf single-warp decode + batched k-loads |
 
 `0001` measured **+17.177%** decode locally (180.325 -> 211.439 tok/s) and
 landed at **+9.99%** overall on the trusted runner. A clean local figure
