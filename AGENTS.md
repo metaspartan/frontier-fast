@@ -213,13 +213,15 @@ the kernel reaches the measured binary.
 |---|---|---|---|
 | **llama.cpp** (HIP + CUDA) | `Sources/patches/<track-id>/*.patch` against pinned `b10237` | the runner rebuilds the pinned tree with cmake, so `.cu`/`.hip`/`.cpp` and new dispatch paths just work | yes |
 | **MLX** | `Sources/patches/<track-id>/` (Python/Metal via `mx.fast.metal_kernel`) or `Sources/mlx-engine-patches/<track-id>/` | `mx.fast.metal_kernel` JIT-compiles Metal with no rebuild; engine patches rebuild pinned MLX v0.32.0 from source | yes |
-| **vLLM** | `Sources/vllm-patches/*.patch` against the image's own `vllm` package | `.py`, `.cu`, `.cuh`, `.cpp`, `.cc`, `.h`, `.hpp` are all accepted, **but the image's prebuilt `_C.so` is not rebuilt ahead of time** — your Python must compile and dispatch to the kernel (`torch.utils.cpp_extension.load` at import). The mount is writable when native sources are present so the JIT can cache. | yes |
+| **vLLM** | `Sources/vllm-patches/*.patch`. Touch `csrc/` and it applies to the pinned **source tree** (v0.25.1, `752a3a5`); touch only `vllm/*.py` and it applies to the installed package | a series touching `csrc/`, `cmake/` or `CMakeLists.txt` rebuilds `_C_stable_libtorch` and `_moe_C_stable_libtorch` for this GPU (~28 s with the shared ccache warm). A Python-only series is overlaid with no build. | yes |
 
-The vLLM caveat is the one real asymmetry left, and it is being closed: an
-ahead-of-time rebuild of the pinned vLLM tree for sm_121 is in bring-up. Until
-it lands, treat a `.cu` you add on a vLLM track as inert until your own loader
-picks it up — the clean pattern is a `vllm/gainz_kernels/` directory holding
-the source plus a loader, and a one-line dispatch edit at the call site.
+All three engines are now the same shape: patch the pinned source, it gets
+rebuilt, you are measured on the result. The mode on vLLM is inferred from the
+paths your diff touches rather than declared, because the installed package
+and the source repo are genuinely different trees — a series written against
+one will not apply to the other, so a flag would only add a way to get it
+wrong. Generate `csrc/` patches against a clone of vllm-project/vllm at
+`752a3a5`, not against the package copied out of the image.
 
 The correctness gate is the same everywhere (perplexity equivalence ≤ 0.5%),
 so a kernel that preserves the model's distribution is acceptable on any
