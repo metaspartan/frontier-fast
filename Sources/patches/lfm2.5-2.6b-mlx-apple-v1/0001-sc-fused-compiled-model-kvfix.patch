@@ -89,23 +89,27 @@
          y = C * conv_out
          return self.out_proj(y)
  
-@@ -261,6 +307,81 @@
+@@ -255,27 +301,94 @@
+             else:
+                 break
+ 
++    _kv_head_dim = 64  # 512 / 8 n_kv_heads
++
+     def __call__(
+         self,
+         inputs: mx.array,
          cache=None,
          input_embeddings: Optional[mx.array] = None,
      ):
 +        if cache is None or input_embeddings is not None:
 +            return self._stock_forward(inputs, cache, input_embeddings)
 +
-+        # Compute masks BEFORE extracting cache arrays (needs cache objects)
 +        h_tmp = self.embed_tokens(inputs) if input_embeddings is None else input_embeddings
 +        attn_mask = create_attention_mask(h_tmp, cache[self.fa_idx])
 +        conv_mask = create_ssm_mask(h_tmp, cache[self.conv_idx])
 +
-+        # Build compiled closure on first call
 +        if not hasattr(self, "_compiled_fn"):
 +            _self = self
-+            fa_idx = self.fa_idx
-+            conv_idx = self.conv_idx
 +
 +            @mx.compile
 +            def _compiled_fn(inputs, attn_mask, conv_mask, cache_flat):
@@ -136,18 +140,16 @@
 +                "kv" if hasattr(c, "keys") else "arr" for c in cache
 +            ]
 +
-+        # Extract cache arrays
 +        flat = []
 +        for ci, c in enumerate(cache):
 +            if self._cache_types[ci] == "kv":
-+                flat.append(c.keys if c.keys is not None else mx.zeros((1, 8, 0, 256), dtype=mx.bfloat16))
-+                flat.append(c.values if c.values is not None else mx.zeros((1, 8, 0, 256), dtype=mx.bfloat16))
++                flat.append(c.keys if c.keys is not None else mx.zeros((1, 8, 0, self._kv_head_dim), dtype=mx.bfloat16))
++                flat.append(c.values if c.values is not None else mx.zeros((1, 8, 0, self._kv_head_dim), dtype=mx.bfloat16))
 +            else:
 +                flat.append(c[0] if c[0] is not None else mx.zeros((1, 2, 2048), dtype=mx.bfloat16))
 +
 +        out, new_flat = self._compiled_fn(inputs, attn_mask, conv_mask, flat)
 +
-+        # Write back cache
 +        idx = 0
 +        for ci, c in enumerate(cache):
 +            if self._cache_types[ci] == "kv":
@@ -171,3 +173,18 @@
          if input_embeddings is not None:
              h = input_embeddings
          else:
+             h = self.embed_tokens(inputs)
+-
+         if cache is None:
+             cache = [None] * len(self.layers)
+-
+         attn_mask = create_attention_mask(h, cache[self.fa_idx])
+         conv_mask = create_ssm_mask(h, cache[self.conv_idx])
+-
+         for layer, c in zip(self.layers, cache):
+             mask = attn_mask if layer.is_attention_layer else conv_mask
+             h = layer(h, mask, cache=c)
+-
+         return self.embedding_norm(h)
+ 
+ 
