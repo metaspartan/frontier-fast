@@ -71,10 +71,15 @@ def one_run(model, tok, prompt_ids, decode_tokens):
         "ttft": ttft,
         "decodeTokensPerSecond": last.generation_tps,
         "prefillTokensPerSecond": last.prompt_tps,
-        # GenerationResponse.peak_memory is ALREADY in GB. Dividing by 1e9
-        # again floored every reading to 0.0 — a field that is always zero is
-        # worse than no field, because it reads as "this model uses no memory".
-        "peakMemoryGB": last.peak_memory if last.peak_memory else mx.get_peak_memory() / 1e9,
+        # Read the runtime counter directly rather than trusting the value the
+        # candidate reports. A submission proposed zeroing peak_memory on
+        # intermediate yields on the grounds that "the harness only uses the
+        # last one" — true, and exactly why a benchmark must not take telemetry
+        # from the code under test. mx.get_peak_memory() is the engine's own
+        # counter in bytes and a patch cannot make it lie without changing real
+        # allocation. (peak_memory on GenerationResponse is already in GB;
+        # dividing it by 1e9 again is what previously floored this to 0.0.)
+        "peakMemoryGB": mx.get_peak_memory() / 1e9,
         "text": "".join(pieces),
     }
 
