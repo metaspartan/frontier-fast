@@ -1,42 +1,31 @@
 --- a/mlx_lm/models/lfm2.py
 +++ b/mlx_lm/models/lfm2.py
-@@ -15,6 +15,35 @@
+@@ -14,7 +14,24 @@
+ )
  from .cache import ArraysCache, KVCache
  
- 
 +_FUSED_SC_KERNEL = mx.fast.metal_kernel(
-+    name="lfm2_shortconv_decode_fused",
-+    input_names=["BCx", "state", "conv_w"],
++    name="lfm2_shortconv_decode_fused", input_names=["BCx", "state", "conv_w"],
 +    output_names=["y", "new_state"],
 +    source=r"""
-+        uint h = thread_position_in_grid.x;
-+        uint b = thread_position_in_grid.y;
-+        uint H = conv_w_shape[0];
-+        uint Bsz = BCx_shape[0];
++        uint h = thread_position_in_grid.x; uint b = thread_position_in_grid.y;
++        uint H = conv_w_shape[0]; uint Bsz = BCx_shape[0];
 +        if (h >= H || b >= Bsz) return;
 +        uint bcx_base = b * 3 * H;
-+        T Bb = BCx[bcx_base + h];
-+        T Cc = BCx[bcx_base + H + h];
-+        T xx = BCx[bcx_base + 2*H + h];
-+        T Bx = Bb * xx;
-+        uint st_base = b * 2 * H;
-+        T s0 = state[st_base + h];
-+        T s1 = state[st_base + H + h];
-+        T w0 = conv_w[h * 3 + 0];
-+        T w1 = conv_w[h * 3 + 1];
-+        T w2 = conv_w[h * 3 + 2];
-+        y[b * H + h] = Cc * (w0 * s0 + w1 * s1 + w2 * Bx);
-+        new_state[st_base + h] = s1;
-+        new_state[st_base + H + h] = Bx;
++        T Bb = BCx[bcx_base + h]; T Cc = BCx[bcx_base + H + h]; T xx = BCx[bcx_base + 2*H + h];
++        T Bx = Bb * xx; uint st_base = b * 2 * H;
++        T s0 = state[st_base + h]; T s1 = state[st_base + H + h];
++        T w0 = conv_w[h*3+0]; T w1 = conv_w[h*3+1]; T w2 = conv_w[h*3+2];
++        y[b*H+h] = Cc*(w0*s0+w1*s1+w2*Bx);
++        new_state[st_base+h] = s1; new_state[st_base+H+h] = Bx;
 +    """,
 +)
-+
-+
+ 
 +
  @dataclass
  class ModelArgs(BaseModelArgs):
      model_type: str
-@@ -137,18 +166,37 @@
+@@ -137,6 +154,30 @@
          mask: Optional[mx.array] = None,
          cache: Optional[Any] = None,
      ):
@@ -63,32 +52,10 @@
 +            if hasattr(cache, "advance"):
 +                cache.advance(1)
 +            return self.out_proj(y)
++
          BCx = self.in_proj(x)
          B, C, x = mx.split(BCx, 3, axis=-1)
          Bx = B * x
-         if mask is not None:
-             Bx = mx.where(mask[..., None], Bx, 0)
--
-         if cache is not None:
-             if cache[0] is None:
--                state = mx.zeros(
--                    (Bx.shape[0], self.L_cache - 1, self.args.hidden_size),
--                    dtype=Bx.dtype,
--                )
-+                state = mx.zeros((Bx.shape[0], self.L_cache - 1, self.args.hidden_size), dtype=Bx.dtype)
-             else:
-                 state = cache[0]
-             Bx = mx.concatenate([state, Bx], axis=1)
-@@ -163,9 +211,7 @@
-             cache.advance(t)
-         else:
-             Bx = mx.pad(Bx, [(0, 0), (self.L_cache - 1, 0), (0, 0)])
--
-         conv_out = self.conv(Bx)
--
-         y = C * conv_out
-         return self.out_proj(y)
- 
 --- a/mlx_lm/generate.py
 +++ b/mlx_lm/generate.py
 @@ -383,7 +383,12 @@
