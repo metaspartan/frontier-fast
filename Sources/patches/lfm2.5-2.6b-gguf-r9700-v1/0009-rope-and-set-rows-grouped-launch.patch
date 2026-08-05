@@ -1,25 +1,26 @@
-From c8145c9474269b5f5c363f3a23fa92c02868fc5b Mon Sep 17 00:00:00 2001
+From a8043209477deaed154a686d5763cc0a849b36e5 Mon Sep 17 00:00:00 2001
 From: Cybara <carsenk@gmail.com>
-Date: Wed, 5 Aug 2026 01:27:02 -0600
-Subject: [PATCH] CUDA/HIP: group rope Q/K and KV set_rows (fixed collect
- arity)
+Date: Wed, 5 Aug 2026 02:46:55 -0600
+Subject: [PATCH] CUDA/HIP: guard rope/set_rows group dispatch on node op
 
-collect_group(cgraph, start, members, norm_grouped_done, mmvq_grouped_done).
-Evaluate call sites match the helper signature. Full groupable/hoist helpers.
-Kill switches: GGML_CUDA_DISABLE_ROPE_GROUP, GGML_CUDA_DISABLE_SET_ROWS_GROUP.
+The grouped launch dispatchers must only fire when the current graph
+node IS a rope (resp. set_rows) op that is groupable, matching the
+Laguna port. Without the guard, members[0] could be any compute node
+and the grouped op would assert (set-rows.cu:444 GGML_ASSERT
+dst->op == GGML_OP_SET_ROWS), crashing the served process.
 ---
- ggml/src/ggml-cuda/ggml-cuda.cu | 257 ++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 259 ++++++++++++++++++++++++++++++++
  ggml/src/ggml-cuda/rope.cu      | 182 ++++++++++++++++++++++
  ggml/src/ggml-cuda/rope.cuh     |  11 ++
  ggml/src/ggml-cuda/set-rows.cu  |  92 ++++++++++++
  ggml/src/ggml-cuda/set-rows.cuh |  10 ++
- 5 files changed, 552 insertions(+)
+ 5 files changed, 554 insertions(+)
 
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index d5a6153..01b398a 100644
+index eb501d2..f35092c 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -3891,6 +3891,236 @@ static bool ggml_cuda_mul_bcast0_quant_ok(const ggml_tensor * node) {
+@@ -3794,6 +3794,236 @@ static bool ggml_cuda_norm_quant_plain_ok(const ggml_cgraph * cgraph, const int
      return true;
  }
  
@@ -256,7 +257,7 @@ index d5a6153..01b398a 100644
  // try and fuse nodes and return the number of nodes to skip
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
-@@ -4734,6 +4964,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4637,6 +4867,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                                                     std::atoi(getenv("GGML_CUDA_DISABLE_PRE_ADD_NORM"));
              static const bool disable_norm_quant = getenv("GGML_CUDA_DISABLE_NORM_QUANT") != nullptr &&
                                                     std::atoi(getenv("GGML_CUDA_DISABLE_NORM_QUANT"));
@@ -267,12 +268,13 @@ index d5a6153..01b398a 100644
              static const bool disable_mmvq_group = getenv("GGML_CUDA_DISABLE_MMVQ_GROUP") != nullptr &&
                                                     std::atoi(getenv("GGML_CUDA_DISABLE_MMVQ_GROUP"));
              const bool mmvq_group_enabled = !disable_mmvq_group && stream_ctx.concurrent_events.empty();
-@@ -4798,6 +5032,29 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+@@ -4701,6 +4935,31 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                      continue; // already computed as part of a grouped rms_norm launch
                  }
  
 +
-+            if (!disable_rope_group && stream_ctx.concurrent_events.empty()) {
++            if (!disable_rope_group && stream_ctx.concurrent_events.empty() &&
++                    node->op == GGML_OP_ROPE && ggml_cuda_rope_groupable(cgraph, i)) {
 +                ggml_tensor * members[4];
 +                const int n_members = ggml_cuda_rope_collect_group(cgraph, i, members, norm_grouped_done, mmvq_grouped_done);
 +                if (n_members >= 2) {
@@ -283,7 +285,8 @@ index d5a6153..01b398a 100644
 +                    continue;
 +                }
 +            }
-+            if (!disable_set_rows_group && stream_ctx.concurrent_events.empty()) {
++            if (!disable_set_rows_group && stream_ctx.concurrent_events.empty() &&
++                    node->op == GGML_OP_SET_ROWS && ggml_cuda_set_rows_groupable(cgraph, i)) {
 +                ggml_tensor * members[4];
 +                const int n_members = ggml_cuda_set_rows_collect_group(cgraph, i, members, norm_grouped_done, mmvq_grouped_done);
 +                if (n_members >= 2) {
