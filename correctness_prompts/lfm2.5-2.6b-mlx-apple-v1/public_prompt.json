@@ -1,0 +1,14 @@
+{
+  "trackId": "lfm2.5-2.6b-mlx-apple-v1",
+  "prompt": "List the prime numbers below fifty, then explain in two sentences why there are infinitely many primes. ",
+  "maxTokens": 128,
+  "temperature": 0,
+  "goldenSha256": null,
+  "reference": {
+    "engine": "MLX via mlx-lm",
+    "serving": "greedy (temperature 0), 512-token prefill + 128 decode",
+    "hardware": "Apple M4 16 GB; the 4-bit model peaks near 2.2 GB so work should stay valid on 8 GB Apple Silicon"
+  },
+  "description": "Public correctness drift tripwire for lfm2.5-2.6b-mlx-apple-v1",
+  "note": "Public tripwire for LFM2.5 2.6B Q4_K_M on llama.cpp HIP. The ranked gate is perplexity equivalence over a fixed corpus (<=0.5% relative delta) measured by the trusted runner; the golden hash is null because greedy text is not the ranked criterion and a hash copied from another model would be a false claim."
+}

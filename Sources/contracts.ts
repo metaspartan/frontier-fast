@@ -37,6 +37,18 @@ export const TRACKS: Record<string, Contract> = {
     warmupRuns: 2,
     measuredRuns: 9,
   },
+  "lfm2.5-2.6b-mlx-apple-v1": {
+    id: "lfm2.5-2.6b-mlx-apple-v1",
+    family: "lfm2.5-2.6b",
+    model: "LiquidAI/LFM2.5-2.6B-MLX",
+    revision: "main",
+    quantization: "mlx-4bit",
+    machine: "apple-m4-16gb",
+    promptTokens: 512,
+    decodeTokens: 128,
+    warmupRuns: 2,
+    measuredRuns: 5,
+  },
   "lfm2.5-2.6b-gguf-r9700-v1": {
     id: "lfm2.5-2.6b-gguf-r9700-v1",
     family: "lfm2.5-2.6b",
