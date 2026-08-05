@@ -89,13 +89,9 @@
          y = C * conv_out
          return self.out_proj(y)
  
-@@ -255,7 +301,83 @@
-             else:
+@@ -256,6 +302,76 @@
                  break
  
-+    _compiled_fn = None
-+    _cache_types = None
-+
      def __call__(
 +        self,
 +        inputs: mx.array,
@@ -105,31 +101,56 @@
 +        if cache is None or input_embeddings is not None:
 +            return self._stock_forward(inputs, cache, input_embeddings)
 +
-+        if Lfm2Model._cache_types is None:
-+            Lfm2Model._cache_types = [
++        # Build compiled closure on first call (captures self in closure)
++        if not hasattr(self, "_compiled_fn"):
++            _self = self
++
++            @mx.compile
++            def _compiled_fn(inputs, cache_flat):
++                h = _self.embed_tokens(inputs)
++                attn_mask = create_attention_mask(h, cache_flat[_self.fa_idx])
++                conv_mask = create_ssm_mask(h, cache_flat[_self.conv_idx])
++                new_flat = []
++                idx = 0
++                for layer, ct in zip(_self.layers, _self._cache_types):
++                    mask = attn_mask if layer.is_attention_layer else conv_mask
++                    if ct == "kv":
++                        kv = KVCache()
++                        kv.keys = cache_flat[idx]
++                        kv.values = cache_flat[idx + 1]
++                        kv.offset = kv.keys.shape[2] if kv.keys.shape[2] > 0 else 0
++                        idx += 2
++                        h = layer(h, mask, cache=kv)
++                        new_flat.append(kv.keys)
++                        new_flat.append(kv.values)
++                    else:
++                        arr = ArraysCache(size=1)
++                        arr[0] = cache_flat[idx]
++                        idx += 1
++                        h = layer(h, mask, cache=arr)
++                        new_flat.append(arr[0])
++                return _self.embedding_norm(h), new_flat
++
++            self._compiled_fn = _compiled_fn
++            self._cache_types = [
 +                "kv" if hasattr(c, "keys") else "arr" for c in cache
 +            ]
 +
++        # Extract cache arrays
 +        flat = []
 +        for ci, c in enumerate(cache):
-+            if Lfm2Model._cache_types[ci] == "kv":
-+                flat.append(
-+                    c.keys if c.keys is not None else mx.zeros((1, 8, 0, 256), dtype=mx.bfloat16)
-+                )
-+                flat.append(
-+                    c.values if c.values is not None else mx.zeros((1, 8, 0, 256), dtype=mx.bfloat16)
-+                )
++            if self._cache_types[ci] == "kv":
++                flat.append(c.keys if c.keys is not None else mx.zeros((1, 8, 0, 256), dtype=mx.bfloat16))
++                flat.append(c.values if c.values is not None else mx.zeros((1, 8, 0, 256), dtype=mx.bfloat16))
 +            else:
 +                flat.append(c[0] if c[0] is not None else mx.zeros((1, 2, 2048), dtype=mx.bfloat16))
 +
-+        if Lfm2Model._compiled_fn is None:
-+            Lfm2Model._compiled_fn = mx.compile(Lfm2Model._compiled_forward)
++        out, new_flat = self._compiled_fn(inputs, flat)
 +
-+        out, new_flat = Lfm2Model._compiled_fn(self, inputs, flat)
-+
++        # Write back cache
 +        idx = 0
 +        for ci, c in enumerate(cache):
-+            if Lfm2Model._cache_types[ci] == "kv":
++            if self._cache_types[ci] == "kv":
 +                was_none = c.keys is None
 +                c.keys = new_flat[idx]; idx += 1
 +                c.values = new_flat[idx]; idx += 1
@@ -140,34 +161,6 @@
 +            else:
 +                c[0] = new_flat[idx]; idx += 1
 +        return out
-+
-+    def _compiled_forward(self, inputs, cache_flat):
-+        h = self.embed_tokens(inputs)
-+        if cache_flat is None:
-+            cache_flat = [None] * len(self.layers)
-+        attn_mask = create_attention_mask(h, cache_flat[4] if len(cache_flat) > 4 else None)
-+        conv_mask = create_ssm_mask(h, cache_flat[0] if len(cache_flat) > 0 else None)
-+        new_flat = []
-+        idx = 0
-+        for li, layer in enumerate(self.layers):
-+            ct = Lfm2Model._cache_types[li]
-+            mask = attn_mask if layer.is_attention_layer else conv_mask
-+            if ct == "kv":
-+                kv = KVCache()
-+                kv.keys = cache_flat[idx]
-+                kv.values = cache_flat[idx + 1]
-+                kv.offset = kv.keys.shape[2] if kv.keys.shape[2] > 0 else 0
-+                idx += 2
-+                h = layer(h, mask, cache=kv)
-+                new_flat.append(kv.keys)
-+                new_flat.append(kv.values)
-+            else:
-+                arr = ArraysCache(size=1)
-+                arr[0] = cache_flat[idx]
-+                idx += 1
-+                h = layer(h, mask, cache=arr)
-+                new_flat.append(arr[0])
-+        return self.embedding_norm(h), new_flat
 +
 +    def _stock_forward(
          self,
