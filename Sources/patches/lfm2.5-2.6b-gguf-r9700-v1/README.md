@@ -5,7 +5,8 @@
 | Patch | Status | Notes |
 | --- | --- | --- |
 | `0001-mmvq-narrow-starved-blocks.patch` | **won** (+17.177% decode, score ~1.100) | Idle-warp narrow for starved K=2048 q4_K shapes |
-| `0002-mmvq-dedupe-q8-1-requant.patch` | candidate | Per-graph q8_1 activation cache (launch-bound regime) |
+| `0002-mmvq-dedupe-q8-1-requant.patch` | candidate / in flight | Per-graph q8_1 activation cache (launch-bound regime) |
+| `0003-mmvq-grouped-launch.patch` | candidate | Group same-activation Q/K/V (and similar) matvecs into one launch |
 
 `0001` is the first landed win: **+17.177%** decode (180.325 -> 211.439 tok/s),
 prefill neutral, perplexity bit-identical.
@@ -28,8 +29,14 @@ same activation across attention Q/K/V and FFN gate/up projections, so stock
 re-runs `quantize_q8_1` once per consumer. The cache is bit-exact by
 construction (parameter-tuple + root-tensor identity + clear-on-eval). On this
 small model the remaining bottleneck after 0001 is per-launch overhead, so
-removing redundant quantize dispatches is the natural next lever. Do **not**
-blindly port Laguna MoE-only patches after this.
+removing redundant quantize dispatches is the natural next lever.
+
+`0003` ports the Laguna grouped mmvq launch: same-activation plain matvecs
+(Q/K/V class) become one kernel with concatenated row ranges. Warp launch
+count mirrors 0001 (trim starved K, keep full warps when the group's total
+rows would not fill the device). Compile-time nwarps stays at the table value
+and trimmed slots pad +0, so results stay bit-identical. Do **not** blindly
+port Laguna MoE-only patches after this.
 
 ## This track is not the Laguna AMD track
 
