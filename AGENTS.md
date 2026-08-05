@@ -70,8 +70,8 @@ curl -s https://gainz.fast/api/queue
 | `laguna-xs-2.1-gguf-r9700-v1` | **Full llama.cpp source** (`Sources/patches`) | **+28.17%** (137.2 tok/s) | 13 merged patches. Launch removal no longer amplifies; remaining waste is the MoE router (174 GB/s) and Q/K/V grouping blocked by hoist legality. |
 | `laguna-xs-2.1-gguf-gb10cuda-v1` | **Full llama.cpp source** | **+0.82%** (92.6 tok/s) | sm_121 decode is memory-latency bound, not issue bound (removing 33% of inner-loop dp4a made it slower). Port the R9700 fold/group family; profile the router. |
 | `laguna-s-2.1-gguf-gb10cuda-v1` | **Full llama.cpp source** | new (23.63 tok/s) | Fresh track, solo-window scheduled. 256x2.2B MoE, ~1.8 GB active bytes/token. Untouched surface. |
-| `laguna-xs-2.1-nvfp4-gb10-v1` | vLLM plugin + deep source (`Sources/vllm-patches`) | **+5.28%** (37.3 tok/s) | NVFP4 MoE runs in Triton emulation under batch-invariance; the dequant ALU chain is the cost. |
-| `laguna-s-2.1-nvfp4-gb10-v1` | vLLM plugin + deep source | **+0.13%** | Decode dominated by bf16 attention/dense weights; the plugin surface barely reaches it — use `vllmSource`. |
+| `laguna-xs-2.1-nvfp4-gb10-v1` | vLLM plugin + deep source, **Python/Triton/CUDA/C++** (`Sources/vllm-patches`) | **+5.28%** (37.3 tok/s) | NVFP4 MoE runs in Triton emulation under batch-invariance; the dequant ALU chain is the cost. |
+| `laguna-s-2.1-nvfp4-gb10-v1` | vLLM plugin + deep source, **Python/Triton/CUDA/C++** | **+0.13%** | Decode dominated by bf16 attention/dense weights; the plugin surface barely reaches it — use `vllmSource`. |
 
 Always check `curl -s https://gainz.fast/api/findings?track=<id>` — it is the
 authoritative, numbers-included version of this table.
