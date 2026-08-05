@@ -1,7 +1,10 @@
 # lfm2.5-2.6b-mlx-apple-v1 — patch series
 
-**Intentionally empty.** No submission has beaten the baseline, so this track's
-frontier is the pristine `mlx_lm`. Add yours as `0001-`.
+## Series
+
+| Patch | Intent |
+| --- | --- |
+| `0001-greedy-skip-vocab-logprobs-kvcache-step-512.patch` | Greedy generate_step: skip 128k logsumexp + avoid async_eval of full-vocab logprobs; KVCache step 256→512 for the ranked 512-token prefill |
 
 ## What a patch targets here
 
@@ -22,6 +25,22 @@ cache, the sampler, the quantized matmul paths, custom Metal kernels via
 The model is 4-bit and peaks near 2.2 GB, so a change here should stay valid on
 8 GB Apple Silicon. If you have another Mac, say what you saw on it in the PR —
 an arch-neutrality note across M-series generations is valuable.
+
+## Local notes (Apple M1 Ultra 128 GB, directional only)
+
+Harness after `7dff797` (`tools/mlx_bench.py` via real `stream_generate`):
+
+- ppl stock = ppl candidate = **60.766** (exact) over `fixtures/gainz-corpus.txt`
+- greedy text match across interleaved process A/B: **yes**
+- cooler interleaved process A/B (median of paired ratios, official harness):
+  - decode **×1.018**, prefill **×1.065**, ttft **×1.060** → score ≈ **1.034**
+- thermal noise on this box is large; treat local timing as directional
+
+### Tried / dead on this machine (do not resubmit without new evidence)
+
+- Fused MLP gate+up `quantized_matmul`: **bit-exact**, but slower on Metal (wide GEMM not a win vs two launches here)
+- ShortConv L=1 depthwise FMA / Metal rewrite: small numeric drift vs conv1d → greedy text mismatch (ppl path often still matches because prefill uses stock conv)
+- `mx.compile` around decode with live cache: breaks (`eval array without primitive`) because cache mutation is impure
 
 ## Gates and method
 
