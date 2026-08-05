@@ -1,0 +1,11 @@
+--- a/mlx_lm/models/cache.py
++++ b/mlx_lm/models/cache.py
+@@ -323,7 +323,7 @@
+ 
+ 
+ class KVCache(_BaseCache):
+-    step = 256
++    step = 512
+ 
+     def __init__(self):
+         self.keys = None

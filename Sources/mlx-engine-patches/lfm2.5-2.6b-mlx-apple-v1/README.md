@@ -1,13 +1,20 @@
 # MLX engine patches — lfm2.5-2.6b-mlx-apple-v1
 
-**Intentionally empty.**
+## Series
 
-A non-empty series forces a full MLX rebuild on the trusted runner
-(`pip install -e .` from mlx v0.32.0). That path currently fails on the
-ranked box with `No such file or directory: 'cmake'`, so engine patches
-cannot land until the runner image has cmake/build tools.
+| Patch | Intent |
+| --- | --- |
+| `0001-qmv-wide-m1-decode-with-cmake.patch` | Route M=1 decode QMV through `affine_qmv_wide` on gen-15+ (M4); add `nv_1` instantiation; auto-install cmake in setup.py |
 
-Use `Sources/patches/lfm2.5-2.6b-mlx-apple-v1/` (Python `mlx_lm` overlay,
-no rebuild) until then.
+## Why this is the lever
+
+LFM2.5-2.6B decode is almost entirely **M=1 affine quantized matvecs**. Stock
+MLX v0.32.0 gates `qmv_wide` dispatch at `M >= 2` even on gen-15+ (M4) where
+`use_qmv_wide` returns true for affine. So single-token decode never uses the
+wide kernel. This patch:
+
+1. Instantiates `affine_qmv_wide` for `vecs_per_tg=1` (nv_1)
+2. Changes dispatch from `M >= 2` to `M >= 1`
+3. Auto-installs cmake via `uv pip install` if missing (runner fix)
 
 Pinned engine: **MLX v0.32.0** (`7a1d4f5c`).

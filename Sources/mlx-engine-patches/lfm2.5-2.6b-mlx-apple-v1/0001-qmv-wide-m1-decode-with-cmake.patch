@@ -1,0 +1,44 @@
+diff --git a/mlx/backend/metal/kernels/quantized.metal b/mlx/backend/metal/kernels/quantized.metal
+index 069482c..5931e8b 100644
+--- a/mlx/backend/metal/kernels/quantized.metal
++++ b/mlx/backend/metal/kernels/quantized.metal
+@@ -125,6 +125,7 @@
+   instantiate_quantized_wide(name, type, group_size, bits, vecs_per_tg, k_lanes, 1)
+ 
+ #define instantiate_quantized_all_wide(type, group_size, bits) \
++  instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 1, 8) \
+   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 2, 8) \
+   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 3, 8) \
+   instantiate_quantized_wide_wrap(affine_qmv_wide, type, group_size, bits, 4, 8) \
+diff --git a/mlx/backend/metal/quantized.cpp b/mlx/backend/metal/quantized.cpp
+index 62d4871..2d1bb2e 100644
+--- a/mlx/backend/metal/quantized.cpp
++++ b/mlx/backend/metal/quantized.cpp
+@@ -1476,7 +1476,7 @@ void dispatch_qmv(
+ 
+   // Small batch so route to qmv_wide, which reuses each weight group across the
+   // M vectors.
+-  if (M >= 2 && use_qmv_wide(mode, d)) {
++  if (M >= 1 && use_qmv_wide(mode, d)) {
+     qmv_wide(x, w, scales, biases, out, group_size, bits, M, N, K, d, s, mode);
+     return;
+   }
+diff --git a/setup.py b/setup.py
+index 3c2f138..b4222e5 100644
+--- a/setup.py
++++ b/setup.py
+@@ -77,6 +77,14 @@ class CMakeBuild(build_ext):
+             self.build_temp = os.path.dirname(self.build_temp)
+ 
+     def build_extension(self, ext: CMakeExtension) -> None:
++        # Ensure cmake is available (the runner may not pre-install it)
++        import shutil
++        if not shutil.which("cmake"):
++            subprocess.check_call(
++                ["uv", "pip", "install", "cmake>=3.25"],
++                stdout=subprocess.DEVNULL,
++            )
++
+         # Must be in this form due to bug in .resolve() only fixed in Python 3.10+
+         ext_fullpath = Path.cwd() / self.get_ext_fullpath(ext.name)  # type: ignore[no-untyped-call]
+         extdir = ext_fullpath.parent.resolve()
