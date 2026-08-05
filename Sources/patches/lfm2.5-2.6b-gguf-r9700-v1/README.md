@@ -1,7 +1,12 @@
 # lfm2.5-2.6b-gguf-r9700-v1 — patch series
 
-`0001-mmvq-narrow-starved-blocks.patch` is the first landed win: **+17.177%**
-decode (180.325 -> 211.439 tok/s), prefill neutral, perplexity bit-identical.
+`0001-mmvq-narrow-starved-blocks.patch` is the first landed win. On the
+trusted runner it scored **+9.99%** overall: decode speedup **1.1621**
+(179.87 -> 209.73 tok/s), prefill 0.9957 (neutral), perplexity
+bit-identical. The local pre-submit measurement was +17.177% decode
+(180.325 -> 211.439 tok/s) — a useful illustration that a clean local number
+lands a point or two lower once the runner's paired protocol and prefill term
+are applied.
 
 It removes idle mmvq warps. On the RDNA4 table `calc_nwarps()` returns 8 for
 q4_K at `ncols_dst=1`, which wants 16 k-blocks, but every K=2048 tensor in this
