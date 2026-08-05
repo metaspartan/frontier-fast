@@ -4,17 +4,13 @@
 
 | Patch | Intent |
 | --- | --- |
-| `0001-qmv-wide-m1-decode-nv1.patch` | Route M=1 decode QMV through `affine_qmv_wide` on gen-15+ (M4); add `nv_1` instantiation |
+| `0001-qmv-fast-widen-bn16.patch` | Widen qmv_fast threadgroup: 4 simdgroups (bn=16, was bn=8) |
 
-## Why this is the lever
+## Why
 
-LFM2.5-2.6B decode is almost entirely **M=1 affine quantized matvecs**.
-Stock MLX v0.32.0 gates `qmv_wide` dispatch at `M >= 2` even on gen-15+
-(M4) where `use_qmv_wide` returns true for affine. So single-token
-decode never uses the wide kernel.
+Stock qmv_fast uses 2 simdgroups (64 threads, bn=8 outputs per threadgroup).
+For LFM2.5's shapes (N=10752, K=2048), this creates 1344 threadgroups.
+Doubling to 4 simdgroups (128 threads, bn=16) halves to 672 threadgroups,
+reducing scheduling overhead while maintaining the same per-thread work.
 
-This patch adds the missing `nv_1` specialization and opens dispatch
-for M=1. `use_qmv_wide` still returns false for affine on gen-13
-(M1/M2), so older Macs keep the stock qmv path.
-
-Pinned engine: **MLX v0.32.0** (`7a1d4f5c`).
+All LFM2.5 N values (10752, 6144, 2048, 512) are divisible by 16.
