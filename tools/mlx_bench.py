@@ -71,7 +71,10 @@ def one_run(model, tok, prompt_ids, decode_tokens):
         "ttft": ttft,
         "decodeTokensPerSecond": last.generation_tps,
         "prefillTokensPerSecond": last.prompt_tps,
-        "peakMemoryGB": (last.peak_memory or 0) / 1e9,
+        # GenerationResponse.peak_memory is ALREADY in GB. Dividing by 1e9
+        # again floored every reading to 0.0 — a field that is always zero is
+        # worse than no field, because it reads as "this model uses no memory".
+        "peakMemoryGB": last.peak_memory if last.peak_memory else mx.get_peak_memory() / 1e9,
         "text": "".join(pieces),
     }
 
