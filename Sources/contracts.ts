@@ -38,7 +38,7 @@ export const TRACKS: Record<string, Contract> = {
     model: "LiquidAI/LFM2.5-2.6B-GGUF",
     revision: "main",
     quantization: "gguf-q4_k_m",
-    machine: "dgx-spark-gb10-sm121",
+    machine: "gb10-cuda-sm121",
     promptTokens: 512,
     decodeTokens: 128,
     warmupRuns: 2,
