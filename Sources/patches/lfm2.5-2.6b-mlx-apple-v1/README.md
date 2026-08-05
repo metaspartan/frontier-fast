@@ -4,56 +4,33 @@
 
 | Patch | Intent |
 | --- | --- |
-| `0001-greedy-skip-vocab-logprobs-kvcache-step-512.patch` | Greedy generate_step: skip 128k logsumexp + avoid async_eval of full-vocab logprobs; KVCache step 256→512 for the ranked 512-token prefill |
+| `0001-greedy-decode-host-overhead-kvcache-step.patch` | Greedy `generate_step`: skip 128k logsumexp + avoid async_eval of full-vocab logprobs; defer per-token `get_peak_memory` to final yield; KVCache step 256→512 |
+
+## Engine series (rebuild)
+
+See `Sources/mlx-engine-patches/lfm2.5-2.6b-mlx-apple-v1/` for the M4-targeted
+`affine_qmv_wide` M=1 decode path (`nv_1` instantiation + dispatch).
 
 ## What a patch targets here
 
-MLX has no engine binary to rebuild. **Your patch applies to the installed
-`mlx_lm` Python tree** — the same shape as the vLLM tracks' source overlay, not
-the llama.cpp tracks' C++ rebuild. The runner copies the pristine `mlx_lm` out
-of its venv, applies the series with `patch -p1`, and selects the arm with
-`PYTHONPATH`, so stock and candidate cannot contaminate each other.
-
-That means everything in `mlx_lm` is fair game: the model implementation, the
-cache, the sampler, the quantized matmul paths, custom Metal kernels via
-`mx.fast.metal_kernel`, or a different algorithm entirely.
+MLX has no engine binary to rebuild for the Python series. **Your patch applies
+to the installed `mlx_lm` Python tree**. The runner copies pristine `mlx_lm`,
+applies the series with `git apply`, and selects the arm with `PYTHONPATH`.
 
 ## Measured stock on the ranking runner (Apple M4, 16 GB)
 
-- decode **58.47 tok/s**, prefill **597 tok/s**, peak memory **2.2 GB**
+- decode **~61.6 tok/s**, prefill **~654 tok/s** (latest baseline phase)
 
-The model is 4-bit and peaks near 2.2 GB, so a change here should stay valid on
-8 GB Apple Silicon. If you have another Mac, say what you saw on it in the PR —
-an arch-neutrality note across M-series generations is valuable.
+## Local notes (Apple M1 Ultra, directional only)
 
-## Local notes (Apple M1 Ultra 128 GB, directional only)
+- ppl stock = cand exact on `fixtures/gainz-corpus.txt`
+- greedy text match on interleaved process A/B
+- cooler paired ratios for this python series (noisy): score ≈ **1.02–1.03**
+- Custom Metal SwiGLU / residual kernels: ppl-ok but **slower** + text drift
+- Fused gate+up `quantized_matmul`: bit-exact, **slower** on Metal here
+- ZMLX stock patches on dense LFM2.5: token-identical but much slower locally
 
-Harness after `7dff797` (`tools/mlx_bench.py` via real `stream_generate`):
+## Gates
 
-- ppl stock = ppl candidate = **60.766** (exact) over `fixtures/gainz-corpus.txt`
-- greedy text match across interleaved process A/B: **yes**
-- cooler interleaved process A/B (median of paired ratios, official harness):
-  - decode **×1.018**, prefill **×1.065**, ttft **×1.060** → score ≈ **1.034**
-- thermal noise on this box is large; treat local timing as directional
-
-### Tried / dead on this machine (do not resubmit without new evidence)
-
-- Fused MLP gate+up `quantized_matmul`: **bit-exact**, but slower on Metal (wide GEMM not a win vs two launches here)
-- ShortConv L=1 depthwise FMA / Metal rewrite: small numeric drift vs conv1d → greedy text mismatch (ppl path often still matches because prefill uses stock conv)
-- `mx.compile` around decode with live cache: breaks (`eval array without primitive`) because cache mutation is impure
-
-## Gates and method
-
-Accuracy is **perplexity equivalence within 0.5%** over the same fixed
-varied-prose corpus the llama.cpp and vLLM tracks use, so scores mean the same
-thing across engines. Greedy text is recorded but never ranks: a numeric change
-can preserve text and still shift the distribution.
-
-The runner alternates whole process launches and scores the **median of
-per-round ratios**. Do the same locally, always with a same-binary control, and
-check that your change actually fires before trusting a delta — this platform
-has repeatedly been fooled by measurements that never executed the new path.
-
-Note the box also runs a GitHub Actions runner. The worker refuses to measure
-while other accelerator work is live, so a contended run is requeued rather
-than scored.
+Accuracy is **perplexity equivalence within 0.5%**. Runner scores median of
+per-round ratios on whole-process A/B.

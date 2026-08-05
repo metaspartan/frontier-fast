@@ -1,46 +1,43 @@
 # MLX engine patches — lfm2.5-2.6b-mlx-apple-v1
 
-**Intentionally empty.** Patches here modify **MLX itself** — the C++ backend and
-the Metal kernels — and force a full engine rebuild on the runner. Add yours as
-`0001-` when you have one.
+## Series
 
-This is the deeper of the two surfaces on this track:
+| Patch | Intent |
+| --- | --- |
+| `0001-affine-qmv-wide-m1-decode-nv1.patch` | Instantiate `affine_qmv_wide` for `vecs_per_tg=1` and route **M=1** decode QMV through it on gen-15+ (Apple M4) |
 
-| Where | What it changes | Rebuild |
-|---|---|---|
-| `Sources/patches/<track>/` | `mlx_lm` and `mlx` Python: attention, MoE path, KV cache, sampler, and Metal kernels written with `mx.fast.metal_kernel` | none |
-| `Sources/mlx-engine-patches/<track>/` | MLX's own C++ backend and vendored `.metal` kernels | full engine build |
+## Why this is the lever
 
-Use the Python surface unless you actually need to change a kernel that already
-exists. It has no build cost, and `mx.fast.metal_kernel` already lets you author
-and JIT-compile new Metal without touching the engine.
+LFM2.5-2.6B decode is almost entirely **M=1 affine quantized matvecs**
+(gate/up/down, QKV, ShortConv projections). Stock MLX v0.32.0:
 
-## The engine
+1. Instantiates `affine_qmv_wide` only for `nv∈{2,3,4,5}` (no `nv_1`)
+2. Gates `dispatch_qmv` with `M >= 2 && use_qmv_wide(...)`
 
-Pinned to **MLX v0.32.0** (`7a1d4f5c`), built from source on the runner as the
-stock arm. The editable kernel surface is `mlx/backend/metal/kernels/` — 26
-`.metal` files plus the steel GEMM sources under
-`mlx/backend/metal/kernels/steel/`. Patches must apply to that pin with
-`git apply`; the runner tells you the pin if yours does not.
+So even on M4 (`use_qmv_wide` true for affine because gen ≥ 15), **single-token
+decode never uses the wide kernel**. This patch adds the missing `nv_1`
+specialization and opens the dispatch for M=1.
 
-Your patch gets its own engine tree, its own venv and a clean build, so it
-cannot contaminate the stock arm. Build failures return the actual compiler
-diagnostics.
+`use_qmv_wide` still returns false for affine on gen-13 (M1/M2), so older Macs
+keep the stock qmv path — no regression there.
 
-## Toolchain on the runner
+## Surfaces
 
-Xcode 17F113, `metal` 32023.883, `metallib` linker, cmake and ninja. The
-worker scopes `DEVELOPER_DIR` to itself, so the box's other CI keeps the
-system toolchain — do not assume `xcode-select -p` points at Xcode.
+| Where | What | Rebuild |
+| --- | --- | --- |
+| `Sources/patches/<track>/` | `mlx_lm` Python overlay | none |
+| `Sources/mlx-engine-patches/<track>/` | MLX C++/Metal (this dir) | full engine build |
 
-## Cost, and what it buys
+Pinned engine: **MLX v0.32.0** (`7a1d4f5c`).
 
-An engine rebuild is minutes, not seconds, and it happens inside your
-submission's slot on a shared machine. That is the price of reaching kernels
-that are already compiled into the engine. Measure locally first — the runner
-alternates whole process launches and scores the median of per-round ratios,
-and a change that does not clear a same-binary control there will not clear it
-here either.
+## Local validation
 
-Accuracy gate is unchanged: perplexity within 0.5% of stock over the shared
-varied-prose corpus.
+- Patch applies cleanly to v0.32.0
+- Built locally with `nv_1` + forced wide on gen-13: kernels load, matmul runs
+- Gen-13 absolute speed is not the target (wide is gen-15+ for affine); ranked
+  box is **Apple M4** where stock already enables wide for M≥2
+
+## Accuracy
+
+Kernel math is the existing `qmv_wide_impl`; only dispatch + instantiation
+change. Gate remains perplexity ≤ 0.5% vs stock.

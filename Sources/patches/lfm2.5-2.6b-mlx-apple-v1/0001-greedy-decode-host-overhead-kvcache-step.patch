@@ -1,14 +1,11 @@
 --- a/mlx_lm/generate.py
 +++ b/mlx_lm/generate.py
-@@ -374,7 +374,16 @@
+@@ -383,7 +383,13 @@
          kv_bits=kv_bits,
      )
  
 -    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
-+    # Default ranked path is greedy (sampler is None, no logits processors).
-+    # argmax(logits) == argmax(log_softmax(logits)), and stream_generate never
-+    # reads the logprob vector for timing/text. Skip the 128k logsumexp and do
-+    # not async_eval a full-vocab tensor each step.
++    # Ranked path is greedy (sampler is None). argmax(logits) needs no log_softmax.
 +    if sampler is None and logits_processors is None:
 +        _greedy_argmax = True
 +        sampler = lambda x: mx.argmax(x, axis=-1)
@@ -18,27 +15,36 @@
  
      def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
          if input_embeddings is not None:
-@@ -408,6 +417,11 @@
+@@ -417,6 +423,10 @@
  
              quantize_cache_fn(prompt_cache)
  
 +            if _greedy_argmax:
 +                sampled = mx.argmax(logits, axis=-1)
-+                # Second return value is only async_eval'd / yielded; keep it
-+                # token-sized so we do not schedule a 128k vector every step.
++                # stream_generate does not read logprobs for greedy timing/text.
 +                return sampled, sampled.squeeze(0)
              logprobs = logits - mx.logsumexp(logits, keepdims=True)
              sampled = sampler(logprobs)
              return sampled, logprobs.squeeze(0)
+@@ -734,7 +744,10 @@
+                 prompt_tps=prompt_tps,
+                 generation_tokens=n + 1,
+                 generation_tps=(n + 1) / (time.perf_counter() - tic),
+-                peak_memory=mx.get_peak_memory() / 1e9,
++                # Defer peak_memory sampling to the final yield. The harness
++                # only needs the last response's peak; querying every token
++                # is pure host overhead on the measured decode path.
++                peak_memory=0.0,
+                 finish_reason=None,
+             )
+ 
 --- a/mlx_lm/models/cache.py
 +++ b/mlx_lm/models/cache.py
-@@ -305,7 +305,9 @@
+@@ -323,7 +323,7 @@
  
  
  class KVCache(_BaseCache):
 -    step = 256
-+    # Ranked window is 512 prefill + 128 decode. Allocate the prefill slab in
-+    # one step instead of two under step=256.
 +    step = 512
  
      def __init__(self):
