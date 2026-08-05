@@ -1,64 +1,48 @@
 """MLX measurement harness for gainz.fast Apple Silicon tracks.
 
 Mirrors what the llama.cpp and vLLM runners measure so scores mean the same
-thing across engines: a 512-token prefill, 128 greedy decode steps, TTFT from a
-one-token completion, and perplexity over the fixed corpus as the accuracy gate.
+thing across engines: a 512-token prefill, 128 greedy decode steps, TTFT, and
+perplexity over the fixed corpus as the accuracy gate.
+
+Decode and prefill rates come from `mlx_lm.stream_generate` — the real
+generation path — not from a hand-rolled loop.
+
+That distinction is the whole point. An earlier version of this file drove the
+model directly:
+
+    logits = model(token[None], cache=cache)
+    token = mx.argmax(logits[:, -1, :], axis=-1)
+    mx.eval(token); out.append(token.item())
+
+which is greedy and correct in its output, but measures the wrong machine.
+`generate_step` pipelines with `mx.async_eval` and evaluates one step ahead,
+so the GPU is never idle waiting for the CPU; forcing `mx.eval` + `.item()`
+every step serialises that and makes CPU synchronisation, not the kernels,
+a large part of per-token time. It also skips the periodic `mx.clear_cache()`
+and the `prefill_step_size` chunking that real generation performs. The result
+is a number that is reproducible but not the number anyone cares about: an
+optimization that helps the pipelined path can be invisible here, and a
+"win" measured here need not be a win in real generation.
+
+`GenerationResponse` reports `prompt_tps` (computed by the engine as
+prompt.size / prompt_time) and `generation_tps` directly, so prefill is a
+genuine independent measurement rather than something derived from TTFT —
+deriving it from TTFT would make prefillSpeedup identical to ttftSpeedup and
+spend 0.35 of the score on one number.
 
 Two modes:
   bench  -> {decodeTokensPerSecond, prefillTokensPerSecond, ttftSeconds, text}
   ppl    -> {perplexity}
-
-Prefill uses the same two-point slope the vLLM runner uses: the same cold
-request at a long and a short prompt, differenced, so the fixed per-request
-cost cancels and what is left is the marginal prompt-processing rate. Deriving
-prefill from TTFT alone would make prefillSpeedup identical to ttftSpeedup and
-spend 0.35 of the score on one number.
 """
 import argparse
 import json
 import math
 import statistics
-import sys
 import time
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx_lm import load
-
-
-def timed_generate(model, tok, prompt_ids, max_tokens):
-    """Greedy generation with an explicit prefill/decode split.
-
-    mlx_lm's generate() helper hides the split, and we need TTFT separately, so
-    the loop is written out: one forward pass over the prompt (prefill), then
-    argmax steps (decode).
-    """
-    from mlx_lm.models.cache import make_prompt_cache
-
-    cache = make_prompt_cache(model)
-    ids = mx.array(prompt_ids)[None]
-
-    t0 = time.perf_counter()
-    logits = model(ids, cache=cache)
-    token = mx.argmax(logits[:, -1, :], axis=-1)
-    mx.eval(token)
-    ttft = time.perf_counter() - t0
-
-    out = [token.item()]
-    t1 = time.perf_counter()
-    for _ in range(max_tokens - 1):
-        logits = model(token[None], cache=cache)
-        token = mx.argmax(logits[:, -1, :], axis=-1)
-        mx.eval(token)
-        out.append(token.item())
-    decode_seconds = time.perf_counter() - t1
-
-    steps = max(len(out) - 1, 1)
-    return {
-        "ttft": ttft,
-        "decodeSecondsPerToken": decode_seconds / steps,
-        "text": tok.decode(out),
-    }
+from mlx_lm import load, stream_generate
 
 
 def corpus_text(path):
@@ -66,47 +50,60 @@ def corpus_text(path):
         return handle.read()
 
 
+def one_run(model, tok, prompt_ids, decode_tokens):
+    """One cache-cold generation through the real path.
+
+    The default sampler is argmax, so this is greedy — the same decoding the
+    correctness gate assumes — without bypassing the generation machinery.
+    """
+    started = time.perf_counter()
+    ttft = None
+    last = None
+    pieces = []
+    for response in stream_generate(model, tok, prompt_ids, max_tokens=decode_tokens):
+        if ttft is None:
+            ttft = time.perf_counter() - started
+        pieces.append(response.text)
+        last = response
+    if last is None:
+        raise SystemExit("stream_generate yielded nothing")
+    return {
+        "ttft": ttft,
+        "decodeTokensPerSecond": last.generation_tps,
+        "prefillTokensPerSecond": last.prompt_tps,
+        "peakMemoryGB": (last.peak_memory or 0) / 1e9,
+        "text": "".join(pieces),
+    }
+
+
 def bench(model, tok, corpus, prompt_tokens, decode_tokens, runs):
-    """Long and short prompts sliced from the same corpus, so the only
-    difference between the two points is length."""
     full = tok.encode(corpus)
     if len(full) < prompt_tokens * 2:
         full = full * (prompt_tokens * 2 // max(len(full), 1) + 2)
-    short_tokens = max(32, prompt_tokens // 8)
 
-    ttfts, shorts, decodes, text = [], [], [], ""
+    ttfts, decodes, prefills, peaks, text = [], [], [], [], ""
     for i in range(runs):
-        # Rotate the slice per run so no two runs are the identical prompt.
+        # Rotate the slice per run so no two runs are the identical prompt and
+        # nothing can be served from a warm prefix.
         offset = (i * 97) % max(len(full) - prompt_tokens - 1, 1)
-        long_ids = full[offset:offset + prompt_tokens]
-        short_ids = full[offset:offset + short_tokens]
-
-        long_run = timed_generate(model, tok, long_ids, decode_tokens)
-        short_run = timed_generate(model, tok, short_ids, 1)
-
-        ttfts.append(long_run["ttft"])
-        shorts.append(short_run["ttft"])
-        decodes.append(long_run["decodeSecondsPerToken"])
+        prompt_ids = full[offset:offset + prompt_tokens]
+        result = one_run(model, tok, prompt_ids, decode_tokens)
+        ttfts.append(result["ttft"])
+        decodes.append(result["decodeTokensPerSecond"])
+        prefills.append(result["prefillTokensPerSecond"])
+        peaks.append(result["peakMemoryGB"])
         if i == 0:
-            text = long_run["text"]
+            text = result["text"]
 
-    ttft = statistics.median(ttfts)
-    short_ttft = statistics.median(shorts)
-    delta_tokens = prompt_tokens - short_tokens
-    delta_seconds = ttft - short_ttft
-    if delta_tokens > 0 and delta_seconds > 1e-4:
-        prefill_per_token = delta_seconds / delta_tokens
-    else:
-        prefill_per_token = ttft / max(prompt_tokens, 1)
-        print("prefill slope unusable; fell back to the TTFT-derived rate", file=sys.stderr)
-
-    decode_per_token = statistics.median(decodes)
+    decode_tps = statistics.median(decodes)
+    prefill_tps = statistics.median(prefills)
     return {
-        "decodeTokensPerSecond": 1.0 / decode_per_token,
-        "decodeSecondsPerToken": decode_per_token,
-        "prefillTokensPerSecond": 1.0 / prefill_per_token,
-        "prefillSecondsPerToken": prefill_per_token,
-        "ttftSeconds": ttft,
+        "decodeTokensPerSecond": decode_tps,
+        "decodeSecondsPerToken": 1.0 / decode_tps,
+        "prefillTokensPerSecond": prefill_tps,
+        "prefillSecondsPerToken": 1.0 / prefill_tps,
+        "ttftSeconds": statistics.median(ttfts),
+        "peakMemoryGB": round(max(peaks), 3),
         "text": text,
     }
 
@@ -154,11 +151,9 @@ def main():
 
     warm = tok.encode(text)[:args.prompt_tokens]
     for _ in range(args.warmup):
-        timed_generate(model, tok, warm, 8)
+        one_run(model, tok, warm, 8)
 
-    result = bench(model, tok, text, args.prompt_tokens, args.decode_tokens, args.runs)
-    result["peakMemoryGB"] = round(mx.get_peak_memory() / 1e9, 3)
-    print(json.dumps(result))
+    print(json.dumps(bench(model, tok, text, args.prompt_tokens, args.decode_tokens, args.runs)))
 
 
 if __name__ == "__main__":
