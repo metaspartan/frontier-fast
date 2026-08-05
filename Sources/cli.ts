@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { TRACKS } from "./contracts";
-import { VllmRunner } from "./runner";
+import { runnerFor, engineFor, serverHint } from "./runner";
 import { score } from "./scoring";
 import type { Contract } from "./types";
 
@@ -9,7 +9,7 @@ const command = args[0] ?? "help";
 
 function getTrack(): Contract {
   const trackFlag = args.indexOf("--track");
-  const trackId = trackFlag >= 0 ? args[trackFlag + 1] : "laguna-xs-2.1-nvfp4-gb10-v1";
+  const trackId = trackFlag >= 0 ? args[trackFlag + 1] : (process.env.GAINZ_TRACK ?? "laguna-xs-2.1-nvfp4-gb10-v1");
   const track = TRACKS[trackId];
   if (!track) { console.error(`Unknown track: ${trackId}`); process.exit(1); }
   return track;
@@ -20,7 +20,7 @@ function readGolden(trackId: string): { goldenSha256?: string | null } | undefin
   catch { return undefined; }
 }
 
-if (command === "benchmark") {
+if (command === "benchmark" || command === "run") {
   const baseTrack = getTrack();
   const mode = args.includes("--local-submit") ? "--local-submit" : args.includes("--baseline") ? "--baseline" : "--local-iterate";
   // Local iterate keeps the loop fast; local submit uses the full contract window.
@@ -32,8 +32,8 @@ if (command === "benchmark") {
   console.log(`Window: ${track.promptTokens}-token prefill + ${track.decodeTokens}-token decode · ${track.warmupRuns} warmup / ${track.measuredRuns} measured`);
   console.log("");
 
-  const vllmUrl = process.env.VLLM_BASE_URL ?? "http://127.0.0.1:8000/v1";
-  const runner = new VllmRunner(vllmUrl, track.model);
+  const runner = runnerFor(track);
+  console.log(`Engine: ${engineFor(track)} (${runner.name})`);
 
   const main = async () => {
     console.log("Measuring baseline...");
@@ -76,11 +76,11 @@ if (command === "benchmark") {
 
   main().catch((err) => {
     console.error("Benchmark failed:", err.message);
-    console.error("\nMake sure a vLLM server is running (VLLM_BASE_URL, VLLM_API_KEY).");
-    console.error("Deterministic serving requires VLLM_BATCH_INVARIANT=1.");
+    console.error("\n" + serverHint(track));
     process.exit(1);
   });
 } else {
-  console.log("Usage: bun run Sources/cli.ts benchmark --track <id> [--local-iterate|--local-submit|--baseline]");
+  console.log("Usage: bun run Sources/cli.ts run --track <id> [--local-iterate|--local-submit|--baseline]");
+  console.log("       (\"benchmark\" is an alias for \"run\"; GAINZ_TRACK also sets the track)");
   console.log("Tracks:", Object.keys(TRACKS).join(", "));
 }

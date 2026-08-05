@@ -1,0 +1,63 @@
+The archivist had spent eleven years cataloguing the water-damaged ledgers before she noticed the discrepancy. Every seventh entry, written in the same careful hand as the rest, recorded a shipment that no port authority had any record of receiving. She photographed each page twice, once under ordinary light and once under ultraviolet, and mailed the negatives to a colleague in Lisbon who had asked her, years earlier, to watch for exactly this kind of pattern.
+
+Memory bandwidth, not arithmetic throughput, sets the floor for single-stream decoding. Each generated token requires reading the full set of active weights from device memory, so the achievable rate is bounded by bytes moved divided by available bandwidth. Increasing arithmetic intensity through fusion helps only insofar as it removes redundant traffic; a kernel that halves its instruction count while reading the same operands twice will measure slower, not faster.
+
+def reconcile(ledger, statement, tolerance=0.005):
+    unmatched = []
+    for entry in ledger:
+        candidates = [s for s in statement if abs(s.amount - entry.amount) <= tolerance * abs(entry.amount)]
+        if not candidates:
+            unmatched.append(entry)
+            continue
+        best = min(candidates, key=lambda s: abs((s.date - entry.date).days))
+        statement.remove(best)
+    return unmatched, statement
+
+"You keep saying the model is confident," he said, pushing the printout across the table. "Confident about what, exactly?" She turned the page around without looking at it. "About the next token. Not about the answer. Those are different claims, and the second one isn't something the architecture can make." He was quiet for a moment. "Then why does everyone report it as though it were?" "Because the first number is easy to compute," she said, "and the second one might not exist."
+
+Consider a mixture-of-experts layer routing each token to eight of two hundred fifty-six experts. The router produces a distribution over experts, the top-k are selected, and their outputs are combined by gate weight. Because selection is discrete, an arbitrarily small perturbation to the router's logits can change which expert is chosen, and the resulting activations diverge immediately rather than gradually. This is why numerical changes that appear harmless in a dense layer can alter generated text within a single step.
+
+The bridge was built twice. The first attempt, completed in 1846, stood for nine years before the central span dropped into the river during an unremarkable February afternoon; the subsequent inquiry found that the ironwork had been specified correctly and manufactured to specification, but that nobody had asked what would happen when the rail traffic it was designed for grew heavier, as it plainly would. The second bridge, finished in 1859, is still carrying trains.
+
+SELECT region, date_trunc('month', ordered_at) AS month, count(*) AS orders, sum(total_cents) / 100.0 AS revenue
+FROM orders
+WHERE ordered_at >= now() - interval '18 months' AND status NOT IN ('cancelled', 'refunded')
+GROUP BY region, month
+HAVING count(*) > 25
+ORDER BY region, month;
+
+Three practical rules follow from the paired-measurement design. First, never compare a number from one process against a number from another, because allocator state, clock behaviour, and cache residency all differ across boots. Second, interleave the arms rather than running one after the other, so that thermal drift affects both equally. Third, report the median of the per-round ratios rather than the ratio of the medians; the two differ whenever variance is asymmetric, and the second quietly hides it.
+
+She had never liked the word 'benchmark'. It suggested a fixed mark on a bench, something a carpenter could return to and trust, when in practice the mark moved every time anyone leaned on the bench. What she wanted was not a number but a procedure: a way of asking the same question twice and noticing when the answers disagreed. The number was only ever a summary of whether the procedure had held.
+
+Quantization to four bits changes the memory system's problem more than the arithmetic unit's. A block-scaled format stores a shared exponent alongside a group of mantissas, so the effective bytes per parameter include that scale; a 144-byte block holding 128 weights is not sixteen bits per four weights but something slightly worse, and the difference shows up precisely in the bandwidth-bound regime where it matters most.
+
+The committee's final recommendation ran to four hundred pages, but its substance fit in a paragraph: measurements should be reproducible by a third party using only the published artefacts, disagreements should be resolved by re-measurement rather than argument, and any result that cannot survive being re-run on a different afternoon should be reported as provisional. Nothing in it was novel. All of it had been ignored before.
+
+Rainfall that season was the heaviest since records began, and the reservoir managers found themselves defending a decision nobody had questioned for thirty years: to hold the winter level high. The policy had been written when the catchment was mostly pasture. It was now mostly roofs and tarmac, and water that once took two days to reach the inflow arrived in four hours.
+
+A profiler that buckets kernels by register count will silently group different tensors together whenever a code change alters occupancy. Comparing those buckets across two builds therefore compares different sets of work and can manufacture a regression that does not exist. Attribute launches to shapes by position in the execution order, then compare like with like.
+
+interface Ledger {
+  entries: Entry[];
+  balanceAt(when: Date): number;
+}
+
+class ImmutableLedger implements Ledger {
+  constructor(readonly entries: readonly Entry[]) {}
+  balanceAt(when: Date): number {
+    return this.entries.filter((e) => e.at <= when).reduce((sum, e) => sum + e.amount, 0);
+  }
+}
+
+The second violinist claimed she could hear the difference between the two recordings; the engineer insisted they were bit-identical and offered to prove it. They spent an hour on it. The files were identical. What differed was the room she had listened in, the time of day, and the fact that on the second hearing she already knew what was coming — which is, the engineer conceded afterwards, a real difference, just not one that lives in the file.
+
+Amortizing a weight read across several generated tokens is the only structural escape from the bandwidth floor at batch size one. Speculative approaches draft a short continuation cheaply, then verify it in a single pass through the full network; when verification is exact, the output is indistinguishable from ordinary greedy decoding, and the speedup is bounded by how often the draft is right.
+
+Five things the inquiry established, in order of how uncomfortable they were: the warning existed; it had been circulated to the right people; the people who received it understood it; the cost of acting on it was known and modest; and no one could afterwards recall deciding not to act. The last of these accounted for most of the report's length and all of its recommendations.
+
+Prefill and decode stress opposite parts of the machine. Prefill processes hundreds of positions at once and is limited by arithmetic throughput, so it rewards large tiles, high occupancy, and any kernel that keeps the tensor units fed. Decode processes a single position and is limited by how fast weights arrive from memory, so it rewards small tiles, low latency, and anything that avoids reading a byte twice. A change tuned for one will frequently harm the other.
+
+The map was wrong in a specific and instructive way. It showed the river's course as surveyed in 1904, which had been accurate then, and the surveyors had noted in the margin that the channel migrated eastward roughly a metre a year. Nobody transcribing the map into later editions carried the note across, so a caveat that would have explained a century of drift was lost in the first copy and never recovered.
+
+Latency and throughput are not the same quantity observed at different scales; they are different questions about the same system. A change that batches four requests together may double throughput while tripling the latency of the first request in the batch. Which of those matters depends entirely on who is waiting, and a scoring function that mixes them is making an editorial claim about that question rather than
