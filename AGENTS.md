@@ -1,6 +1,6 @@
 # gainz.fast — Agent Instructions
 
-You are participating in the gainz.fast inference optimization challenge. Your goal is to make model inference faster while keeping the model behaviourally intact, as measured by your track's correctness gate (perplexity equivalence on the llama.cpp and MLX tracks, teacher-forced agreement on the vLLM tracks).
+You are participating in the gainz.fast inference optimization challenge. Your goal is to make model inference faster while keeping the model behaviourally intact, as measured by your track's correctness gate — perplexity equivalence (<= 0.5% relative delta) on every track, plus teacher-forced argmax agreement (>= 90%) on the vLLM tracks.
 
 ## The gainzfast CLI
 
@@ -204,6 +204,27 @@ infrastructure fault, not a comment on your patch. (A field named
 `maxSingleSubmissionGain: 1.053` used to sit in the registry while the R9700
 frontier stood at +37%; it was never enforced and has been removed.)
 
+## Custom kernels: what each engine lets you do
+
+You can write real kernels on **all three engines**. What differs is only how
+the kernel reaches the measured binary.
+
+| Engine | Where your kernel goes | How it gets compiled | New files? |
+|---|---|---|---|
+| **llama.cpp** (HIP + CUDA) | `Sources/patches/<track-id>/*.patch` against pinned `b10237` | the runner rebuilds the pinned tree with cmake, so `.cu`/`.hip`/`.cpp` and new dispatch paths just work | yes |
+| **MLX** | `Sources/patches/<track-id>/` (Python/Metal via `mx.fast.metal_kernel`) or `Sources/mlx-engine-patches/<track-id>/` | `mx.fast.metal_kernel` JIT-compiles Metal with no rebuild; engine patches rebuild pinned MLX v0.32.0 from source | yes |
+| **vLLM** | `Sources/vllm-patches/*.patch` against the image's own `vllm` package | `.py`, `.cu`, `.cuh`, `.cpp`, `.cc`, `.h`, `.hpp` are all accepted, **but the image's prebuilt `_C.so` is not rebuilt ahead of time** — your Python must compile and dispatch to the kernel (`torch.utils.cpp_extension.load` at import). The mount is writable when native sources are present so the JIT can cache. | yes |
+
+The vLLM caveat is the one real asymmetry left, and it is being closed: an
+ahead-of-time rebuild of the pinned vLLM tree for sm_121 is in bring-up. Until
+it lands, treat a `.cu` you add on a vLLM track as inert until your own loader
+picks it up — the clean pattern is a `vllm/gainz_kernels/` directory holding
+the source plus a loader, and a one-line dispatch edit at the call site.
+
+The correctness gate is the same everywhere (perplexity equivalence ≤ 0.5%),
+so a kernel that preserves the model's distribution is acceptable on any
+track regardless of how it reorders arithmetic.
+
 ## The serving surface (vLLM tracks)
 
 `Sources/runner/serving.json` is deployed as the candidate vLLM engine and
@@ -227,7 +248,9 @@ enforces it.
 | `Sources/model/` | all — engine flags, backend selection, speculative configs |
 | `Sources/scoring/` | all — scoring helpers (the formula is pinned) |
 | `Sources/kernels/` | vLLM — Triton/CUDA plugin package |
-| `Sources/vllm-patches/` | vLLM — patches to the image's own `vllm` package (shared by both tracks) |
+| `Sources/vllm-patches/` | vLLM — patches to the image's own `vllm` package (shared by both tracks); Python, CUDA and C++ sources, new files allowed |
+| `Sources/patches/<track-id>/` | llama.cpp and MLX — per-track patch series against the pinned engine tree |
+| `Sources/mlx-engine-patches/<track-id>/` | MLX — patches that rebuild pinned MLX from source (Metal kernel work) |
 | `Sources/patches/<track-id>/` | llama.cpp — patches to pinned `b10237`; MLX — overlay of installed `mlx_lm`/`mlx` |
 | `Sources/mlx-engine-patches/<track-id>/` | MLX — patches to MLX itself at pinned v0.32.0 (full engine rebuild) |
 

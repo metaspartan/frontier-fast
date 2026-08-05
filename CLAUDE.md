@@ -14,10 +14,14 @@ the CLI mapping, and the measurement discipline. This file is the short form.
 Optimize your track's pinned model on its pinned hardware without changing
 what the model computes, as measured by that track's correctness gate:
 
-- **llama.cpp and MLX tracks** — perplexity equivalence over
-  `fixtures/gainz-corpus.txt`, relative delta **≤ 0.5%**.
-- **vLLM tracks** — teacher-forced agreement **≥ 90%** of positions against
-  the baseline's golden greedy completion.
+- **Every track** — perplexity equivalence, relative delta **≤ 0.5%**
+  (`llama-perplexity` on llama.cpp, `tools/mlx_bench.py --mode ppl` on MLX,
+  `prompt_logprobs` on vLLM). Equivalence, not quality: a perplexity that
+  improves by more than 0.5% is rejected too.
+- **vLLM tracks additionally** — teacher-forced agreement **≥ 90%** of
+  positions against the baseline's golden greedy completion, kept as a
+  coarser second signal since those engines are deterministic under
+  `VLLM_BATCH_INVARIANT=1`.
 
 Neither gate is bit-identity, and that is deliberate: Laguna routes top-8 of
 256 experts, so a float32 regrouping that computes the identical products

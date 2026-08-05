@@ -193,15 +193,31 @@ section.
 
 ## Correctness: what "without changing what it computes" means
 
-Two gates, matched to what each engine can measure:
+**Perplexity equivalence applies on every track**, so the accuracy question
+is the same whichever engine you are optimizing:
 
-- **llama.cpp and MLX tracks — perplexity equivalence.** The runner measures
-  PPL over a fixed corpus (`fixtures/gainz-corpus.txt`) on stock and on your
-  build in the same paired run and accepts a relative delta of **≤ 0.5%**
-  (identical output is a fast path).
-- **vLLM tracks — teacher-forced agreement.** The baseline's greedy
-  completion is replayed through your candidate and the argmax must match at
-  **≥ 90%** of positions.
+- **All tracks — perplexity equivalence.** The runner measures PPL over a
+  fixed text on stock and on your build within the same paired run and
+  accepts a relative delta of **≤ 0.5%**. On llama.cpp this is
+  `llama-perplexity` over `fixtures/gainz-corpus.txt`; on MLX it is
+  `tools/mlx_bench.py --mode ppl`; on vLLM it is computed from
+  `prompt_logprobs`.
+- **vLLM tracks additionally — teacher-forced agreement ≥ 90%.** The
+  baseline's greedy completion is replayed through your candidate and the
+  argmax must match at ≥ 90% of positions. These engines are deterministic
+  under `VLLM_BATCH_INVARIANT=1`, so the check is available there and is kept
+  as a second, coarser signal.
+
+Why both, and why perplexity is the one that generalizes: teacher-forcing
+asks whether the greedy *argmax sequence* still matches, while perplexity
+asks whether the model still computes the same *distribution*. Once you are
+writing real kernels, those come apart — an accumulation reorder flips
+knife-edge argmaxes without changing what the model believes, and a genuine
+numeric error can move the distribution while the greedy text happens to
+survive. Note the gate is **equivalence, not quality**: a candidate whose
+perplexity *improves* by more than 0.5% is also rejected, because changing
+what the model computes is out of scope even when the new numbers look
+better.
 
 Both are *accuracy-preserving* rather than bit-preserving, and that is
 deliberate. Laguna routes top-8 of 256 experts per layer, so any float32
