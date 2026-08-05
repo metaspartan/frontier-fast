@@ -89,27 +89,27 @@
          y = C * conv_out
          return self.out_proj(y)
  
-@@ -256,6 +302,76 @@
-                 break
- 
-     def __call__(
-+        self,
-+        inputs: mx.array,
-+        cache=None,
-+        input_embeddings: Optional[mx.array] = None,
-+    ):
+@@ -261,6 +307,81 @@
+         cache=None,
+         input_embeddings: Optional[mx.array] = None,
+     ):
 +        if cache is None or input_embeddings is not None:
 +            return self._stock_forward(inputs, cache, input_embeddings)
 +
-+        # Build compiled closure on first call (captures self in closure)
++        # Compute masks BEFORE extracting cache arrays (needs cache objects)
++        h_tmp = self.embed_tokens(inputs) if input_embeddings is None else input_embeddings
++        attn_mask = create_attention_mask(h_tmp, cache[self.fa_idx])
++        conv_mask = create_ssm_mask(h_tmp, cache[self.conv_idx])
++
++        # Build compiled closure on first call
 +        if not hasattr(self, "_compiled_fn"):
 +            _self = self
++            fa_idx = self.fa_idx
++            conv_idx = self.conv_idx
 +
 +            @mx.compile
-+            def _compiled_fn(inputs, cache_flat):
++            def _compiled_fn(inputs, attn_mask, conv_mask, cache_flat):
 +                h = _self.embed_tokens(inputs)
-+                attn_mask = create_attention_mask(h, cache_flat[_self.fa_idx])
-+                conv_mask = create_ssm_mask(h, cache_flat[_self.conv_idx])
 +                new_flat = []
 +                idx = 0
 +                for layer, ct in zip(_self.layers, _self._cache_types):
@@ -145,7 +145,7 @@
 +            else:
 +                flat.append(c[0] if c[0] is not None else mx.zeros((1, 2, 2048), dtype=mx.bfloat16))
 +
-+        out, new_flat = self._compiled_fn(inputs, flat)
++        out, new_flat = self._compiled_fn(inputs, attn_mask, conv_mask, flat)
 +
 +        # Write back cache
 +        idx = 0
@@ -163,6 +163,11 @@
 +        return out
 +
 +    def _stock_forward(
-         self,
-         inputs: mx.array,
-         cache=None,
++        self,
++        inputs: mx.array,
++        cache=None,
++        input_embeddings: Optional[mx.array] = None,
++    ):
+         if input_embeddings is not None:
+             h = input_embeddings
+         else:
