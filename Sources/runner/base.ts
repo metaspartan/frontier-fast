@@ -21,12 +21,29 @@ function median(values: number[]): number {
   return sorted.length % 2 ? sorted[mid] : (sorted[mid - 1] + sorted[mid]) / 2;
 }
 
+/** Telemetry label from the contract's machine id. This was hardcoded to
+ * "GB10", which mislabelled every R9700 result. */
+function deviceLabel(machine: string): string {
+  if (machine.includes("r9700")) return "Radeon AI PRO R9700";
+  if (machine.includes("apple")) return "Apple Silicon";
+  if (machine.includes("gb10")) return "GB10";
+  return machine;
+}
+
 /**
- * Baseline runner — participants optimize the serving stack this measures.
+ * OpenAI-completions runner — drives vLLM or llama-server. Participants
+ * optimize the serving stack this measures.
  *
  * Measurement is wall-clock and cache-cold:
  * - TTFT is the wall time of a max_tokens=1 completion over a fresh prompt.
  * - Decode rate comes from a full decode-window completion minus that TTFT.
+ * - Prefill is a two-point slope: the same cold request at a long and a short
+ *   prompt, differenced, so the fixed per-request cost cancels and what is
+ *   left is the marginal prompt-processing rate. This used to be
+ *   `ttft / promptTokens`, which made prefillSpeedup identical to
+ *   ttftSpeedup and rested 0.35 of the score on one number; the trusted
+ *   runner and tools/mlx_bench.py both use the slope, so the local harness
+ *   has to as well or local prefill cannot predict a ranked verdict.
  * - Every timing prompt carries a unique prefix so vLLM prefix caching can
  *   never turn a repeated prompt into a fake prefill speedup.
  * - A fixed greedy correctness probe runs twice; if the engine cannot
@@ -63,7 +80,11 @@ export class VllmRunner implements Runner {
   }
 
   async benchmark(contract: Contract): Promise<BenchmarkResult> {
-    const basePrompt = "The quick brown fox jumps over the lazy dog. ".repeat(Math.ceil(contract.promptTokens / 10));
+    const filler = "The quick brown fox jumps over the lazy dog. ";
+    const basePrompt = filler.repeat(Math.ceil(contract.promptTokens / 10));
+    // Short arm of the prefill slope. Same request shape, ~1/8 the prompt.
+    const shortTokens = Math.max(32, Math.floor(contract.promptTokens / 8));
+    const shortPrompt = filler.repeat(Math.ceil(shortTokens / 10));
     const session = crypto.randomUUID().slice(0, 8);
 
     const probe = await this.timedCompletion(CORRECTNESS_PROMPT, contract.decodeTokens);
@@ -76,21 +97,33 @@ export class VllmRunner implements Runner {
     }
 
     const ttfts: number[] = [];
+    const shortTtfts: number[] = [];
     const decodeSecondsPerToken: number[] = [];
     let promptTokens = contract.promptTokens;
+    let shortPromptTokens = shortTokens;
     let completionTokens = contract.decodeTokens;
     for (let i = 0; i < Math.max(contract.measuredRuns, 1); i++) {
       const first = await this.timedCompletion(`ttft ${session} ${i}: ${basePrompt}`, 1);
+      const short = await this.timedCompletion(`short ${session} ${i}: ${shortPrompt}`, 1);
       const full = await this.timedCompletion(`full ${session} ${i}: ${basePrompt}`, contract.decodeTokens);
       promptTokens = full.promptTokens;
+      shortPromptTokens = short.promptTokens;
       completionTokens = full.completionTokens;
       ttfts.push(first.seconds);
+      shortTtfts.push(short.seconds);
       decodeSecondsPerToken.push(Math.max(full.seconds - first.seconds, 1e-6) / Math.max(full.completionTokens - 1, 1));
     }
 
     const ttftSeconds = median(ttfts);
     const decodePerToken = median(decodeSecondsPerToken);
-    const prefillPerToken = ttftSeconds / Math.max(promptTokens, 1);
+
+    // Two-point slope; fall back to the TTFT-derived rate only if the two
+    // points are too close to difference meaningfully.
+    const deltaTokens = promptTokens - shortPromptTokens;
+    const deltaSeconds = ttftSeconds - median(shortTtfts);
+    const prefillPerToken = deltaTokens > 0 && deltaSeconds > 1e-4
+      ? deltaSeconds / deltaTokens
+      : ttftSeconds / Math.max(promptTokens, 1);
 
     return {
       schemaVersion: 1,
@@ -102,7 +135,7 @@ export class VllmRunner implements Runner {
       decode: { tokens: completionTokens, secondsPerToken: decodePerToken, tokensPerSecond: 1 / decodePerToken },
       ttft: { seconds: ttftSeconds },
       outputSha256,
-      telemetry: { gpuName: "GB10" },
+      telemetry: { gpuName: deviceLabel(contract.machine) },
       eligible: selfConsistent,
       failure: selfConsistent ? undefined : "engine output is nondeterministic for identical greedy input; serve with VLLM_BATCH_INVARIANT=1",
     };

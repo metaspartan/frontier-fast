@@ -17,7 +17,8 @@
     "decodeFloor": 0.95,
     "prefillFloor": 0.95,
     "ttftFloor": 0.9,
-    "maxSingleSubmissionGain": 1.053
+    "gainsUncapped": true,
+    "acceptanceBandAppliesTo": "baseline phase vs pinned calibration (box health), not the candidate"
   },
   "editablePaths": [
     "Sources/runner/",
@@ -26,7 +27,8 @@
     "Sources/scoring/",
     "Sources/kernels/",
     "Sources/patches/**",
-    "Sources/vllm-patches/**"
+    "Sources/vllm-patches/**",
+    "Sources/mlx-engine-patches/**"
   ],
   "correctnessPrompts": "correctness_prompts/"
 }

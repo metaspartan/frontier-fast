@@ -1,14 +1,16 @@
 {
   "name": "gainz-fast-challenge",
   "version": "0.1.0",
-  "description": "gainz.fast inference optimization challenge for DGX Spark",
+  "description": "gainz.fast inference optimization challenge across NVIDIA, AMD and Apple runners",
   "license": "MIT",
   "type": "module",
   "scripts": {
     "benchmark": "bun run Sources/cli.ts benchmark",
-    "test": "bun test"
+    "test": "bun test",
+    "typecheck": "tsc --noEmit"
   },
   "devDependencies": {
-    "@types/bun": "latest"
+    "@types/bun": "latest",
+    "typescript": "^5"
   }
 }

@@ -1,5 +1,7 @@
 node_modules/
 .bun/
+__pycache__/
+.venv/
 weights/
 results/
 .env

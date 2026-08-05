@@ -1,15 +1,22 @@
 # lfm2.5-2.6b-gguf-r9700-v1 — patch series
 
-## Landed / pending
+## Landed
 
-| Patch | Status | Notes |
+All three are verified on the trusted R9700 runner. The scores below are the
+runner's, not local ones.
+
+| Patch | Verdict | What it does |
 | --- | --- | --- |
-| `0001-mmvq-narrow-starved-blocks.patch` | **won** (+17.177% decode, score ~1.100) | Idle-warp narrow for starved K=2048 q4_K shapes |
-| `0002-mmvq-dedupe-q8-1-requant.patch` | **won** (score 1.1067, decode 1.170x / 211.3 tok/s) | Per-graph q8_1 activation cache |
-| `0003-mmvq-grouped-launch.patch` | **won** (score 1.1103, decode 1.176x / 212.2 tok/s) | Group same-activation Q/K/V matvecs into one launch |
+| `0001-mmvq-narrow-starved-blocks.patch` | **won** — score 1.0999 (+9.99%), decode 1.1621 | Drop idle warps on starved K=2048 q4_K shapes |
+| `0002-mmvq-dedupe-q8-1-requant.patch` | **won** — score 1.1067 (+10.67%), decode 211.3 tok/s | Per-graph q8_1 activation cache |
+| `0003-mmvq-grouped-launch.patch` | **won** — score 1.1103 (+11.03%), decode 212.2 tok/s | Group same-activation Q/K/V matvecs into one launch |
 
-`0001` is the first landed win: **+17.177%** decode (180.325 -> 211.439 tok/s),
-prefill neutral, perplexity bit-identical.
+Read the runner's number, not your local one. `0001` measured **+17.177%**
+decode locally (180.325 -> 211.439 tok/s) and landed at **+9.99%** overall:
+decode 1.1621 (179.87 -> 209.73 tok/s), prefill 0.9957 (neutral), perplexity
+bit-identical. A clean local figure routinely lands a point or two lower once
+the runner's paired protocol and the prefill term are applied — budget for
+that before deciding a candidate is worth a runner slot.
 
 It removes idle mmvq warps. On the RDNA4 table `calc_nwarps()` returns 8 for
 q4_K at `ncols_dst=1`, which wants 16 k-blocks, but every K=2048 tensor in this
