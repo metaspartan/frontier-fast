@@ -204,6 +204,26 @@ infrastructure fault, not a comment on your patch. (A field named
 `maxSingleSubmissionGain: 1.053` used to sit in the registry while the R9700
 frontier stood at +37%; it was never enforced and has been removed.)
 
+## Python on the runners is uv
+
+Every Python environment the trusted runners create — the MLX candidate venv,
+the engine rebuild, the vLLM kernel plugin install — uses **uv**, not pip or
+`python -m venv`. It resolves and installs in seconds rather than minutes,
+which matters because some of that happens inside your submission's measured
+turnaround, and it pins deterministically so two submissions get identical
+build environments.
+
+Use it locally too, so your environment matches the one you are scored in:
+
+```bash
+curl -LsSf https://astral.sh/uv/install.sh | sh
+uv venv .venv && . .venv/bin/activate
+uv pip install mlx-lm            # MLX tracks
+```
+
+`uv pip install` takes the same arguments as `pip install`. Inside a container
+where there is no venv, `uv pip install --system` is the equivalent.
+
 ## Custom kernels: what each engine lets you do
 
 You can write real kernels on **all three engines**. What differs is only how

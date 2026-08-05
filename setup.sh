@@ -46,7 +46,7 @@ case "$TRACK" in
     command -v python3 >/dev/null || echo "  WARNING: python3 not found"
     python3 -c 'import mlx_lm' 2>/dev/null \
       && echo "  mlx-lm: installed" \
-      || echo "  mlx-lm: MISSING — run: python3 -m venv .venv && . .venv/bin/activate && pip install mlx-lm"
+      || echo "  mlx-lm: MISSING — run: uv venv .venv && . .venv/bin/activate && uv pip install mlx-lm"
     echo "  harness: tools/mlx_bench.py (set GAINZ_PYTHON to pick a different interpreter)"
     echo "  engine rebuilds (Sources/mlx-engine-patches/) need cmake, ninja and Xcode."
     ;;
