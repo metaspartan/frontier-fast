@@ -85,8 +85,9 @@ It is applied to the **baseline phase** of a run, comparing this run's
 measurement of stock against the pinned calibration reference for the box. It
 answers "is this machine healthy right now", not "did the candidate gain too
 much". A band rejection is an infrastructure fault to be retried, not a
-comment on your patch. (`maxSingleSubmissionGain` in `benchmark.json` and
-`/api/tracks` is the upper edge of that band, despite the name.)
+comment on your patch. Gains themselves are uncapped: `/api/tracks` carries
+`gainsUncapped: true`, and the misleadingly named `maxSingleSubmissionGain`
+that used to imply a ~5% ceiling has been removed.
 
 The rule that *does* constrain you is the **frontier rule**: your candidate is
 scored against the track's current best, not against stock, so a result that

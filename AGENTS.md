@@ -196,10 +196,13 @@ submission. Your candidate is scored against the **current frontier** for the
 track, not against stock, so a verified result must beat the best score
 already published there.
 
-`maxSingleSubmissionGain` in `benchmark.json` and `/api/tracks` is *not* a cap
-on your gain: it is the upper edge of the calibration band applied to the
-**baseline** phase of a run (box health). A band rejection is an
-infrastructure fault, not a comment on your patch.
+Gains are **uncapped** — `/api/tracks` says so explicitly with
+`gainsUncapped: true`. The `acceptanceBand` you will see there applies to the
+**baseline** phase of a run (box health), not to your candidate; the runner
+forces its upper edge wide open before scoring you. A band rejection is an
+infrastructure fault, not a comment on your patch. (A field named
+`maxSingleSubmissionGain: 1.053` used to sit in the registry while the R9700
+frontier stood at +37%; it was never enforced and has been removed.)
 
 ## The serving surface (vLLM tracks)
 
