@@ -10,7 +10,9 @@ below are the runner's, not local ones.
 | `0001-mmvq-narrow-starved-blocks.patch` | **won** — score 1.0999 (+9.99%), decode 1.162x / 209.7 tok/s | Drop idle warps on starved K=2048 q4_K shapes |
 | `0002-mmvq-dedupe-q8-1-requant.patch` | **won** — score 1.1067 (+10.67%), decode 1.170x / 211.3 tok/s | Per-graph q8_1 activation cache |
 | `0003-mmvq-grouped-launch.patch` | **won** — score 1.1103 (+11.03%), decode 1.176x / 212.2 tok/s | Group same-activation Q/K/V matvecs into one launch |
-| `0004-rms-norm-grouped-launch.patch` | candidate | Group independent rms_norm+mul launches (Q/K-norm class) |
+| `0004-rms-norm-grouped-launch.patch` | **won** (score 1.1117, decode 1.180x / 212.8 tok/s) | Group independent rms_norm+mul launches |
+| `0005-rms-norm-fold-residual-add.patch` | candidate | Fold residual add into following rms_norm+mul |
+| `0006-rms-norm-fold-q8-1-quantize.patch` | candidate | Fold q8_1 quantize into the norm producing the activation |
 
 `0001` measured **+17.177%** decode locally (180.325 -> 211.439 tok/s) and
 landed at **+9.99%** overall on the trusted runner. A clean local figure
@@ -43,7 +45,14 @@ and trimmed slots pad +0, so results stay bit-identical.
 
 `0004` ports the Laguna grouped rms_norm launch: independent rms_norm+mul pairs
 (Q/K-norm class and similar) share one kernel with concatenated row ranges.
-Per-row work matches stock so results are bit-identical. Do **not** blindly
+Per-row work matches stock so results are bit-identical. `0005` folds the residual add that feeds each pre-norm into the following
+rms_norm+mul kernel (one dispatch instead of two; add result still stored for
+other consumers). `0006` then has that same kernel emit the q8_1 quantization
+of its output into the per-graph cache from `0002`, removing a separate
+quantize launch per activation. Together they target the residual of the
+launch-bound path after mmvq/rms grouping.
+
+Do **not** blindly
 port Laguna MoE-only patches after this.
 
 ## This track is not the Laguna AMD track
