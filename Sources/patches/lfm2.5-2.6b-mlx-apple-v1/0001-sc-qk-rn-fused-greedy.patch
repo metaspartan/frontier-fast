@@ -1,6 +1,6 @@
 --- a/mlx_lm/models/lfm2.py
 +++ b/mlx_lm/models/lfm2.py
-@@ -13,6 +13,156 @@
+@@ -13,6 +13,113 @@
      scaled_dot_product_attention,
  )
  from .cache import ArraysCache, KVCache
@@ -101,39 +101,6 @@
 +    """,
 +)
 +
-+_RMSNORM_2048_KERNEL = mx.fast.metal_kernel(
-+    name="lfm2_rmsnorm_2048",
-+    input_names=["x", "w"],
-+    output_names=["out"],
-+    source=r"""
-+        constexpr uint D = 2048;
-+        constexpr uint NR = 4;
-+        constexpr float EPS = 1e-5f;
-+        uint lid = thread_position_in_threadgroup.x;
-+        uint row = threadgroup_position_in_grid.x;
-+        uint base = row * D;
-+        const device T* xin = x + base + lid * NR;
-+        const device T* w = w + lid * NR;
-+        float tx[NR] = {0};
-+        for (uint i = 0; i < NR; i++) tx[i] = (float)xin[i];
-+        float acc = 0;
-+        for (uint i = 0; i < NR; i++) acc += tx[i] * tx[i];
-+        threadgroup float gs[16];
-+        acc = simd_sum(acc);
-+        uint sg = lid / 32;
-+        uint lane = lid % 32;
-+        if (lane == 0) gs[sg] = acc;
-+        threadgroup_barrier(mem_flags::mem_threadgroup);
-+        float total = 0;
-+        for (uint g = 0; g < 16; g++) total += gs[g];
-+        float inv = metal::precise::rsqrt(total / (float)D + EPS);
-+        for (uint i = 0; i < NR; i++) {
-+            T nb = (T)(tx[i] * inv);
-+            out[base + lid * NR + i] = (T)(w[i] * nb);
-+        }
-+    """,
-+)
-+
 +
 +def _fused_rn(r, x, weight):
 +    rows = x.size // 2048
@@ -144,20 +111,10 @@
 +        output_dtypes=[x.dtype, x.dtype],
 +    )
 +
-+
-+def _fused_norm(x, weight):
-+    rows = x.size // 2048
-+    return _RMSNORM_2048_KERNEL(
-+        inputs=[x, weight], template=[("T", x.dtype)],
-+        grid=(rows * 512, 1, 1), threadgroup=(512, 1, 1),
-+        output_shapes=[(x.size,)],
-+        output_dtypes=[x.dtype],
-+    )[0].reshape(x.shape)
-+
  
  
  @dataclass
-@@ -86,21 +236,36 @@
+@@ -86,21 +193,36 @@
  
          queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
  
@@ -182,7 +139,10 @@
 +            )
 +            queries = q_f.reshape(B, self.n_heads, L, self.head_dim)
 +            keys = k_f.reshape(B, self.n_kv_heads, L, self.head_dim)
-+            keys, values = cache.update_and_fetch(keys, values)
+             keys, values = cache.update_and_fetch(keys, values)
+-        else:
+-            queries = self.rope(queries)
+-            keys = self.rope(keys)
 +        elif cache is not None:
 +            queries = self.rope(
 +                self.q_layernorm(queries.reshape(B, L, self.n_heads, -1)).transpose(0, 2, 1, 3),
@@ -192,10 +152,8 @@
 +                self.k_layernorm(keys.reshape(B, L, self.n_kv_heads, -1)).transpose(0, 2, 1, 3),
 +                offset=cache.offset,
 +            )
-             keys, values = cache.update_and_fetch(keys, values)
-         else:
--            queries = self.rope(queries)
--            keys = self.rope(keys)
++            keys, values = cache.update_and_fetch(keys, values)
++        else:
 +            queries = self.rope(
 +                self.q_layernorm(queries.reshape(B, L, self.n_heads, -1)).transpose(0, 2, 1, 3)
 +            )
@@ -205,7 +163,7 @@
  
          output = scaled_dot_product_attention(
              queries, keys, values, cache=cache, mask=mask, scale=self.scale
-@@ -137,6 +302,30 @@
+@@ -137,6 +259,30 @@
          mask: Optional[mx.array] = None,
          cache: Optional[Any] = None,
      ):
@@ -236,14 +194,7 @@
          BCx = self.in_proj(x)
          B, C, x = mx.split(BCx, 3, axis=-1)
          Bx = B * x
-@@ -225,12 +414,18 @@
-             r = self.self_attn(self.operator_norm(x), mask=mask, cache=cache)
-         else:
-             r = self.conv(
--                self.operator_norm(x),
-+                _fused_norm(x, self.operator_norm.weight)
-+                if (x.shape[1] == 1 and x.shape[-1] == 2048)
-+                else self.operator_norm(x),
+@@ -229,8 +375,12 @@
                  mask=mask,
                  cache=cache,
              )
