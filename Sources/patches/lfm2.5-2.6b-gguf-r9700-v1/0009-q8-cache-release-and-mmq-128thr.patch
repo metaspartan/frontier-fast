@@ -1,8 +1,7 @@
 From a2b0d288af9384a0417feab2786a0c4281b69f25 Mon Sep 17 00:00:00 2001
 From: Cybara <carsenk@gmail.com>
 Date: Wed, 5 Aug 2026 23:04:18 +0000
-Subject: [PATCH] 
- cand8:nq8_1ncachenreleasenbeforenpoolnteardownn+nmmqn128thrnprefilln
+Subject: [PATCH] cand8: q8_1 cache release before pool teardown + mmq 128thr prefill
 
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu         |  5 +++++
@@ -17,10 +16,10 @@ index eb501d2..a3feafd 100644
  static std::atomic<int> ggml_cuda_lock_counter;
  
  ggml_backend_cuda_context::~ggml_backend_cuda_context() {
-+    if (quantized_src1_cache) {
-+        delete quantized_src1_cache;
-+        quantized_src1_cache = nullptr;
-+    }
++    // The q8_1 reuse cache (patch 0002) holds pool allocations that would
++    // otherwise outlive the pools, tripping the teardown
++    // GGML_ASSERT(pool_size == 0) and crashing the process after serving.
++    quantized_src1_cache.clear();
 +
      std::unique_lock<std::mutex> lock(ggml_cuda_lock);
      ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
@@ -61,4 +60,3 @@ index 9293d9d..1b1669e 100644
      CASE(GGML_TYPE_Q6_K, 256, 2, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, false, false);
 -- 
 2.53.0
-
