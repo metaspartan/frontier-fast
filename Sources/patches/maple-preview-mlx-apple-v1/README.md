@@ -3,8 +3,7 @@
 | Patch | Intent |
 | --- | --- |
 | `0001-registry-load-flashhead.patch` | Registry-preferred model load (no trust_remote_code needed) + auto-enable FlashHead approximate lm_head for L=1 decode |
-| `0002-request-overhead.patch` | Per-request host overhead: cache the BPE detokenizer tokenmap (was rebuilt from a fresh `tokenizer.vocab` dict on every `stream_generate` call, ~95 ms on M1 Ultra); stop flushing the MLX buffer pool after the final prefill chunk and at decode step 0 (both flushes forced the next allocations back to the OS). **Verified: +20.93% frontier** |
-| `0003-ngram-speculation.patch` | Draftless n-gram speculation (k≤3 chains, prompt-lookup, most-recent-wins) with exact greedy verification; loose-draft RotatingKVCache (commit the certain token in place, carry draft K/V loose, commit-on-accept / drop-on-reject — no rollback, no clobbered ring slot); rotation-aware verify masks; per-position FlashHead at verify L≤4; cached fp32 router weight (was a 2 MB astype per layer per reference-router call). Env toggles: `MLX_NGRAM_SPEC=0` disables, `MLX_NGRAM_SPEC_K` caps chain length |
+| `0002-request-overhead.patch` | Per-request host overhead: cache the BPE detokenizer tokenmap (was rebuilt from a fresh `tokenizer.vocab` dict on every `stream_generate` call, ~95 ms on M1 Ultra); stop flushing the MLX buffer pool after the final prefill chunk and at decode step 0 (both flushes forced the next allocations back to the OS) |
 
 ## Why registry-preferred load
 
@@ -72,27 +71,6 @@ detokenizer rebuilt its tokenmap from it on every request (~95 ms, inside
 measured TTFT but before `prompt_time`'s clock starts); the two
 `mx.clear_cache()` calls dumped the warm buffer pool right where decode (and
 the next harness run's prefill) re-allocates it.
-
-## 0003 measurements (interleaved whole-process A/B, official harness)
-
-Feasibility on the benchmark corpus: n-gram proposal coverage 0.873,
-acceptance-when-proposed 0.957, overall hit 0.836. Perplexity bit-identical
-(115.8171952670014) — the ppl path never speculates.
-
-Decode is regime-dependent and the two dev boxes bracket the runner:
-
-- M1 Ultra (dispatch-latency-bound): decode 168.7 → 242.9 tok/s (**1.44x**),
-  prefill 1.017, ttft 1.017.
-- M4 Pro mini (GPU-throughput-bound, ~6% per-launch lottery): per-round
-  decode ratios 1.024 / 1.015 / 1.051 (median **1.024**), prefill 1.005,
-  ttft 1.005 — positive in all three rounds.
-
-Token-stream note: batched verify uses the reference QK/router kernels while
-L=1 uses the fused ones; their low-bit differences flip near-tie argmaxes a
-few steps after an accept, so the greedy text can drift from the unspeculated
-stream. Verified three ways that the spec attention semantics are exact:
-spec-mode verify == stock concat-path verify == plain L=1 on identical cache
-state. The drift is the same class the ppl gate was adopted to tolerate.
 
 ## Local numbers (M4 Pro, directional)
 
