@@ -1,0 +1,77 @@
+diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
+index 60d8001..805e83a 100644
+--- a/mlx_lm/models/maple.py
++++ b/mlx_lm/models/maple.py
+@@ -1078,6 +1078,72 @@ class Model(nn.Module):
+ 
+         return weights
+ 
++    def load_weights(self, weights, strict=True):
++        out = super().load_weights(weights, strict=strict)
++        self._regroup_ternary_scales()
++        return out
++
++    @staticmethod
++    def _gs512_available():
++        """One-time probe: does this engine instantiate gs512/bits2 kernels?
++        Stock mlx wheels ship only gs 32/64/128; the track's engine patch adds
++        512 for bits=2. Degrade silently on a stock engine."""
++        try:
++            w = mx.zeros((8, 512 // 16), dtype=mx.uint32)
++            s = mx.ones((8, 1), dtype=mx.bfloat16)
++            x = mx.zeros((1, 512), dtype=mx.bfloat16)
++            mx.eval(
++                mx.quantized_matmul(
++                    x, w, scales=s, biases=-s, transpose=True, group_size=512, bits=2
++                )
++            )
++            return True
++        except Exception:
++            return False
++
++    def _regroup_ternary_scales(self):
++        """Ternary tensors carry one scale per output row (row_alpha); load
++        expands that to per-group scales/biases at group_size 128 for mlx's
++        affine kernels — 4 redundant bytes per 32 code bytes read on every
++        matmul. Merging to group_size 512 dequantizes every element with the
++        same scale and bias values (each merged run is constant), so outputs
++        are bit-identical while the scale/bias read shrinks 4x. Only rows
++        whose runs really are constant regroup; anything else is left alone.
++        """
++        import sys
++
++        have = self._gs512_available()
++        print(
++            f"[maple] gs512 ternary regroup: engine support {'present' if have else 'absent'}",
++            file=sys.stderr,
++        )
++        if not have:
++            return
++
++        def eligible(m):
++            return (
++                getattr(m, "bits", None) == 2
++                and getattr(m, "group_size", None) == 128
++                and hasattr(m, "scales")
++                and m.scales.shape[-1] % 4 == 0
++            )
++
++        for _, m in self.named_modules():
++            if not eligible(m):
++                continue
++            s, b = m.scales, m.biases
++            rs = s.reshape(*s.shape[:-1], -1, 4)
++            rb = b.reshape(*b.shape[:-1], -1, 4)
++            constant_runs = bool(
++                mx.all(rs == rs[..., :1]) and mx.all(rb == rb[..., :1])
++            )
++            if not constant_runs:
++                continue
++            m.scales = mx.contiguous(s[..., ::4])
++            m.biases = mx.contiguous(b[..., ::4])
++            m.group_size = 512
++            mx.eval(m.scales, m.biases)
++
+     def make_cache(self):
+         caches = []
+         for layer_type in self.model.layer_types:
