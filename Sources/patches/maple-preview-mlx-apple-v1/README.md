@@ -109,6 +109,21 @@ down gather) 0.054, fused add+norm ×2 ~0.01, aggregate ~0.004 → 0.14/layer.
   CLOSED verdict; full implementation preserved in
   `reference/fused-moe-decode-attempt.patch.txt` (not part of the applied
   series). CLOSED at the overlay level.
+- **Dense bf16 prefill attention (2026-08-06)**: ternary dequant is EXACT in
+  bf16 (weights are {-a, 0, +a} with a already bf16), and dense bf16 GEMM
+  beats the 2-bit dequant GEMM 1.26x at prefill shapes (5.99 vs 4.75
+  TFLOPS). Keeping dense copies of qkv/o_proj (+503 MB) and routing L>1
+  through them measured prefill +1.5%, ttft +1.4% — but decode -0.5%
+  (residency/cache pressure, likely worse on the 16 GB runner) for a net
+  ~+0.2% score, and it spends 0.29% of the 0.5% ppl budget (113.638 vs
+  113.966 — accumulation order differs even though the products are exact).
+  Below the frontier-noise bar with amplified runner risk. CLOSED as
+  measured; the exact-bf16-dequant fact may matter elsewhere.
+- **Custom-kernel math_mode (2026-08-06)**: mx.fast.metal_kernel compiles at
+  MathMode::Safe by default and compile_options={"math_mode": "relaxed"/
+  "fast"} is available per kernel — measured IDENTICAL (0.83x/0.83x/0.81x)
+  on the fused-MoE kernels. The ~17-20% custom-kernel deficit is not
+  compile flags; it sits at ISA/scheduling level. CLOSED.
 - **gs512 ternary scale regroup (2026-08-06)**: row-alpha scales are per-row
   constant, so regrouping scales/biases gs128→gs512 (with a 2-line engine
   patch adding `instantiate_quantized_types(512, 2)` to quantized.metal +
