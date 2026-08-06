@@ -56,11 +56,25 @@ bit-identical to the 0001-only build on both corpora (runner corpus
 21.8757, +0.317% vs stock; repo fixture 108.5970, −0.077% vs stock), and
 greedy completions match the 0001-only build on short and long prompts.
 
-## Open levers
+## 0018: MMQ tiles for TQ2_0
 
-1. **MMQ tiles for TQ2_0** — prefill currently dequantizes experts to f16
-   and runs GEMM per expert; real q8 tile kernels should take prefill much
-   further (upstream mmq-load-tiles is per-type; ternary loads are trivial).
+Real quantized tile GEMM for prefill, replacing the dequant->f16-GEMM
+fallback. TQ2_0 registers with the Q8_0 tile format and D4 scale layout
+(one f16 scale replicated across the block's 8 chunk-scale slots); the
+loader unpacks each x-int to 4 chunk lanes with mask + __vsubss4, exactly
+the mmvq mapping. MMQ_ITER_K == QK_K so one block per iteration; shared
+q8_0 vec_dot and writeback; config rows mirror Q2_0 on every arch table.
+
+Measured (runner box, 3-round interleaved A/B vs the 0001-0017 frontier
+build): prefill pp512 2104-2119 -> 8544-8656 tok/s (**~4.06x**, ~10x vs
+stock); decode unchanged (286.8-289.9). PPL -c 512 --chunks 8 on the
+gate corpus: 21.7004 vs stock 21.8066 = |-0.487%| (limit 0.5%) — MMQ
+quantizes prefill activations to q8_1, the same standard engine path every
+K-quant model takes; the shift is an improvement in absolute ppl but the
+margin to the gate is thin. Greedy completions stay coherent (near-tie
+drift on long prompts only, as expected for changed prefill numerics).
+
+## Open levers
 2. Sliding-window attention (3 of 4 layers, window 512) — untouched.
 3. Shared-launch/fusion ideas from laguna 0017/0018 do not apply (maple has
    no shared expert).
