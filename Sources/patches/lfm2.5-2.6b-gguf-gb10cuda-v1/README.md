@@ -1,18 +1,19 @@
 # lfm2.5-2.6b-gguf-gb10cuda-v1 — patch series
 
-**Intentionally empty.** No submission has beaten the baseline, so this track's
-frontier IS pinned llama.cpp b10237. Add yours as `0001-`.
+The laguna-xs gb10cuda engine family 0001–0011, unchanged (q8_1 requant
+dedupe, grouped launches with grouped-mmvq off by default, norm/rope/
+set-rows groups, quantize folds, mmvf batched k-loads). No LFM-specific
+patches yet — the R9700 LFM levers (mmvq narrow, pre-add-norm fold) are
+RDNA geometry plays the sm_121 findings warn against porting blind.
 
-LFM2.5 2.6B is a **dense hybrid, not a mixture-of-experts** — none of the
-expert-dispatch levers from the Laguna tracks exist here. At 1.55 GiB of
-weights, decode is dominated by per-launch overhead rather than weight
-bandwidth, which is a different regime from every Laguna track.
+## Measured (runner box gx10-838f, 5-round interleaved whole-process A/B)
 
-The identical model also runs on `lfm2.5-2.6b-gguf-r9700-v1` (RDNA4). That is
-deliberate: it is the only way to tell whether a kernel idea is portable or is
-really a device quirk. Check the sibling track's findings before assuming a win
-transfers — one cross-track port on this platform (the q8_1 dedupe, +8.69% on
-AMD) turned out to be worth about 0.6% on the other box.
+- decode tg128: stock 74.30–75.17 → cand 74.80–75.40, median per-round
+  ratio **1.0091**
+- prefill pp512: 3008–3017 → 3034–3042, median ~1.0083
+- ppl `-c 512 --chunks 8`: **22.7466 → 22.7466 bit-identical**
 
-Accuracy gate: perplexity within 0.5% of stock via `llama-perplexity` on the
-fixed corpus. Build that target as well as `llama-server`.
+Consistent with the platform's cross-port finding (the +8.69% AMD dedupe
+was worth ~0.6% here): this box is memory-latency bound, not launch bound,
+and LFM's small graph gives the launch levers little to remove. Submitted
+to establish the frontier on a null track; expect ~+0.8%.
