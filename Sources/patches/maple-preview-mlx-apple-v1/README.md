@@ -70,6 +70,21 @@ down gather) 0.054, fused add+norm ×2 ~0.01, aggregate ~0.004 → 0.14/layer.
   CLOSED.
 - **In-place KV write from QK kernel**: mlx metal_kernel wraps inputs as
   `const device` — writes are compile errors. CLOSED.
+- **Prefill expert GEMMs (2026-08-06)**: sorted gather runs at 94% of the
+  box's dequant-GEMM ceiling (4.08 vs 4.34 TFLOPS dense on M4 Pro), and
+  segment size does not matter (16-row segments vs tile-filling 64-row:
+  1.01x) — the NAX gather absorbs ragged segments. The ceiling is the 2-bit
+  dequant GEMM rate itself, confirming the earlier "fp32 compute floor"
+  verdict mechanically. Unsorted gather is 2.3x worse — never remove the
+  sort. CLOSED.
+- **qmv guarded-tail fix (2026-08-06)**: qmv_impl's K-loop sends the final
+  full block through the runtime-bounded safe path for K % 512 == 0 — but
+  every matvec shape in this model (N % 8 == 0, K % 512 == 0) dispatches to
+  qmv_fast / gather_qmv_fast, which have no guarded tail. A fix never fires
+  here. Kernel census for decode: qmv_fast (qkv, o_proj), gather_qmv_fast
+  (up_gate, down; M=1 stays on the vector path — get_qmv_batch_limit gates
+  the matrix path), fused metal_kernels for router/QK/add-norm, FlashHead
+  gather. CLOSED.
 - **gs512 ternary scale regroup (2026-08-06)**: row-alpha scales are per-row
   constant, so regrouping scales/biases gs128→gs512 (with a 2-line engine
   patch adding `instantiate_quantized_types(512, 2)` to quantized.metal +
