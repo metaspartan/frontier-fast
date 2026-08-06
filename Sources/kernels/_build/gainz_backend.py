@@ -25,7 +25,7 @@ import zipfile
 
 NAME = "gainz_kernels"
 DIST_NAME = "gainz-kernels"
-VERSION = "0.2.0"
+VERSION = "0.4.0"
 TAG = "py3-none-any"
 
 _METADATA = (
