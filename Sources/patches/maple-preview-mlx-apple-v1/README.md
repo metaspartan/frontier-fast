@@ -3,7 +3,8 @@
 | Patch | Intent |
 | --- | --- |
 | `0001-registry-load-flashhead.patch` | Registry-preferred model load (no trust_remote_code needed) + auto-enable FlashHead approximate lm_head for L=1 decode |
-| `0002-request-overhead.patch` | Per-request host overhead: cache the BPE detokenizer tokenmap (was rebuilt from a fresh `tokenizer.vocab` dict on every `stream_generate` call, ~95 ms on M1 Ultra); stop flushing the MLX buffer pool after the final prefill chunk and at decode step 0 (both flushes forced the next allocations back to the OS) |
+| `0002-request-overhead.patch` | Per-request host overhead: cache the BPE detokenizer tokenmap (was rebuilt from a fresh `tokenizer.vocab` dict on every `stream_generate` call, ~95 ms on M1 Ultra); stop flushing the MLX buffer pool after the final prefill chunk and at decode step 0 (both flushes forced the next allocations back to the OS). **Verified: +20.93% frontier** |
+| `0003-flashhead-probes-256.patch` | FlashHead probe count 512 → 256 for this checkpoint: halves the probed lm_head read (16.8 → 8.4 MB per decoded token). Probe sweep on the benchmark corpus: 0/640 greedy tokens drift at 384, 256 and 192 probes; the miss cliff is at 128 (239/640). 256 keeps a 2x margin above the cliff. ppl gate untouched (prefill/ppl use the exact head). `MLX_FLASH_PROBES` overrides for same-binary A/B |
 
 ## Why registry-preferred load
 
@@ -51,7 +52,16 @@ down gather) 0.054, fused add+norm ×2 ~0.01, aggregate ~0.004 → 0.14/layer.
 - **mx.compile of the decode switch**: 1.005x (noise); compile doesn't merge
   matmul-heavy graphs. CLOSED.
 - **N-gram M=2 speculation**: M=2 batch costs 1.5x at the growing rotating
-  cache while accept ≈ 78% — net loss. CLOSED.
+  cache while accept ≈ 78% — net loss. CLOSED. **Re-tested 2026-08-06 with the
+  cache cost removed** (loose-draft RotatingKVCache: certain token commits via
+  the stock S=1 in-place write, draft K/V ride loose, commit-on-accept — no
+  concat, no rollback; k≤3 chains, coverage 0.873 / acceptance 0.957): decode
+  1.44x on M1 Ultra (dispatch-latency-bound) but ~1.02x on M4 Pro and
+  **runner-rejected 1.1949 vs 1.2093** — the runner M4 is GPU-throughput-bound
+  and a 1+k-token verify step costs ~(1+k)x GPU work (8 fresh experts per
+  token; no weight reuse across positions). The implementation survives on
+  branch `maple/0003-ngram-speculation`; the lever stays CLOSED on this
+  hardware for real, not for cache-cost reasons.
 - **bf16 RMSNorm**: 1.002x (noise). CLOSED.
 - **Packed QK norm+rope (4 heads/TG, 1.6x isolated)**: 0.9985 end-to-end —
   GPU already saturated; launch count irrelevant in-context. CLOSED.
@@ -60,6 +70,17 @@ down gather) 0.054, fused add+norm ×2 ~0.01, aggregate ~0.004 → 0.14/layer.
   CLOSED.
 - **In-place KV write from QK kernel**: mlx metal_kernel wraps inputs as
   `const device` — writes are compile errors. CLOSED.
+- **gs512 ternary scale regroup (2026-08-06)**: row-alpha scales are per-row
+  constant, so regrouping scales/biases gs128→gs512 (with a 2-line engine
+  patch adding `instantiate_quantized_types(512, 2)` to quantized.metal +
+  quantized_nax.metal) is bit-identical at every benchmark shape on both the
+  classic and NAX kernel paths — and decode-NEUTRAL: M4 Pro interleaved
+  ratios 0.983/0.988/1.025. The qmv-family kernels are not scale-fetch
+  limited, and M=1 decode never takes the NAX path (`get_qmv_batch_limit`
+  routes small M to the vector kernels). ~9% of ternary bytes are scale/bias
+  overhead, but cutting them buys nothing here. CLOSED. (Side finding: dense
+  qmm at M∈{3..8} picks different valid kernel variants per process — ~1-ulp
+  cross-process flicker exists in stock too.)
 
 ## 0002 measurements (M1 Ultra, interleaved whole-process A/B, official harness)
 

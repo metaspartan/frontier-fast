@@ -1,0 +1,29 @@
+diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
+index a0673f7..60d8001 100644
+--- a/mlx_lm/models/maple.py
++++ b/mlx_lm/models/maple.py
+@@ -1,5 +1,6 @@
+ # Copyright © 2026 DeepGrove AI.
+ 
++import os
+ from dataclasses import dataclass
+ from functools import partial
+ from typing import Any, List, Optional
+@@ -873,9 +874,14 @@ class FlashHead(nn.Module):
+             )
+         n_clusters = meta["n_clusters"]
+         cluster_size = meta["cluster_size"]
+-        # Default matches the converter's `--probes` default; every generated
+-        # checkpoint records the value explicitly.
+-        self.n_probes = min(meta.get("n_probes", 512), n_clusters)
++        # The converter's default is 512 probes, recorded in the metadata.
++        # On this checkpoint 256 probes reproduce every greedy token across
++        # the full benchmark corpus (0/640 drifted; the miss cliff is below
++        # 128 probes) while halving the probed lm_head read from 16.8 MB to
++        # 8.4 MB per decoded token. MLX_FLASH_PROBES overrides for same-binary
++        # A/B; values above the metadata's probe count are clamped to it.
++        n_probes = int(os.environ.get("MLX_FLASH_PROBES", "256"))
++        self.n_probes = min(n_probes, meta.get("n_probes", 512), n_clusters)
+         self.head_group_size = meta.get("head_group_size", 64)
+         self.head_bits = meta.get("head_bits", 4)
+         # Centroids are directions, pre-scaled at generation time by the
