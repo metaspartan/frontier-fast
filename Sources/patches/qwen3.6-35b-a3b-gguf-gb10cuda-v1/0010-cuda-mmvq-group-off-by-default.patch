@@ -1,0 +1,60 @@
+From 4318695fda1a23e03564b19d2011fbb4d89c8148 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Mon, 3 Aug 2026 13:31:56 -0600
+Subject: [PATCH 10/10] CUDA: do not group same-activation matvecs on this
+ device by default
+
+The grouped mmvq launch ported in this series is a large loss on GB10, which
+is the opposite of its effect on RDNA4, so this turns it off by default and
+keeps it behind an opt-in.
+
+Measured with llama-bench (Laguna-XS-2.1-Q4_K_M, -ngl 99, tg128, sm_121,
+CUDA 13.0), interleaved with stock in the same session:
+
+  stock                        96.50 / 96.39 / 96.66 / 96.68 tok/s
+  series with grouping ON      82.06 / 82.44 tok/s          (-15%)
+  series with grouping OFF     99.17 / 98.97 tok/s          (+2.5%)
+
+The cause is not the CUDA-graph path: stock with GGML_CUDA_DISABLE_GRAPHS=1
+measures 94.75 tok/s, so graph replay is worth only ~2% on this box and cannot
+account for a 15% swing. The grouped kernel is simply slower here than the
+per-op mul_mat_vec_q instantiations it replaces - on sm_121 those are
+specialised (own launch bounds, own fusion variant) in a way the segment-routed
+grouped kernel is not, and the dispatches it saves are cheap on this device.
+Every other launch-count patch in the series (rms_norm, rope, set_rows
+grouping, and the quantize folds) stays on and is part of the +2.5%.
+
+The implementation is left in place, correct and byte-exact, behind
+GGML_CUDA_ENABLE_MMVQ_GROUP=1 - nothing groups unless that is set - so the
+lever stays available for CUDA devices where it does pay.
+
+Output is unaffected: greedy text and full float top-5 logprob hashes match
+the stock build on 3 prompts with the default (grouping off) build.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 13 ++++++++++---
+ 1 file changed, 10 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 5fd801f..fb3cadb 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4942,9 +4942,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_PRE_ADD_NORM"));
+             static const bool disable_norm_quant = getenv("GGML_CUDA_DISABLE_NORM_QUANT") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_NORM_QUANT"));
+-            static const bool disable_mmvq_group = getenv("GGML_CUDA_DISABLE_MMVQ_GROUP") != nullptr &&
+-                                                   std::atoi(getenv("GGML_CUDA_DISABLE_MMVQ_GROUP"));
+-            const bool mmvq_group_enabled = !disable_mmvq_group && stream_ctx.concurrent_events.empty();
++            // Measured on GB10 (sm_121, CUDA 13.0, Laguna-XS-2.1-Q4_K_M, llama-bench
++            // tg128): grouping these matvecs costs 15% of decode throughput
++            // (96.5 -> 82.1 tok/s) where it gains on RDNA4. This build path keeps
++            // CUDA graphs enabled, so the dispatches the grouping removes are graph
++            // nodes that cost almost nothing to replay, while the grouped kernel
++            // gives up the per-op specialised instantiation. It is therefore OFF by
++            // default here and kept behind an opt-in for devices where it does pay.
++            static const bool enable_mmvq_group = getenv("GGML_CUDA_ENABLE_MMVQ_GROUP") != nullptr &&
++                                                  std::atoi(getenv("GGML_CUDA_ENABLE_MMVQ_GROUP"));
++            const bool mmvq_group_enabled = enable_mmvq_group && stream_ctx.concurrent_events.empty();
+             static const bool log_mmvq_group_stats = getenv("GGML_MMVQ_GROUP_STATS") != nullptr;
+             int64_t mmvq_group_stats_buf[2] = {0, 0};
+             int64_t * mmvq_group_stats = log_mmvq_group_stats ? mmvq_group_stats_buf : nullptr;
