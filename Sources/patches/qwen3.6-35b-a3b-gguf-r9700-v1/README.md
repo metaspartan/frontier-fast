@@ -77,6 +77,18 @@ per-round ratio **1.0335**; prefill neutral. PPL on the gate corpus 3.9358
 adjacency pins shift which folds fire, all within gate). Server smoke clean
 on short and long prompts.
 
+**Ranked status: real but frontier-blocked by draw variance.** The trusted
+run measured this build at **108.2 tok/s decode** (3/3 paired rounds,
+spread 0.35% — the highest absolute decode recorded on this track; the
+verified frontier entry ran 104.0), confirming the +3.3-4.0% gain. It was
+still rejected (1.1938 vs 1.2980) because the stock baseline drew its FAST
+mode (82.5 tok/s vs the frontier run's 78.1 — the same ~5.5% per-launch
+bimodality the platform documents on Laguna S) and the banked frontier
+score also carries a hot prefill-slope draw (1.199 ranked vs ~1.01 local).
+Compare candidates across runs by absolute cand tok/s, not banked ratios.
+Resubmit this series when the box's stock phase draws slow again, or
+stacked with the next real decode gain.
+
 ## Open levers
 
 1. (moved to closed: shexp ninth-channel — see above)
