@@ -51,6 +51,32 @@ rounds observed in 5 rounds).
   need a second vec_dot template parameter and forfeits the bit-identity
   argument — not worth the +3.6%-class gain unless someone requants.
 
+## 0018: grouped mmvf launch for the GDN small-matvec swarm
+
+The 30 GDN layers issue tiny F32 matvecs (ssm_alpha/ssm_beta [2048->32])
+and every layer runs the F32 router [2048->256] plus the 1-row shared-expert
+gate — ~180 one-warp-per-row launches per token, ~680 us of pure launch
+latency (profiled 1683 dispatches/token total). This patch:
+
+- `mmvf.cu/.cuh`: `mul_mat_vec_f_grouped` — the RDNA single-warp
+  `mul_mat_vec_f<float,float,1,32>` body (same unroll-batched k-loop, same
+  warp reduction) with integer-only segment routing on blockIdx, exactly the
+  grouped-mmvq pattern.
+- `ggml-cuda.cu`: detection + collection mirroring the mmvq group (same-src1
+  plain F32 matvecs, RDNA-only, mmvf-route-only, reusing the hoist-legality
+  and GLU-fuse guards). Toggle `GGML_CUDA_DISABLE_MMVF_GROUP`.
+- `qwen35moe.cpp`: adjacency pins — beta+alpha built and forward-expanded
+  together (sigmoid deferred), the shared-expert gate pinned next to the
+  router. Creation order does not set cgraph order; the pins do.
+
+Measured (runner box): dispatches 1683 -> 1593/token, kernel time
+10.07 -> 9.75 ms/token; 7-round interleaved whole-process A/B vs the
+verified 0001-0017 build: decode tg128 101.0-101.7 -> 104.5-105.2, median
+per-round ratio **1.0335**; prefill neutral. PPL on the gate corpus 3.9358
+(stock 3.9314, +0.112% — tighter than the verified series' +0.193%; the
+adjacency pins shift which folds fire, all within gate). Server smoke clean
+on short and long prompts.
+
 ## Open levers
 
 1. (moved to closed: shexp ninth-channel — see above)

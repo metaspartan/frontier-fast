@@ -1,0 +1,339 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 2d50c80bf..53182fce5 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3350,6 +3350,86 @@ static int ggml_cuda_mmvq_collect_group(const ggml_cgraph * cgraph, const int st
+ 
+ 
+ 
++// ----- grouped mmvf (tiny F32 matvec class) launch detection ------------------
++//
++// The GDN/linear-attention layers issue several tiny F32 matvecs over the same
++// activation (alpha/beta projections, the MoE router, the shared-expert gate).
++// Each is a one-warp-per-row launch of a few dozen rows: pure launch latency.
++// Grouping them mirrors the grouped mmvq launch: same-src1 plain F32 matvecs
++// become one kernel with concatenated row ranges, per-row arithmetic unchanged.
++// Restricted to RDNA, where the decode mmvf path always uses one-warp blocks,
++// so the grouped kernel reproduces the exact stock instruction sequence.
++
++static bool ggml_cuda_mmvf_can_group(const ggml_tensor * node, const int cc) {
++    if (!GGML_CUDA_CC_IS_RDNA(cc)) {
++        return false;
++    }
++    if (node->op != GGML_OP_MUL_MAT) {
++        return false;
++    }
++    const ggml_tensor * src0 = node->src[0];
++    const ggml_tensor * src1 = node->src[1];
++    if (src0 == nullptr || src1 == nullptr || node->src[2] != nullptr) {
++        return false;
++    }
++    if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++        return false;
++    }
++    if (ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
++        return false;
++    }
++    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src0->nb[0] != sizeof(float)) {
++        return false;
++    }
++    if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 || !ggml_is_contiguous(src1)) {
++        return false;
++    }
++    if (node->ne[1] != 1 || node->ne[2] != 1 || node->ne[3] != 1 || !ggml_is_contiguous(node)) {
++        return false;
++    }
++    if (src0->ne[0] % 2 != 0) {
++        return false; // float2 loads
++    }
++    if (src0->buffer == nullptr ||
++            ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++        return false;
++    }
++    // must be exactly the mmvf route of ggml_cuda_mul_mat (checked first there)
++    if (!ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, /*ne11 =*/ 1)) {
++        return false;
++    }
++    return true;
++}
++
++static int ggml_cuda_mmvf_collect_group(const ggml_cgraph * cgraph, const int start, ggml_tensor ** members, const int cc) {
++    ggml_tensor * first = cgraph->nodes[start];
++    const ggml_tensor * src1 = first->src[1];
++    members[0] = first;
++    int n = 1;
++
++    constexpr int scan_window = 40;
++    const int end = std::min(cgraph->n_nodes, start + 1 + scan_window);
++
++    for (int j = start + 1; j < end && n < MMVF_MAX_GROUP_SIZE; ++j) {
++        ggml_tensor * cand = cgraph->nodes[j];
++        if (ggml_cuda_is_view_or_noop(cand)) {
++            continue;
++        }
++        if (cand->op == GGML_OP_MUL_MAT && cand->src[1] == src1 &&
++                cand->src[0]->ne[0] == first->src[0]->ne[0] &&
++                cand->src[0]->nb[1] == first->src[0]->nb[1] &&
++                ggml_cuda_mmvf_can_group(cand, cc) &&
++                !ggml_cuda_mmvq_would_glu_fuse(cgraph, j) &&
++                ggml_cuda_mmvq_hoist_legal(cgraph, start, j)) {
++            members[n++] = cand;
++        }
++    }
++    return n;
++}
++
+ // ----- grouped rms_norm (QK-norm class) launch detection ----------------------
+ //
+ // A decoder layer normalises Q and K with two independent rms_norm+mul pairs of
+@@ -5036,6 +5116,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_PRE_ADD_NORM"));
+             static const bool disable_norm_quant = getenv("GGML_CUDA_DISABLE_NORM_QUANT") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_NORM_QUANT"));
++            static const bool disable_mmvf_group = getenv("GGML_CUDA_DISABLE_MMVF_GROUP") != nullptr &&
++                                                   std::atoi(getenv("GGML_CUDA_DISABLE_MMVF_GROUP"));
++            const bool mmvf_group_enabled = !disable_mmvf_group && stream_ctx.concurrent_events.empty();
++            const int  cc_mmvf_group = ggml_cuda_info().devices[cuda_ctx->device].cc;
+             static const bool disable_mmvq_group = getenv("GGML_CUDA_DISABLE_MMVQ_GROUP") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_MMVQ_GROUP"));
+             static const bool disable_softplus_mul = getenv("GGML_CUDA_DISABLE_SOFTPLUS_MUL") != nullptr &&
+@@ -5255,6 +5339,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                         continue;
+                     }
+                 }
++
++                if (mmvf_group_enabled && ggml_cuda_mmvf_can_group(node, cc_mmvf_group)) {
++                    ggml_tensor * members[MMVF_MAX_GROUP_SIZE];
++                    const int n_members = ggml_cuda_mmvf_collect_group(cgraph, i, members, cc_mmvf_group);
++                    if (n_members >= 2) {
++                        ggml_cuda_mul_mat_vec_f_grouped(*cuda_ctx, members, n_members);
++                        for (int m = 1; m < n_members; ++m) {
++                            mmvq_grouped_done.insert(members[m]);
++                        }
++                        continue;
++                    }
++                }
+ #ifndef NDEBUG
+                 assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device));
+                 for (int j = 0; j < GGML_MAX_SRC; j++) {
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index d6170701b..223845cb8 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -750,6 +750,129 @@ static void mul_mat_vec_f_cuda(
+         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
+ }
+ 
++struct mmvf_grouped_args {
++    const float * vx[MMVF_MAX_GROUP_SIZE];
++    float       * dst[MMVF_MAX_GROUP_SIZE];
++    uint32_t      seg_end[MMVF_MAX_GROUP_SIZE - 1];
++};
++
++// The mul_mat_vec_f<float, float, /*ncols_dst=*/1, warp_size, false, false>
++// body with the dead channel/sample/ids indexing constant-folded away, plus
++// integer-only segment routing on blockIdx.x. One warp per row, identical
++// unroll-batched k-loop, identical warp reduction: results are byte-identical
++// to the individual launches.
++static __global__ void mul_mat_vec_f_grouped(
++        const mmvf_grouped_args args, const float * __restrict__ y_ptr,
++        const int ncols2, const int stride_row) {
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    constexpr int block_size = warp_size;
++    const int tid = threadIdx.x;
++
++    uint32_t seg       = 0;
++    uint32_t seg_start = 0;
++#pragma unroll
++    for (int s = 0; s < MMVF_MAX_GROUP_SIZE - 1; ++s) {
++        if (blockIdx.x >= args.seg_end[s]) {
++            seg       = s + 1;
++            seg_start = args.seg_end[s];
++        }
++    }
++    const int row = blockIdx.x - seg_start;
++
++    ggml_cuda_pdl_sync();
++
++    const float2 * x2 = (const float2 *) (args.vx[seg] + (int64_t) row * stride_row);
++    const float2 * y2 = (const float2 *) y_ptr;
++    float        * dst = args.dst[seg];
++
++    float sumf = 0.0f;
++
++    constexpr int nunroll = mmvf_nunroll<1, false>();
++    int col2 = tid;
++    for (; col2 + (nunroll - 1)*block_size < ncols2; col2 += nunroll*block_size) {
++        float2 tmpx[nunroll];
++        float2 tmpy[nunroll];
++#pragma unroll
++        for (int u = 0; u < nunroll; ++u) {
++            tmpx[u] = x2[col2 + u*block_size];
++        }
++#pragma unroll
++        for (int u = 0; u < nunroll; ++u) {
++            tmpy[u] = y2[col2 + u*block_size];
++        }
++#pragma unroll
++        for (int u = 0; u < nunroll; ++u) {
++            ggml_cuda_mad(sumf, tmpx[u].x, tmpy[u].x);
++            ggml_cuda_mad(sumf, tmpx[u].y, tmpy[u].y);
++        }
++    }
++    for (; col2 < ncols2; col2 += block_size) {
++        const float2 tmpx = x2[col2];
++        const float2 tmpy = y2[col2];
++        ggml_cuda_mad(sumf, tmpx.x, tmpy.x);
++        ggml_cuda_mad(sumf, tmpx.y, tmpy.y);
++    }
++
++    ggml_cuda_pdl_lc();
++    sumf = warp_reduce_sum<warp_size>(sumf);
++
++    if (tid != 0) {
++        return;
++    }
++    dst[row] = sumf;
++}
++
++void ggml_cuda_mul_mat_vec_f_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes) {
++    GGML_ASSERT(n_nodes >= 2 && n_nodes <= MMVF_MAX_GROUP_SIZE);
++
++    const ggml_tensor * src1       = nodes[0]->src[1];
++    const ggml_tensor * src0_first = nodes[0]->src[0];
++
++    GGML_ASSERT(src1->type == GGML_TYPE_F32);
++    GGML_ASSERT(src0_first->type == GGML_TYPE_F32);
++    GGML_ASSERT(src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1);
++
++    const int64_t ne10 = src1->ne[0];
++    GGML_ASSERT(ne10 % 2 == 0);
++
++    const int64_t stride_row = src0_first->nb[1] / sizeof(float);
++
++    mmvf_grouped_args args = {};
++    uint32_t total_rows = 0;
++    for (int m = 0; m < n_nodes; ++m) {
++        const ggml_tensor * src0 = nodes[m]->src[0];
++        ggml_tensor       * dst  = nodes[m];
++        GGML_ASSERT(dst->op == GGML_OP_MUL_MAT);
++        GGML_ASSERT(dst->src[1] == src1 && dst->src[2] == nullptr);
++        GGML_ASSERT(src0->type == GGML_TYPE_F32);
++        GGML_ASSERT(src0->ne[0] == ne10);
++        GGML_ASSERT(src0->ne[2] == 1 && src0->ne[3] == 1);
++        GGML_ASSERT((int64_t)(src0->nb[1]/sizeof(float)) == stride_row);
++        GGML_ASSERT(dst->type == GGML_TYPE_F32);
++        GGML_ASSERT(dst->ne[0] == src0->ne[1]);
++        GGML_ASSERT(dst->ne[1] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1);
++
++        args.vx[m]  = (const float *) src0->data;
++        args.dst[m] = (float *) dst->data;
++        total_rows += (uint32_t) src0->ne[1];
++        if (m < MMVF_MAX_GROUP_SIZE - 1) {
++            args.seg_end[m] = total_rows;
++        }
++    }
++    // pad the routing table so unused slots never match
++    for (int m = n_nodes - 1; m < MMVF_MAX_GROUP_SIZE - 1; ++m) {
++        args.seg_end[m] = total_rows;
++    }
++
++    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
++    const dim3 block_nums(total_rows, 1, 1);
++    const dim3 block_dims(warp_size, 1, 1);
++
++    const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, ctx.stream()};
++    ggml_cuda_kernel_launch(mul_mat_vec_f_grouped, launch_params,
++        args, (const float *) src1->data, (int)(ne10/2), (int) stride_row);
++}
++
+ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+     const ggml_cuda_mm_fusion_args_host * fusion) {
+     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+diff --git a/ggml/src/ggml-cuda/mmvf.cuh b/ggml/src/ggml-cuda/mmvf.cuh
+index a50f7c021..daf00e516 100644
+--- a/ggml/src/ggml-cuda/mmvf.cuh
++++ b/ggml/src/ggml-cuda/mmvf.cuh
+@@ -2,6 +2,18 @@
+ 
+ #define MMVF_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVF kernels.
+ 
++#define MMVF_MAX_GROUP_SIZE 4
++
++// Launch a group of plain (no ids, no fusion, single dst column) F32 matvecs
++// that all read the same src1 as ONE kernel. Eligibility (F32 src0/src1/dst,
++// same ne00 / row stride, shared src1, single column, the RDNA single-warp
++// mmvf route) is checked by the caller in ggml-cuda.cu. Per-row arithmetic is
++// byte-identical to the individual launches: the k-loop, unroll batching and
++// warp reduction are copied from mul_mat_vec_f<float, float, 1, warp_size,
++// false, false>; only the (weight, dst) base pointers and the local row index
++// depend on the group segment, and both are integer-only.
++void ggml_cuda_mul_mat_vec_f_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes);
++
+ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+     const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+ 
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 38f2a5798..8ebe321e5 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -383,14 +383,23 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+     ggml_tensor * qkv_mixed = qkvz.first;
+     ggml_tensor * z         = qkvz.second;
+ 
++    // beta and alpha are two tiny independent F32 matvecs over the same
++    // activation. Emitting them adjacently (sigmoid deferred below) lets the
++    // CUDA backend fold them into one grouped launch; the ops, operands and
++    // shapes are unchanged.
+     ggml_tensor * beta = build_lora_mm(model.layers[il].ssm_beta, cur, model.layers[il].ssm_beta_s);
++    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
++    // Creation order does not set cgraph order - the topological visit does.
++    // Pin the two matvecs adjacently so the backend can group them.
++    ggml_build_forward_expand(gf, beta);
++    ggml_build_forward_expand(gf, alpha);
++
+     beta = ggml_reshape_4d(ctx0, beta, 1, num_v_heads, n_seq_tokens, n_seqs);
+     cb(beta, "beta", il);
+ 
+     beta = ggml_sigmoid(ctx0, beta);
+     cb(beta, "beta_sigmoid", il);
+ 
+-    ggml_tensor * alpha = build_lora_mm(model.layers[il].ssm_alpha, cur, model.layers[il].ssm_alpha_s);
+     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+     cb(alpha, "alpha", il);
+ 
+@@ -498,6 +507,19 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
+     // Check if this is an MoE layer
+     GGML_ASSERT(model.layers[il].ffn_gate_inp != nullptr);
+ 
++    // The shared-expert gate is a 1-row F32 matvec over the same activation the
++    // router reads. Emitting it adjacent to the router (inside build_moe_ffn,
++    // which starts with the router matvec) lets the backend group the two into
++    // one launch. Independent of the MoE subgraph; sigmoid stays below.
++    ggml_tensor * shared_gate_pre = nullptr;
++    if (model.layers[il].ffn_up_shexp != nullptr) {
++        shared_gate_pre = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
++        cb(shared_gate_pre, "shared_expert_gate", il);
++        // Pin it here so it lands adjacent to the router matvec that
++        // build_moe_ffn emits first; the backend groups the pair.
++        ggml_build_forward_expand(gf, shared_gate_pre);
++    }
++
+     ggml_tensor * moe_out =
+         build_moe_ffn(cur,
+             model.layers[il].ffn_gate_inp,
+@@ -529,8 +551,9 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
+         // Apply shared expert gating as in the reference implementation
+         // The shared expert has its own gate that is sigmoided
+         // Note: ffn_gate_inp_shexp is the shared expert gate (outputs 1 value per token)
+-        ggml_tensor * shared_gate = build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+-        cb(shared_gate, "shared_expert_gate", il);
++        ggml_tensor * shared_gate = shared_gate_pre != nullptr
++            ? shared_gate_pre
++            : build_lora_mm(model.layers[il].ffn_gate_inp_shexp, cur);
+ 
+         // Apply sigmoid to the gate
+         shared_gate = ggml_sigmoid(ctx0, shared_gate);
