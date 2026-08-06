@@ -3,6 +3,7 @@
 | Patch | Intent |
 | --- | --- |
 | `0001-registry-load-flashhead.patch` | Registry-preferred model load (no trust_remote_code needed) + auto-enable FlashHead approximate lm_head for L=1 decode |
+| `0002-request-overhead.patch` | Per-request host overhead: cache the BPE detokenizer tokenmap (was rebuilt from a fresh `tokenizer.vocab` dict on every `stream_generate` call, ~95 ms on M1 Ultra); stop flushing the MLX buffer pool after the final prefill chunk and at decode step 0 (both flushes forced the next allocations back to the OS) |
 
 ## Why registry-preferred load
 
@@ -59,6 +60,17 @@ down gather) 0.054, fused add+norm ×2 ~0.01, aggregate ~0.004 → 0.14/layer.
   CLOSED.
 - **In-place KV write from QK kernel**: mlx metal_kernel wraps inputs as
   `const device` — writes are compile errors. CLOSED.
+
+## 0002 measurements (M1 Ultra, interleaved whole-process A/B, official harness)
+
+Per-round cand/ref ratios over 2 rounds: ttft 1.370 / 1.396, prefill 1.063 /
+1.065, decode 0.989 / 1.007. Perplexity bit-identical (115.8171952670014 both
+arms) — the patch touches no numerics. Mechanism: `tokenizer.vocab`
+materializes a fresh 152k-entry dict per access and the BPE streaming
+detokenizer rebuilt its tokenmap from it on every request (~95 ms, inside
+measured TTFT but before `prompt_time`'s clock starts); the two
+`mx.clear_cache()` calls dumped the warm buffer pool right where decode (and
+the next harness run's prefill) re-allocates it.
 
 ## Local numbers (M4 Pro, directional)
 
