@@ -49,6 +49,17 @@ and trimmed slots pad +0, so results stay bit-identical.
 Per-row work matches stock so results are bit-identical. Do **not** blindly
 port Laguna MoE-only patches after this.
 
+## Measured-neutral: the remaining laguna family ports (do not spend a slot)
+
+The four laguna-series patches this series does not carry — rope-grouped
+launch, set-rows-grouped launch, mul-fold-q8-1-quantize, and the pool-teardown
+fix — were ported (with seam repairs) onto 0001-0009 and measured on the
+runner box, 2026-08-06: 5-round interleaved whole-process A/B vs the 0001-0009
+build read decode median ratio ~1.001 and neutral prefill; ppl bit-identical
+(22.5182 = stock). LFM2.5's graph is mostly conv layers: there are too few
+rope/set_rows/foldable-mul sites for the launch savings to clear noise. The
+ports are correct but not worth a submission on this model.
+
 ## This track is not the Laguna AMD track
 
 LFM2.5 2.6B is a **dense hybrid**, not a mixture-of-experts. Every lever that
