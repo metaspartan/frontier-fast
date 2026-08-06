@@ -236,7 +236,14 @@
          BCx = self.in_proj(x)
          B, C, x = mx.split(BCx, 3, axis=-1)
          Bx = B * x
-@@ -229,8 +418,12 @@
+@@ -225,12 +414,18 @@
+             r = self.self_attn(self.operator_norm(x), mask=mask, cache=cache)
+         else:
+             r = self.conv(
+-                self.operator_norm(x),
++                _fused_norm(x, self.operator_norm.weight)
++                if (x.shape[1] == 1 and x.shape[-1] == 2048)
++                else self.operator_norm(x),
                  mask=mask,
                  cache=cache,
              )
