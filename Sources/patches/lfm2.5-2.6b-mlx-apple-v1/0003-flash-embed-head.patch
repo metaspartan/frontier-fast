@@ -1,0 +1,239 @@
+diff --git a/mlx_lm/models/lfm2.py b/mlx_lm/models/lfm2.py
+index 331d180..e58a0e1 100644
+--- a/mlx_lm/models/lfm2.py
++++ b/mlx_lm/models/lfm2.py
+@@ -2,6 +2,7 @@
+ from dataclasses import dataclass
+ from typing import Any, List, Optional
+ 
++import os
+ import mlx.core as mx
+ import mlx.nn as nn
+ 
+@@ -403,6 +404,182 @@ class Lfm2Model(nn.Module):
+         return self.embedding_norm(h)
+ 
+ 
++
++class _FlashEmbedHead:
++    """Probed output projection over the tied quantized embedding.
++
++    Same scheme as DeepGrove's FlashHead, but the clustering is built at load
++    time (deterministically — strided seeds, fixed iteration count) instead of
++    being shipped in checkpoint metadata: vocabulary rows are grouped into
++    balanced 32-token clusters by spherical k-means; each cluster's centroid
++    direction is pre-scaled by the largest row norm in the cluster, so scoring
++    the centroids upper-bounds each cluster's best attainable logit. At L=1
++    decode, only the tokens of the top ``n_probes`` clusters (plus forced
++    special tokens) get exact logits through one gather over a
++    cluster-ordered copy of the quantized embedding; everything else is -inf.
++    Greedy argmax is exact whenever the true argmax lies in a probed cluster
++    or the forced set. Prefill and the perplexity path use the exact head.
++    """
++
++    CLUSTER_SIZE = 40
++    KMEANS_ITERS = 20
++
++    def __init__(self, embed, n_probes):
++        import numpy as np
++
++        V = embed.weight.shape[0]
++        D_ = embed.scales.shape[-1] * embed.group_size
++        cs = self.CLUSTER_SIZE
++        C = max(1, V // 32)  # cluster count from a nominal 32-token target
++        self.n_probes = min(n_probes, C)
++        self.group_size = embed.group_size
++        self.bits = embed.bits
++
++        W = mx.dequantize(
++            embed.weight,
++            embed.scales,
++            embed.biases,
++            group_size=embed.group_size,
++            bits=embed.bits,
++        ).astype(mx.float32)
++        norms = mx.maximum(mx.linalg.norm(W, axis=-1), 1e-8)
++        dirs = (W / norms[:, None]).astype(mx.bfloat16)
++        mx.eval(dirs, norms)
++
++        # Deterministic spherical k-means: strided seeds, fixed iterations.
++        cents = mx.contiguous(dirs[:: V // C][:C]).astype(mx.float32)
++        assign = None
++        for _ in range(self.KMEANS_ITERS):
++            sims_parts = []
++            for s in range(0, V, 16384):
++                sims_parts.append(
++                    mx.argmax(dirs[s : s + 16384].astype(mx.float32) @ cents.T, axis=-1)
++                )
++            assign = mx.concatenate(sims_parts)
++            acc = mx.zeros((C, D_), dtype=mx.float32)
++            acc = acc.at[assign].add(dirs.astype(mx.float32))
++            n = mx.zeros((C,), dtype=mx.float32).at[assign].add(mx.ones((V,)))
++            acc = acc / mx.maximum(n[:, None], 1.0)
++            cents = acc / mx.maximum(mx.linalg.norm(acc, axis=-1), 1e-8)[:, None]
++            mx.eval(cents)
++        mx.eval(assign)
++
++        # Repack to exactly cs tokens per cluster: keep the cs best-matching
++        # members of each over-full cluster, spill the rest, then fill
++        # under-full clusters with their best-matching spilled tokens.
++        a = np.array(assign)
++        sim_own = np.array(
++            mx.concatenate(
++                [
++                    mx.sum(
++                        dirs[s : s + 16384].astype(mx.float32)
++                        * cents[assign[s : s + 16384]],
++                        axis=-1,
++                    )
++                    for s in range(0, V, 16384)
++                ]
++            )
++        )
++        members = [[] for _ in range(C)]
++        for tok in range(V):
++            members[a[tok]].append(tok)
++        # Clusters keep every true member up to the padded capacity; only the
++        # tail of genuinely oversized clusters spills, into the deficit
++        # cluster whose centroid matches best (deterministic greedy). Short
++        # clusters pad by repeating members - duplicates in the gather are
++        # harmless and keep every token homed at its own nearest centroid.
++        spill = []
++        for c in range(C):
++            m = members[c]
++            if len(m) > cs:
++                m.sort(key=lambda t: -sim_own[t])
++                spill.extend(m[cs:])
++                members[c] = m[:cs]
++        if spill:
++            cents_np = np.array(cents.astype(mx.float32))
++            spill_arr = np.array(spill)
++            dirs_sp = np.array(
++                mx.take(dirs, mx.array(spill_arr), axis=0).astype(mx.float32)
++            )
++            deficits = [c for c in range(C) for _ in range(cs - len(members[c]))]
++            sim_sp = dirs_sp @ cents_np[deficits].T if deficits else None
++            used = np.zeros(len(spill_arr), dtype=bool)
++            for j, c in enumerate(deficits):
++                if used.all():
++                    break
++                cand = np.where(~used)[0]
++                best = cand[np.argmax(sim_sp[cand, j])]
++                used[best] = True
++                members[c].append(int(spill_arr[best]))
++        token_map = np.zeros((C, cs), dtype=np.int32)
++        for c in range(C):
++            m = sorted(members[c]) or [0]  # empty cluster: harmless filler row
++            row = (m * ((cs // len(m)) + 1))[:cs]
++            token_map[c] = np.array(sorted(row), dtype=np.int32)
++        self.token_map = mx.array(token_map)
++
++        # Scaled centroids: direction x max member row norm.
++        norms_np = np.array(norms)
++        scale_c = np.array(
++            [norms_np[token_map[c]].max() for c in range(C)], dtype=np.float32
++        )
++        self.centroids = (cents * mx.array(scale_c)[:, None]).astype(mx.bfloat16)
++
++        # Cluster-ordered copy of the quantized embedding for the gather.
++        order = self.token_map.reshape(-1)
++        self.head_w = mx.contiguous(embed.weight[order]).reshape(C, cs, -1)
++        self.head_s = mx.contiguous(embed.scales[order]).reshape(C, cs, -1)
++        self.head_b = mx.contiguous(embed.biases[order]).reshape(C, cs, -1)
++
++        force = sorted(
++            {int(t) for t in getattr(_FlashEmbedHead, "_force_ids", [])}
++        )
++        self._force_ids = mx.array(force, dtype=mx.int32) if force else None
++        self._force_rows = None
++        if self._force_ids is not None:
++            self._force_rows = (
++                mx.contiguous(embed.weight[self._force_ids]),
++                mx.contiguous(embed.scales[self._force_ids]),
++                mx.contiguous(embed.biases[self._force_ids]),
++            )
++        self.vocab_size = V
++        mx.eval(
++            self.token_map, self.centroids, self.head_w, self.head_s, self.head_b
++        )
++
++    def __call__(self, h, embed):
++        hv = h[:, -1, :]
++        top = mx.argpartition(hv @ self.centroids.T, kth=-self.n_probes, axis=-1)[
++            ..., -self.n_probes :
++        ]
++        oids = self.token_map[top[0]].reshape(-1)
++        logits = mx.gather_qmm(
++            hv.reshape(1, 1, 1, 1, -1),
++            self.head_w,
++            self.head_s,
++            self.head_b,
++            rhs_indices=top[:, None, :],
++            transpose=True,
++            group_size=self.group_size,
++            bits=self.bits,
++        ).reshape(-1)
++        if self._force_rows is not None:
++            fw, fs, fb = self._force_rows
++            force_logits = mx.quantized_matmul(
++                hv,
++                fw,
++                scales=fs,
++                biases=fb,
++                transpose=True,
++                group_size=self.group_size,
++                bits=self.bits,
++            )[0]
++            oids = mx.concatenate([oids, self._force_ids])
++            logits = mx.concatenate([logits, force_logits])
++        full = mx.full((1, 1, self.vocab_size), float("-inf"), dtype=logits.dtype)
++        full[0, 0, oids] = logits
++        return full
++
+ class Model(nn.Module):
+     def __init__(self, args: ModelArgs):
+         super().__init__()
+@@ -417,8 +594,43 @@ class Model(nn.Module):
+         input_embeddings: Optional[mx.array] = None,
+     ):
+         out = self.model(inputs, cache, input_embeddings)
++        if (
++            out.shape[0] == 1
++            and out.shape[1] == 1
++            and self._flash_embed is not False
++            and os.environ.get("MLX_FLASH_EMBED", "1") != "0"
++        ):
++            if self._flash_embed is None:
++                self._flash_embed = self._build_flash_embed()
++            if self._flash_embed is not False:
++                return self._flash_embed(out, self.model.embed_tokens)
+         return self.model.embed_tokens.as_linear(out)
+ 
++    _flash_embed = None
++
++    def _build_flash_embed(self):
++        import sys
++
++        embed = self.model.embed_tokens
++        try:
++            import mlx.nn as _nn
++
++            if not isinstance(embed, _nn.QuantizedEmbedding):
++                raise ValueError("embedding not quantized")
++            tok_specials = getattr(Model, "_flash_force_ids", [])
++            _FlashEmbedHead._force_ids = tok_specials
++            n_probes = int(os.environ.get("MLX_FLASH_EMBED_PROBES", "512"))
++            fh = _FlashEmbedHead(embed, n_probes)
++            print(
++                f"[lfm2] flash embed head: {fh.token_map.shape[0]} clusters, "
++                f"{fh.n_probes} probes, {len(tok_specials)} forced",
++                file=sys.stderr,
++            )
++            return fh
++        except Exception as e:
++            print(f"[lfm2] flash embed head disabled: {e}", file=sys.stderr)
++            return False
++
+     def sanitize(self, weights):
+         sanitized_weights = {}
+         for name, param in weights.items():

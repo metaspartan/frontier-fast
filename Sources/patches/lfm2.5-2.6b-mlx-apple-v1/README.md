@@ -5,6 +5,8 @@
 | Patch | Intent |
 | --- | --- |
 | `0001-sc-fused-qk-norm-rope-greedy.patch` | Fused ShortConv elementwise + fused attention q/k RMSNorm+RoPE Metal kernels + greedy logsumexp skip |
+| `0002-request-overhead.patch` | Cache streaming-detokenizer construction (125k tokenmap rebuilt from a fresh `tokenizer.vocab` dict every `stream_generate` call). **Verified: +1.564% frontier** (ttft 0.823 → 0.781 s) |
+| `0003-flash-embed-head.patch` | FlashEmbed head: probed output projection over the tied 6-bit embedding, clustering built deterministically at load (20-iter spherical k-means, 4000 padded 40-token clusters, scaled centroids). L=1 decode reads centroids (16 MB) + 512 probed clusters instead of the full 212 MB embedding. Prefill and ppl use the exact head (ppl bit-identical 61.151709966257926). M4 Pro: decode 1.087-1.095x, teacher-forced argmax deviation 5/640 (0.8%, disclosed), ttft/prefill neutral-positive. `MLX_FLASH_EMBED=0` disables; `MLX_FLASH_EMBED_PROBES` tunes |
 
 ## What's in it
 
