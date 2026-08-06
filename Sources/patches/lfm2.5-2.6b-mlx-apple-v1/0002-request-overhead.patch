@@ -1,93 +1,65 @@
-diff --git a/mlx_lm/tokenizer_utils.py b/mlx_lm/tokenizer_utils.py
-index c7e50fb..df879d8 100644
---- a/mlx_lm/tokenizer_utils.py
-+++ b/mlx_lm/tokenizer_utils.py
-@@ -115,14 +115,26 @@ class SPMStreamingDetokenizer(StreamingDetokenizer):
-         self.trim_space = trim_space
-         self._sep = "\u2581".encode()
- 
--        # Extract the tokens in a list from id to text
--        self.tokenmap = [""] * (max(tokenizer.vocab.values()) + 1)
--        for value, tokenid in tokenizer.vocab.items():
--            if value.startswith("<0x"):
--                # Replace bytes with their value
--                self.tokenmap[tokenid] = bytes([int(value[3:5], 16)])
--            else:
--                self.tokenmap[tokenid] = value.encode()
-+        # Extract the tokens in a list from id to text. The map is immutable
-+        # and identical for every detokenizer built from the same tokenizer,
-+        # but `tokenizer.vocab` materializes a fresh vocab-size dict per
-+        # access and the per-entry decode below runs tens of ms \u2014 paid on
-+        # every stream_generate call. Build once, cache on the tokenizer.
-+        tokenmap = getattr(tokenizer, "_spm_streaming_tokenmap", None)
-+        if tokenmap is None:
-+            vocab = tokenizer.vocab
-+            tokenmap = [""] * (max(vocab.values()) + 1)
-+            for value, tokenid in vocab.items():
-+                if value.startswith("<0x"):
-+                    # Replace bytes with their value
-+                    tokenmap[tokenid] = bytes([int(value[3:5], 16)])
-+                else:
-+                    tokenmap[tokenid] = value.encode()
-+            try:
-+                tokenizer._spm_streaming_tokenmap = tokenmap
-+            except AttributeError:
-+                pass
-+        self.tokenmap = tokenmap
- 
-         self.reset()
- 
-@@ -165,10 +177,20 @@ class BPEStreamingDetokenizer(StreamingDetokenizer):
-     def __init__(self, tokenizer):
-         self.clean_spaces = tokenizer.clean_up_tokenization_spaces
- 
--        # Extract the tokens in a list from id to text
--        self.tokenmap = [None] * len(tokenizer.vocab)
--        for value, tokenid in tokenizer.vocab.items():
--            self.tokenmap[tokenid] = value
-+        # Same one-time construction as the SPM detokenizer above: the map is
-+        # immutable per tokenizer and `tokenizer.vocab` is a fresh dict per
-+        # access, so rebuilding it per stream_generate call wastes tens of ms.
-+        tokenmap = getattr(tokenizer, "_bpe_streaming_tokenmap", None)
-+        if tokenmap is None:
-+            vocab = tokenizer.vocab
-+            tokenmap = [None] * len(vocab)
-+            for value, tokenid in vocab.items():
-+                tokenmap[tokenid] = value
-+            try:
-+                tokenizer._bpe_streaming_tokenmap = tokenmap
-+            except AttributeError:
-+                pass
-+        self.tokenmap = tokenmap
- 
-         self.reset()
- 
-diff --git a/mlx_lm/generate.py b/mlx_lm/generate.py
-index 1a96c01..fb54cc9 100644
---- a/mlx_lm/generate.py
-+++ b/mlx_lm/generate.py
-@@ -456,7 +456,11 @@ def generate_step(
-                 if input_embeddings is not None
-                 else input_embeddings
-             )
--            mx.clear_cache()
-+            # Only trim the buffer pool between chunks of a long prompt.
-+            # Flushing after the final chunk (the common short-prompt case)
-+            # just forces the first decode steps to re-allocate from the OS.
-+            if total_prompt_tokens - prompt_processed_tokens > 1:
-+                mx.clear_cache()
- 
-         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
- 
-@@ -472,7 +476,10 @@ def generate_step(
-         if n == max_tokens:
-             break
-         yield y.item(), logprobs
--        if n % 256 == 0:
-+        # n=0 lands immediately after prefill: flushing there dumps the warm
-+        # buffer pool right before decode re-allocates it. Keep the periodic
-+        # trim for long generations only.
-+        if n and n % 256 == 0:
-             mx.clear_cache()
-         y, logprobs = next_y, next_logprobs
-         n += 1
+diff --git a/mlx_lm/_gainz_request_overhead.py b/mlx_lm/_gainz_request_overhead.py
+new file mode 100644
+index 0000000..5249a0d
+--- /dev/null
++++ b/mlx_lm/_gainz_request_overhead.py
+@@ -0,0 +1,45 @@
++"""Request-path overhead fix: cache streaming-detokenizer construction.
++
++`TokenizerWrapper.detokenizer` builds a fresh detokenizer on every access,
++and every construction rebuilds an immutable tokenmap from a freshly
++materialized `tokenizer.vocab` dict — ~34-50 ms per `stream_generate` call
++for a 125k vocab, inside measured TTFT. The first construction per
++(tokenizer, class, args) is cached; later ones copy the cached attribute
++dict (sharing the immutable tokenmap) and re-run `reset()`, which
++reinitializes all mutable streaming state. Version-agnostic: no assumptions
++about which fields a given mlx-lm release stores.
++"""
++
++from . import tokenizer_utils as _tu
++
++
++def _wrap(cls):
++    orig = cls.__init__
++    if getattr(orig, "_gz_cached", False):
++        return
++
++    def __init__(self, tokenizer, *args, **kwargs):
++        key = (cls, args, tuple(sorted(kwargs.items())))
++        cache = getattr(tokenizer, "_gz_detok_cache", None)
++        if cache is not None and cache[0] == key:
++            self.__dict__.update(cache[1])
++            self.reset()
++            return
++        orig(self, tokenizer, *args, **kwargs)
++        try:
++            tokenizer._gz_detok_cache = (key, dict(self.__dict__))
++        except Exception:
++            pass
++
++    __init__._gz_cached = True
++    cls.__init__ = __init__
++
++
++for _name in dir(_tu):
++    _cls = getattr(_tu, _name)
++    if (
++        isinstance(_cls, type)
++        and _name.endswith("StreamingDetokenizer")
++        and _name != "StreamingDetokenizer"
++    ):
++        _wrap(_cls)
+diff --git a/mlx_lm/models/lfm2.py b/mlx_lm/models/lfm2.py
+index ba82408..331d180 100644
+--- a/mlx_lm/models/lfm2.py
++++ b/mlx_lm/models/lfm2.py
+@@ -13,6 +13,9 @@ from .base import (
+     scaled_dot_product_attention,
+ )
+ from .cache import ArraysCache, KVCache
++
++# Request-path overhead fix (see mlx_lm/_gainz_request_overhead.py).
++from .. import _gainz_request_overhead as _gz_ro  # noqa: F401
+ _FUSED_SC_KERNEL = mx.fast.metal_kernel(
+     name="lfm2_shortconv_decode_fused", input_names=["BCx", "state", "conv_w"],
+     output_names=["y", "new_state"],
