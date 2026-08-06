@@ -9,7 +9,10 @@
     "laguna-s-2.1-gguf-gb10cuda-v1",
     "lfm2.5-2.6b-gguf-r9700-v1",
     "lfm2.5-2.6b-gguf-gb10cuda-v1",
-    "lfm2.5-2.6b-mlx-apple-v1"
+    "lfm2.5-2.6b-mlx-apple-v1",
+    "maple-preview-mlx-apple-v1",
+    "maple-preview-gguf-r9700-v1",
+    "maple-preview-gguf-gb10cuda-v1"
   ],
   "defaultTrack": "laguna-xs-2.1-nvfp4-gb10-v1",
   "scoring": {
