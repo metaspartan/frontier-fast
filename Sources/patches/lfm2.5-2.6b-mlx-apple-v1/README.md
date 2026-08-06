@@ -4,22 +4,21 @@
 
 | Patch | Intent |
 | --- | --- |
-| `0001-sc-fused-qk-norm-rope-greedy.patch` | Fused ShortConv elementwise + fused attention q/k RMSNorm+RoPE Metal kernels + greedy logsumexp skip |
+| `0001-sc-qk-rn-fused-greedy.patch` | Four Metal kernels + greedy skip: SC elementwise, q/k RMSNorm+RoPE, residual+RMSNorm, greedy logsumexp skip |
 
-## What's in it
+## Kernels
 
-1. **ShortConv elementwise Metal kernel** (verified 1.003642): one dispatch replaces
-   split + mul + concat + conv1d + mul for L=1 decode (22 of 30 layers).
-2. **Fused q/k RMSNorm + RoPE Metal kernel** (bit-exact, verified 0.0 diff at
-   offsets 0–16000): one dispatch replaces q_layernorm + k_layernorm + transpose +
-   2× rope for L=1 decode (8 attention layers). Mirrors MLX's rms_single_row
-   (N_READS=4, simd_sum, precise::rsqrt, bf16 rounding order) and rope_impl
-   (metal::fast::cos, base=1e7, pairing (j, j+32)).
-3. **Greedy logsumexp skip** (verified): argmax(logits) without the 128k
-   logsumexp; token-sized second value for async_eval.
+1. **ShortConv elementwise** (verified 1.003642): one dispatch for L=1 decode (22 conv layers).
+2. **q/k RMSNorm+RoPE** (verified 1.006225): one dispatch replaces q_layernorm +
+   k_layernorm + transpose + 2× rope (8 attention layers). Bit-identical
+   (mirrors rms_single_row N_READS=4 + rope_impl rotation).
+3. **Residual add + RMSNorm** (NEW): one dispatch replaces h=x+r + ffn_norm(h)
+   for L=1 decode (30 layers). Mirrors MLX rms reduction order exactly:
+   N_READS=4 per thread, 16 simdgroups with sequential group-partial sum,
+   precise::rsqrt, bf16 cast-then-multiply.
+4. **Greedy logsumexp skip** (verified 1.003831).
 
-## Local marginal effect of the QK fusion (vs verified SC+greedy)
+## Accuracy
 
-decode **×1.025**, prefill ×0.996, ttft ×0.988 → projected score ~1.017.
-
-Accuracy gate: perplexity ≤ 0.5% — exact match (61.069 both).
+Perplexity exact match (61.069 both arms). All kernels bit-identical to the
+stock ops they replace (verified 0.0 diff on random inputs across offsets).
