@@ -1,0 +1,244 @@
+diff --git a/ggml/src/ggml-cuda/binbcast.cu b/ggml/src/ggml-cuda/binbcast.cu
+index 37c0c2fa5..9bd8698b7 100644
+--- a/ggml/src/ggml-cuda/binbcast.cu
++++ b/ggml/src/ggml-cuda/binbcast.cu
+@@ -1,4 +1,5 @@
+ #include "binbcast.cuh"
++#include "unary.cuh"
+ #include <cstdint>
+ #include <utility>
+ 
+@@ -591,6 +592,7 @@ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+ //   * d = amax/127.0f, q = roundf(val/d) and the (d, sum) ds write are the
+ //     stock quantize_q8_1 statements.
+ 
++template <bool softplus>
+ static __global__ void k_mul_bcast0_quant(const float * __restrict__ src0,
+                                           const float * __restrict__ src1,
+                                           float * __restrict__ dst,
+@@ -608,7 +610,8 @@ static __global__ void k_mul_bcast0_quant(const float * __restrict__ src0,
+     const uint32_t i1 = fastdiv((uint32_t) i, ne0);
+ 
+     ggml_cuda_pdl_sync();
+-    const float val = src0[i] * src1[(int64_t) i1 * s11];
++    const float g = src1[(int64_t) i1 * s11];
++    const float val = src0[i] * (softplus ? ggml_cuda_softplus_f32(g) : g);
+     dst[i] = val;
+ 
+     block_q8_1 * y = (block_q8_1 *) q8_1_dst;
+@@ -632,7 +635,8 @@ static __global__ void k_mul_bcast0_quant(const float * __restrict__ src0,
+     }
+ }
+ 
+-void ggml_cuda_op_mul_bcast0_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst, char * q8_1_dst) {
++void ggml_cuda_op_mul_bcast0_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst, char * q8_1_dst,
++                                   const ggml_tensor * softplus_src) {
+     const ggml_tensor * src0 = dst->src[0];
+     const ggml_tensor * src1 = dst->src[1];
+ 
+@@ -650,6 +654,18 @@ void ggml_cuda_op_mul_bcast0_quant(ggml_backend_cuda_context & ctx, ggml_tensor
+     const int64_t num_blocks = (k + 255) / 256;
+     const ggml_cuda_kernel_launch_params launch_params =
+         ggml_cuda_kernel_launch_params((dim3) num_blocks, (dim3) 256, 0, ctx.stream());
+-    ggml_cuda_kernel_launch(k_mul_bcast0_quant, launch_params,
++
++    if (softplus_src != nullptr) {
++        // src1 is the (contiguous, elementwise) softplus of softplus_src, so the
++        // element at flat index i1 of one is the softplus of the element at flat
++        // index i1 of the other: read the input and apply softplus in-kernel.
++        GGML_ASSERT(softplus_src->type == GGML_TYPE_F32);
++        GGML_ASSERT(ggml_is_contiguous(softplus_src));
++        ggml_cuda_kernel_launch(k_mul_bcast0_quant<true>, launch_params,
++            (const float *) src0->data, (const float *) softplus_src->data, (float *) dst->data, k, ne0, s11, q8_1_dst);
++        return;
++    }
++
++    ggml_cuda_kernel_launch(k_mul_bcast0_quant<false>, launch_params,
+         (const float *) src0->data, (const float *) src1->data, (float *) dst->data, k, ne0, s11, q8_1_dst);
+ }
+diff --git a/ggml/src/ggml-cuda/binbcast.cuh b/ggml/src/ggml-cuda/binbcast.cuh
+index c58d59e4a..2653dc5a3 100644
+--- a/ggml/src/ggml-cuda/binbcast.cuh
++++ b/ggml/src/ggml-cuda/binbcast.cuh
+@@ -9,7 +9,11 @@ void ggml_cuda_op_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ // (dst[i0,i1] = src0[i0,i1] * src1[0,i1]) together with the q8_1 quantization
+ // of the result, for the case where the result feeds a mul_mat_vec_q that would
+ // otherwise launch quantize_q8_1 over the values this kernel just wrote.
+-void ggml_cuda_op_mul_bcast0_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst, char * q8_1_dst);
++// softplus_src != nullptr folds a softplus over src1 into the multiply: the
++// kernel reads softplus_src (the input of the softplus that produced src1) and
++// evaluates the softplus itself. See ggml_cuda_softplus_mul_fold_target.
++void ggml_cuda_op_mul_bcast0_quant(ggml_backend_cuda_context & ctx, ggml_tensor * dst, char * q8_1_dst,
++                                   const ggml_tensor * softplus_src = nullptr);
+ void ggml_cuda_op_div(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index cdd732575..ab6f7090a 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4098,6 +4098,95 @@ static bool ggml_cuda_mul_bcast0_quant_ok(const ggml_tensor * node) {
+     return true;
+ }
+ 
++// ----- softplus -> broadcast-mul fold ---------------------------------------
++//
++// Gated attention multiplies the attention result by softplus(g_proj), a
++// per-head gate that broadcasts over the head dimension. The upstream fused
++// unary+mul path requires the two multiply operands to have the SAME shape, so
++// it declines this one and the softplus stays a separate tiny launch whose only
++// consumer is the multiply right after it.
++//
++// The multiply already runs as the folded-quantize kernel (mul + q8_1 in one
++// launch). Reading the softplus input there instead and evaluating the softplus
++// per element removes the separate launch. It is bit-identical because
++//   * softplus is elementwise and both tensors are contiguous over the same
++//     elements in the same order, so flat index i1 corresponds in both;
++//   * the value used is ggml_cuda_softplus_f32(g), the expression the stock
++//     unary kernel stores;
++//   * the multiply order (src0 * gate) and everything downstream is unchanged.
++//
++// The fold is only legal when nothing else in the graph reads the softplus
++// result (or the reshape of it that the multiply consumes).
++
++static int ggml_cuda_count_src_uses(const ggml_cgraph * cgraph, const ggml_tensor * t) {
++    int uses = 0;
++    for (int k = 0; k < cgraph->n_nodes; ++k) {
++        const ggml_tensor * n = cgraph->nodes[k];
++        for (int si = 0; si < GGML_MAX_SRC; ++si) {
++            if (n->src[si] == t) {
++                ++uses;
++            }
++        }
++    }
++    return uses;
++}
++
++// A plain reshape of base: same elements, same order, same memory.
++static bool ggml_cuda_is_plain_reshape_of(const ggml_tensor * v, const ggml_tensor * base) {
++    return v == base ||
++        (v->view_src == base && v->data == base->data && v->type == base->type &&
++         ggml_is_contiguous(v) && ggml_nelements(v) == ggml_nelements(base));
++}
++
++// At a SOFTPLUS node, returns the index of the multiply that consumes it and can
++// absorb it, or -1. Only view/no-op nodes may sit in between.
++static int ggml_cuda_softplus_mul_fold_target(const ggml_cgraph * cgraph, const int i) {
++    const ggml_tensor * sp = cgraph->nodes[i];
++    if (sp->op != GGML_OP_UNARY || ggml_get_unary_op(sp) != GGML_UNARY_OP_SOFTPLUS) {
++        return -1;
++    }
++    const ggml_tensor * src = sp->src[0];
++    if (src == nullptr || src->type != GGML_TYPE_F32 || sp->type != GGML_TYPE_F32) {
++        return -1;
++    }
++    if (!ggml_is_contiguous(src) || !ggml_is_contiguous(sp) || !ggml_are_same_shape(src, sp)) {
++        return -1;
++    }
++    if ((sp->flags & GGML_TENSOR_FLAG_OUTPUT) != 0 || sp->view_src != nullptr) {
++        return -1;
++    }
++
++    int j = i + 1;
++    while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
++        ++j;
++    }
++    if (j >= cgraph->n_nodes) {
++        return -1;
++    }
++    const ggml_tensor * mul = cgraph->nodes[j];
++    if (mul->op != GGML_OP_MUL || mul->src[1] == nullptr) {
++        return -1;
++    }
++    const ggml_tensor * gate = mul->src[1];
++    if ((gate->flags & GGML_TENSOR_FLAG_OUTPUT) != 0) {
++        return -1;
++    }
++    if (!ggml_cuda_is_plain_reshape_of(gate, sp)) {
++        return -1;
++    }
++    // the softplus result must reach nothing but this multiply
++    if (gate == sp) {
++        if (ggml_cuda_count_src_uses(cgraph, sp) != 1) {
++            return -1;
++        }
++    } else {
++        if (ggml_cuda_count_src_uses(cgraph, sp) != 1 || ggml_cuda_count_src_uses(cgraph, gate) != 1) {
++            return -1;
++        }
++    }
++    return j;
++}
++
+ // try and fuse nodes and return the number of nodes to skip
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+@@ -4938,6 +5027,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_NORM_QUANT"));
+             static const bool disable_mmvq_group = getenv("GGML_CUDA_DISABLE_MMVQ_GROUP") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_MMVQ_GROUP"));
++            static const bool disable_softplus_mul = getenv("GGML_CUDA_DISABLE_SOFTPLUS_MUL") != nullptr &&
++                                                   std::atoi(getenv("GGML_CUDA_DISABLE_SOFTPLUS_MUL"));
+             const bool mmvq_group_enabled = !disable_mmvq_group && stream_ctx.concurrent_events.empty();
+             static const bool log_mmvq_group_stats = getenv("GGML_MMVQ_GROUP_STATS") != nullptr;
+             int64_t mmvq_group_stats_buf[2] = {0, 0};
+@@ -5051,6 +5142,28 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     }
+                 }
+ 
++                if (!disable_norm_quant && !disable_softplus_mul && stream_ctx.concurrent_events.empty() &&
++                        node->op == GGML_OP_UNARY) {
++                    const int j = ggml_cuda_softplus_mul_fold_target(cgraph, i);
++                    if (j > i && ggml_cuda_mul_bcast0_quant_ok(cgraph->nodes[j])) {
++                        ggml_tensor * mul = cgraph->nodes[j];
++                        char * q8_1_dst = ggml_cuda_quant_register_for_consumer(cuda_ctx, cgraph, j + 1, mul);
++                        if (q8_1_dst != nullptr) {
++                            ggml_cuda_op_mul_bcast0_quant(*cuda_ctx, mul, q8_1_dst, node->src[0]);
++                            // the same view-write invalidation the other fused paths run
++                            // for the nodes they consume (pure views never write)
++                            for (int k = i + 1; k <= j; ++k) {
++                                const ggml_tensor * skipped = cgraph->nodes[k];
++                                if (skipped->view_src != nullptr && !ggml_cuda_is_view_or_noop(skipped)) {
++                                    cuda_ctx->quantized_src1_cache.invalidate_views_of(skipped);
++                                }
++                            }
++                            i = j;
++                            continue;
++                        }
++                    }
++                }
++
+                 if (!disable_norm_quant && stream_ctx.concurrent_events.empty() && node->op == GGML_OP_GLU &&
+                         node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) &&
+                         ggml_nelements(node) % QK8_1 == 0) {
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index 56fcd42c8..e1b16b83f 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -91,7 +91,7 @@ static __device__ __forceinline__ float op_expm1(float x) {
+ }
+ 
+ static __device__ __forceinline__ float op_softplus(float x) {
+-    return (x > 20.0f) ? x : logf(1.0f + expf(x));
++    return ggml_cuda_softplus_f32(x);
+ }
+ 
+ static __device__ __forceinline__ float op_elu(float x) {
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+index 392721118..b8df5532d 100644
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -65,6 +65,13 @@ void ggml_cuda_op_expm1(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
++// The softplus expression itself, shared with the folded softplus+mul kernel in
++// binbcast.cu so that the fold evaluates exactly the statement the stock unary
++// kernel evaluates.
++static __device__ __forceinline__ float ggml_cuda_softplus_f32(float x) {
++    return (x > 20.0f) ? x : logf(1.0f + expf(x));
++}
++
+ void ggml_cuda_op_elu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_floor(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

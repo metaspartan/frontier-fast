@@ -34,13 +34,33 @@ GPU:
   → candidate 108.5970 (**−0.077%**, gate 0.5%)
 - candidate `llama-server` boots, serves coherent greedy text, exits clean
 
+## 0002–0017: the launch-bound family, rebased onto this fork
+
+The laguna-xs R9700 series (trim, q8_1 requant dedupe, grouped launches,
+fold family, topk sorted-list, mmid Q4_K path, pool-teardown fix) rebased
+onto this fork's newer tree, on top of the TQ2_0 base. Two adjustments:
+
+- laguna's mmvf single-warp patch is **excluded** (corpus-sensitive on
+  other models, and maple's mmvf traffic is marginal).
+- 0005 additionally registers TQ2_0 in `mul_mat_vec_q_grouped_switch_type`.
+  Without it the grouped path GGML_ABORTs on the first small-batch prefill
+  (`llama-server` first task, ne11 <= 8) — llama-bench pp512/tg128 never
+  exercises that shape, so bench alone would not have caught it. Smoke-test
+  a real server completion before submitting anything here.
+
+Measured on the runner box vs the 0001-only frontier build (5-round
+interleaved whole-process A/B): decode tg128 195.0 → 288.7 tok/s (median
+per-round ratio **1.4815**), prefill neutral (median 0.977, within the
+prefill noise band). Vs stock: decode ~4.15x, prefill ~2.5x. PPL is
+bit-identical to the 0001-only build on both corpora (runner corpus
+21.8757, +0.317% vs stock; repo fixture 108.5970, −0.077% vs stock), and
+greedy completions match the 0001-only build on short and long prompts.
+
 ## Open levers
 
 1. **MMQ tiles for TQ2_0** — prefill currently dequantizes experts to f16
    and runs GEMM per expert; real q8 tile kernels should take prefill much
    further (upstream mmq-load-tiles is per-type; ternary loads are trivial).
-2. The launch-bound R9700 playbook (grouped launches, q8_1 dedupe, topk
-   sorted-list) has not been ported to this fork yet — the tree is newer
-   than b10237, so the laguna patches need rebasing, but the wins are the
-   same class. Decode at 195 tok/s now looks like Laguna's profile did.
-3. Sliding-window attention (3 of 4 layers, window 512) — untouched.
+2. Sliding-window attention (3 of 4 layers, window 512) — untouched.
+3. Shared-launch/fusion ideas from laguna 0017/0018 do not apply (maple has
+   no shared expert).

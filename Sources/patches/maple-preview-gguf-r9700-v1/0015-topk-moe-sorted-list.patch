@@ -1,0 +1,170 @@
+diff --git a/ggml/src/ggml-cuda/topk-moe.cu b/ggml/src/ggml-cuda/topk-moe.cu
+index c8cec70bb..d29967ba2 100644
+--- a/ggml/src/ggml-cuda/topk-moe.cu
++++ b/ggml/src/ggml-cuda/topk-moe.cu
+@@ -78,6 +78,28 @@ __device__ void sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], co
+     }
+ }
+ 
++
++// Order-preserving unsigned image of a float: for any two non-NaN floats a, b
++// (a > b) <=> (topk_moe_order(a) > topk_moe_order(b)). The selection value goes
++// in the high word and the complement of the expert index in the low word, so a
++// single unsigned 64-bit compare reproduces the stock comparison including its
++// "on a tie the lower expert index wins" rule.
++static __device__ __forceinline__ uint64_t topk_moe_key(float v, int expert) {
++    uint32_t u = __float_as_uint(v);
++    u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
++    return ((uint64_t) u << 32) | (uint64_t) (0xFFFFFFFFu - (uint32_t) expert);
++}
++
++static __device__ __forceinline__ int topk_moe_key_expert(uint64_t k) {
++    return (int) (0xFFFFFFFFu - (uint32_t) k);
++}
++
++static __device__ __forceinline__ uint64_t topk_moe_shfl_xor(uint64_t v, int mask) {
++    const int lo = __shfl_xor_sync(0xFFFFFFFF, (int) (uint32_t) (v & 0xFFFFFFFFu), mask, WARP_SIZE);
++    const int hi = __shfl_xor_sync(0xFFFFFFFF, (int) (uint32_t) (v >> 32),         mask, WARP_SIZE);
++    return ((uint64_t) (uint32_t) hi << 32) | (uint64_t) (uint32_t) lo;
++}
++
+ /*
+     This kernel does the following:
+     1. optionally softmax over the logits per token [n_experts, n_tokens]
+@@ -166,6 +188,128 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float *
+     //or the raw logits. We do the argmax reduce over n_expert_used, each time marking
+     //the expert weight as -inf to exclude from the next iteration
+ 
++    ggml_cuda_pdl_lc();
++
++    // Sorted-list top-k.
++    //
++    // The argmax loop below runs one full 5-step __shfl_xor butterfly per
++    // selected expert, and every step waits on the previous one, so selecting
++    // top-8 on wave32 is a chain of 40 dependent cross-lane round trips with
++    // almost no work between them. This kernel is launched as a single
++    // workgroup (one row per decoded token), so that chain is the whole kernel:
++    // 39 launches per token on this model, ~3.4% of decode kernel time.
++    //
++    // Same result, fixed depth: sort the experts each lane holds into a
++    // descending list (lane-local, no cross-lane traffic), then run a 5-round
++    // xor butterfly where each round merges the two partner lists and keeps the
++    // larger half (bitonic half-cleaner + merge). The shuffles inside a round
++    // are independent, so the dependent depth is 5 rounds instead of 40, and
++    // the butterfly leaves every lane holding the same sorted top list.
++    //
++    // Selection is by the same values with the same tie-break as the loop
++    // below, the weights are the same floats, and the normalisation sum is
++    // rebuilt with the stock per-lane partials and the stock warp butterfly, so
++    // the kernel is bit-identical to the one it replaces.
++    if (!config.delayed_softmax && n_expert_used <= experts_per_thread) {
++        uint64_t key[experts_per_thread];
++        float    wv[experts_per_thread];
++
++#pragma unroll
++        for (int i = 0; i < experts_per_thread; i++) {
++            const int expert = threadIdx.x + i * WARP_SIZE;
++            float     sel;
++            if constexpr (has_bias) {
++                sel = selection_wt[i];
++            } else {
++                sel = wt[i];
++            }
++            key[i] = topk_moe_key(sel, expert);
++            wv[i]  = wt[i];
++        }
++
++        // lane-local bitonic sort, descending
++#pragma unroll
++        for (int k = 2; k <= experts_per_thread; k <<= 1) {
++#pragma unroll
++            for (int j = k >> 1; j > 0; j >>= 1) {
++#pragma unroll
++                for (int i = 0; i < experts_per_thread; i++) {
++                    const int l = i ^ j;
++                    if (l > i) {
++                        const bool desc = ((i & k) == 0);
++                        const bool sw   = desc ? (key[i] < key[l]) : (key[i] > key[l]);
++                        if (sw) {
++                            const uint64_t tk = key[i]; key[i] = key[l]; key[l] = tk;
++                            const float    tw = wv[i];  wv[i]  = wv[l];  wv[l]  = tw;
++                        }
++                    }
++                }
++            }
++        }
++
++        // butterfly: merge partner lists, keep the larger half, re-sort
++#pragma unroll
++        for (int mask = 1; mask < WARP_SIZE; mask <<= 1) {
++            uint64_t pk[experts_per_thread];
++            float    pw[experts_per_thread];
++#pragma unroll
++            for (int i = 0; i < experts_per_thread; i++) {
++                pk[i] = topk_moe_shfl_xor(key[i], mask);
++                pw[i] = __shfl_xor_sync(0xFFFFFFFF, wv[i], mask, WARP_SIZE);
++            }
++#pragma unroll
++            for (int i = 0; i < experts_per_thread; i++) {
++                const int j = experts_per_thread - 1 - i;
++                if (pk[j] > key[i]) {
++                    key[i] = pk[j];
++                    wv[i]  = pw[j];
++                }
++            }
++#pragma unroll
++            for (int j = experts_per_thread >> 1; j > 0; j >>= 1) {
++#pragma unroll
++                for (int i = 0; i < experts_per_thread; i++) {
++                    const int l = i ^ j;
++                    if (l > i && key[i] < key[l]) {
++                        const uint64_t tk = key[i]; key[i] = key[l]; key[l] = tk;
++                        const float    tw = wv[i];  wv[i]  = wv[l];  wv[l]  = tw;
++                    }
++                }
++            }
++        }
++
++        float inv_sum = 1.0f;
++        if (config.with_norm) {
++            // Reproduce the stock normalisation sum exactly: each lane adds the
++            // weights of the selected experts it owns, in increasing k, and the
++            // 32 partials go through the same warp butterfly. Same addends, same
++            // per-lane order, same reduction -> bit-identical wt_sum.
++            float contrib = 0.f;
++#pragma unroll
++            for (int i = 0; i < experts_per_thread; i++) {
++                if (i < n_expert_used) {
++                    const int e = topk_moe_key_expert(key[i]);
++                    if ((e & (WARP_SIZE - 1)) == (int) threadIdx.x) {
++                        contrib += wv[i];
++                    }
++                }
++            }
++            float sum = warp_reduce_sum(contrib);
++            sum       = max(sum, clamp_val);
++            inv_sum   = 1.0f / sum;
++        }
++
++        // every lane holds the same list; lane i publishes slot i
++#pragma unroll
++        for (int i = 0; i < experts_per_thread; i++) {
++            if ((int) threadIdx.x == i && i < n_expert_used) {
++                ids[i]     = topk_moe_key_expert(key[i]);
++                weights[i] = (config.with_norm ? wv[i] * inv_sum : wv[i]) * scale_val;
++            }
++        }
++        return;
++    }
++
+     float wt_sum = 0.f;
+ 
+     float output_weights[experts_per_thread];
+@@ -175,7 +319,6 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float *
+         output_weights[i] = 0.f;
+     }
+ 
+-    ggml_cuda_pdl_lc();
+     for (int k = 0; k < n_expert_used; k++) {
+         float max_val    = wt[0];
+         int   max_expert = threadIdx.x;

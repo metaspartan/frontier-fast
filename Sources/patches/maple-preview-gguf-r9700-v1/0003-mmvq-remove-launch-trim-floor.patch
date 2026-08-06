@@ -1,0 +1,13 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index df5dcabdc..bf5b183d4 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -7,7 +7,7 @@
+ 
+ // Floor on how far the launch may be trimmed. Staged across the patch series so each
+ // submission stays inside the track's per-submission calibration band.
+-#define MMVQ_MIN_LAUNCHED_WARPS 6
++#define MMVQ_MIN_LAUNCHED_WARPS 1
+ 
+ typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
+ 

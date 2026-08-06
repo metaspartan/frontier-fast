@@ -1,0 +1,47 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index dbc12e312..91c78ba4f 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -839,6 +839,28 @@ static __host__ int calc_nwarps_launched(const int ncols_x, const int nwarps, co
+     return nwarps_launched < 1 ? 1 : (nwarps_launched > nwarps ? nwarps : nwarps_launched);
+ }
+ 
++// Warp trimming (calc_nwarps_launched) removes warps that would get no k-blocks.
++// That is a clear win while the grid is large enough to keep the memory system
++// busy on its own, but a small grid is limited by how many memory requests are
++// in flight, not by wave slots: there the trimmed warps are exactly the extra
++// concurrency the launch needs, and the trim costs several microseconds on
++// launches that only move a few hundred KiB (the shared-expert down projection
++// and the small attention projections here).
++//
++// Below this many blocks the launch keeps every warp. Restoring warps is
++// bit-identical by construction: a warp the trim would drop starts its k-loop at
++// kbx >= blocks_per_row_x, so it contributes exactly the +0.0f the kernel
++// otherwise writes into its reduction slot (see mul_mat_vec_q), leaving the
++// operand values and the reduction order untouched. It is also the stock
++// (pre-trim) launch geometry.
++static int mmvq_untrim_below_blocks() {
++    static const int v = []() -> int {
++        const char * e = getenv("GGML_MMVQ_UNTRIM_BLOCKS");
++        return e != nullptr ? std::atoi(e) : 4096;
++    }();
++    return v;
++}
++
+ template<ggml_type type>
+ static std::pair<dim3, dim3> calc_launch_params(
+         const int ncols_dst, const int ncols_x, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
+@@ -847,7 +869,12 @@ static std::pair<dim3, dim3> calc_launch_params(
+     const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
+     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
+-    const dim3 block_dims(warp_size, calc_nwarps_launched<type>(ncols_x, nwarps, warp_size), 1);
++    int nwarps_launched = calc_nwarps_launched<type>(ncols_x, nwarps, warp_size);
++    const int64_t total_blocks = (int64_t) block_nums.x * block_nums.y * block_nums.z;
++    if (total_blocks < (int64_t) mmvq_untrim_below_blocks()) {
++        nwarps_launched = nwarps;
++    }
++    const dim3 block_dims(warp_size, nwarps_launched, 1);
+     return {block_nums, block_dims};
+ }
+ 

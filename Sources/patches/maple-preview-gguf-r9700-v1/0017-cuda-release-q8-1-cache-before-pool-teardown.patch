@@ -1,0 +1,22 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index ab6f7090a..17a0d3958 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -701,6 +701,17 @@ static std::condition_variable ggml_cuda_lock_cv;
+ static std::atomic<int> ggml_cuda_lock_counter;
+ 
+ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
++    // The q8_1 reuse cache owns pool allocations, and it is declared ahead of
++    // `pools` in the context. Members are destroyed in reverse declaration order,
++    // so on teardown the pools would go first and the cache would then return its
++    // buffers to a destroyed pool - ggml_cuda_pool_leg's destructor catches that
++    // as GGML_ASSERT(pool_size == 0) and aborts the process. The destructor BODY
++    // runs before any member is destroyed, so releasing the cache here is what
++    // keeps the two in order. Only reached at context teardown; a server that
++    // never frees its context never saw it, but llama-bench frees one per
++    // configuration and aborted between them.
++    quantized_src1_cache.clear();
++
+     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+ 
