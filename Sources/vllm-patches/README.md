@@ -12,6 +12,24 @@ is *not* split per track: `laguna-xs-2.1-nvfp4-gb10-v1` and
 subdirectory here — the runner will not look in one. If a change helps XS and
 hurts S, gate it on the model or shape inside the patch.
 
+## S-track validation (2026-08-05)
+
+The merged frontier tree (kernels: NVFP4 MoE M-sub-tile + sign-folded nibble
+decode + 2-warp decode schedule + stock-geometry prefill signfold; vllmSource:
+0001 batch-invariant dense decode tile) measured on the GB10 box at the
+ranked-style S window (fresh 512-token prompt + 128 decode steps, median of 5):
+**17.46 tok/s decode** (57.3 ms/token) against the S frontier's 16.06 — the
+MoE decode wins transfer to Laguna-S. Served with the pinned baseline flags
+(util 0.88, KV blocks pinned to the baseline's 4,785).
+
+## Series log
+
+- `0001` — dense decode tile for the batch-invariant matmul (XS-verified
+  +12.4%); decode branch fires at M <= 16 with BLOCK_SIZE_M=16, N=64, nw=4,
+  ns=4, registered as an opaque custom op so the runtime-shape branch is live
+  under torch.compile.
+
+
 ## Scope
 
 - Everything in vLLM's **Python/Triton layer** is fair game: the NVFP4 MoE
