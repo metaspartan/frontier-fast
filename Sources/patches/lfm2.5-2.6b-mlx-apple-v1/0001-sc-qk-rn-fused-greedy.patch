@@ -77,7 +77,7 @@
 +        uint base = row * D;
 +        const device T* rin = r + base + lid * NR;
 +        const device T* xin = x + base + lid * NR;
-+        const device T* w = w + lid * NR;
++        const device T* wt = w + lid * NR;
 +        float tx[NR] = {0};
 +        for (uint i = 0; i < NR; i++) {
 +            tx[i] = (float)rin[i] + (float)xin[i];
@@ -96,7 +96,7 @@
 +        float inv = metal::precise::rsqrt(total / (float)D + EPS);
 +        for (uint i = 0; i < NR; i++) {
 +            T nb = (T)(tx[i] * inv);
-+            normed[base + lid * NR + i] = (T)(w[i] * nb);
++            normed[base + lid * NR + i] = (T)(wt[i] * nb);
 +        }
 +    """,
 +)
