@@ -1,17 +1,14 @@
-# lfm2.5-2.6b-mlx-apple-v1 — patch series (verified frontier: 1.006225)
+# lfm2.5-2.6b-mlx-apple-v1 — patch series
 
 | Patch | Intent |
 | --- | --- |
-| `0001-sc-fused-qk-norm-rope-greedy.patch` | SC elementwise + q/k RMSNorm+RoPE Metal kernels + greedy logsumexp skip |
+| `0001-rn256-qk-sc-greedy.patch` | SC elementwise + q/k RMSNorm+RoPE + residual+RMSNorm(256-thread) + greedy skip |
 
-Kernels (all bit-identical to stock, ppl exact 61.069):
-1. ShortConv elementwise (verified 1.003642): one dispatch for L=1 decode (22 layers)
-2. q/k RMSNorm+RoPE (verified 1.006225): one dispatch for L=1 decode (8 attention layers)
-3. Greedy logsumexp skip (verified 1.003831)
-
-## Measured dead ends (do not resubmit without new evidence)
-- N-gram speculative decoding (K=1/K=3, pipelined, reference-snapshots): 0.85x harness —
-  batch M=2 costs 1.47x at growing cache, online accept 78%, overlap incomplete
-- Fused residual add + RMSNorm (30 layers): 1.0033 runner (below frontier)
-- Fused operator_norm: +0.11% local (noise)
-- mx.compile variants, engine qmv tuning, requant, KVCache step: all dead
+Kernels (ppl exact 61.069):
+1. ShortConv elementwise (verified 1.003642): one dispatch, L=1 decode, 22 layers
+2. q/k RMSNorm+RoPE (verified 1.006225): one dispatch, L=1 decode, 8 attention layers
+3. residual add + RMSNorm (256-thread / 8-simdgroup geometry): one dispatch replaces
+   h=x+r + ffn_norm(h) for L=1 decode, all 30 layers. 256-thread threadgroups pack
+   onto M4's 10 GPU cores; the previous 512-thread (16-simdgroup) version scored
+   below the frontier on M4 despite winning locally on M1 Ultra (64 cores).
+4. Greedy logsumexp skip (verified 1.003831)

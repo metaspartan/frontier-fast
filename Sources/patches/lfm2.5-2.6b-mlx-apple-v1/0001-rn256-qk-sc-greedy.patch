@@ -1,6 +1,6 @@
 --- a/mlx_lm/models/lfm2.py
 +++ b/mlx_lm/models/lfm2.py
-@@ -13,6 +13,66 @@
+@@ -13,6 +13,116 @@
      scaled_dot_product_attention,
  )
  from .cache import ArraysCache, KVCache
@@ -64,10 +64,60 @@
 +    """,
 +)
 +
++# Residual add + RMSNorm, 256 threads (8 simdgroups), N_READS=8.
++# Small threadgroups pack well on M4's 10 cores (512-thread groups lost on M4).
++_FUSED_RN_KERNEL = mx.fast.metal_kernel(
++    name="lfm2_residual_rmsnorm_fused_v2",
++    input_names=["r", "x", "w"],
++    output_names=["h", "normed"],
++    source=r"""
++        constexpr uint D = 2048;
++        constexpr uint NR = 8;
++        constexpr float EPS = 1e-5f;
++        uint lid = thread_position_in_threadgroup.x;   // 256 threads
++        uint row = threadgroup_position_in_grid.x;
++        uint base = row * D;
++        const device T* rin = r + base + lid * NR;
++        const device T* xin = x + base + lid * NR;
++        const device T* wt = w + lid * NR;
++        float tx[NR];
++        for (uint i = 0; i < NR; i++) {
++            tx[i] = (float)rin[i] + (float)xin[i];
++            h[base + lid * NR + i] = (T)tx[i];
++        }
++        float acc = 0;
++        for (uint i = 0; i < NR; i++) acc += tx[i] * tx[i];
++        acc = simd_sum(acc);
++        threadgroup float gs[8];
++        uint sg = lid / 32;
++        uint lane = lid % 32;
++        if (lane == 0) gs[sg] = acc;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        float total = 0;
++        for (uint g = 0; g < 8; g++) total += gs[g];
++        float inv = metal::precise::rsqrt(total / (float)D + EPS);
++        for (uint i = 0; i < NR; i++) {
++            T nb = (T)(tx[i] * inv);
++            normed[base + lid * NR + i] = (T)(wt[i] * nb);
++        }
++    """,
++)
++
++
++def _fused_rn(r, x, weight):
++    rows = x.size // 2048
++    h, normed = _FUSED_RN_KERNEL(
++        inputs=[r, x, weight], template=[("T", x.dtype)],
++        grid=(rows * 256, 1, 1), threadgroup=(256, 1, 1),
++        output_shapes=[(x.size,), (x.size,)],
++        output_dtypes=[x.dtype, x.dtype],
++    )
++    return h.reshape(x.shape), normed.reshape(x.shape)
++
  
  
  @dataclass
-@@ -86,21 +146,36 @@
+@@ -86,21 +196,36 @@
  
          queries, keys, values = self.q_proj(x), self.k_proj(x), self.v_proj(x)
  
@@ -92,7 +142,10 @@
 +            )
 +            queries = q_f.reshape(B, self.n_heads, L, self.head_dim)
 +            keys = k_f.reshape(B, self.n_kv_heads, L, self.head_dim)
-+            keys, values = cache.update_and_fetch(keys, values)
+             keys, values = cache.update_and_fetch(keys, values)
+-        else:
+-            queries = self.rope(queries)
+-            keys = self.rope(keys)
 +        elif cache is not None:
 +            queries = self.rope(
 +                self.q_layernorm(queries.reshape(B, L, self.n_heads, -1)).transpose(0, 2, 1, 3),
@@ -102,10 +155,8 @@
 +                self.k_layernorm(keys.reshape(B, L, self.n_kv_heads, -1)).transpose(0, 2, 1, 3),
 +                offset=cache.offset,
 +            )
-             keys, values = cache.update_and_fetch(keys, values)
-         else:
--            queries = self.rope(queries)
--            keys = self.rope(keys)
++            keys, values = cache.update_and_fetch(keys, values)
++        else:
 +            queries = self.rope(
 +                self.q_layernorm(queries.reshape(B, L, self.n_heads, -1)).transpose(0, 2, 1, 3)
 +            )
@@ -115,7 +166,7 @@
  
          output = scaled_dot_product_attention(
              queries, keys, values, cache=cache, mask=mask, scale=self.scale
-@@ -137,6 +212,30 @@
+@@ -137,6 +262,30 @@
          mask: Optional[mx.array] = None,
          cache: Optional[Any] = None,
      ):
@@ -146,6 +197,21 @@
          BCx = self.in_proj(x)
          B, C, x = mx.split(BCx, 3, axis=-1)
          Bx = B * x
+@@ -229,8 +378,12 @@
+                 mask=mask,
+                 cache=cache,
+             )
+-        h = x + r
+-        out = h + self.feed_forward(self.ffn_norm(h))
++        if x.shape[1] == 1 and x.shape[-1] == 2048:
++            h, normed = _fused_rn(r, x, self.ffn_norm.weight)
++            out = h + self.feed_forward(normed)
++        else:
++            h = x + r
++            out = h + self.feed_forward(self.ffn_norm(h))
+         return out
+ 
+ 
 --- a/mlx_lm/generate.py
 +++ b/mlx_lm/generate.py
 @@ -383,7 +383,12 @@
