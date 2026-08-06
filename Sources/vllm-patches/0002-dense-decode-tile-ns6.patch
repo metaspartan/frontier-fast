@@ -1,0 +1,13 @@
+diff --git a/vllm/model_executor/layers/batch_invariant.py b/vllm/model_executor/layers/batch_invariant.py
+index 320639f..f8fafe3 100644
+--- a/vllm/model_executor/layers/batch_invariant.py
++++ b/vllm/model_executor/layers/batch_invariant.py
+@@ -154,7 +154,7 @@ _DECODE_M_MAX = 16
+ _DECODE_BLOCK_M = 16
+ _DECODE_BLOCK_N = 64
+ _DECODE_NUM_WARPS = 4
+-_DECODE_NUM_STAGES = 4
++_DECODE_NUM_STAGES = 6
+ 
+ 
+ @functools.lru_cache(maxsize=8)
