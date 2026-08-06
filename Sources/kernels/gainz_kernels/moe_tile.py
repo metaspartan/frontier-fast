@@ -127,6 +127,16 @@ _engaged_stock_shape = False
 # away from the stock kernel's.
 _STOCK_NUM_WARPS = 4
 
+# Launch schedule for prefill-shaped forwards (M > _SMALL_M_MAX).  The
+# dequant ALU chain (nibble decode + scale multiply per B element) is the
+# documented prefill cost on this track, and num_warps only changes how the
+# output tile is partitioned across warps — the K-reduction sequence of every
+# output element is unchanged (same BLOCK_SIZE_*, same MMA instructions in
+# the same order into the same fp32 accumulator), exactly the argument the
+# verified 2-warp decode sub-tile used.  Eight warps spread the per-tile
+# dequant ALU over twice the threads at the same tile geometry.
+_PREFILL_NUM_WARPS = 8
+
 # Launch schedule for the decode sub-tile kernel.  num_warps=2 (instead of
 # Triton's default 4) is where the speed comes from: the [16, 64] output tile
 # occupies exactly two m16n8 MMA fragment rows per warp at nw=2, and the
@@ -369,7 +379,9 @@ def _subtile_invoke(
         and 0 < _current_tokens <= _SMALL_M_MAX
     )
     sub_m = _SUB_BLOCK_M if decode_shaped else block_stride_m
-    launch_warps = _SUB_NUM_WARPS if decode_shaped else _STOCK_NUM_WARPS
+    launch_warps = (
+        _SUB_NUM_WARPS if decode_shaped else _PREFILL_NUM_WARPS
+    )
 
     assert B_scale is not None and B_scale.ndim == 3
 
