@@ -37,9 +37,23 @@ and 0019 unchanged (only renumbered). Two laguna patches are deliberately
 The A/B without the mmvf patch is *more* stable than with it (no bimodal
 rounds observed in 5 rounds).
 
+## Closed levers — do not spend a slot re-deriving
+
+- **Shared-expert ninth-channel fold (laguna 0017/0018): structurally
+  impossible on this GGUF.** The fold's pair guard requires the shared
+  expert's weight slab to match the routed experts' type exactly
+  (`sw->type != w->type → decline`), because the extra channel reuses the
+  routed launch's vec_dot. Unsloth's UD-Q4_K_M upcasts all three shexp
+  tensors to **Q8_0** while the routed experts are Q4_K (gate/up) and Q5_K
+  (down) — no layer can ever pair. Verified by reading the guard against
+  the tensor table (blk.*.ffn_down_shexp Q8_0 [512,2048] vs
+  ffn_down_exps Q5_K [512,2048,256]). A mixed-type extra channel would
+  need a second vec_dot template parameter and forfeits the bit-identity
+  argument — not worth the +3.6%-class gain unless someone requants.
+
 ## Open levers
 
-1. Shared-expert ninth-channel fold adapted to `build_qwen35moe` (see above).
+1. (moved to closed: shexp ninth-channel — see above)
 2. The GDN/linear-attention layers (3 of every 4) are untouched by this
    series beyond the generic grouped launches — profile their dispatch
    structure; `ssm` conv/scan ops may group the same way rms_norm did.
