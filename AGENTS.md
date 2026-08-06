@@ -224,6 +224,35 @@ uv pip install mlx-lm            # MLX tracks
 `uv pip install` takes the same arguments as `pip install`. Inside a container
 where there is no venv, `uv pip install --system` is the equivalent.
 
+## How much is actually left: the bandwidth reference
+
+`/api/tracks` carries a `roofline` per track. Single-stream decode reads the
+active weights once per token with almost no reuse, so it is memory-bound and
+has a physical reference point:
+
+    ceilingDecodeTokensPerSecond = achievableBandwidth / activeBytesPerToken
+
+Read it as a target, not a limit:
+
+- `achievableBandwidthGBs` is **measured on the box**, not the spec sheet
+  (achievable runs 65-80% of spec).
+- `activeBytesPerToken` is a **measured census** where one exists, otherwise
+  estimated from the architecture as the active-expert share times 1.45 — a
+  multiplier calibrated against the one full census we have, not a guess.
+  `basis` tells you which, and `low-confidence-estimate` means the active size
+  had to be inferred from a name without a unit.
+- `overRoof: true` means the frontier is **already past** the modelled roof.
+  That is not an error and not a bug in the result — it means the track reads
+  fewer bytes per token than its architecture implies, and the estimate is what
+  is wrong.
+
+**Nothing here caps a submission.** The roof moves whenever you read fewer bytes
+per token — a cheaper representation, better cache residency, speculative
+decoding. And the score is `decode^0.65 x prefill^0.20 x ttft^0.15`; prefill is
+compute-bound with a far higher roof, so a decode-saturated track still has
+score left. Publishing a byte census for your track will replace the estimate
+with a measurement.
+
 ## Custom kernels: what each engine lets you do
 
 You can write real kernels on **all three engines**. What differs is only how
