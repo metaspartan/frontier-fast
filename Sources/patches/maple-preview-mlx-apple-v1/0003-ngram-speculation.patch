@@ -1,0 +1,337 @@
+diff --git a/mlx_lm/generate.py b/mlx_lm/generate.py
+index 453357c..35cf61f 100644
+--- a/mlx_lm/generate.py
++++ b/mlx_lm/generate.py
+@@ -5,6 +5,7 @@ import contextlib
+ import copy
+ import functools
+ import json
++import os
+ import sys
+ import time
+ from collections import deque
+@@ -302,6 +303,40 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
+             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
+ 
+ 
++# Prompt-lookup n-gram proposer for speculative greedy decoding: remember the
++# token that followed each recent n-gram (longest n wins, most recent
++# occurrence wins) over prompt + generated context.
++_NGRAM_NS = (4, 3, 2)
++
++
++def _ngram_build(ctx):
++    tables = {n: {} for n in _NGRAM_NS}
++    for i in range(1, len(ctx)):
++        t = ctx[i]
++        for n in _NGRAM_NS:
++            if i >= n:
++                tables[n][tuple(ctx[i - n : i])] = t
++    return tables
++
++
++def _ngram_observe(tables, ctx):
++    length = len(ctx)
++    t = ctx[-1]
++    for n in _NGRAM_NS:
++        if length > n:
++            tables[n][tuple(ctx[length - 1 - n : length - 1])] = t
++
++
++def _ngram_propose(tables, ctx):
++    length = len(ctx)
++    for n in _NGRAM_NS:
++        if length >= n:
++            t = tables[n].get(tuple(ctx[length - n :]))
++            if t is not None:
++                return t
++    return None
++
++
+ def generate_step(
+     prompt: mx.array,
+     model: nn.Module,
+@@ -381,6 +416,7 @@ def generate_step(
+         kv_bits=kv_bits,
+     )
+ 
++    _greedy_sampler = sampler is None
+     sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+ 
+     def _model_call(input_tokens: mx.array, input_embeddings: Optional[mx.array]):
+@@ -419,6 +455,8 @@ def generate_step(
+             sampled = sampler(logprobs)
+             return sampled, logprobs.squeeze(0)
+ 
++    _spec_prompt = prompt
++
+     with mx.stream(generation_stream):
+         total_prompt_tokens = (
+             len(input_embeddings) if input_embeddings is not None else len(prompt)
+@@ -454,6 +492,110 @@ def generate_step(
+ 
+         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
+ 
++    # Draftless n-gram speculation with exact greedy verification. The token
++    # stream is identical to plain greedy decoding by construction: a drafted
++    # token is emitted only when the model's own argmax at the previous
++    # position equals it. Enabled only in the plain greedy configuration and
++    # when every cache supports a safe reject path (loose-draft rotating
++    # caches, trimmable append caches).
++    _spec = (
++        _greedy_sampler
++        and not logits_processors
++        and kv_bits is None
++        and input_embeddings is None
++        and max_tokens != 0
++        and os.environ.get("MLX_NGRAM_SPEC", "1") != "0"
++        and all(
++            hasattr(c, "commit_spec") or type(c) is KVCache for c in prompt_cache
++        )
++        and all(c._spec_ready() for c in prompt_cache if hasattr(c, "commit_spec"))
++    )
++
++    if _spec:
++        _dbg = os.environ.get("MLX_SPEC_DEBUG") == "1"
++        spec_caches = [c for c in prompt_cache if hasattr(c, "commit_spec")]
++        trim_caches = [c for c in prompt_cache if not hasattr(c, "commit_spec")]
++        for c in spec_caches:
++            c.spec_mode = True
++        model._spec_flash = True
++        try:
++            mx.async_eval(y, logprobs)
++            mx.eval(y)
++            prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
++            ctx = _spec_prompt.tolist()
++            tables = None  # built after the first yield, off the TTFT path
++            cur = int(y.item())
++            cur_lp = logprobs
++            k_max = max(1, min(3, int(os.environ.get("MLX_NGRAM_SPEC_K", "3"))))
++            n = 0
++            done = False
++            while not done:
++                yield cur, cur_lp
++                n += 1
++                ctx.append(cur)
++                if tables is not None:
++                    _ngram_observe(tables, ctx)
++                if n == max_tokens:
++                    break
++                if n % 256 == 0:
++                    mx.clear_cache()
++                if tables is None:
++                    tables = _ngram_build(ctx)
++                # Draft a chain of up to k_max tokens by iterated prompt-lookup.
++                chain = []
++                while len(chain) < k_max:
++                    nxt = _ngram_propose(tables, ctx)
++                    if nxt is None:
++                        break
++                    chain.append(nxt)
++                    ctx.append(nxt)
++                for _ in chain:
++                    ctx.pop()
++                if not chain:
++                    y2, lp2 = _step(mx.array([cur]))
++                    mx.async_eval(y2, lp2)
++                    cur = int(y2.item())
++                    cur_lp = lp2
++                    continue
++                k = len(chain)
++                with mx.stream(generation_stream):
++                    logits = model(mx.array([[cur, *chain]]), cache=prompt_cache)
++                    lps = logits - mx.logsumexp(logits, axis=-1, keepdims=True)
++                    ts = mx.argmax(lps, axis=-1)
++                mx.async_eval(ts, lps)
++                tvals = [int(t) for t in ts[0].tolist()]
++                a = 0
++                while a < k and tvals[a] == chain[a]:
++                    a += 1
++                if _dbg:
++                    print(
++                        f"[spec] n={n} verify cur={cur} chain={chain} "
++                        f"model={tvals} accepted={a}/{k}",
++                        file=sys.stderr,
++                    )
++                with mx.stream(generation_stream):
++                    for c in spec_caches:
++                        c.commit_spec(a)
++                for c in trim_caches:
++                    c.trim(k - a)
++                for i in range(a):
++                    yield chain[i], lps[0, i]
++                    n += 1
++                    ctx.append(chain[i])
++                    _ngram_observe(tables, ctx)
++                    if n == max_tokens:
++                        done = True
++                        break
++                if done:
++                    break
++                cur = tvals[a]
++                cur_lp = lps[0, a]
++        finally:
++            for c in spec_caches:
++                c.spec_mode = False
++            model._spec_flash = False
++        return
++
+     mx.async_eval(y, logprobs)
+     n = 0
+     while True:
+diff --git a/mlx_lm/models/cache.py b/mlx_lm/models/cache.py
+index b84c9d6..74d2d06 100644
+--- a/mlx_lm/models/cache.py
++++ b/mlx_lm/models/cache.py
+@@ -512,8 +512,89 @@ class RotatingKVCache(_BaseCache):
+     def update_and_fetch(self, keys, values):
+         if keys.shape[2] == 1:
+             return self._update_in_place(keys, values)
++        if (
++            2 <= keys.shape[2] <= 8
++            and getattr(self, "spec_mode", False)
++            and self._spec_ready()
++        ):
++            return self._spec_update(keys, values)
+         return self._update_concat(keys, values)
+ 
++    # --- speculative (loose-draft) support -------------------------------
++    # A 2-token verify step [certain, draft] commits only the certain token
++    # into the ring (the stock S=1 in-place write) and carries the draft's
++    # K/V as loose tensors appended to the fetched view. Accepting the draft
++    # commits the loose slot exactly as the stock S=1 write would have;
++    # rejecting it drops the loose tensors and leaves the ring untouched, so
++    # no rollback (and no clobbered window slot) can ever occur. Attention
++    # semantics match processing the two tokens one at a time through the
++    # stock path; make_mask supplies the rotation-aware (2, size+1) mask.
++
++    spec_mode = False
++    _loose_k = None
++    _loose_v = None
++
++    def _spec_ready(self):
++        return (
++            self.keys is not None
++            and self.offset >= self.max_size
++            and self.max_size == self.keys.shape[2]
++        )
++
++    def _spec_update(self, keys, values):
++        k, v = self._update_in_place(keys[..., :1, :], values[..., :1, :])
++        self._loose_k = keys[..., 1:, :]
++        self._loose_v = values[..., 1:, :]
++        return (
++            mx.concatenate([k, self._loose_k], axis=2),
++            mx.concatenate([v, self._loose_v], axis=2),
++        )
++
++    def _spec_mask(self, n_loose):
++        # Called at model entry, before the certain token's write. Column
++        # layout of the fetched view: max_size ring slots then the loose
++        # drafts in order. Query row i sits at position p+i (row 0 is the
++        # certain token at p). It must see: the ring minus its i
++        # out-of-window oldest slots (the slots that i further stock S=1
++        # writes would have evicted, starting at the one past the certain
++        # token's own write), and loose drafts j <= i-1 plus nothing newer —
++        # exactly what 1+n consecutive stock S=1 steps would attend to.
++        size = self.max_size
++        w = self.keep if self._idx == size else self._idx
++        rows = []
++        cols = mx.arange(size + n_loose)
++        span = size - self.keep
++        for i in range(1 + n_loose):
++            ring_ok = cols < size
++            for j in range(i):
++                dead = self.keep + ((w - self.keep + 1 + j) % span)
++                ring_ok = ring_ok & (cols != dead)
++            loose_ok = (cols >= size) & (cols < size + i)
++            rows.append(ring_ok | loose_ok)
++        return mx.stack(rows)
++
++    def commit_spec(self, n=None):
++        if self._loose_k is None:
++            return
++        take = self._loose_k.shape[2] if n is None else n
++        for i in range(take):
++            if self._idx == self.max_size:
++                self._idx = self.keep
++            self.keys[..., self._idx : self._idx + 1, :] = self._loose_k[
++                ..., i : i + 1, :
++            ]
++            self.values[..., self._idx : self._idx + 1, :] = self._loose_v[
++                ..., i : i + 1, :
++            ]
++            self.offset += 1
++            self._idx += 1
++        self._loose_k = None
++        self._loose_v = None
++
++    def discard_spec(self):
++        self._loose_k = None
++        self._loose_v = None
++
+     def size(self):
+         return min(self.offset, self.max_size)
+ 
+@@ -554,6 +635,8 @@ class RotatingKVCache(_BaseCache):
+     def make_mask(
+         self, N: int, window_size: Optional[int] = None, return_array: bool = False
+     ):
++        if 2 <= N <= 8 and getattr(self, "spec_mode", False) and self._spec_ready():
++            return self._spec_mask(N - 1)
+         if N > 1:
+             window_size = window_size or self.max_size
+             offset = min(self.max_size - 1, self.offset)
+diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
+index a0673f7..e1ceba0 100644
+--- a/mlx_lm/models/maple.py
++++ b/mlx_lm/models/maple.py
+@@ -633,6 +633,7 @@ class MapleGate(nn.Module):
+         self.weight = mx.zeros((args.num_experts, args.hidden_size))
+         self._router_ctr = None
+         self._fused = None  # None = unprobed, then True/False
++        self._w32 = None  # cached fp32 view of the router weight
+ 
+     def _fused_call(self, x):
+         if self._router_ctr is None:
+@@ -656,7 +657,13 @@ class MapleGate(nn.Module):
+     def _reference(self, x):
+         # `router_dtype: fp32`. In bf16 the near-tied top-8 boundary flips a
+         # few percent of picks per layer, which compounds over 24 layers.
+-        gates = x.astype(mx.float32) @ self.weight.astype(mx.float32).T
++        # The fp32 view of the router weight is cached: rebuilding it was a
++        # 2 MB astype per layer per call, paid on every prefill chunk and
++        # every batched verify step. Same values, same matmul.
++        w32 = self._w32
++        if w32 is None or w32.dtype != mx.float32:
++            w32 = self._w32 = mx.contiguous(self.weight.astype(mx.float32))
++        gates = x.astype(mx.float32) @ w32.T
+         return group_expert_select(gates, self.top_k)
+ 
+     def _probe(self, x):
+@@ -982,11 +989,23 @@ class Model(nn.Module):
+         if (
+             self.lm_head_flash is not None
+             and out.shape[0] == 1
+-            and out.shape[1] == 1
+             and isinstance(self.lm_head, nn.QuantizedLinear)
+             and getattr(self.lm_head, "mode", "affine") == "affine"
+         ):
+-            return self.lm_head_flash(out, self.lm_head)
++            if out.shape[1] == 1:
++                return self.lm_head_flash(out, self.lm_head)
++            # Speculative verify steps (opt-in via _spec_flash, set by the
++            # generation loop) need per-position argmax at a tiny L. Apply
++            # FlashHead independently per position — same envelope as the
++            # single-token path — instead of reading the full exact head.
++            if getattr(self, "_spec_flash", False) and out.shape[1] <= 4:
++                return mx.concatenate(
++                    [
++                        self.lm_head_flash(out[:, i : i + 1], self.lm_head)
++                        for i in range(out.shape[1])
++                    ],
++                    axis=1,
++                )
+         return self.lm_head(out)
+ 
+     def sanitize(self, weights):
