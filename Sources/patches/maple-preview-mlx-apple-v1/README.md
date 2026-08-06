@@ -85,6 +85,21 @@ down gather) 0.054, fused add+norm ×2 ~0.01, aggregate ~0.004 → 0.14/layer.
   (up_gate, down; M=1 stays on the vector path — get_qmv_batch_limit gates
   the matrix path), fused metal_kernels for router/QK/add-norm, FlashHead
   gather. CLOSED.
+- **Fused ternary MoE decode kernels (2026-08-06)**: a complete, correct
+  mx.fast.metal_kernel replacement for the M=1 switch — K1 fuses
+  up_gate+clamped-SwiGLU, K2 fuses down+score-weighted combine (2 dispatches
+  vs ~6, stock-parity rounding, all 24 layer probes pass, token streams
+  identical). Five geometry/codegen variants measured on the M4 Pro against
+  the stock pair (gather_qmv_fast + elementwise): best was 0.83x / 0.85x
+  isolated, 0.965x end-to-end decode. Findings that transfer: per-LANE
+  contiguous access dominates on Apple GPUs (cross-lane interleaving was
+  2-8x worse), 32-thread threadgroups halve throughput vs 64, multi-row
+  register blocking regresses via spills, and vectorized uint4/bfloat4 loads
+  change nothing (the compiler already coalesces). Apple's qmv_fast template
+  keeps a ~17% lead that survived every variant. Third confirmation of the
+  custom-ternary-kernel CLOSED verdict; full implementation preserved in
+  `reference/fused-moe-decode-attempt.patch.txt` (not part of the applied
+  series). CLOSED.
 - **gs512 ternary scale regroup (2026-08-06)**: row-alpha scales are per-row
   constant, so regrouping scales/biases gs128→gs512 (with a 2-line engine
   patch adding `instantiate_quantized_types(512, 2)` to quantized.metal +
