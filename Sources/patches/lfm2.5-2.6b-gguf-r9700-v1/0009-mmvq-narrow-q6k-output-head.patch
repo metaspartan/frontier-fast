@@ -1,0 +1,34 @@
+From 12dfe36bfa019b0f11b4b68cd8886392ce7a89c6 Mon Sep 17 00:00:00 2001
+From: Cybara <carsenk@gmail.com>
+Date: Thu, 6 Aug 2026 01:59:27 -0600
+Subject: [PATCH] CUDA/HIP: narrow the q6_K output head to 4 warps on RDNA
+
+LFM output head (q6_K, K=2048, 128000 rows) has vdr=1 -> 1 k-block/warp ->
+one tiny load/thread -> latency-bound at ~55% of peak. Force the RDNA small_k
+narrow (4 warps, 2 k-blocks/warp) to pipeline loads.
+
+Measured on R9700 (5 interleaved pairs x 5 reps, LFM2.5 2.6B Q4_K):
+  tg128 227.41 -> 228.07 (+0.29%), pp32 225.02 -> 225.67 (+0.29%), 5/5 pairs.
+ppl-equivalent (pure block-geometry change).
+---
+ ggml/src/ggml-cuda/mmvq.cu | 4 ++++
+ 1 file changed, 4 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index cdeefd6..c11c254 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1149,6 +1149,10 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         const int     blocks_per_iter_1warp = vdr * warp_size / qi;
+         const int     nwarps                = calc_nwarps(type, c_ncols_dst, table_id);
+         bool          use                   = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
++        // Head-narrow (same as laguna 0021): q6_K output head (K=2048,
++        // nrows>=16384) has vdr=1 -> 1 k-block/warp -> latency-bound at ~55%
++        // of peak. 4 warps pipeline 2 k-blocks/warp.
++        use = use || (GGML_CUDA_CC_IS_RDNA(cc) && type == GGML_TYPE_Q6_K && ncols_x == 2048 && nrows_x >= 16384);
+ 
+         constexpr std::array<ggml_type, 2> iq_slow_turing = {
+             GGML_TYPE_IQ3_XXS,
+-- 
+2.49.0.windows.1
+
