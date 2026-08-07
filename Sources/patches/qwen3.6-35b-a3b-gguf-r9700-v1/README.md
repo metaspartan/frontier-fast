@@ -243,3 +243,29 @@ Two portable lessons:
 
 The 0022 sigmoid fusion was server-identity-verified clean in the same
 session (byte-identical greedy output with the fusion toggled).
+
+
+## Prefill profile (rocprofv3, pp512, 0022 build) - the round-7 map
+
+Never profiled before this. Per-pass kernel time ~151 ms (pp512 = 3255 tok/s
+local bench):
+
+| share | kernel | note |
+|---|---|---|
+| 29.3% | mul_mat_q Q4_K (expert gate+up MMQ) | ~50% of int8 compute peak |
+| 14.3% | mul_mat_q Q5_K (expert down MMQ) | same class |
+| 11.1% | gated_delta_net | GDN chunked scan |
+| 13.5% | Cijk_* rocBLAS GEMMs | fp16 attention + the 0021 GEMM route |
+| 3.8% | mm_ids_helper | MoE routing scatter |
+| 2.8% | dequantize_block_q6_K | the 0021 route's dequant cost |
+
+The MoE expert MMQ (43.6% combined) is the biggest untouched surface on this
+track: RDNA4 mmq tile tuning for the mmid expert shapes. Optimistic ceiling
+~+15-20% prefill (score x1.03) - combined with ~+2-3% more decode this is
+the remaining path to the 1.298 bank. gated_delta_net prefill efficiency is
+the secondary target.
+
+Decode-side note: the conv-state fold done RIGHT (try_fuse, adjacent
+cpy/ssm_conv/silu pattern, byte-exact server identity) is performance-
+NEUTRAL - with HIP graphs replaying, sub-10us launch elimination is
+exhausted on this box. Kernel-time work only from here.
