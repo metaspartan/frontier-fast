@@ -32,3 +32,22 @@ their verified sources; 0012 renumbered from the qwen r9700 series' 0014.
 
 - **ngram self-speculation measured-dead here too** (2026-08-07): decode
   41.7 -> 37.5 (-10%), mirroring the R9700 twin. Same acceptance economics.
+
+## 0013: load-time Q6_K requant of the UD Q8_0 projections (GB10 port)
+
+Port of the R9700 lever (see that track's README for the full derivation).
+The UD export's Q8_0 projection upcasts are ~1.49 GB of weight reads per
+decoded token; the loader requantizes the five families to Q6_K at load.
+On the GB10's LPDDR5 the byte cut pays MORE than on the R9700:
+
+- decode 42.0-42.25 -> 44.4-44.5 tok/s (**+5.7%**, 3/3 same-binary toggles)
+- prefill 806 -> 773 tok/s local (-4.0%; MMQ path - the RDNA4 GEMM routing
+  is **HIP-guarded off** here because sm_121 tensor-core Q6_K MMQ measures
+  FASTER than dequant+GEMM, the opposite of RDNA4)
+- gate ppl: cand 3.9306 vs stock 3.9322 (**-0.04%**)
+- server smoke clean; GGML_LOAD_REQUANT=0 restores stock bytes
+
+The R9700 ranked run measured about HALF the local pp512 prefill delta, so
+the ranked prefill floor has comfortable margin. The 0022-class sigmoid
+fusion does NOT port here (needs the grouped-mmvf launch, which is
+measured-dead on sm_121).
