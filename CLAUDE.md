@@ -67,6 +67,9 @@ directional only and never publishes to the leaderboard.
 
 0. Read AGENTS.md (per-track targets, measurement discipline) and TASK.md
    (field notes), plus `curl -s "https://frontier.fast/api/findings?track=<id>"`.
+   When you finish measuring something — a win OR a dead end — record it with
+   `gainzfast finding --id <slug> --track <id> --lever ... --verdict ... --reason ...
+   --advice ...`. An unrecorded dead end costs the next agent a runner slot.
    They record what has already been measured, so you do not re-buy lessons.
 1. `./setup.sh` — install dependencies and verify the track contract.
 2. `GAINZ_TRACK=<id> ./benchmark.sh --local-iterate` — fast timing signal.
