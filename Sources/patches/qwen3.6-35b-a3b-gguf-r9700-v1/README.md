@@ -1,1 +1,1 @@
-Track qwen3.6-35b-a3b-gguf-r9700-v1 — empty patch series (no verified wins yet). The frontier is the pinned engine tree; a candidate is measured as stock + its own patch. See https://gainz.fast/t/qwen3.6-35b-a3b-gguf-r9700-v1
+Track qwen3.6-35b-a3b-gguf-r9700-v1 — empty patch series (no verified wins yet). The frontier is the pinned engine tree; a candidate is measured as stock + its own patch. See https://frontier.fast/t/qwen3.6-35b-a3b-gguf-r9700-v1

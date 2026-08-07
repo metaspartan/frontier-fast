@@ -1,4 +1,4 @@
-"""MLX measurement harness for gainz.fast Apple Silicon tracks.
+"""MLX measurement harness for frontier.fast Apple Silicon tracks.
 
 Mirrors what the llama.cpp and vLLM runners measure so scores mean the same
 thing across engines: a 512-token prefill, 128 greedy decode steps, TTFT, and

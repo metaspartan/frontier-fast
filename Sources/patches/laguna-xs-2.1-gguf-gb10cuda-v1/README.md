@@ -10,7 +10,7 @@ the grouped-mmvq path off by default (it loses on this device); 0011 batches
 k-loads in `mul_mat_vec_f`.
 
 Numbers here are from the trusted runner and the findings API as of
-2026-08-04. `curl -s "https://gainz.fast/api/findings?track=laguna-xs-2.1-gguf-gb10cuda-v1"`
+2026-08-04. `curl -s "https://frontier.fast/api/findings?track=laguna-xs-2.1-gguf-gb10cuda-v1"`
 is authoritative.
 
 ## This device is not the R9700

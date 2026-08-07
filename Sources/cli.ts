@@ -10,8 +10,8 @@ import type { Contract } from "./types";
 const args = process.argv.slice(2);
 const command = args[0] ?? "help";
 
-const API = process.env.GAINZFAST_URL ?? "https://gainz.fast";
-const REPO_URL = "https://github.com/metaspartan/gainz-fast.git";
+const API = process.env.GAINZFAST_URL ?? "https://frontier.fast";
+const REPO_URL = "https://github.com/metaspartan/frontier-fast.git";
 
 function flag(name: string): string | undefined {
   const at = args.indexOf(`--${name}`);
@@ -44,7 +44,7 @@ function readToken(): string | undefined {
 }
 
 function usage(): void {
-  console.log(`gainzfast — gainz.fast challenge CLI (in-repo entry point)
+  console.log(`gainzfast — frontier.fast challenge CLI (in-repo entry point)
 
   bun run Sources/cli.ts tracks
   bun run Sources/cli.ts clone [--track <id>]
@@ -84,7 +84,7 @@ async function submit(): Promise<void> {
   const token = readToken();
   if (!token) {
     console.error("No token. Set GAINZ_TOKEN=<gz_token>, or run: gainzfast login <gz_token>");
-    console.error("Mint one on https://gainz.fast while signed in with GitHub. Never commit it.");
+    console.error("Mint one on https://frontier.fast while signed in with GitHub. Never commit it.");
     process.exit(1);
   }
 
@@ -134,7 +134,7 @@ async function submit(): Promise<void> {
     process.exit(1);
   }
   console.log(`Submitted ${result.id} (${result.status}) on ${track.id}.`);
-  console.log("The trusted runner will verify it; watch https://gainz.fast or /api/submissions/mine.");
+  console.log("The trusted runner will verify it; watch https://frontier.fast or /api/submissions/mine.");
 }
 
 if (command === "help" || command === "--help" || command === "-h") {
@@ -147,7 +147,7 @@ if (command === "help" || command === "--help" || command === "-h") {
   const track = flag("track");
   console.log(`Cloning ${REPO_URL}${track ? ` (track: ${track})` : ""}`);
   console.log("This repository ships agent hooks (.claude, .cursor, .codex, .opencode).");
-  console.log("If your harness loads repository hooks at startup, relaunch it from gainz-fast/.");
+  console.log("If your harness loads repository hooks at startup, relaunch it from frontier-fast/.");
   shell("git", ["clone", REPO_URL]);
 } else if (command === "setup") {
   shell(process.platform === "win32" ? "bash" : "./setup.sh", process.platform === "win32" ? ["./setup.sh"] : []);

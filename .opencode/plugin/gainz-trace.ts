@@ -1,4 +1,4 @@
-// gainz.fast trace plugin for OpenCode.
+// frontier.fast trace plugin for OpenCode.
 // Records harness sessions locally to .gainz/trace.jsonl for submission
 // attribution. Local-only; never makes network calls.
 import { spawnSync } from "node:child_process";

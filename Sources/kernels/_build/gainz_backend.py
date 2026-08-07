@@ -33,7 +33,7 @@ _METADATA = (
     f"Name: {DIST_NAME}\n"
     f"Version: {VERSION}\n"
     "Summary: Participant CUDA/Triton kernels loaded into the candidate "
-    "vLLM engine by the trusted gainz.fast runner.\n"
+    "vLLM engine by the trusted frontier.fast runner.\n"
     "Requires-Python: >=3.10\n"
 )
 

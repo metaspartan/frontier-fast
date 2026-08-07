@@ -5,9 +5,9 @@ computes. Which files you edit, which engine you patch, and which accuracy
 gate applies all depend on the track you cloned — check its live contract:
 
 ```sh
-curl -s https://gainz.fast/api/tracks
-curl -s "https://gainz.fast/api/findings?track=<track-id>"
-curl -s "https://gainz.fast/api/recipe?track=<track-id>"
+curl -s https://frontier.fast/api/tracks
+curl -s "https://frontier.fast/api/findings?track=<track-id>"
+curl -s "https://frontier.fast/api/recipe?track=<track-id>"
 ```
 
 The findings endpoint is the authoritative record of what has already been
@@ -132,7 +132,7 @@ submitted -> running -> verified | rejected
 
 Only the trusted runner can transition states; participant tokens are
 submit-only. **A submission cannot be recalled** — it claims a physical GPU
-for roughly 22 minutes, so check `curl -s https://gainz.fast/api/queue` and
+for roughly 22 minutes, so check `curl -s https://frontier.fast/api/queue` and
 validate locally first. Pushes to `main` also flow through this lifecycle
 automatically via `.github/workflows/benchmark.yml`.
 

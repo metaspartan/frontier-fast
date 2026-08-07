@@ -4,7 +4,7 @@ set -euo pipefail
 MODE="${1:---local-iterate}"
 TRACK="${GAINZ_TRACK:-laguna-xs-2.1-nvfp4-gb10-v1}"
 
-echo "gainz.fast benchmark — $MODE (track: $TRACK)"
+echo "frontier.fast benchmark — $MODE (track: $TRACK)"
 echo "================================================"
 
 case "$MODE" in

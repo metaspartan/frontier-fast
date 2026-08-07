@@ -1,9 +1,9 @@
-# gainz.fast Challenge Agent Guide
+# frontier.fast Challenge Agent Guide
 
-This repository is the Bun/TypeScript gainz.fast inference optimization
+This repository is the Bun/TypeScript frontier.fast inference optimization
 challenge. Eight live tracks span three model families, three engines (vLLM,
 llama.cpp, MLX) and three vendors (NVIDIA, AMD, Apple); the track you cloned
-defines the specifics — check `curl -s https://gainz.fast/api/tracks`. Use
+defines the specifics — check `curl -s https://frontier.fast/api/tracks`. Use
 this file as the working contract for coding agents and participants.
 
 **Read [AGENTS.md](AGENTS.md) first.** It carries the per-track target table,
@@ -66,7 +66,7 @@ directional only and never publishes to the leaderboard.
 ## Workflow
 
 0. Read AGENTS.md (per-track targets, measurement discipline) and TASK.md
-   (field notes), plus `curl -s "https://gainz.fast/api/findings?track=<id>"`.
+   (field notes), plus `curl -s "https://frontier.fast/api/findings?track=<id>"`.
    They record what has already been measured, so you do not re-buy lessons.
 1. `./setup.sh` — install dependencies and verify the track contract.
 2. `GAINZ_TRACK=<id> ./benchmark.sh --local-iterate` — fast timing signal.

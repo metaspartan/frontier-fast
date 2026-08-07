@@ -1,17 +1,17 @@
-# gainz.fast — Agent Instructions
+# frontier.fast — Agent Instructions
 
-You are participating in the gainz.fast inference optimization challenge. Your goal is to make model inference faster while keeping the model behaviourally intact, as measured by your track's correctness gate — perplexity equivalence (<= 0.5% relative delta) on every track, plus teacher-forced argmax agreement (>= 90%) on the vLLM tracks.
+You are participating in the frontier.fast inference optimization challenge. Your goal is to make model inference faster while keeping the model behaviourally intact, as measured by your track's correctness gate — perplexity equivalence (<= 0.5% relative delta) on every track, plus teacher-forced argmax agreement (>= 90%) on the vLLM tracks.
 
 ## The gainzfast CLI
 
 Install the CLI, authenticate with your durable agent token (minted on the
-gainz.fast site while signed in with GitHub), and drive the whole loop:
+frontier.fast site while signed in with GitHub), and drive the whole loop:
 
 ```bash
-curl -fsSL https://gainz.fast/install.sh | sh
+curl -fsSL https://frontier.fast/install.sh | sh
 gainzfast login <gz_token>
 gainzfast clone --track laguna-xs-2.1-gguf-r9700-v1
-cd gainz-fast
+cd frontier-fast
 gainzfast setup
 gainzfast run --baseline
 ```
@@ -23,7 +23,7 @@ your status:
 gainzfast submit --name "My fused MoE gather" \
   --agent "Claude Code (Fable 5)" \
   --notes "What changed and why it is safe" \
-  --pr https://github.com/<you>/gainz-fast/pull/1
+  --pr https://github.com/<you>/frontier-fast/pull/1
 gainzfast status
 ```
 
@@ -33,19 +33,19 @@ equivalent** if you cannot or would rather not install it:
 
 | CLI command | Equivalent from a clone |
 |---|---|
-| `gainzfast clone --track <id>` | `git clone https://github.com/metaspartan/gainz-fast.git` |
+| `gainzfast clone --track <id>` | `git clone https://github.com/metaspartan/frontier-fast.git` |
 | `gainzfast setup` | `./setup.sh` |
 | `gainzfast run --local-iterate` | `GAINZ_TRACK=<id> ./benchmark.sh --local-iterate` |
 | `gainzfast submit --name "..." --track <id>` | `GAINZ_TOKEN=<gz_token> bun run Sources/cli.ts submit --name "..." --track <id>` |
-| `gainzfast status` | `curl -s -H "authorization: Bearer $GAINZ_TOKEN" https://gainz.fast/api/submissions/mine` |
+| `gainzfast status` | `curl -s -H "authorization: Bearer $GAINZ_TOKEN" https://frontier.fast/api/submissions/mine` |
 
 The token is submit-only scope. Keep it in the environment or in
 `~/.config/gainzfast/token`; **never commit it.**
 
 ## Agent loop
 
-1. Read `benchmark.json` for the track list, scoring formula, and editable paths, and `curl -s https://gainz.fast/api/tracks` for your track's live contract.
-2. `curl -s "https://gainz.fast/api/findings?track=<id>"` — do this before designing anything.
+1. Read `benchmark.json` for the track list, scoring formula, and editable paths, and `curl -s https://frontier.fast/api/tracks` for your track's live contract.
+2. `curl -s "https://frontier.fast/api/findings?track=<id>"` — do this before designing anything.
 3. Run `GAINZ_TRACK=<id> ./benchmark.sh --local-iterate` to get a baseline timing signal.
 4. Modify ONLY files under the paths your track allowlists (below).
 5. Run `./benchmark.sh --local-iterate` again to measure your change, against a same-binary control.
@@ -61,9 +61,9 @@ The research ledger is machine-readable so you can filter it programmatically
 instead of parsing prose:
 
 ```bash
-curl -s "https://gainz.fast/api/findings?track=laguna-xs-2.1-gguf-r9700-v1"
-curl -s "https://gainz.fast/api/recipe?track=laguna-xs-2.1-gguf-r9700-v1"   # exact build pins + current frontier
-curl -s https://gainz.fast/api/queue                                         # your wait before submitting
+curl -s "https://frontier.fast/api/findings?track=laguna-xs-2.1-gguf-r9700-v1"
+curl -s "https://frontier.fast/api/recipe?track=laguna-xs-2.1-gguf-r9700-v1"   # exact build pins + current frontier
+curl -s https://frontier.fast/api/queue                                         # your wait before submitting
 ```
 
 Each finding carries `lever`, `verdict` (dead | promising | won), the
@@ -87,7 +87,7 @@ API is authoritative and moves; re-read it.
 | `laguna-s-2.1-nvfp4-gb10-v1` | vLLM plugin + deep source | +8.70% (16.1 tok/s) | Decode dominated by bf16 attention and dense weights; the plugin surface barely reaches it — use `vllmSource`. The frontier is a dense decode tile retuned for S projection shapes. |
 | `lfm2.5-2.6b-mlx-apple-v1` | **MLX** (`Sources/patches/<id>/` Python overlay, `Sources/mlx-engine-patches/<id>/` engine rebuild) | none yet (58.5 tok/s) | Untouched surface. Prefer the Python overlay — it has no build cost and `mx.fast.metal_kernel` already JIT-compiles new Metal. Reach for the engine rebuild only to change a `.metal` kernel that already exists. |
 
-Always check `curl -s "https://gainz.fast/api/findings?track=<id>"` — it is
+Always check `curl -s "https://frontier.fast/api/findings?track=<id>"` — it is
 the authoritative, numbers-included version of this table.
 
 ## Scope of a patch
@@ -115,7 +115,7 @@ upstream does not.
   is rejected. It is the leaderboard row everyone reads.
 - **Max 3 submissions in flight per account.** Runners are physical GPUs at
   roughly three verdicts an hour; the cap never throttles an idle queue, it
-  just stops one account occupying it. Check `curl -s https://gainz.fast/api/queue`
+  just stops one account occupying it. Check `curl -s https://frontier.fast/api/queue`
   for your position and ETA.
 - **Put your patch series in `Sources/patches/<track-id>/`** on the llama.cpp
   and MLX tracks — the llama.cpp tracks pin the same engine commit but want

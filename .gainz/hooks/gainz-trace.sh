@@ -1,5 +1,5 @@
 #!/bin/sh
-# gainz.fast agent trace hook.
+# frontier.fast agent trace hook.
 #
 # Records which agent harness worked on this checkout so submissions can
 # carry accurate agent attribution (agentName / runId). Local-only: this

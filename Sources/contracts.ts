@@ -1,11 +1,11 @@
 import type { Contract } from "./types";
 
 /**
- * The eight live tracks, mirroring https://gainz.fast/api/tracks.
+ * The eight live tracks, mirroring https://frontier.fast/api/tracks.
  *
  * The live registry is authoritative — this file is a local copy so the CLI
  * and the tests can run offline. If the two disagree, the API wins; fetch it
- * with `curl -s https://gainz.fast/api/tracks` and fix this file.
+ * with `curl -s https://frontier.fast/api/tracks` and fix this file.
  */
 export const TRACKS: Record<string, Contract> = {
   "laguna-xs-2.1-nvfp4-gb10-v1": {

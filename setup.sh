@@ -3,7 +3,7 @@ set -euo pipefail
 
 TRACK="${GAINZ_TRACK:-$(python3 -c 'import json;print(json.load(open("benchmark.json"))["defaultTrack"])' 2>/dev/null || echo laguna-xs-2.1-nvfp4-gb10-v1)}"
 
-echo "gainz.fast setup"
+echo "frontier.fast setup"
 echo "================"
 
 # Check bun
@@ -24,7 +24,7 @@ bun run Sources/cli.ts tracks
 echo ""
 echo "Active track: $TRACK"
 echo "  (override with GAINZ_TRACK=<id>; the live contract is always"
-echo "   authoritative: curl -s https://gainz.fast/api/tracks)"
+echo "   authoritative: curl -s https://frontier.fast/api/tracks)"
 
 # Engine-specific prerequisites. Which one applies is decided by the track's
 # quantization, the same rule Sources/runner/engine.ts uses.
@@ -36,7 +36,7 @@ case "$TRACK" in
     echo "  git checkout 2b63e0610bbc2be990ae1360d5256efcdc3f9efb   # b10237"
     echo "  for p in ../Sources/patches/$TRACK/*.patch; do git apply \"\$p\"; done"
     echo "Build llama-perplexity as well as llama-server — it is the accuracy gate."
-    echo "Exact build flags: curl -s \"https://gainz.fast/api/recipe?track=$TRACK\""
+    echo "Exact build flags: curl -s \"https://frontier.fast/api/recipe?track=$TRACK\""
     echo "Then serve:  ./build/bin/llama-server -m <gguf> -ngl 99 -c 8192 --parallel 1"
     echo "The benchmark drives GAINZ_BASE_URL (default http://127.0.0.1:8080/v1)."
     ;;
