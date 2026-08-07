@@ -1,0 +1,260 @@
+diff --git a/mlx_lm/models/cache.py b/mlx_lm/models/cache.py
+index b84c9d6..670273c 100644
+--- a/mlx_lm/models/cache.py
++++ b/mlx_lm/models/cache.py
+@@ -728,6 +728,38 @@ class ArraysCache(_BaseCache):
+         return sum(c.nbytes for c in self.cache if c is not None)
+ 
+ 
++
++class SpecConvCache(ArraysCache):
++    """ArraysCache for ShortConv layers with speculative partial-commit.
++
++    A verify step processes [certain, draft_1..draft_k] in one batched pass.
++    The conv state after accepting a of the k drafts is a pure slice of the
++    concatenated [prev_state || Bx] sequence the layer already computes
++    (columns a+1 : a+3 for a kernel-3 conv), so committing a partial prefix
++    needs no snapshot, no recompute and no rollback: the layer stashes the
++    concatenated Bx during spec steps and commit_spec(a) re-points the state
++    and rewinds the offset.
++    """
++
++    spec_mode = False
++    _spec_bx = None
++    _spec_t = 0
++
++    def __init__(self):
++        super().__init__(size=1)
++
++    def stash_spec(self, bx_cat, t):
++        self._spec_bx = bx_cat
++        self._spec_t = t
++
++    def commit_spec(self, a):
++        if self._spec_bx is None:
++            return
++        n_keep = self._spec_bx.shape[1] - self._spec_t
++        self[0] = self._spec_bx[:, a + 1 : a + 1 + n_keep, :]
++        self._spec_bx = None
++
++
+ class ChunkedKVCache(_BaseCache):
+     step = 256
+ 
+diff --git a/mlx_lm/models/lfm2.py b/mlx_lm/models/lfm2.py
+index e58a0e1..7e3e0c6 100644
+--- a/mlx_lm/models/lfm2.py
++++ b/mlx_lm/models/lfm2.py
+@@ -13,7 +13,7 @@ from .base import (
+     create_ssm_mask,
+     scaled_dot_product_attention,
+ )
+-from .cache import ArraysCache, KVCache
++from .cache import ArraysCache, KVCache, SpecConvCache
+ 
+ # Request-path overhead fix (see mlx_lm/_gainz_request_overhead.py).
+ from .. import _gainz_request_overhead as _gz_ro  # noqa: F401
+@@ -279,6 +279,8 @@ class ShortConv(nn.Module):
+             Bx = mx.concatenate([state, Bx], axis=1)
+             n_keep = self.L_cache - 1
+             t = x.shape[1]
++            if getattr(cache, "spec_mode", False):
++                cache.stash_spec(Bx, t)
+             if cache.lengths is not None:
+                 ends = mx.clip(cache.lengths, 0, t)
+                 positions = (ends[:, None] + mx.arange(n_keep))[..., None]
+@@ -594,16 +596,27 @@ class Model(nn.Module):
+         input_embeddings: Optional[mx.array] = None,
+     ):
+         out = self.model(inputs, cache, input_embeddings)
++        small = out.shape[1] == 1 or (
++            getattr(self, "_spec_flash", False) and out.shape[1] <= 4
++        )
+         if (
+             out.shape[0] == 1
+-            and out.shape[1] == 1
++            and small
+             and self._flash_embed is not False
+             and os.environ.get("MLX_FLASH_EMBED", "1") != "0"
+         ):
+             if self._flash_embed is None:
+                 self._flash_embed = self._build_flash_embed()
+             if self._flash_embed is not False:
+-                return self._flash_embed(out, self.model.embed_tokens)
++                if out.shape[1] == 1:
++                    return self._flash_embed(out, self.model.embed_tokens)
++                return mx.concatenate(
++                    [
++                        self._flash_embed(out[:, i : i + 1], self.model.embed_tokens)
++                        for i in range(out.shape[1])
++                    ],
++                    axis=1,
++                )
+         return self.model.embed_tokens.as_linear(out)
+ 
+     _flash_embed = None
+@@ -647,6 +660,6 @@ class Model(nn.Module):
+ 
+     def make_cache(self):
+         return [
+-            KVCache() if l.is_attention_layer else ArraysCache(size=1)
++            KVCache() if l.is_attention_layer else SpecConvCache()
+             for l in self.layers
+         ]
+diff --git a/mlx_lm/generate.py b/mlx_lm/generate.py
+index 1a96c01..8e90384 100644
+--- a/mlx_lm/generate.py
++++ b/mlx_lm/generate.py
+@@ -304,6 +304,41 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
+             prompt_cache[e] = c.to_quantized(group_size=kv_group_size, bits=kv_bits)
+ 
+ 
++
++# Prompt-lookup n-gram proposer for speculative greedy decoding: remember the
++# token that followed each recent n-gram (longest n wins, most recent
++# occurrence wins) over prompt + generated context.
++_NGRAM_NS = (4, 3, 2)
++
++
++def _ngram_build(ctx):
++    tables = {n: {} for n in _NGRAM_NS}
++    for i in range(1, len(ctx)):
++        t = ctx[i]
++        for n in _NGRAM_NS:
++            if i >= n:
++                tables[n][tuple(ctx[i - n : i])] = t
++    return tables
++
++
++def _ngram_observe(tables, ctx):
++    length = len(ctx)
++    t = ctx[-1]
++    for n in _NGRAM_NS:
++        if length > n:
++            tables[n][tuple(ctx[length - 1 - n : length - 1])] = t
++
++
++def _ngram_propose(tables, ctx):
++    length = len(ctx)
++    for n in _NGRAM_NS:
++        if length >= n:
++            t = tables[n].get(tuple(ctx[length - n :]))
++            if t is not None:
++                return t
++    return None
++
++
+ def generate_step(
+     prompt: mx.array,
+     model: nn.Module,
+@@ -429,6 +464,8 @@ def generate_step(
+             sampled = sampler(logprobs)
+             return sampled, logprobs.squeeze(0)
+ 
++    _spec_prompt = prompt
++
+     with mx.stream(generation_stream):
+         total_prompt_tokens = (
+             len(input_embeddings) if input_embeddings is not None else len(prompt)
+@@ -460,6 +497,101 @@ def generate_step(
+ 
+         y, logprobs = _step(input_tokens=prompt, input_embeddings=input_embeddings)
+ 
++    # Draftless n-gram speculation with exact greedy verification (see the
++    # maple-preview sibling series for the protocol). Dense models amortize
++    # weight reads across the verify batch, so a k-token verify step costs
++    # ~1.1-1.5x a single step. Enabled only for plain greedy decoding when
++    # every cache supports a safe partial-commit: attention KVCache entries
++    # trim, ShortConv SpecConvCache states re-slice (no rollback needed - the
++    # first token of every verify step is always accepted).
++    import os as _os
++
++    _spec = (
++        _greedy_argmax
++        and not logits_processors
++        and kv_bits is None
++        and input_embeddings is None
++        and max_tokens != 0
++        and _os.environ.get("MLX_NGRAM_SPEC", "1") != "0"
++        and all(
++            hasattr(c, "commit_spec") or type(c) is KVCache for c in prompt_cache
++        )
++    )
++
++    if _spec:
++        spec_caches = [c for c in prompt_cache if hasattr(c, "commit_spec")]
++        trim_caches = [c for c in prompt_cache if not hasattr(c, "commit_spec")]
++        for c in spec_caches:
++            c.spec_mode = True
++        model._spec_flash = True
++        try:
++            mx.async_eval(y, logprobs)
++            mx.eval(y)
++            prompt_progress_callback(total_prompt_tokens, total_prompt_tokens)
++            ctx = _spec_prompt.tolist()
++            tables = None  # built after the first yield, off the TTFT path
++            cur = int(y.item())
++            k_max = max(1, min(3, int(_os.environ.get("MLX_NGRAM_SPEC_K", "3"))))
++            n = 0
++            done = False
++            while not done:
++                yield cur, y
++                n += 1
++                ctx.append(cur)
++                if tables is not None:
++                    _ngram_observe(tables, ctx)
++                if n == max_tokens:
++                    break
++                if n and n % 256 == 0:
++                    mx.clear_cache()
++                if tables is None:
++                    tables = _ngram_build(ctx)
++                chain = []
++                while len(chain) < k_max:
++                    nxt = _ngram_propose(tables, ctx)
++                    if nxt is None:
++                        break
++                    chain.append(nxt)
++                    ctx.append(nxt)
++                for _ in chain:
++                    ctx.pop()
++                if not chain:
++                    y, _lp = _step(mx.array([cur]))
++                    mx.async_eval(y)
++                    cur = int(y.item())
++                    continue
++                k = len(chain)
++                with mx.stream(generation_stream):
++                    logits = model(mx.array([[cur, *chain]]), cache=prompt_cache)
++                    ts = mx.argmax(logits, axis=-1)
++                mx.async_eval(ts)
++                tvals = [int(t) for t in ts[0].tolist()]
++                a = 0
++                while a < k and tvals[a] == chain[a]:
++                    a += 1
++                with mx.stream(generation_stream):
++                    for c in spec_caches:
++                        c.commit_spec(a)
++                for c in trim_caches:
++                    c.trim(k - a)
++                for i in range(a):
++                    yield chain[i], ts[:, i]
++                    n += 1
++                    ctx.append(chain[i])
++                    _ngram_observe(tables, ctx)
++                    if n == max_tokens:
++                        done = True
++                        break
++                if done:
++                    break
++                cur = tvals[a]
++                y = ts[:, a]
++        finally:
++            for c in spec_caches:
++                c.spec_mode = False
++            model._spec_flash = False
++        return
++
+     mx.async_eval(y, logprobs)
+     n = 0
+     while True:
