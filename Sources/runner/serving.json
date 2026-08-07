@@ -1,7 +1,10 @@
 {
   "$doc": "Candidate vLLM serving configuration (vLLM tracks only; llama.cpp and MLX tracks ignore this file). The trusted GB10 runner fetches it at your submitted commit, validates it against a strict whitelist, deploys it as the candidate engine, and measures it paired against the pinned baseline. Empty overrides reproduce the baseline. Allowed keys: kernels (bool, loads Sources/kernels), vllmSource (bool, applies Sources/vllm-patches), maxNumSeqs (1-8), maxNumBatchedTokens (512-16384), enforceEager (bool), compilationLevel (0-3), speculative ({model: pinned Poolside DFlash NVFP4 id, numSpeculativeTokens: 1-15}). attentionBackend is DISABLED: all three previously-whitelisted values were measured diverging from the pinned batch-invariant baseline. Greedy output must survive your configuration: teacher-forced agreement below 90% is rejected.",
   "overrides": {
-    "kernels": true,
-    "vllmSource": true
+    "vllmSource": true,
+    "speculative": {
+      "model": "poolside/Laguna-XS-2.1-DFlash-NVFP4",
+      "numSpeculativeTokens": 3
+    }
   }
 }
