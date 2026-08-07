@@ -95,6 +95,23 @@ Do not spend further slots redrawing; this patch ships with the next real
 decode gain (~+8% needed to clear 1.298 on neutral draws — the GDN
 l2_norm-grouping and Q6_K-head-bandwidth levers are the candidates).
 
+## 0019 + 0020: round 4 — l2_norm grouping and untrim default
+
+- **0019**: grouped l2_norm launch for the GDN q/k conv-norm pairs
+  (`l2_norm_f32_grouped`, same warp reduction and scale per row, segment
+  routing on blockIdx — byte-identical). Toggle
+  `GGML_CUDA_DISABLE_L2_NORM_GROUP`. Toggle-isolated 5-round A/B: +1.05%
+  decode.
+- **0020**: `GGML_MMVQ_UNTRIM_BLOCKS` default 4096 → 0 (always trim
+  zero-work warps; bit-identical). Swept: 106.4 → 107.6 tok/s (+1.1%).
+
+Stacked with 0018 (grouped mmvf), 5-round A/B vs the verified frontier
+build: decode tg128 101.0–102.0 → **106.9–107.5 tok/s, median per-round
+ratio 1.0580**; prefill neutral; ppl 3.9390 (+0.193% vs stock, equal to
+the verified series' own reading); server smoke clean. Absolute decode
+record for the track (previous ranked best: 108.2 by the 0018-only build
+under a different draw; this build should exceed it on the runner).
+
 ## Open levers
 
 1. (moved to closed: shexp ninth-channel — see above)

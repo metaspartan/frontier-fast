@@ -1,0 +1,14 @@
+--- a/ggml/src/ggml-cuda/mmvq.cu	2026-08-07 02:17:47.959577482 +0000
++++ b/ggml/src/ggml-cuda/mmvq.cu	2026-08-07 02:11:46.364091158 +0000
+@@ -853,7 +853,10 @@
+ static int mmvq_untrim_below_blocks() {
+     static const int v = []() -> int {
+         const char * e = getenv("GGML_MMVQ_UNTRIM_BLOCKS");
+-        return e != nullptr ? std::atoi(e) : 4096;
++        // Qwen3.6: the trim wins on every mmvq launch here too (swept
++        // default-4096 vs 0: 106.4 -> 107.6 tok/s); zero-work warps are
++        // bit-identical either way.
++        return e != nullptr ? std::atoi(e) : 0;
+     }();
+     return v;
+ }
