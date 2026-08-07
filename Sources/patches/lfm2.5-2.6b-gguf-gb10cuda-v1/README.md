@@ -17,3 +17,14 @@ Consistent with the platform's cross-port finding (the +8.69% AMD dedupe
 was worth ~0.6% here): this box is memory-latency bound, not launch bound,
 and LFM's small graph gives the launch levers little to remove. Submitted
 to establish the frontier on a null track; expect ~+0.8%.
+
+
+## Measured-neutral: ssm-conv-fuse-mul port (do not spend a slot)
+
+The R9700 LFM series' conv fold (ssm_conv + c-gate mul fused, toggle
+`GGML_CUDA_DISABLE_SSM_MUL`) was ported onto the verified family and
+toggle-A/B'd on the runner box 2026-08-07: ppl bit-identical (22.7466),
+decode median ratio 0.996 over 5 interleaved rounds (75.6-76.5 both arms),
+prefill +0.4%. The launch saved per conv layer does not pay on this
+memory-latency-bound box — consistent with every other launch-class lever
+measured here (grouped-mmvf +0.5%, dedupe family +0.9%).
