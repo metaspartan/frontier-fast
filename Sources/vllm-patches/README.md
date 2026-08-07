@@ -82,3 +82,25 @@ identically-configured control beside your candidate and runs the same check.
 This surface exists because the profiled headroom on these tracks lives in
 engine code a plugin cannot cleanly reach. Use it to remove provably-dead
 work — never to change values.
+
+
+## DFlash speculation, measured (2026-08-07)
+
+The whitelisted-but-unmeasured `speculative` knob was preflighted and
+ranked on XS: `vllmSource + {model: Laguna-XS-2.1-DFlash-NVFP4, k=3}`
+(kernels off — the runner entry-path quoting still breaks
+`--speculative-config` when kernels=true; the JSON's double quotes
+collide with the bash -c entry string in serving-swap.ts).
+
+- Preflight: **PASS, teacher-forced 128/128 bit-exact** against an
+  identically-configured control under VLLM_BATCH_INVARIANT=1.
+- Ranked: **rejected on speed floors — prefill 0.7832 (< 0.95), ttft
+  0.8748 (< 0.90)**. The draft model prefills the same 512-token prompt,
+  a fixed ~43 ms tax that is ~28% of XS's fast prefill. Decode passed its
+  floor (the verdict lists only prefill/ttft).
+
+Consequence: draft-model speculation is **floor-blocked on XS at this
+window** regardless of decode gains. The S track's arithmetic differs
+(the same tax is ~7% of S's prefill); measured next. A draftless design
+or a prefill-skipping draft integration would evade the tax but is
+outside the serving whitelist.
