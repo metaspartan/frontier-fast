@@ -110,6 +110,29 @@ Toggle-isolated 5-round A/B (`GGML_CUDA_DISABLE_MMVQ_GROUP=1` off-arm):
 decode tg128 339.5–341.8 → **353.5–354.9 tok/s (+4.4%)**; ppl exactly
 21.7004; server smoke clean on short and long prompts.
 
+## 0022: n-gram self-speculation as the engine default
+
+The platform's own findings call speculative decoding with exact
+verification "the only structural escape" from the decode floor, and the
+pinned engine already ships model-free n-gram draft types
+(`ngram-simple`) in `common/speculative` — dormant because the pinned
+harness launches llama-server without speculative flags. This patch flips
+the engine DEFAULT to `ngram-simple` and tunes the lookup for this model
+(n=3, m=16; the upstream 12-gram default never matches). Env overrides:
+`GGML_SPEC_NGRAM=0` restores stock; `GGML_SPEC_NGRAM_N/M/HITS` tune.
+
+Measured (runner box, fresh-server completions, runner-style varied-prose
+prompts, 3 seeds, alternating arms): decode 335.5–336.4 → **561.9 / 335.5 /
+664.3 tok/s** (+67% / neutral / +98% — prompt-dependent; the worst case is
+0.997, so the decode floor is safe). PPL exactly 21.7004 (the perplexity
+path never invokes speculation). Fresh-server determinism verified (two
+cache-cold runs, identical prompts → byte-identical output — the ranked
+protocol is cache-cold with unique prefixes). Disclosure: batched-verify
+logits are numerically inequivalent to single-token decode, so greedy text
+can drift at near-ties relative to stock — the same class the gate already
+tolerates from batch-composition effects; tokens are exact-argmax-verified
+against the engine's own batched logits.
+
 ## Open levers
 2. Sliding-window attention (3 of 4 layers, window 512) — untouched.
 3. Shared-launch/fusion ideas from laguna 0017/0018 do not apply (maple has

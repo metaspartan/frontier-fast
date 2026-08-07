@@ -1,0 +1,44 @@
+diff --git a/common/common.h b/common/common.h
+index 2e15ec3f8..1c8444f69 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -356,9 +356,16 @@ struct common_params_speculative_ngram_mod {
+ };
+ 
+ struct common_params_speculative_ngram_map {
+-    uint16_t size_n   = 12; // ngram size for lookup
+-    uint16_t size_m   = 48; // mgram size for speculative tokens
+-    uint16_t min_hits = 1;  // minimum hits at ngram/mgram lookup for mgram to be proposed
++    // Maple track defaults, env-overridable for A/B: short n-grams propose far
++    // more often on this model's repetitive greedy output (MLX sibling
++    // measured 0.836 overall acceptance with n=4..2).
++    static uint16_t env_u16(const char * name, uint16_t dflt) {
++        const char * e = getenv(name);
++        return e != nullptr ? (uint16_t) atoi(e) : dflt;
++    }
++    uint16_t size_n   = env_u16("GGML_SPEC_NGRAM_N", 3);  // ngram size for lookup
++    uint16_t size_m   = env_u16("GGML_SPEC_NGRAM_M", 16); // mgram size for speculative tokens
++    uint16_t min_hits = env_u16("GGML_SPEC_NGRAM_HITS", 1); // minimum hits for proposal
+ };
+ 
+ struct common_params_speculative_ngram_cache {
+@@ -367,7 +374,18 @@ struct common_params_speculative_ngram_cache {
+ };
+ 
+ struct common_params_speculative {
+-    std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
++    // Maple track: default to n-gram self-speculation (exact greedy verify, no
++    // draft model). The pinned harness launches llama-server without spec
++    // flags, so the engine default is the only reachable switch. Env
++    // GGML_SPEC_NGRAM=0 restores stock for same-binary A/B.
++    static std::vector<enum common_speculative_type> default_spec_types() {
++        const char * e = getenv("GGML_SPEC_NGRAM");
++        if (e != nullptr && atoi(e) == 0) {
++            return { COMMON_SPECULATIVE_TYPE_NONE };
++        }
++        return { COMMON_SPECULATIVE_TYPE_NGRAM_SIMPLE };
++    }
++    std::vector<enum common_speculative_type> types = default_spec_types();
+ 
+     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
+     common_params_speculative_draft draft;
