@@ -196,3 +196,27 @@ Measurement traps burned into this round (do not re-buy):
 - **HIP graphs are already active by default** (disable costs ~1%) - no
   differential lever; RDNA4 graph replay keeps a per-node cost, which is
   why launch grouping still pays.
+
+
+## 0022: sigmoid epilogue fusion in the grouped mmvf launch
+
+The GDN beta sigmoid (30 layers) and the shared-expert gate sigmoid (every
+layer) consume grouped-mmvf segment outputs and nothing else. 0022 applies
+the exact `op_sigmoid` expression in the segment epilogue and writes straight
+to the sigmoid node's destination - ~70 elementwise launches/token removed,
+**byte-identical outputs** (same accumulator, same expression). Per-member
+gates: use_count==1, F32 contiguous same-shape, hoist-legality of the early
+write vs every intermediate node, disjointness from other segment dsts.
+Fused sigmoids enter the grouped-done skip set.
+`GGML_CUDA_DISABLE_MMVF_SIG_FUSE` disables.
+
+Toggle A/B (same binary, pinned): decode 110.1-110.6 -> 111.4-111.7 tok/s
+(**+1.2%**, 3/3 rounds); ppl within the 0021 band; server smoke clean.
+
+Ranked context: 0021 v2 ranked at **113.9 tok/s decode (1.3783, sixth
+consecutive track record), prefill 0.9995, ttft 1.013** - floors fully
+fixed; rejected only on the frontier rule (1.2342 vs the banked 1.2980,
+which carries a hot-prefill 1.199 draw). The remaining gap is ~+2-8% decode
+depending on the stock draw; 0022 closes ~+1.2% of it. Next scoped levers:
+GDN get_rows/cpy state-movement folds (~0.28 ms/token of copies + 70
+launches).

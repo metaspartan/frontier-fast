@@ -1,0 +1,192 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH 22/22] cuda: sigmoid epilogue fusion in the grouped mmvf launch
+
+The GDN beta sigmoid (30 layers) and the shared-expert gate sigmoid (every
+layer) consume grouped-mmvf segment outputs and nothing else (use_count 1).
+Apply the exact op_sigmoid expression in the segment epilogue and write
+straight to the sigmoid node's destination: ~70 elementwise launches per
+decoded token removed, outputs byte-identical (the same accumulator value
+passes through the same expression the separate kernel applies).
+
+Per-member fusion requires: F32 contiguous same-shape sigmoid whose only
+input is the segment, hoist-legality of the early write against every
+intermediate node's reads and writes, and disjointness from the other
+segments' destinations. Fused sigmoid nodes enter the grouped-done skip set.
+GGML_CUDA_DISABLE_MMVF_SIG_FUSE disables.
+
+Toggle A/B (same binary, pinned device 0): decode 110.1-110.6 ->
+111.4-111.7 tok/s (+1.2%); gate ppl within the 0021 build's band
+(3.9158/3.9191); server smoke clean on short and long prompts.
+---
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7a75a2633..2d0553b2d 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3420,6 +3420,87 @@ static bool ggml_cuda_mmvf_can_group(const ggml_tensor * node, const int cc) {
+     return true;
+ }
+ 
++
++// ----- sigmoid epilogue fusion for grouped mmvf -------------------------------
++//
++// beta = sigmoid(ssm_beta @ x) on the GDN layers and the shared-expert gate
++// sigmoid on every layer consume grouped-mmvf segment outputs and nothing
++// else. Applying the exact op_sigmoid expression in the segment epilogue
++// removes ~70 elementwise launches per decoded token; outputs are
++// byte-identical because the same accumulator value passes through the same
++// expression the separate kernel would apply. GGML_CUDA_DISABLE_MMVF_SIG_FUSE
++// disables.
++static void ggml_cuda_mmvf_collect_sigmoid_epilogues(
++        const ggml_cgraph * cgraph, const int start,
++        ggml_tensor * const * members, const int n_members, ggml_tensor ** sig_nodes) {
++    for (int m = 0; m < n_members; ++m) {
++        sig_nodes[m] = nullptr;
++    }
++    static const bool disabled = getenv("GGML_CUDA_DISABLE_MMVF_SIG_FUSE") != nullptr &&
++                                 std::atoi(getenv("GGML_CUDA_DISABLE_MMVF_SIG_FUSE"));
++    if (disabled) {
++        return;
++    }
++    constexpr int scan_window = 48;
++    const int end = std::min(cgraph->n_nodes, start + 1 + scan_window);
++    for (int j = start + 1; j < end; ++j) {
++        ggml_tensor * cand = cgraph->nodes[j];
++        if (cand->op != GGML_OP_UNARY || ggml_get_unary_op(cand) != GGML_UNARY_OP_SIGMOID) {
++            continue;
++        }
++        for (int m = 0; m < n_members; ++m) {
++            if (cand->src[0] != members[m] || sig_nodes[m] != nullptr) {
++                continue;
++            }
++            if (cand->type != GGML_TYPE_F32 || !ggml_is_contiguous(cand) ||
++                    !ggml_is_contiguous(members[m]) || !ggml_are_same_shape(cand, members[m])) {
++                continue;
++            }
++            // the segment output must have no consumer other than this sigmoid
++            int member_idx = -1;
++            for (int k = start; k < j; ++k) {
++                if (cgraph->nodes[k] == members[m]) {
++                    member_idx = k;
++                    break;
++                }
++            }
++            if (member_idx < 0 || ggml_node_get_use_count(cgraph, member_idx) != 1) {
++                continue;
++            }
++            // hoisting the sigmoid's write to group-launch time must not
++            // conflict with anything the intermediate nodes read or write
++            bool legal = true;
++            for (int k = start + 1; k < j && legal; ++k) {
++                const ggml_tensor * mid = cgraph->nodes[k];
++                if (ggml_cuda_is_view_or_noop(mid) || mid == members[m]) {
++                    continue;
++                }
++                for (int si = 0; si < GGML_MAX_SRC && legal; ++si) {
++                    if (mid->src[si] != nullptr && !ggml_cuda_mmvq_ranges_disjoint(cand, mid->src[si])) {
++                        legal = false;
++                    }
++                }
++                if (legal && !ggml_cuda_mmvq_ranges_disjoint(cand, mid)) {
++                    legal = false;
++                }
++            }
++            // the fused write must not overlap any other segment's destination
++            for (int mm = 0; mm < n_members && legal; ++mm) {
++                if (mm == m) {
++                    continue;
++                }
++                const ggml_tensor * other = sig_nodes[mm] != nullptr ? sig_nodes[mm] : members[mm];
++                if (!ggml_cuda_mmvq_ranges_disjoint(cand, other)) {
++                    legal = false;
++                }
++            }
++            if (legal) {
++                sig_nodes[m] = cand;
++            }
++        }
++    }
++}
++
+ static int ggml_cuda_mmvf_collect_group(const ggml_cgraph * cgraph, const int start, ggml_tensor ** members, const int cc) {
+     ggml_tensor * first = cgraph->nodes[start];
+     const ggml_tensor * src1 = first->src[1];
+@@ -5422,10 +5503,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     ggml_tensor * members[MMVF_MAX_GROUP_SIZE];
+                     const int n_members = ggml_cuda_mmvf_collect_group(cgraph, i, members, cc_mmvf_group);
+                     if (n_members >= 2) {
+-                        ggml_cuda_mul_mat_vec_f_grouped(*cuda_ctx, members, n_members);
++                        ggml_tensor * sig_nodes[MMVF_MAX_GROUP_SIZE];
++                        ggml_cuda_mmvf_collect_sigmoid_epilogues(cgraph, i, members, n_members, sig_nodes);
++                        ggml_cuda_mul_mat_vec_f_grouped(*cuda_ctx, members, sig_nodes, n_members);
+                         for (int m = 1; m < n_members; ++m) {
+                             mmvq_grouped_done.insert(members[m]);
+                         }
++                        for (int m = 0; m < n_members; ++m) {
++                            if (sig_nodes[m] != nullptr) {
++                                mmvq_grouped_done.insert(sig_nodes[m]);
++                            }
++                        }
+                         continue;
+                     }
+                 }
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index 223845cb8..6f9c0c576 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -753,6 +753,7 @@ static void mul_mat_vec_f_cuda(
+ struct mmvf_grouped_args {
+     const float * vx[MMVF_MAX_GROUP_SIZE];
+     float       * dst[MMVF_MAX_GROUP_SIZE];
++    uint8_t       postop[MMVF_MAX_GROUP_SIZE]; // 0 = none, 1 = sigmoid (exact op_sigmoid math)
+     uint32_t      seg_end[MMVF_MAX_GROUP_SIZE - 1];
+ };
+ 
+@@ -819,10 +820,14 @@ static __global__ void mul_mat_vec_f_grouped(
+     if (tid != 0) {
+         return;
+     }
+-    dst[row] = sumf;
++    float out = sumf;
++    if (args.postop[seg] != 0) {
++        out = 1.0f / (1.0f + expf(-out)); // must match op_sigmoid in unary.cu exactly
++    }
++    dst[row] = out;
+ }
+ 
+-void ggml_cuda_mul_mat_vec_f_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes) {
++void ggml_cuda_mul_mat_vec_f_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, ggml_tensor * const * sigmoid_nodes, int n_nodes) {
+     GGML_ASSERT(n_nodes >= 2 && n_nodes <= MMVF_MAX_GROUP_SIZE);
+ 
+     const ggml_tensor * src1       = nodes[0]->src[1];
+@@ -853,7 +858,17 @@ void ggml_cuda_mul_mat_vec_f_grouped(ggml_backend_cuda_context & ctx, ggml_tenso
+         GGML_ASSERT(dst->ne[1] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1);
+ 
+         args.vx[m]  = (const float *) src0->data;
+-        args.dst[m] = (float *) dst->data;
++        if (sigmoid_nodes != nullptr && sigmoid_nodes[m] != nullptr) {
++            // fused epilogue: write sigmoid(sum) straight into the sigmoid
++            // node's destination; the matvec's own dst is never materialized
++            // (its only consumer is the fused sigmoid)
++            GGML_ASSERT(sigmoid_nodes[m]->src[0] == dst);
++            args.dst[m]    = (float *) sigmoid_nodes[m]->data;
++            args.postop[m] = 1;
++        } else {
++            args.dst[m]    = (float *) dst->data;
++            args.postop[m] = 0;
++        }
+         total_rows += (uint32_t) src0->ne[1];
+         if (m < MMVF_MAX_GROUP_SIZE - 1) {
+             args.seg_end[m] = total_rows;
+diff --git a/ggml/src/ggml-cuda/mmvf.cuh b/ggml/src/ggml-cuda/mmvf.cuh
+index daf00e516..564c6c101 100644
+--- a/ggml/src/ggml-cuda/mmvf.cuh
++++ b/ggml/src/ggml-cuda/mmvf.cuh
+@@ -12,7 +12,7 @@
+ // warp reduction are copied from mul_mat_vec_f<float, float, 1, warp_size,
+ // false, false>; only the (weight, dst) base pointers and the local row index
+ // depend on the group segment, and both are integer-only.
+-void ggml_cuda_mul_mat_vec_f_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes);
++void ggml_cuda_mul_mat_vec_f_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, ggml_tensor * const * sigmoid_nodes, int n_nodes);
+ 
+ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+     const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
