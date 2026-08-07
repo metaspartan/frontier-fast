@@ -1,0 +1,38 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH 14/14] cuda: route sm_121 to the Turing mmvq parameter table
+
+nsys profiling of GB10 decode shows the MoE expert matvecs (Q4_K gate+up
+fused, Q5_K down) running at 35-40% of achievable bandwidth under the
+GENERIC mmvq config (4 warps/row) while the dense Q6_K mats sit at the
+ceiling - the LPDDR5 latency wants more ILP per warp, not more warps. The
+Turing table (2 warps for K-quants) is the right shape: decode 44.4-44.5 ->
+45.2-45.4 tok/s (+1.9%, 3/3 whole-process rounds) on top of the 0013
+requant build. Gate ppl unchanged (3.9306 - the ppl path is prefill-shaped
+MMQ; mmvq only runs at decode). Server smoke clean.
+---
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index c3f95f9..abea72f 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -83,6 +83,11 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+     return MMVQ_PARAMETERS_GCN;
+ #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
+     return MMVQ_PARAMETERS_TURING;
++#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1210
++    // GB10 (sm_121): LPDDR5 latency-bound decode measures the MoE expert
++    // matvecs at 35-40% of achievable bandwidth under the GENERIC config;
++    // the Turing table (2 warps for K-quants) trades warp count for ILP.
++    return MMVQ_PARAMETERS_TURING;
+ #else
+     return MMVQ_PARAMETERS_GENERIC;
+ #endif
+@@ -104,6 +109,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
+         return MMVQ_PARAMETERS_TURING;
+     }
++    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == 1210) {
++        return MMVQ_PARAMETERS_TURING;
++    }
+     return MMVQ_PARAMETERS_GENERIC;
+ }
+ 

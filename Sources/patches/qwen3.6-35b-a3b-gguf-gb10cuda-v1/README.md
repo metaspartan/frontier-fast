@@ -51,3 +51,19 @@ The R9700 ranked run measured about HALF the local pp512 prefill delta, so
 the ranked prefill floor has comfortable margin. The 0022-class sigmoid
 fusion does NOT port here (needs the grouped-mmvf launch, which is
 measured-dead on sm_121).
+
+
+## 0014: Turing mmvq parameter table for sm_121
+
+nsys decode profile (post-0013): the MoE expert matvecs run at **35-40% of
+achievable bandwidth** (Q4_K gate+up fused ~99 GB/s, Q5_K down ~80 GB/s)
+while the dense Q6_K mats sit at the ~240 GB/s ceiling - LPDDR5 latency
+wants more ILP per warp. sm_121 was falling to the GENERIC table (4
+warps/row); the Turing table (2 warps for K-quants) fits better: decode
+44.4-44.5 -> **45.2-45.4 tok/s (+1.9%)**, ppl byte-unchanged for the gate
+(mmvq is decode-only; the ppl path is prefill-shaped MMQ).
+
+Remaining headroom on this track: the expert matvecs are still far off the
+ceiling - a custom mmid config (more rows per block / deeper unroll for the
+[2048->512]x8 and [512->2048]x8 shapes at ncols_dst=1) is the scoped next
+lever, worth up to ~+15% if they reach dense-mat efficiency.
