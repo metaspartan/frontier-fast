@@ -1,0 +1,39 @@
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 89b852b73..24c7dd178 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1621,8 +1621,17 @@ llm_graph_qkv llm_graph_context::build_qkv(
+             ggml_row_size(qkv->type, n_embd_head), qkv->nb[1],
+             ggml_row_size(qkv->type, n_embd_q + n_embd_kv));
+     } else {
+-        // separate Q/K/V path
++        // separate Q/K/V path. The three matvecs read the same activation and
++        // are independent: build and PIN them adjacently (creation order does
++        // not set cgraph order - the topological pull does, and Q's norm/rope
++        // cone would otherwise interleave before K/V), so the backend can fold
++        // them into one grouped launch. Pure reordering of independent work.
+         Qcur = build_lora_mm(layer.wq, cur, layer.wq_s);
++        Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
++        Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
++        ggml_build_forward_expand(gf, Qcur);
++        ggml_build_forward_expand(gf, Kcur);
++        ggml_build_forward_expand(gf, Vcur);
+         cb(Qcur, "Qcur", il);
+         if (layer.wq_b) {
+             Qcur = ggml_add(ctx0, Qcur, layer.wq_b);
+@@ -1632,7 +1641,6 @@ llm_graph_qkv llm_graph_context::build_qkv(
+             Qcur = ggml_clamp(ctx0, Qcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
+             cb(Qcur, "Qcur_clamped", il);
+         }
+-        Kcur = build_lora_mm(layer.wk, cur, layer.wk_s);
+         cb(Kcur, "Kcur", il);
+         if (layer.wk_b) {
+             Kcur = ggml_add(ctx0, Kcur, layer.wk_b);
+@@ -1642,7 +1650,6 @@ llm_graph_qkv llm_graph_context::build_qkv(
+             Kcur = ggml_clamp(ctx0, Kcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
+             cb(Kcur, "Kcur_clamped", il);
+         }
+-        Vcur = build_lora_mm(layer.wv, cur, layer.wv_s);
+         cb(Vcur, "Vcur", il);
+         if (layer.wv_b) {
+             Vcur = ggml_add(ctx0, Vcur, layer.wv_b);

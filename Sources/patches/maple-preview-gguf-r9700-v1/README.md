@@ -95,6 +95,21 @@ always-untrim = 328.2 / 323.3 / 307.9 / 212.3 tok/s. Toggle-isolated
 **326.7-327.2 tok/s (+7.0%)**, prefill neutral, ppl exactly 21.7004 —
 restoring or dropping zero-work warps is bit-identical by construction.
 
+## 0021: Q/K/V adjacency pins (grouped attention matvecs)
+
+Maple stores separate wq/wk/wv (TQ2_0, same activation) but the grouped
+mmvq launch never fired: the topological pull interleaves Q's norm/rope
+cone before K/V's matvecs, and the hoist-legality check correctly refuses
+to jump the intermediates. `build_qkv` now creates the three matvecs
+first and pins them adjacently with `ggml_build_forward_expand` (the
+qwen35moe 0018 lesson: creation order does not set cgraph order — pins
+do), then applies bias/clamp/reshape per tensor. Pure reordering of
+independent work; the grouped launch (byte-identical per row) then fires.
+
+Toggle-isolated 5-round A/B (`GGML_CUDA_DISABLE_MMVQ_GROUP=1` off-arm):
+decode tg128 339.5–341.8 → **353.5–354.9 tok/s (+4.4%)**; ppl exactly
+21.7004; server smoke clean on short and long prompts.
+
 ## Open levers
 2. Sliding-window attention (3 of 4 layers, window 512) — untouched.
 3. Shared-launch/fusion ideas from laguna 0017/0018 do not apply (maple has
