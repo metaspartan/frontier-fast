@@ -137,3 +137,11 @@ Unlike qwen (rejected batch-17 verifies on 22GB lose −3..−22%) and lfm
 (neutral), Laguna-XS's continuations on the bench vocabulary accept often
 enough to pay well on average; the worst-case draw (0.86) carries ~7%
 runner-median floor risk, accepted knowingly.
+
+**Ranked outcome: rejected (1.311 vs 1.373).** The runner's own corpus
+drew the low-acceptance tail: candidate decode 144.7 tok/s vs the
+frontier's 155.0 — speculation COST ~7% on the ranked prompts. The
+synthetic 6-seed mean (+14.2%) does not represent the ranked corpus's
+acceptance. Do not resubmit without a mechanism that prices acceptance
+online (propose only when the recent accept rate clears the verify
+premium); the static n=3 lookup is net-negative on this track's corpus.
