@@ -1,0 +1,110 @@
+diff --git a/mlx_lm/models/lfm2.py b/mlx_lm/models/lfm2.py
+index 7e3e0c6..928b368 100644
+--- a/mlx_lm/models/lfm2.py
++++ b/mlx_lm/models/lfm2.py
+@@ -525,7 +525,13 @@ class _FlashEmbedHead:
+         scale_c = np.array(
+             [norms_np[token_map[c]].max() for c in range(C)], dtype=np.float32
+         )
+-        self.centroids = (cents * mx.array(scale_c)[:, None]).astype(mx.bfloat16)
++        cent_scaled = (cents * mx.array(scale_c)[:, None]).astype(mx.bfloat16)
++        # Quantize the centroid matrix (4-bit, like the maple FlashHead):
++        # scoring is a ranking, not an exact logit, and this cuts the
++        # per-verify-position centroid read from 16 MB to 4 MB.
++        self.cw, self.cs, self.cb = mx.quantize(
++            cent_scaled.astype(mx.float32), group_size=64, bits=4
++        )
+ 
+         # Cluster-ordered copy of the quantized embedding for the gather.
+         order = self.token_map.reshape(-1)
+@@ -546,17 +552,26 @@ class _FlashEmbedHead:
+             )
+         self.vocab_size = V
+         mx.eval(
+-            self.token_map, self.centroids, self.head_w, self.head_s, self.head_b
++            self.token_map, self.cw, self.cs, self.cb,
++            self.head_w, self.head_s, self.head_b,
+         )
+ 
+     def __call__(self, h, embed):
+-        hv = h[:, -1, :]
+-        top = mx.argpartition(hv @ self.centroids.T, kth=-self.n_probes, axis=-1)[
++        # Batched over the (possibly speculative) positions: the quantized
++        # centroid matrix is read once for all L rows instead of per position.
++        L = h.shape[1]
++        hv = h[0]  # (L, D)
++        scores = mx.quantized_matmul(
++            hv, self.cw, scales=self.cs, biases=self.cb,
++            transpose=True, group_size=64, bits=4,
++        )
++        top = mx.argpartition(scores, kth=-self.n_probes, axis=-1)[
+             ..., -self.n_probes :
+-        ]
+-        oids = self.token_map[top[0]].reshape(-1)
++        ]  # (L, P)
++        cs_ = self.token_map.shape[1]
++        oids = self.token_map[top]  # (L, P, cs)
+         logits = mx.gather_qmm(
+-            hv.reshape(1, 1, 1, 1, -1),
++            hv.reshape(L, 1, 1, 1, -1),
+             self.head_w,
+             self.head_s,
+             self.head_b,
+@@ -564,7 +579,8 @@ class _FlashEmbedHead:
+             transpose=True,
+             group_size=self.group_size,
+             bits=self.bits,
+-        ).reshape(-1)
++        ).reshape(L, -1)  # (L, P*cs)
++        oids = oids.reshape(L, -1)
+         if self._force_rows is not None:
+             fw, fs, fb = self._force_rows
+             force_logits = mx.quantized_matmul(
+@@ -575,12 +591,15 @@ class _FlashEmbedHead:
+                 transpose=True,
+                 group_size=self.group_size,
+                 bits=self.bits,
+-            )[0]
+-            oids = mx.concatenate([oids, self._force_ids])
+-            logits = mx.concatenate([logits, force_logits])
+-        full = mx.full((1, 1, self.vocab_size), float("-inf"), dtype=logits.dtype)
+-        full[0, 0, oids] = logits
+-        return full
++            )  # (L, F)
++            oids = mx.concatenate(
++                [oids, mx.broadcast_to(self._force_ids[None], (L, self._force_ids.size))],
++                axis=-1,
++            )
++            logits = mx.concatenate([logits, force_logits], axis=-1)
++        full = mx.full((L, self.vocab_size), float("-inf"), dtype=logits.dtype)
++        full[mx.arange(L)[:, None], oids] = logits
++        return full[None]
+ 
+ class Model(nn.Module):
+     def __init__(self, args: ModelArgs):
+@@ -597,7 +616,7 @@ class Model(nn.Module):
+     ):
+         out = self.model(inputs, cache, input_embeddings)
+         small = out.shape[1] == 1 or (
+-            getattr(self, "_spec_flash", False) and out.shape[1] <= 4
++            getattr(self, "_spec_flash", False) and out.shape[1] <= 8
+         )
+         if (
+             out.shape[0] == 1
+@@ -608,15 +627,7 @@ class Model(nn.Module):
+             if self._flash_embed is None:
+                 self._flash_embed = self._build_flash_embed()
+             if self._flash_embed is not False:
+-                if out.shape[1] == 1:
+-                    return self._flash_embed(out, self.model.embed_tokens)
+-                return mx.concatenate(
+-                    [
+-                        self._flash_embed(out[:, i : i + 1], self.model.embed_tokens)
+-                        for i in range(out.shape[1])
+-                    ],
+-                    axis=1,
+-                )
++                return self._flash_embed(out, self.model.embed_tokens)
+         return self.model.embed_tokens.as_linear(out)
+ 
+     _flash_embed = None
