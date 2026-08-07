@@ -27,3 +27,12 @@
 decode **×1.025**, prefill ×0.996, ttft ×0.988 → projected score ~1.017.
 
 Accuracy gate: perplexity ≤ 0.5% — exact match (61.069 both).
+
+## Measured dead ends (do not resubmit without new evidence)
+
+- Dense bf16/fp16 prefill GEMMs (dequantize-once, 1.26x GEMM rate): 4-bit
+  dequant rounding is a real numerics change — ppl delta 0.716% bf16 against
+  the 0.5% gate; fp16 shows saturation pathology. The lever works only for
+  ternary models, whose dequant is exact in bf16 (see maple-preview notes).
+- Fixed speculation depth constants: mini optimum k=2, runner deeper — use
+  the 0005 adaptive controller instead of retuning constants per box.
