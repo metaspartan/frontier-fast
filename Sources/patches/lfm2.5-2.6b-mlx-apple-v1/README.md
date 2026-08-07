@@ -51,6 +51,15 @@ Accuracy gate: perplexity ≤ 0.5% — exact match (61.069 both).
   on fresh caches. conv_mask is None at verify (branch fires legitimately).
   The failure lives somewhere the single-module differentials cannot reach
   (whole-model interaction, allocator, or kernel-compilation state).
-  Reproduction: per-run decode telemetry in one process, scseq=1. Two clean
-  bisection next-steps recorded: (a) fused-y with stock state management,
-  (b) stock-y with fused state. Parked; the stock verify path is correct.
+  RESOLVED by bisection + live divergence probe: the kernel was never
+  wrong (live max|dy| <= 0.05 vs stock on every step; kernel-state variant
+  is clean). The throughput swings are STREAM-PATH SENSITIVITY: bf16-noise
+  near-tie flips change the greedy text, which changes n-gram acceptance,
+  which changes decode tok/s by +-30% per corpus window (the verified
+  config itself spans 124-237 tok/s across the five windows). KEY PLATFORM
+  FINDING: under high-acceptance speculation the +-0.6% noise-floor
+  assumption is void - decode is text-dependent, and any numerics-class
+  change re-rolls a stream lottery that swamps mechanical gains of a few
+  percent. The fused-SC kernel's real dispatch saving is unmeasurable
+  beneath that variance locally; submitting it would be a lottery ticket,
+  not an isolated win. Parked on measurement-discipline grounds.
