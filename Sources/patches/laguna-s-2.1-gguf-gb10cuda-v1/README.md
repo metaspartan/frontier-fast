@@ -142,3 +142,16 @@ the documented ~7% per-launch bimodality). Median per-round ratio 0.941.
 Laguna-S's much larger layers make the router a negligible share, and the
 sorted-list kernel's occupancy interaction appears to cost more than the
 selection saves on sm_121 at this scale. XS result does not transfer.
+
+
+## Measured-neutral: the XS engine family stack (do not spend a slot)
+
+The XS gb10 family (dedupe, norm/rope/set-rows groups, quantize folds, mmvf
+batched k-loads — minus the grouped-launch pieces that conflict with this
+track's own 0001, minus topk which measured -6% here) was stacked on 0001
+and A/B'd on the runner box 2026-08-07: ppl EXACTLY 4.7508 (bit-exact merge
+verified), decode median ratio ~1.003 over 3 interleaved rounds (15.15/15.20,
+16.13/15.18 — one arm drew the fast mode — 15.08/15.31). S's much larger
+layers leave the launch-latency levers nothing to pay for, and the ~7%
+per-launch decode bimodality swamps sub-2% effects at practical round
+counts. The S frontier remains the deferred grouped-matvec launch alone.
