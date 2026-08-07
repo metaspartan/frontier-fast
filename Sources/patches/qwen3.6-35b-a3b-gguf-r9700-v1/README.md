@@ -220,3 +220,26 @@ which carries a hot-prefill 1.199 draw). The remaining gap is ~+2-8% decode
 depending on the stock draw; 0022 closes ~+1.2% of it. Next scoped levers:
 GDN get_rows/cpy state-movement folds (~0.28 ms/token of copies + 70
 launches).
+
+
+## Measured-dead: GDN conv-state writeback fold (do not re-derive as-is)
+
+Folding the per-layer conv-state writeback cpy into the ssm_conv kernel
+(skip 30 cpy launches/token) measured **+1.3% on llama-bench** with in-band
+ppl - and **zero fold dispatches under llama-server**: the fork dispatches
+the GDN section through its concurrent-events path in server graphs,
+bypassing custom in-evaluate-loop fusion branches, so the skipped cpys
+corrupt the recurrent state and greedy output diverges (caught by a
+fold-on/off server identity test; a keep-cpy diagnostic isolated the
+mechanism). llama-bench never activates that path.
+
+Two portable lessons:
+- **bench-only gains on this engine are not serving gains** - always run a
+  SERVER-side greedy identity test for anything that skips graph nodes;
+- **route new fusions through `ggml_cuda_try_fuse`** (like the existing
+  gdn cache fusion) rather than the evaluate loop's inline branches - that
+  is the redesign path if this lever is attempted again (~+1.3% decode plus
+  the get_rows/concat virtualization behind it).
+
+The 0022 sigmoid fusion was server-identity-verified clean in the same
+session (byte-identical greedy output with the fusion toggled).
