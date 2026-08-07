@@ -42,3 +42,10 @@ Accuracy gate: perplexity ≤ 0.5% — exact match (61.069 both).
   controller's ceiling is the per-box best fixed k - which the frontier
   already uses. Chain-depth tuning is closed unless the corpus or window
   changes.
+- Batched fused ShortConv for verify steps (L<=4 in-kernel sequential,
+  one dispatch per layer vs the five-op stock chain): isolated equivalence
+  passes (max|d| 0.002, state exact) but the live loop produces degenerate
+  repeating output with high self-acceptance and decode drops to 144 tok/s
+  (below unspeculated) - a state-interleaving bug the single-call test does
+  not exercise. Needs real diagnosis before retry; the stock-op verify path
+  in the verified series is correct and fast enough.
