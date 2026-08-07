@@ -18,9 +18,18 @@ const FIXTURE_PENDING = new Set([
   "maple-preview-gguf-gb10cuda-v1",
 ]);
 
+// Frozen tracks accept no submissions, so nobody can be iterating on one and
+// nobody needs a local drift tripwire for it. This is NOT the same exemption as
+// FIXTURE_PENDING above, which covers active tracks that are missing one — that
+// list is a real gap and must only shrink. Sourced from benchmark.json so the
+// two registries cannot disagree about which tracks are frozen.
+const FROZEN: Set<string> = new Set(
+  (JSON.parse(readFileSync("benchmark.json", "utf8")).frozenTracks ?? []) as string[],
+);
+
 test("every track has a public correctness fixture", () => {
   for (const track of Object.values(TRACKS)) {
-    if (FIXTURE_PENDING.has(track.id)) continue;
+    if (FIXTURE_PENDING.has(track.id) || FROZEN.has(track.id)) continue;
     const fixture = JSON.parse(readFileSync(fixtureDir(track.id), "utf8"));
     expect(fixture.trackId).toBe(track.id);
     expect(typeof fixture.prompt).toBe("string");

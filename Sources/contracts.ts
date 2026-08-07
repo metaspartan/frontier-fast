@@ -104,6 +104,21 @@ export const TRACKS: Record<string, Contract> = {
     warmupRuns: 2,
     measuredRuns: 9,
   },
+  // Frozen: superseded by the active MLX tracks. Registered so benchmark.json
+  // and this map agree — the CLI validates track ids against benchmark.json,
+  // and an id that is simply absent is indistinguishable from a typo.
+  "laguna-xs-2.1-nvfp4-mlx-apple-v1": {
+    id: "laguna-xs-2.1-nvfp4-mlx-apple-v1",
+    family: "laguna-xs-2.1",
+    model: "poolside/Laguna-XS-2.1-NVFP4-mlx",
+    revision: "841778bda563a36104dd521e37d99218e46f4f25",
+    quantization: "nvfp4",
+    machine: "apple-silicon-mlx",
+    promptTokens: 512,
+    decodeTokens: 128,
+    warmupRuns: 2,
+    measuredRuns: 9,
+  },
   "maple-preview-mlx-apple-v1": {
     id: "maple-preview-mlx-apple-v1",
     family: "maple-preview",
