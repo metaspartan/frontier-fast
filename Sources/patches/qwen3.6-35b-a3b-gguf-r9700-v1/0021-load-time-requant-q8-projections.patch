@@ -1,22 +1,59 @@
 From: Claude Fable 5 <noreply@anthropic.com>
-Subject: [PATCH 21/21] llama: load-time Q6_K requantization of the UD Q8_0 projection upcasts
+Subject: [PATCH 21/21] llama: load-time Q6_K requant of the UD Q8_0 projections + large-batch GEMM routing
 
-The unsloth UD-Q4_K_M export upcasts the whole qwen35moe GDN/attention
-projection stack to Q8_0 (~1.49 GB of weight reads per decoded token,
-39.7% of decode kernel time, already at 76-87% of the R9700's bandwidth
-ceiling). Requantize attn_qkv, attn_gate, ssm_out, attn_q and attn_output
-to Q6_K while the model loads: ~300 MB/token of traffic removed, decode
-106.5 -> 111.3 tok/s (+4.5%) same-binary. Gate-corpus ppl 3.931-3.947
-across 10 runs (stock 3.9314, bound 3.9511) - the requantized weights are
-byte-identical across loads (FNV-checksummed); the residual spread is
-GPU-side accumulation-order noise also present at +/-0.01% on the
-unmodified build. The shared-expert mats are deliberately excluded
-(+0.5% ppl AND slower). GGML_LOAD_REQUANT=0 restores byte-identical
-stock loading; GGML_LOAD_REQUANT_NTHREAD / _CSUM are debug toggles.
+Two coupled pieces that together convert the unsloth UD export's Q8_0
+projection upcasts (attn_qkv/attn_gate/ssm_out/attn_q/attn_output, ~1.49 GB
+of weight reads per decoded token, 39.7% of decode kernel time) into a
+floor-safe decode win:
 
+1. llama_model_loader requantizes the five families to Q6_K at load
+   (~300 MB/token of decode traffic removed; exact-suffix matching; same
+   ggml_quantize_chunk path as llama-quantize; conversion verified
+   byte-identical across loads; GGML_LOAD_REQUANT=0 restores stock bytes).
+2. Plain (non-expert, non-head) Q6_K matmuls at batch >= 64 route to the
+   fp16 dequant+GEMM path instead of MMQ: RDNA4 Q6_K MMQ tiles cost ~20%
+   more than GEMM at prefill batch sizes, which broke the ranked prefill
+   floor (0.9476) on the requant-only variant. The output head is excluded
+   so logit arithmetic matches stock - including it makes the ppl reading
+   noisy and biased low. GGML_Q6K_MMQ_MAX_BATCH overrides; 0 disables.
+
+Same-binary toggles, pinned to device 0 like the ranked runner: decode
+106.1-106.4 -> 109.6-109.8 tok/s; prefill -1.9% (vs -10% through MMQ);
+gate-corpus ppl 3.9146/3.9148/3.9151/3.9167 over four loads (stock 3.9314,
+band 3.9118-3.9511). Q5_1 variants and shexp coverage measured and
+rejected - the perplexity landscape is non-additive; see the track README.
 ---
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 9bf23832a..7a75a2633 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1870,7 +1870,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
+         return;
+     }
+-    if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
++    // Q6_K large-batch plain matmuls (not the output head, not experts): the
++    // RDNA4 Q6_K MMQ tiles cost ~20% more than the fp16 dequant+GEMM path at
++    // prefill batch sizes - measured on the ranked runner, where the load-time
++    // requant to Q6_K pushed prefill to 0.9476 of stock through MMQ. The head
++    // is excluded so logit arithmetic stays identical to stock (it dominates
++    // the perplexity reading). GGML_Q6K_MMQ_MAX_BATCH overrides; 0 disables.
++    bool use_mmq_here = ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0);
++    if (use_mmq_here && src0->type == GGML_TYPE_Q6_K && src0->ne[1] <= 16384) {
++        static const int q6k_gemm_min_batch = [] {
++            const char * e = getenv("GGML_Q6K_MMQ_MAX_BATCH");
++            return e != nullptr ? atoi(e) : 64;
++        }();
++        if (q6k_gemm_min_batch > 0 && ne11 >= q6k_gemm_min_batch) {
++            use_mmq_here = false;
++        }
++    }
++    if (use_mmq_here) {
+         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+         return;
+     }
 diff --git a/src/llama-model-loader.cpp b/src/llama-model-loader.cpp
-index df8313e81..12c140fa5 100644
+index df8313e81..8cc039188 100644
 --- a/src/llama-model-loader.cpp
 +++ b/src/llama-model-loader.cpp
 @@ -7,6 +7,8 @@
@@ -28,7 +65,7 @@ index df8313e81..12c140fa5 100644
  #include <array>
  #include <cinttypes>
  #include <cstdint>
-@@ -1040,6 +1042,87 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
+@@ -1040,6 +1042,95 @@ static ggml_backend_buffer_type_t select_weight_buft(const llama_hparams & hpara
      return nullptr;
  }
  
@@ -56,15 +93,23 @@ index df8313e81..12c140fa5 100644
 +    if (!enabled || cur != GGML_TYPE_Q8_0 || (ne0 % 256) != 0 || strncmp(name, "blk.", 4) != 0) {
 +        return cur;
 +    }
-+    static const char * const fams[] = {
-+        ".attn_qkv.weight", ".attn_gate.weight", ".ssm_out.weight",
-+        ".attn_q.weight",   ".attn_output.weight",
++    // Per-family targets. Q5_1 for the GDN in-projection: its legacy-quant MMQ
++    // tiles keep prefill near stock (Q6_K tiles cost ~20% more there) and its
++    // 6.0 b/w cuts the most decode traffic. Q6_K for the rest keeps the ppl
++    // delta inside the +/-0.5% equivalence band - all-Q5_1 IMPROVES gate ppl
++    // by 0.72%, which the symmetric band rejects.
++    static const struct { const char * suffix; ggml_type type; } fams[] = {
++        { ".attn_qkv.weight",    GGML_TYPE_Q6_K },
++        { ".attn_gate.weight",   GGML_TYPE_Q6_K },
++        { ".ssm_out.weight",     GGML_TYPE_Q6_K },
++        { ".attn_q.weight",      GGML_TYPE_Q6_K },
++        { ".attn_output.weight", GGML_TYPE_Q6_K },
 +    };
 +    const size_t len = strlen(name);
-+    for (const char * fam : fams) {
-+        const size_t fl = strlen(fam);
-+        if (len > fl && strcmp(name + len - fl, fam) == 0) {
-+            return GGML_TYPE_Q6_K;
++    for (const auto & fam : fams) {
++        const size_t fl = strlen(fam.suffix);
++        if (len > fl && strcmp(name + len - fl, fam.suffix) == 0) {
++            return fam.type;
 +        }
 +    }
 +    return cur;
@@ -116,7 +161,7 @@ index df8313e81..12c140fa5 100644
  struct ggml_tensor * llama_model_loader::create_tensor(
          const llama_hparams & hparams, const buft_list_t * buft_list_cpu, const buft_list_t * buft_list_input, const buft_list_t * buft_list_output,
          const buft_list_t * buft_list_layer, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-@@ -1270,7 +1353,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
+@@ -1270,7 +1361,13 @@ struct ggml_tensor * llama_model_loader::create_tensor(
  
      const bool duplicated = flags & TENSOR_DUPLICATED;
  
@@ -131,7 +176,7 @@ index df8313e81..12c140fa5 100644
      ggml_set_name(tensor, ggml_get_name(cur));
  
      if (duplicated) {
-@@ -1531,6 +1620,10 @@ bool llama_model_loader::load_all_data(
+@@ -1531,6 +1628,10 @@ bool llama_model_loader::load_all_data(
  
          size_t n_size = ggml_nbytes(cur);
  
@@ -142,7 +187,7 @@ index df8313e81..12c140fa5 100644
          if (use_mmap) {
              const auto & mapping = mappings.at(weight->idx);
              ggml_backend_buffer_t buf_mmap = nullptr;
-@@ -1540,22 +1633,28 @@ bool llama_model_loader::load_all_data(
+@@ -1540,22 +1641,28 @@ bool llama_model_loader::load_all_data(
              uint8_t * data = (uint8_t *) mapping->addr() + weight->offs;
  
              if (check_tensors) {
@@ -175,7 +220,7 @@ index df8313e81..12c140fa5 100644
              } else {
                  ggml_backend_tensor_set(cur, data, 0, n_size);
              }
-@@ -1563,8 +1662,15 @@ bool llama_model_loader::load_all_data(
+@@ -1563,8 +1670,15 @@ bool llama_model_loader::load_all_data(
              const auto & file = files.at(weight->idx);
  
              if (ggml_backend_buffer_is_host(cur->buffer)) {
@@ -191,7 +236,7 @@ index df8313e81..12c140fa5 100644
                  if (check_tensors) {
                      validation_result.emplace_back(std::async(std::launch::async, [cur, n_size] {
                          return std::make_pair(cur, ggml_validate_row_data(cur->type, cur->data, n_size));
-@@ -1572,7 +1678,7 @@ bool llama_model_loader::load_all_data(
+@@ -1572,7 +1686,7 @@ bool llama_model_loader::load_all_data(
                  }
              } else {
                  // If upload_backend is valid load the tensor in chunks to pinned memory and upload the buffers asynchronously to the GPU.
@@ -200,7 +245,7 @@ index df8313e81..12c140fa5 100644
                      size_t offset = weight->offs;
                      alignment = file->read_alignment();
                      size_t aligned_offset = offset & ~(alignment - 1);
-@@ -1625,18 +1731,24 @@ bool llama_model_loader::load_all_data(
+@@ -1625,18 +1739,24 @@ bool llama_model_loader::load_all_data(
                          buffer_idx %= n_buffers;
                      }
                  } else {

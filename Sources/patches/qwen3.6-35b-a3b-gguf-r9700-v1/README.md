@@ -133,52 +133,66 @@ on a 22GB model costs more than the accepted tokens repay. Consistent with
 the platform's laguna-vLLM ngram finding (acceptance ~0.25). Maple's win
 does not transfer here.
 
-## 0021: load-time requantization of the UD Q8_0 projection upcasts
+## 0021: load-time Q6_K requant of the UD Q8_0 projections + GEMM prefill routing
 
 Profiling the 0018-0020 build (rocprofv3, 33 decode tokens): Q8_0 matvecs
 consume **39.7% of all decode kernel time** (~2.96 ms/token). The unsloth
 UD-Q4_K_M export upcasts the whole GDN/attention projection stack to Q8_0 -
 attn_qkv 30x[2048->8192], attn_gate 30x[2048->4096], ssm_out 30x[4096->2048],
 attn_q/attn_output on the 10 full-attention layers, plus the three shexp
-mats: **~1.49 GB of weight reads per token**, already running at 76-87% of
-the 640 GB/s ceiling. The kernel side is spent - the bytes are the lever.
+mats: **~1.49 GB of weight reads per token** at 76-87% of the 640 GB/s
+ceiling. The kernel side is spent - the bytes are the lever.
 
-0021 requantizes five of those families - **attn_qkv, attn_gate, ssm_out,
-attn_q, attn_output** - to Q6_K **at model load** inside
-`llama_model_loader` (the ranked runner serves the pinned GGUF path, so an
-offline transform has no execution hook; the per-track engine patch is the
-sanctioned surface, and the ppl gate measures the requantized model through
-the same binary). Exact suffix matching on `blk.*` names; same
-`ggml_quantize_chunk` code path as llama-quantize; multithreaded (a few
-seconds of boot cost); `GGML_LOAD_REQUANT=0` restores byte-identical stock
-loading. ~300 MB/token of traffic removed.
+0021 has two coupled pieces:
 
-Measured on the gate corpus (stock 3.9314, bound +/-0.5% => 3.9117-3.9511),
-all deterministic on this box:
+1. **Load-time requant**: `llama_model_loader` converts the five projection
+   families (NOT shexp) to Q6_K as the model loads (the ranked runner serves
+   the pinned GGUF path, so the loader is the execution hook; the ppl gate
+   measures the requantized model through the same binary). ~300 MB/token of
+   decode traffic removed. `GGML_LOAD_REQUANT=0` restores stock bytes;
+   conversion is multithreaded (seconds) and byte-identical across loads
+   (FNV-checksummed under `GGML_LOAD_REQUANT_CSUM=1`).
+2. **Large-batch GEMM routing**: the requant-only variant was ranked-
+   rejected on the prefill floor (0.9476 < 0.95; decode 113.7 tok/s - fifth
+   consecutive track record) because **RDNA4 Q6_K MMQ tiles cost ~20% more
+   than the fp16 dequant+GEMM path at prefill batches**. Plain non-expert,
+   non-head Q6_K matmuls at ne11 >= 64 now take the GEMM path: prefill
+   damage shrinks from -10% (local pp512) to **-1.9%**. The output head is
+   excluded: routing it makes the gate reading biased low AND noisy
+   (3.908-3.924 across draws, straddling the lower bound); with the head on
+   MMQ like stock, four consecutive loads read 3.9146/3.9148/3.9151/3.9167 -
+   tight and mid-low in the 3.9118-3.9511 band.
 
-| exact tensor set (loader) | ppl | delta | decode |
-|---|---|---|---|
-| gate+ssm_out+q+output | 3.9269 | -0.114% | 109.1 (+2.5%) |
-| **+ attn_qkv (SHIPPED)** | **3.9298** | **-0.041%** | **111.3 (+4.5%)** |
-| + shexp trio (full set) | 3.9495 | +0.460% | 109.8 - slower AND near the bound |
+Decode same-binary toggle A/B (pinned device 0): 106.1-106.4 ->
+109.6-111.3 tok/s (+3.2-4.5% across sessions).
 
-The shexp trio is deliberately excluded: it alone costs ~+0.5% ppl (it
-participates in every token) and its tiny [2048->512] rows get slower at
-Q6_K (vec_dot ALU overhead beats the bandwidth saving). attn_qkv - the
-family unsloth presumably upcast for safety - measures **cheaper than free**
-on the gate corpus with exact matching.
+The perplexity landscape here is **non-additive** - measured configs:
+
+| config | gate ppl | verdict |
+|---|---|---|
+| 5 fams Q6_K, MMQ prefill | 3.931-3.947 | in-band but prefill floor fails (ranked 0.9476) |
+| 5 fams Q5_1 | 3.9031 | -0.72%, out of band LOW (band is symmetric!) |
+| qkv=Q5_1 + rest Q6_K | 3.896-3.899 | out of band low |
+| qkv=Q6_K + rest Q5_1 | 3.954-3.965 | out of band high |
+| + shexp trio (any type) | +0.5% and SLOWER decode | excluded |
+| 5 fams Q6_K + GEMM routing incl. head | 3.908-3.924 | noisy, straddles lower bound |
+| **5 fams Q6_K + GEMM routing, head excluded (SHIPPED)** | **3.9146-3.9167** | **in-band, tight** |
 
 Measurement traps burned into this round (do not re-buy):
 
-- `llama-quantize --tensor-type` overrides are SUBSTRING patterns:
-  `attn_q=...` also matches `attn_qkv`, and a generic `ffn_down_exps=q5_k`
-  line clobbers the three layers (34/38/39) that ship as Q6_K. Every offline
-  ablation in the first pass carried phantom damage from this; the loader's
-  exact suffix matching is the ground truth.
-- **imatrix-weighted Q6_K made ppl WORSE** (3.9924 vs 3.9562 plain on the
-  full set; imatrix from wikitext-2+fixture, 60 chunks, healthy run). For
-  requant-from-Q8_0 the importance weighting concentrates precision the
-  wrong way on this model. Do not reach for imatrix here.
-- **HIP graphs are already active by default** (`GGML_HIP_GRAPHS=ON` at
-  b10237; disabling costs ~1%). No differential lever - and consistent with
-  grouping still paying: RDNA4 graph replay keeps a per-node cost.
+- `llama-quantize --tensor-type` overrides are SUBSTRING patterns: `attn_q=`
+  also matches `attn_qkv`, and a generic `ffn_down_exps=q5_k` clobbers the
+  three layers that ship as Q6_K. The loader's exact suffix matching is the
+  ground truth; offline ablations from the first pass carried phantom damage.
+- **imatrix-weighted requant made ppl WORSE** (3.9924 vs 3.9562 plain,
+  full-set; healthy 60-chunk wikitext imatrix). Do not reach for imatrix on
+  a requant-from-Q8_0 here.
+- **Always run the prefill OFF-control.** The first ranked rejection
+  happened because local validation only benched prefill with requant ON.
+- **Pin `HIP_VISIBLE_DEVICES=0`** (the runner's GPU_PREFIX): the box has an
+  iGPU, and unpinned runs wander by ~0.1% ppl.
+- ppl is not bit-deterministic even pinned (+/-0.01% stock, more with
+  config changes in the graph) - sample several loads near a band edge.
+- **HIP graphs are already active by default** (disable costs ~1%) - no
+  differential lever; RDNA4 graph replay keeps a per-node cost, which is
+  why launch grouping still pays.
