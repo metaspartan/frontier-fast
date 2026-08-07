@@ -129,3 +129,16 @@ Larger remaining targets, from a per-launch nsys census (25 decode steps):
 The Q4_K expert bucket is the biggest prize, but its obvious angle —
 `q4k-expert-thread-utilisation` — is already recorded **dead** (both fixes
 measured +0.006% and −0.072%).
+
+
+## Measured-dead on this model: topk-moe sorted-list (do not spend a slot)
+
+The XS-track frontier lever (sorted-list top-k selection, bit-identical by
+construction) was stacked on 0001 and A/B'd on the runner box 2026-08-07:
+ppl bit-identical (4.7508 = 4.7508), but decode tg128 REGRESSES ~6% in the
+box's fast decode mode (16.07/16.02 -> 15.06/15.08 across interleaved
+rounds 1-2) and is neutral in the slow mode (14.89 -> 14.96, round 3;
+the documented ~7% per-launch bimodality). Median per-round ratio 0.941.
+Laguna-S's much larger layers make the router a negligible share, and the
+sorted-list kernel's occupancy interaction appears to cost more than the
+selection saves on sm_121 at this scale. XS result does not transfer.
