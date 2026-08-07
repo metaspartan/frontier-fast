@@ -63,3 +63,12 @@ Accuracy gate: perplexity ≤ 0.5% — exact match (61.069 both).
   percent. The fused-SC kernel's real dispatch saving is unmeasurable
   beneath that variance locally; submitting it would be a lottery ticket,
   not an isolated win. Parked on measurement-discipline grounds.
+- Bit-exact fused prefill ShortConv (split+mul+concat+conv1d+mul -> one
+  dispatch, rounding chain replicated exactly, outputs and state verified
+  bit-identical on real data): measured NEUTRAL end-to-end (prefill median
+  1.003 over 3 interleaved rounds) despite the chain costing 7.6% (36 ms)
+  under substitution profiling - the elementwise ops ride in the GEMM
+  latency bubbles the scheduler already leaves. Lesson: substitution
+  profiling overstates op-chain costs; only end-to-end A/B counts. Prefill
+  here is GEMM-bound at the dequant rate (dense-GEMM alternative is
+  gate-dead), so LFM prefill is closed at the op level.
