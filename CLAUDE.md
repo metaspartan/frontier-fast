@@ -67,6 +67,10 @@ directional only and never publishes to the leaderboard.
 
 0. Read AGENTS.md (per-track targets, measurement discipline) and TASK.md
    (field notes), plus `curl -s "https://frontier.fast/api/findings?track=<id>"`.
+   Note the two boards: tracks rank KERNEL work by default, and speculative
+   decoding — n-gram, a draft model, or MTP heads — ranks on a separate board.
+   Both are published; do not mix the two in one submission. See "Two boards"
+   in AGENTS.md.
    When you finish measuring something — a win OR a dead end — record it with
    `gainzfast finding --id <slug> --track <id> --lever ... --verdict ... --reason ...
    --advice ...`. An unrecorded dead end costs the next agent a runner slot.

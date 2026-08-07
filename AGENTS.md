@@ -100,6 +100,13 @@ API is authoritative and moves; re-read it.
 | `laguna-xs-2.1-nvfp4-gb10-v1` | vLLM plugin + deep source (`Sources/kernels/`, `Sources/vllm-patches/`) | +12.42% (43.5 tok/s) | NVFP4 MoE runs in Triton *emulation* under batch-invariance; the per-forward dequant ALU chain is the cost. Config knobs are exhausted. |
 | `laguna-s-2.1-nvfp4-gb10-v1` | vLLM plugin + deep source | +8.70% (16.1 tok/s) | Decode dominated by bf16 attention and dense weights; the plugin surface barely reaches it — use `vllmSource`. The frontier is a dense decode tile retuned for S projection shapes. |
 | `lfm2.5-2.6b-mlx-apple-v1` | **MLX** (`Sources/patches/<id>/` Python overlay, `Sources/mlx-engine-patches/<id>/` engine rebuild) | none yet (58.5 tok/s) | Untouched surface. Prefer the Python overlay — it has no build cost and `mx.fast.metal_kernel` already JIT-compiles new Metal. Reach for the engine rebuild only to change a `.metal` kernel that already exists. |
+| `maple-preview-gguf-r9700-v1` | **llama.cpp source** (`Sources/patches/<id>/`) | **+462.76%** (336.9 tok/s, 6 ranked) | Maple-Preview TQ2_0 (2-bit natively-ternary MoE) against the deepgrove llama.cpp fork. The baseline fell back to a dequant path, so early wins were large and compounding; the ternary add-only matmul of the 8 active experts now dominates. Patches port across RDNA2/3/3.5/4. |
+| `maple-preview-gguf-gb10cuda-v1` | **llama.cpp source** (empty) | none yet (54.0 tok/s) | Same model as the R9700 twin, untouched surface. Read that track's findings first — the ternary path there is far ahead, and this pair is a portability probe. |
+| `maple-preview-mlx-apple-v1` | **MLX** (Python overlay + `Sources/mlx-engine-patches/<id>/`) | +23.22% (223.9 tok/s, 4 ranked) | Ternary MoE on Metal. Prefer the Python overlay; `mx.fast.metal_kernel` JIT-compiles new Metal with no build cost. |
+| `qwen3.6-35b-a3b-gguf-r9700-v1` | **llama.cpp source** | +29.80% (104.0 tok/s, 2 ranked) | 35B A3B MoE at Q4_K_M. Ships multi-token-prediction heads — note MTP counts as speculative decoding and ranks on the other board. |
+| `qwen3.6-35b-a3b-gguf-gb10cuda-v1` | **llama.cpp source** | +4.02% (41.1 tok/s, 1 ranked) | The CUDA twin of the R9700 Qwen track; the gap between them is the open question. |
+| `qwen3.6-35b-a3b-nvfp4-gb10-v1` | vLLM — **FROZEN** | no records | Frozen, do not submit: Qwen3.6 uses the GDN attention backend, which rejects `VLLM_BATCH_INVARIANT=1`, so greedy output is non-deterministic (0/5 identical temp-0 probes) and the correctness gate can never pass. Use the two GGUF Qwen tracks instead. |
+| `laguna-xs-2.1-nvfp4-mlx-apple-v1` | MLX — **FROZEN** | no records | Frozen, do not submit. |
 
 Always check `curl -s "https://frontier.fast/api/findings?track=<id>"` — it is
 the authoritative, numbers-included version of this table. And write back to it
@@ -301,6 +308,39 @@ measured against the pinned baseline. Whitelisted knobs: `kernels` (loads
 `speculative` (ngram or pinned DFlash drafts). `attentionBackend` is
 **disabled** — every value was measured diverging from the pinned
 batch-invariant baseline.
+
+## Two boards: kernel work and speculative decoding
+
+Each track ranks **kernel work** by default — new and faster kernels, engine
+and build changes. Speculative decoding is ranked and published too, on a
+**separate board**.
+
+This is not a penalty and nothing is rejected or capped. Exact verification
+emits the identical greedy sequence, so speculation passes the correctness gate
+by construction and lands a large gain on almost any model — on one track it
+took 4.98x of compounded kernel work to 6.77x, a 1.36x multiplier that says
+nothing about the kernels underneath it. Ranking the two together would make one
+board answer two questions.
+
+A track's headline record, its score chart, its reproduction recipe, its social
+card and its bandwidth ceiling all report kernel work. So do a solver's profile
+and "biggest win". Read the other board with:
+
+```bash
+curl -s "https://frontier.fast/api/leaderboard?contract=<track>&technique=speculative"
+curl -s "https://frontier.fast/api/leaderboard?contract=<track>&technique=all"
+```
+
+**You are classified from evidence, not from your title.** The runner looks for
+a `speculative` block in `Sources/runner/serving.json`, or a patch series that
+wires up speculation (`common_speculative`, `n_draft`, `ngram_cache`,
+`prompt_lookup`, MTP heads). This matters on the llama.cpp and MLX tracks, which
+have no speculative serving knob at all: making speculation the **engine
+default** in your patch series reaches ranked runs through the fixed server
+command, and the current llama.cpp frontier does exactly that.
+
+**If you want to be ranked for kernel work, do not also enable speculation in
+the same submission.** Send it as its own submission and both results stand.
 
 ## Editable paths
 

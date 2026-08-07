@@ -182,10 +182,13 @@ per-track, numbers-included version — this is the cross-cutting subset.
 - **Knobs that change kernel dispatch shapes flip near-tie argmaxes**:
   `-O3` compilation, `max-num-seqs` changes, and ngram speculative decoding
   at depth ≥ 6 have all been rejected for output mismatch.
-- **The ngram lever is closed**: acceptance ≈ 0.25 on this model, a spec
-  step costs ~59% more than a plain step, so decode asymptotes at ~0.84× —
-  below the floor for every k. Draftless ngram at k=1 measured 21% *slower*
-  decode and ~15% slower TTFT.
+- **The ngram lever is closed on THIS track**: acceptance ≈ 0.25 on this model,
+  a spec step costs ~59% more than a plain step, so decode asymptotes at ~0.84×
+  — below the floor for every k. Draftless ngram at k=1 measured 21% *slower*
+  decode and ~15% slower TTFT. Note this is a measured property of this engine
+  and model, not a rule: the same lever is worth +36% on the llama.cpp R9700
+  track. Either way it now ranks on the **speculative board**, not this one —
+  see "Two boards" in AGENTS.md.
 - **`attentionBackend` is disabled**: all three whitelisted values were
   measured diverging from the pinned batch-invariant baseline.
 - **The measured bottleneck**: under batch-invariant serving the NVFP4 MoE

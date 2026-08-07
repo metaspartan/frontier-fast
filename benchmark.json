@@ -2,21 +2,27 @@
   "schemaVersion": 1,
   "name": "frontier-fast-challenge",
   "tracks": [
-    "laguna-xs-2.1-nvfp4-gb10-v1",
     "laguna-s-2.1-nvfp4-gb10-v1",
+    "laguna-xs-2.1-nvfp4-gb10-v1",
+    "laguna-xs-2.1-nvfp4-mlx-apple-v1",
+    "lfm2.5-2.6b-mlx-apple-v1",
+    "lfm2.5-2.6b-gguf-gb10cuda-v1",
+    "lfm2.5-2.6b-gguf-r9700-v1",
     "laguna-xs-2.1-gguf-r9700-v1",
     "laguna-xs-2.1-gguf-gb10cuda-v1",
     "laguna-s-2.1-gguf-gb10cuda-v1",
-    "lfm2.5-2.6b-gguf-r9700-v1",
-    "lfm2.5-2.6b-gguf-gb10cuda-v1",
-    "lfm2.5-2.6b-mlx-apple-v1",
-    "maple-preview-mlx-apple-v1",
-    "maple-preview-gguf-r9700-v1",
-    "maple-preview-gguf-gb10cuda-v1",
     "qwen3.6-35b-a3b-nvfp4-gb10-v1",
     "qwen3.6-35b-a3b-gguf-gb10cuda-v1",
-    "qwen3.6-35b-a3b-gguf-r9700-v1"
+    "qwen3.6-35b-a3b-gguf-r9700-v1",
+    "maple-preview-mlx-apple-v1",
+    "maple-preview-gguf-r9700-v1",
+    "maple-preview-gguf-gb10cuda-v1"
   ],
+  "frozenTracks": [
+    "laguna-xs-2.1-nvfp4-mlx-apple-v1",
+    "qwen3.6-35b-a3b-nvfp4-gb10-v1"
+  ],
+  "frozenTracksNote": "Listed in `tracks` so the id validates, but do NOT submit: these are frozen and no submission can be verified. qwen3.6-35b-a3b-nvfp4-gb10-v1 is frozen because Qwen3.6 uses the GDN attention backend, which rejects VLLM_BATCH_INVARIANT=1, so greedy output is non-deterministic and the correctness gate can never pass.",
   "defaultTrack": "laguna-xs-2.1-nvfp4-gb10-v1",
   "scoring": {
     "formula": "decode_speedup^0.65 * prefill_speedup^0.20 * ttft_speedup^0.15",
@@ -25,6 +31,18 @@
     "ttftFloor": 0.9,
     "gainsUncapped": true,
     "acceptanceBandAppliesTo": "baseline phase vs pinned calibration (box health), not the candidate"
+  },
+  "boards": {
+    "default": "kernel",
+    "kernel": "New and faster kernels, engine and build changes. This is what a track's headline record, chart, recipe, social card and bandwidth ceiling report.",
+    "speculative": "Speculative decoding: n-gram/prompt-lookup, a draft model, or multi-token-prediction heads. Ranked and published on its own board.",
+    "why": "Exact verification emits the identical greedy sequence, so speculation passes the correctness gate by construction and wins on almost any model. Ranking it beside a kernel result would make one board answer two questions.",
+    "classifiedFrom": [
+      "Sources/runner/serving.json `speculative` block",
+      "patch series wiring up speculation (common_speculative, n_draft, ngram_cache, prompt_lookup, MTP)"
+    ],
+    "readOtherBoard": "GET /api/leaderboard?contract=<track>&technique=speculative | all",
+    "advice": "Do not enable speculation in the same submission as kernel work \u2014 send it separately and both results stand."
   },
   "editablePaths": [
     "Sources/runner/",
