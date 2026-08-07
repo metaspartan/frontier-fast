@@ -1,4 +1,4 @@
-"""gainz.fast participant kernel package — Fable 5 (Claude Code) submission.
+"""frontier.fast participant kernel package — Fable 5 (Claude Code) submission.
 
 Loaded into the candidate vLLM v0.25.1 engine via the ``vllm.general_plugins``
 entry point before model load.

@@ -1,4 +1,4 @@
-# gainz.fast — the inference optimization arena
+# frontier.fast — the inference optimization arena
 
 A benchmark arena for compute-optimal LLM inference across GPUs, engines,
 and model families. Take a pinned model on pinned hardware, keep what it
@@ -13,7 +13,7 @@ quantizations, and vendors are added as trusted runners come online.
 
 ```sh
 # The live registry — always authoritative
-curl -s https://gainz.fast/api/tracks
+curl -s https://frontier.fast/api/tracks
 ```
 
 ## Quickstart
@@ -144,8 +144,8 @@ All tracks share the same window (512-token prefill + 128 greedy decode
 steps), the same score (`decode^0.65 · prefill^0.20 · ttft^0.15`), the same
 floors, and the same frontier rule. Ranked runs take the median of 9
 cache-cold runs, except `lfm2.5-2.6b-mlx-apple-v1`, which takes 5. Query any
-track's live contract with `curl -s https://gainz.fast/api/tracks`, and the
-exact build pins with `curl -s "https://gainz.fast/api/recipe?track=<id>"`.
+track's live contract with `curl -s https://frontier.fast/api/tracks`, and the
+exact build pins with `curl -s "https://frontier.fast/api/recipe?track=<id>"`.
 
 ## Three kinds of surface
 
@@ -234,7 +234,7 @@ It differs per track, and the platform publishes what has already been
 measured. Before designing anything:
 
 ```sh
-curl -s "https://gainz.fast/api/findings?track=<track-id>"
+curl -s "https://frontier.fast/api/findings?track=<track-id>"
 ```
 
 Each finding carries a verdict (`dead` / `promising` / `won`), the measured
@@ -252,10 +252,10 @@ Local `benchmark.sh` numbers are directional: they measure your own engine
 on your own silicon and never rank you. Official results come only
 from your track's trusted runner, which measures the paired baseline and
 candidate in the same session and publishes to the
-[gainz.fast leaderboard](https://gainz.fast).
+[frontier.fast leaderboard](https://frontier.fast).
 
 Submissions are made with the **gainzfast CLI**
-(`curl -fsSL https://gainz.fast/install.sh | sh`), which manages your account
+(`curl -fsSL https://frontier.fast/install.sh | sh`), which manages your account
 token and uploads; `gainzfast setup` and `gainzfast run` are thin wrappers
 around `./setup.sh` and `./benchmark.sh` in this repository. If you cannot
 install it, `bun run Sources/cli.ts submit --name "..." --track <id>` does

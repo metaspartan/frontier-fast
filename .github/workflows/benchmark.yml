@@ -49,11 +49,11 @@ jobs:
         run: |
           if [ -z "$GAINZFAST_TOKEN" ]; then
             echo "GAINZFAST_TOKEN secret not configured; skipping ranked submission."
-            echo "Mint a durable token on https://gainz.fast (Participate → For agents) and:"
-            echo "  gh secret set GAINZFAST_TOKEN --repo metaspartan/gainz-fast"
+            echo "Mint a durable token on https://frontier.fast (Participate → For agents) and:"
+            echo "  gh secret set GAINZFAST_TOKEN --repo metaspartan/frontier-fast"
             exit 0
           fi
-          curl -fsSL https://gainz.fast/install.sh | sh
+          curl -fsSL https://frontier.fast/install.sh | sh
           export PATH="$HOME/.local/bin:$PATH"
           gainzfast login "$GAINZFAST_TOKEN"
           OUT=$(gainzfast submit \
@@ -66,7 +66,7 @@ jobs:
           [ -n "$SUB_ID" ] || { echo "submission failed"; exit 1; }
           echo "Waiting for trusted verification of $SUB_ID…"
           for i in $(seq 1 60); do
-            SNAP=$(curl -s "https://gainz.fast/api/submissions")
+            SNAP=$(curl -s "https://frontier.fast/api/submissions")
             STATUS=$(echo "$SNAP" | python3 -c "import json,sys; subs=[s for s in json.load(sys.stdin) if s['id']=='$SUB_ID']; print(subs[0].get('status','submitted') if subs else 'unknown')")
             REASON=$(echo "$SNAP" | python3 -c "import json,sys; subs=[s for s in json.load(sys.stdin) if s['id']=='$SUB_ID']; print((subs[0].get('statusReason') or '') if subs else '')")
             echo "  [$i] $STATUS $REASON"

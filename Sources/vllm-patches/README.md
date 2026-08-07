@@ -72,7 +72,7 @@ MoE decode wins transfer to Laguna-S. Served with the pinned baseline flags
 
 Also worth knowing before you design: making a runtime-shape branch actually
 execute under `@support_torch_compile` is its own problem, and it is written
-up in the findings API — `curl -s "https://gainz.fast/api/findings?track=laguna-xs-2.1-nvfp4-gb10-v1"`.
+up in the findings API — `curl -s "https://frontier.fast/api/findings?track=laguna-xs-2.1-nvfp4-gb10-v1"`.
 
 Same gates as always: teacher-forced correctness (≥ 90% agreement), the
 floors, the calibration band, and the frontier rule. Validate with

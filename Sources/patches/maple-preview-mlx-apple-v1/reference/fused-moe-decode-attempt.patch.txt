@@ -1,0 +1,240 @@
+diff --git a/mlx_lm/models/maple.py b/mlx_lm/models/maple.py
+index 60d8001..d9a5580 100644
+--- a/mlx_lm/models/maple.py
++++ b/mlx_lm/models/maple.py
+@@ -686,6 +686,146 @@ class MapleGate(nn.Module):
+         return self._reference(x)
+ 
+ 
++def _make_fused_upgate_swiglu_kernel():
++    """Up+gate projections and clamped SwiGLU for ONE token in ONE dispatch.
++
++    Grid (64, NH, TOPK): each 64-thread threadgroup owns one (expert slot,
++    hidden unit) pair — simdgroup 0 computes the up row's dot product,
++    simdgroup 1 the gate row's, single pass over K (each lane covers K/32
++    consecutive values; with group_size >= K/32 a lane never straddles a
++    quantization group). Dequant follows the engine's affine convention
++    byte-for-byte: per byte the four 2-bit fields multiply x, x/4, x/16,
++    x/64 (mask without shift), accumulated in float32, then s*qx + b*sum.
++    Thread 0 applies the clamped SwiGLU and writes the activation.
++    """
++    source = """
++        uint tid = thread_position_in_threadgroup.x;
++        uint lane = tid % 32u;
++        uint half_id = tid / 32u;              // 0 = up row, 1 = gate row
++        uint i = thread_position_in_grid.y;    // hidden unit
++        uint e = thread_position_in_grid.z;    // expert slot
++        uint expert = (uint)inds[e];
++
++        constexpr uint NH = NHALF;
++        constexpr uint K = KDIM;
++        constexpr uint WPR = K / 16u;          // uint32 words per row
++        constexpr uint VPL = K / 32u;          // values per lane (contiguous)
++        constexpr uint WPL = VPL / 16u;        // words per lane (contiguous)
++        constexpr uint NGROUPS = K / GROUP_;
++
++        uint row = half_id * NH + i;
++        ulong rbase = ((ulong)expert * (2u * NH) + row);
++        const device uint4* w4 = (const device uint4*)(w + rbase * WPR + lane * WPL);
++        const device bfloat4* xv = (const device bfloat4*)(x + lane * VPL);
++        uint g = (lane * VPL) / GROUP_;
++
++        float accum = 0.0f;
++        float xsum = 0.0f;
++        constexpr float4 PRE = float4(1.0f, 0.25f, 0.0625f, 0.015625f);
++        constexpr float4 POST = float4(1.0f, 4.0f, 16.0f, 64.0f);
++        for (uint q = 0u; q < WPL / 4u; ++q) {
++            uint4 wq = w4[q];
++            for (uint wi = 0u; wi < 4u; ++wi) {
++                uint32_t wv = wq[wi];
++                const thread uint8_t* wb = (const thread uint8_t*)&wv;
++                for (uint m = 0u; m < 4u; ++m) {
++                    float4 xf = float4(xv[(q * 4u + wi) * 4u + m]) * PRE;
++                    xsum += dot(xf, POST);
++                    uint8_t byte = wb[m];
++                    accum += dot(xf, float4(byte & 0x03, byte & 0x0c,
++                                            byte & 0x30, byte & 0xc0));
++                }
++            }
++        }
++        float s = (float)scales[rbase * NGROUPS + g];
++        float b = (float)biases[rbase * NGROUPS + g];
++        float part = simd_sum(s * accum + b * xsum);
++        threadgroup float dots[2];
++        if (lane == 0u) dots[half_id] = part;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (tid == 0u) {
++            float u = dots[0];
++            float gt = dots[1];
++            float gc = metal::min(gt, CLAMP_);
++            float uc = metal::clamp(u, -CLAMP_, CLAMP_);
++            float sil = gc / (1.0f + metal::exp(-gc));
++            acts[e * NH + i] = (T_)(sil * uc);
++        }
++    """.replace("CLAMP_", f"{MLP_CLAMP:.1f}f")
++    return mx.fast.metal_kernel(
++        name="maple_fused_upgate_swiglu",
++        input_names=["x", "w", "scales", "biases", "inds"],
++        output_names=["acts"],
++        source=source,
++    )
++
++
++def _make_fused_down_combine_kernel():
++    """Down projections and the score-weighted expert combine in ONE dispatch.
++
++    Grid (32*TOPK, NOUT, 1): each threadgroup owns one output unit; simdgroup
++    e computes expert slot e's down-row dot over its activation vector in a
++    single pass (one word per lane). Each expert's dot is rounded to the
++    activation dtype first — exactly the rounding the unfused path applies to
++    each expert output — then combined in float32 in slot order and rounded
++    once, matching aggregate_expert_outputs bit-for-bit in structure.
++    """
++    source = """
++        uint tid = thread_position_in_threadgroup.x;
++        uint lane = tid % 32u;
++        uint sg = tid / 32u;                   // expert slot
++        uint j = thread_position_in_grid.y;    // output unit
++        uint expert = (uint)inds[sg];
++
++        constexpr uint K = KDIM;
++        constexpr uint NO = NOUT;
++        constexpr uint WPR = K / 16u;
++        constexpr uint NGROUPS = K / GROUP_;
++
++        ulong rbase = ((ulong)expert * NO + j);
++        float part = 0.0f;
++        constexpr float4 PRE = float4(1.0f, 0.25f, 0.0625f, 0.015625f);
++        constexpr float4 POST = float4(1.0f, 4.0f, 16.0f, 64.0f);
++        for (uint w0 = lane; w0 < WPR; w0 += 32u) {
++            uint v0 = w0 * 16u;
++            const device bfloat4* av = (const device bfloat4*)(acts + sg * K + v0);
++            uint32_t wv = wd[rbase * WPR + w0];
++            const thread uint8_t* wb = (const thread uint8_t*)&wv;
++            float accum = 0.0f;
++            float xsum = 0.0f;
++            for (uint m = 0u; m < 4u; ++m) {
++                float4 xf = float4(av[m]) * PRE;
++                xsum += dot(xf, POST);
++                uint8_t byte = wb[m];
++                accum += dot(xf, float4(byte & 0x03, byte & 0x0c,
++                                        byte & 0x30, byte & 0xc0));
++            }
++            uint g = v0 / GROUP_;
++            part += (float)scales[rbase * NGROUPS + g] * accum
++                + (float)biases[rbase * NGROUPS + g] * xsum;
++        }
++        part = simd_sum(part);
++        threadgroup float dots[TOPK_];
++        if (lane == 0u) dots[sg] = (float)(T_)part;
++        threadgroup_barrier(mem_flags::mem_threadgroup);
++        if (tid == 0u) {
++            float y = 0.0f;
++            for (uint e2 = 0u; e2 < TOPK_; ++e2) y += dots[e2] * scores[e2];
++            out[j] = (T_)y;
++        }
++    """
++    return mx.fast.metal_kernel(
++        name="maple_fused_down_combine",
++        input_names=["acts", "wd", "scales", "biases", "inds", "scores"],
++        output_names=["out"],
++        source=source,
++    )
++
++
++_fused_upgate_kernel = _make_fused_upgate_swiglu_kernel()
++_fused_down_kernel = _make_fused_down_combine_kernel()
++
++
+ @partial(mx.compile, shapeless=True)
+ def aggregate_expert_outputs(expert_outputs, scores):
+     # Combined in float32, rounded once at the end (reference `moe_infer`).
+@@ -737,12 +877,86 @@ class MapleSparseMoeBlock(nn.Module):
+             args.num_experts,
+             bias=args.use_bias,
+         )
++        self._hidden = args.hidden_size
++        self._nh = args.moe_intermediate_size
++        self._topk = args.num_experts_per_tok
++        self._fused_moe = None  # None = unprobed, then True/False
++
++    def _fused_ok(self, x):
++        """Shape preconditions for the fused single-token kernels."""
++        sm = self.switch_mlp
++        up, dn = sm.up_gate_proj, sm.down_proj
++        gs_u = getattr(up, "group_size", None)
++        gs_d = getattr(dn, "group_size", None)
++        return (
++            x.size == x.shape[-1]
++            and getattr(up, "bits", None) == 2
++            and getattr(dn, "bits", None) == 2
++            and gs_u is not None
++            and gs_d is not None
++            and self._hidden % 512 == 0
++            and gs_u >= 16  # a lane chunk never straddles a group
++            and self._nh % 8 == 0
++            and gs_d >= 16  # a code word never straddles a group
++            and getattr(up, "bias", None) is None
++            and getattr(dn, "bias", None) is None
++        )
+ 
+-    def __call__(self, x):
+-        inds, scores = self.gate(x)
++    def _fused_call(self, x, inds, scores):
++        sm = self.switch_mlp
++        up, dn = sm.up_gate_proj, sm.down_proj
++        (acts,) = _fused_upgate_kernel(
++            inputs=[x.reshape(-1), up.weight, up.scales, up.biases, inds.reshape(-1)],
++            template=[
++                ("T_", x.dtype),
++                ("NHALF", self._nh),
++                ("KDIM", self._hidden),
++                ("GROUP_", up.group_size),
++            ],
++            grid=(64, self._nh, self._topk),
++            threadgroup=(64, 1, 1),
++            output_shapes=[(self._topk, self._nh)],
++            output_dtypes=[x.dtype],
++        )
++        (y,) = _fused_down_kernel(
++            inputs=[
++                acts,
++                dn.weight,
++                dn.scales,
++                dn.biases,
++                inds.reshape(-1),
++                scores.reshape(-1),
++            ],
++            template=[
++                ("T_", x.dtype),
++                ("NOUT", self._hidden),
++                ("KDIM", self._nh),
++                ("GROUP_", dn.group_size),
++                ("TOPK_", self._topk),
++            ],
++            grid=(32 * self._topk, self._hidden, 1),
++            threadgroup=(32 * self._topk, 1, 1),
++            output_shapes=[(self._hidden,)],
++            output_dtypes=[x.dtype],
++        )
++        return y.reshape(x.shape)
++
++    def _reference_moe(self, x, inds, scores):
+         y = self.switch_mlp(x, inds)
+         return aggregate_expert_outputs(y, scores)
+ 
++    def __call__(self, x):
++        inds, scores = self.gate(x)
++        if self._fused_moe is not False and self._fused_ok(x):
++            if self._fused_moe is None:
++                self._fused_moe = _matches(
++                    lambda: (self._fused_call(x, inds, scores),),
++                    lambda: (self._reference_moe(x, inds, scores),),
++                )
++            if self._fused_moe:
++                return self._fused_call(x, inds, scores)
++        return self._reference_moe(x, inds, scores)
++
+ 
+ class MapleDecoderLayer(nn.Module):
+     def __init__(self, args: ModelArgs, layer_idx: int):

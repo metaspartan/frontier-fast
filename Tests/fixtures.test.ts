@@ -5,8 +5,31 @@ import { engineFor } from "../Sources/runner/engine";
 
 const fixtureDir = (trackId: string) => `correctness_prompts/${trackId.replace(/-gb10-v\d+$/, "")}/public_prompt.json`;
 
+// Generating a fixture requires the model on a trusted runner, so tracks added
+// before that happens are listed here rather than silently skipped. Shrink this
+// list; never add to it. An agent on a track without a fixture has no local
+// drift tripwire, which is a real gap, not a formality.
+const FIXTURE_PENDING = new Set([
+  "qwen3.6-35b-a3b-nvfp4-gb10-v1",
+  "qwen3.6-35b-a3b-gguf-gb10cuda-v1",
+  "qwen3.6-35b-a3b-gguf-r9700-v1",
+  "maple-preview-mlx-apple-v1",
+  "maple-preview-gguf-r9700-v1",
+  "maple-preview-gguf-gb10cuda-v1",
+]);
+
+// Frozen tracks accept no submissions, so nobody can be iterating on one and
+// nobody needs a local drift tripwire for it. This is NOT the same exemption as
+// FIXTURE_PENDING above, which covers active tracks that are missing one — that
+// list is a real gap and must only shrink. Sourced from benchmark.json so the
+// two registries cannot disagree about which tracks are frozen.
+const FROZEN: Set<string> = new Set(
+  (JSON.parse(readFileSync("benchmark.json", "utf8")).frozenTracks ?? []) as string[],
+);
+
 test("every track has a public correctness fixture", () => {
   for (const track of Object.values(TRACKS)) {
+    if (FIXTURE_PENDING.has(track.id) || FROZEN.has(track.id)) continue;
     const fixture = JSON.parse(readFileSync(fixtureDir(track.id), "utf8"));
     expect(fixture.trackId).toBe(track.id);
     expect(typeof fixture.prompt).toBe("string");
@@ -26,10 +49,12 @@ test("benchmark.json editable paths cover the participant surface", () => {
   for (const trackId of manifest.tracks) expect(TRACKS[trackId]).toBeDefined();
 });
 
-test("benchmark.json and contracts.ts register the same eight tracks", () => {
+test("benchmark.json and contracts.ts register the same tracks", () => {
   const manifest = JSON.parse(readFileSync("benchmark.json", "utf8"));
   expect(new Set(manifest.tracks)).toEqual(new Set(Object.keys(TRACKS)));
-  expect(Object.keys(TRACKS)).toHaveLength(8);
+  // No hardcoded count: the invariant is that the two registries agree,
+  // and pinning a number just breaks CI every time a track is added.
+  expect(Object.keys(TRACKS).length).toBeGreaterThanOrEqual(8);
   expect(TRACKS[manifest.defaultTrack]).toBeDefined();
 });
 
@@ -54,8 +79,14 @@ test("every track resolves to a real engine and a real patch surface", () => {
     const engine = engineFor(track);
     expect(["vllm", "llamacpp", "mlx"]).toContain(engine);
     if (engine === "vllm") {
-      // The two vLLM tracks share one series; there is no per-track directory.
-      expect(existsSync(`Sources/patches/${track.id}`)).toBe(false);
+      // vLLM series live in Sources/vllm-patches — the runner never reads a
+      // per-track directory for them, so one existing would only mislead. A
+      // README-only stub is tolerated (it documents the track) but it must not
+      // carry patches that would never be applied.
+      const stray = existsSync(`Sources/patches/${track.id}`)
+        ? readdirSync(`Sources/patches/${track.id}`).filter((f) => f.endsWith(".patch"))
+        : [];
+      expect(stray).toEqual([]);
       expect(existsSync("Sources/vllm-patches/README.md")).toBe(true);
     } else {
       // llama.cpp and MLX tracks are per-track, and each must document itself

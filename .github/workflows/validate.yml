@@ -23,13 +23,13 @@ jobs:
           echo "Watching submission $ID on the trusted runner (public API mirror)"
           LAST=""
           for i in $(seq 1 150); do
-            STATUS=$(curl -sf -m 15 "https://gainz.fast/api/submissions" | python3 -c "
+            STATUS=$(curl -sf -m 15 "https://frontier.fast/api/submissions" | python3 -c "
           import json,sys
           subs=[s for s in json.load(sys.stdin) if s.get('id')=='$ID']
           print(subs[0].get('status') if subs else 'unknown')")
             [ "$STATUS" != "$LAST" ] && echo "$(date -u +%H:%M:%SZ) status: $STATUS" && LAST="$STATUS"
             if [ "$STATUS" = "verified" ] || [ "$STATUS" = "rejected" ]; then
-              curl -sf -m 15 "https://gainz.fast/api/submissions" | python3 -c "
+              curl -sf -m 15 "https://frontier.fast/api/submissions" | python3 -c "
           import json,sys
           s=[x for x in json.load(sys.stdin) if x.get('id')=='$ID'][0]
           print('verdict:', s.get('status'))

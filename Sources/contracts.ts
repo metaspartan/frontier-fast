@@ -1,11 +1,11 @@
 import type { Contract } from "./types";
 
 /**
- * The eight live tracks, mirroring https://gainz.fast/api/tracks.
+ * The eight live tracks, mirroring https://frontier.fast/api/tracks.
  *
  * The live registry is authoritative — this file is a local copy so the CLI
  * and the tests can run offline. If the two disagree, the API wins; fetch it
- * with `curl -s https://gainz.fast/api/tracks` and fix this file.
+ * with `curl -s https://frontier.fast/api/tracks` and fix this file.
  */
 export const TRACKS: Record<string, Contract> = {
   "laguna-xs-2.1-nvfp4-gb10-v1": {
@@ -99,6 +99,21 @@ export const TRACKS: Record<string, Contract> = {
     revision: "sha256:a8b55c75714ea73fd90ec85de5defdc0b8d88ca0ad2108343cdd8fc22f7583e4",
     quantization: "gguf-q4_k_m",
     machine: "gb10-cuda-sm121",
+    promptTokens: 512,
+    decodeTokens: 128,
+    warmupRuns: 2,
+    measuredRuns: 9,
+  },
+  // Frozen: superseded by the active MLX tracks. Registered so benchmark.json
+  // and this map agree — the CLI validates track ids against benchmark.json,
+  // and an id that is simply absent is indistinguishable from a typo.
+  "laguna-xs-2.1-nvfp4-mlx-apple-v1": {
+    id: "laguna-xs-2.1-nvfp4-mlx-apple-v1",
+    family: "laguna-xs-2.1",
+    model: "poolside/Laguna-XS-2.1-NVFP4-mlx",
+    revision: "841778bda563a36104dd521e37d99218e46f4f25",
+    quantization: "nvfp4",
+    machine: "apple-silicon-mlx",
     promptTokens: 512,
     decodeTokens: 128,
     warmupRuns: 2,

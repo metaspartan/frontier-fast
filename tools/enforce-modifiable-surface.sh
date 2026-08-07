@@ -6,7 +6,7 @@
 #
 # The editable list below MUST stay in sync with `editablePaths` in
 # benchmark.json and with each track's `allowlistedPaths` in
-# https://gainz.fast/api/tracks. Tests/fixtures.test.ts fails if it drifts.
+# https://frontier.fast/api/tracks. Tests/fixtures.test.ts fails if it drifts.
 #
 # This once rejected every llama.cpp, MLX and vLLM-source submission: the
 # patch directories are the whole participant surface on six of the eight

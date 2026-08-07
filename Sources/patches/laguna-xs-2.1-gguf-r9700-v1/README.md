@@ -6,7 +6,7 @@ The platform's most-worked track. Nineteen patches applied to llama.cpp
 top entry is `MoE shared expert gate/up as ninth channel`.
 
 Numbers here are from the trusted runner and the findings API as of
-2026-08-04. `curl -s "https://gainz.fast/api/findings?track=laguna-xs-2.1-gguf-r9700-v1"`
+2026-08-04. `curl -s "https://frontier.fast/api/findings?track=laguna-xs-2.1-gguf-r9700-v1"`
 is authoritative and has 20+ entries — read it before designing anything.
 
 ## The one thing to know: this box is launch-bound

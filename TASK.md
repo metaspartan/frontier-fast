@@ -5,9 +5,9 @@ computes. Which files you edit, which engine you patch, and which accuracy
 gate applies all depend on the track you cloned — check its live contract:
 
 ```sh
-curl -s https://gainz.fast/api/tracks
-curl -s "https://gainz.fast/api/findings?track=<track-id>"
-curl -s "https://gainz.fast/api/recipe?track=<track-id>"
+curl -s https://frontier.fast/api/tracks
+curl -s "https://frontier.fast/api/findings?track=<track-id>"
+curl -s "https://frontier.fast/api/recipe?track=<track-id>"
 ```
 
 The findings endpoint is the authoritative record of what has already been
@@ -132,7 +132,7 @@ submitted -> running -> verified | rejected
 
 Only the trusted runner can transition states; participant tokens are
 submit-only. **A submission cannot be recalled** — it claims a physical GPU
-for roughly 22 minutes, so check `curl -s https://gainz.fast/api/queue` and
+for roughly 22 minutes, so check `curl -s https://frontier.fast/api/queue` and
 validate locally first. Pushes to `main` also flow through this lifecycle
 automatically via `.github/workflows/benchmark.yml`.
 
@@ -182,10 +182,13 @@ per-track, numbers-included version — this is the cross-cutting subset.
 - **Knobs that change kernel dispatch shapes flip near-tie argmaxes**:
   `-O3` compilation, `max-num-seqs` changes, and ngram speculative decoding
   at depth ≥ 6 have all been rejected for output mismatch.
-- **The ngram lever is closed**: acceptance ≈ 0.25 on this model, a spec
-  step costs ~59% more than a plain step, so decode asymptotes at ~0.84× —
-  below the floor for every k. Draftless ngram at k=1 measured 21% *slower*
-  decode and ~15% slower TTFT.
+- **The ngram lever is closed on THIS track**: acceptance ≈ 0.25 on this model,
+  a spec step costs ~59% more than a plain step, so decode asymptotes at ~0.84×
+  — below the floor for every k. Draftless ngram at k=1 measured 21% *slower*
+  decode and ~15% slower TTFT. Note this is a measured property of this engine
+  and model, not a rule: the same lever is worth +36% on the llama.cpp R9700
+  track. Either way it now ranks on the **speculative board**, not this one —
+  see "Two boards" in AGENTS.md.
 - **`attentionBackend` is disabled**: all three whitelisted values were
   measured diverging from the pinned batch-invariant baseline.
 - **The measured bottleneck**: under batch-invariant serving the NVFP4 MoE

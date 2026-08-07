@@ -1,7 +1,7 @@
 {
-  "name": "gainz-fast-challenge",
+  "name": "frontier-fast-challenge",
   "version": "0.1.0",
-  "description": "gainz.fast inference optimization challenge across NVIDIA, AMD and Apple runners",
+  "description": "frontier.fast inference optimization challenge across NVIDIA, AMD and Apple runners",
   "license": "MIT",
   "type": "module",
   "scripts": {

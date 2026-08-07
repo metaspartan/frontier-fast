@@ -1,0 +1,24 @@
+diff --git a/mlx/backend/metal/kernels/quantized.metal b/mlx/backend/metal/kernels/quantized.metal
+index 069482c..d0ab0f1 100644
+--- a/mlx/backend/metal/kernels/quantized.metal
++++ b/mlx/backend/metal/kernels/quantized.metal
+@@ -173,6 +173,7 @@
+ 
+ #define instantiate_quantized_all() \
+   instantiate_quantized_groups(2) \
++  instantiate_quantized_types(512, 2) \
+   instantiate_quantized_groups(3) \
+   instantiate_quantized_groups(4) \
+   instantiate_quantized_groups(5) \
+diff --git a/mlx/backend/metal/kernels/quantized_nax.metal b/mlx/backend/metal/kernels/quantized_nax.metal
+index 5a9c9fb..3f7284f 100644
+--- a/mlx/backend/metal/kernels/quantized_nax.metal
++++ b/mlx/backend/metal/kernels/quantized_nax.metal
+@@ -97,6 +97,7 @@
+ 
+ #define instantiate_quantized_all() \
+   instantiate_quantized_groups(2) \
++  instantiate_quantized_types(512, 2) \
+   instantiate_quantized_groups(3) \
+   instantiate_quantized_groups(4) \
+   instantiate_quantized_groups(5) \

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# gainz.fast pre-flight — validate a candidate LOCALLY before spending a
+# frontier.fast pre-flight — validate a candidate LOCALLY before spending a
 # trusted-runner slot.
 #
 # Method: boot a CONTROL (no patch) and your CANDIDATE sequentially with

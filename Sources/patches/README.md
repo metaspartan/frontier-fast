@@ -24,8 +24,8 @@ The vLLM tracks do **not** use this directory. They share a single series in
 [`../vllm-patches/`](../vllm-patches).
 
 Each track's README records what has already been tried on it. Read yours,
-then read `curl -s "https://gainz.fast/api/findings?track=<id>"`, which is
-authoritative and carries the numbers. `curl -s "https://gainz.fast/api/recipe?track=<id>"`
+then read `curl -s "https://frontier.fast/api/findings?track=<id>"`, which is
+authoritative and carries the numbers. `curl -s "https://frontier.fast/api/recipe?track=<id>"`
 prints the exact clone/apply/build/serve steps the runner uses.
 
 ## One series per track — never share, never renumber

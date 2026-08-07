@@ -3,7 +3,9 @@
 | Patch | Intent |
 | --- | --- |
 | `0001-registry-load-flashhead.patch` | Registry-preferred model load (no trust_remote_code needed) + auto-enable FlashHead approximate lm_head for L=1 decode |
-| `0002-request-overhead.patch` | Per-request host overhead: cache the BPE detokenizer tokenmap (was rebuilt from a fresh `tokenizer.vocab` dict on every `stream_generate` call, ~95 ms on M1 Ultra); stop flushing the MLX buffer pool after the final prefill chunk and at decode step 0 (both flushes forced the next allocations back to the OS) |
+| `0002-request-overhead.patch` | Per-request host overhead: cache the BPE detokenizer tokenmap (was rebuilt from a fresh `tokenizer.vocab` dict on every `stream_generate` call, ~95 ms on M1 Ultra); stop flushing the MLX buffer pool after the final prefill chunk and at decode step 0 (both flushes forced the next allocations back to the OS). **Verified: +20.93% frontier** |
+| `0003-flashhead-probes-256.patch` | FlashHead probe count 512 → 256 for this checkpoint: halves the probed lm_head read (16.8 → 8.4 MB per decoded token). Probe sweep on the benchmark corpus: 0/640 greedy tokens drift at 384, 256 and 192 probes; the miss cliff is at 128 (239/640). 256 keeps a 2x margin above the cliff. ppl gate untouched (prefill/ppl use the exact head). `MLX_FLASH_PROBES` overrides for same-binary A/B. **Verified: +22.85% frontier — runner decode gained +2.4% for an 8.4 MB/token cut, 2.4x the mini's response** |
+| `0004-gs512-ternary-regroup.patch` | Regroup the row-alpha ternary scales/biases from group_size 128 to 512 after load: each merged 4-run carries the row constant and bias == -scale, so every dequantized value — and the generated token stream — is bit-identical while scale/bias reads shrink 4x (~20 MB per decoded token off qkv/o_proj/experts). Probes for the engine's gs512 kernels (prints a stderr marker) and no-ops gracefully on a stock engine. Pairs with `Sources/mlx-engine-patches/maple-preview-mlx-apple-v1/0001-gs512-bits2-instantiations.patch` (2-line kernel-instantiation addition, full engine rebuild). Mini-neutral (0.983/0.988/1.025); submitted on the runner byte-sensitivity evidence from 0003 |
 
 ## Why registry-preferred load
 
@@ -51,7 +53,16 @@ down gather) 0.054, fused add+norm ×2 ~0.01, aggregate ~0.004 → 0.14/layer.
 - **mx.compile of the decode switch**: 1.005x (noise); compile doesn't merge
   matmul-heavy graphs. CLOSED.
 - **N-gram M=2 speculation**: M=2 batch costs 1.5x at the growing rotating
-  cache while accept ≈ 78% — net loss. CLOSED.
+  cache while accept ≈ 78% — net loss. CLOSED. **Re-tested 2026-08-06 with the
+  cache cost removed** (loose-draft RotatingKVCache: certain token commits via
+  the stock S=1 in-place write, draft K/V ride loose, commit-on-accept — no
+  concat, no rollback; k≤3 chains, coverage 0.873 / acceptance 0.957): decode
+  1.44x on M1 Ultra (dispatch-latency-bound) but ~1.02x on M4 Pro and
+  **runner-rejected 1.1949 vs 1.2093** — the runner M4 is GPU-throughput-bound
+  and a 1+k-token verify step costs ~(1+k)x GPU work (8 fresh experts per
+  token; no weight reuse across positions). The implementation survives on
+  branch `maple/0003-ngram-speculation`; the lever stays CLOSED on this
+  hardware for real, not for cache-cost reasons.
 - **bf16 RMSNorm**: 1.002x (noise). CLOSED.
 - **Packed QK norm+rope (4 heads/TG, 1.6x isolated)**: 0.9985 end-to-end —
   GPU already saturated; launch count irrelevant in-context. CLOSED.
@@ -60,6 +71,70 @@ down gather) 0.054, fused add+norm ×2 ~0.01, aggregate ~0.004 → 0.14/layer.
   CLOSED.
 - **In-place KV write from QK kernel**: mlx metal_kernel wraps inputs as
   `const device` — writes are compile errors. CLOSED.
+- **Prefill expert GEMMs (2026-08-06)**: sorted gather runs at 94% of the
+  box's dequant-GEMM ceiling (4.08 vs 4.34 TFLOPS dense on M4 Pro), and
+  segment size does not matter (16-row segments vs tile-filling 64-row:
+  1.01x) — the NAX gather absorbs ragged segments. The ceiling is the 2-bit
+  dequant GEMM rate itself, confirming the earlier "fp32 compute floor"
+  verdict mechanically. Unsorted gather is 2.3x worse — never remove the
+  sort. CLOSED.
+- **qmv guarded-tail fix (2026-08-06)**: qmv_impl's K-loop sends the final
+  full block through the runtime-bounded safe path for K % 512 == 0 — but
+  every matvec shape in this model (N % 8 == 0, K % 512 == 0) dispatches to
+  qmv_fast / gather_qmv_fast, which have no guarded tail. A fix never fires
+  here. Kernel census for decode: qmv_fast (qkv, o_proj), gather_qmv_fast
+  (up_gate, down; M=1 stays on the vector path — get_qmv_batch_limit gates
+  the matrix path), fused metal_kernels for router/QK/add-norm, FlashHead
+  gather. CLOSED.
+- **Fused ternary MoE decode kernels (2026-08-06)**: a complete, correct
+  mx.fast.metal_kernel replacement for the M=1 switch — K1 fuses
+  up_gate+clamped-SwiGLU, K2 fuses down+score-weighted combine (2 dispatches
+  vs ~6, stock-parity rounding, all 24 layer probes pass, token streams
+  identical). Five geometry/codegen variants measured on the M4 Pro against
+  the stock pair (gather_qmv_fast + elementwise): best was 0.83x / 0.85x
+  isolated, 0.965x end-to-end decode. Findings that transfer: per-LANE
+  contiguous access dominates on Apple GPUs (cross-lane interleaving was
+  2-8x worse), 32-thread threadgroups halve throughput vs 64, multi-row
+  register blocking regresses via spills, and vectorized uint4/bfloat4 loads
+  change nothing (the compiler already coalesces). Apple's qmv_fast template
+  keeps a ~17% lead that survived every variant — including a sixth,
+  geometry-faithful clone of qmv_fast itself (2 simdgroups x 4-row register
+  blocking, interleaved lanes, identical scale stepping) with the SwiGLU
+  fused into the tail: correct (max|d| 0.002) and still 0.82x. The gap sits
+  below template-source level (custom-kernel wrapper and/or ISA scheduling);
+  `-fno-fast-math` applies to both sides, and GatherQMM's dispatch confirms
+  decode really does race gather_qmv_fast (M=1 stays on the vector path).
+  Beating it requires compiling kernels into the engine itself — a
+  full-session campaign. Third confirmation of the custom-ternary-kernel
+  CLOSED verdict; full implementation preserved in
+  `reference/fused-moe-decode-attempt.patch.txt` (not part of the applied
+  series). CLOSED at the overlay level.
+- **Dense bf16 prefill attention (2026-08-06)**: ternary dequant is EXACT in
+  bf16 (weights are {-a, 0, +a} with a already bf16), and dense bf16 GEMM
+  beats the 2-bit dequant GEMM 1.26x at prefill shapes (5.99 vs 4.75
+  TFLOPS). Keeping dense copies of qkv/o_proj (+503 MB) and routing L>1
+  through them measured prefill +1.5%, ttft +1.4% — but decode -0.5%
+  (residency/cache pressure, likely worse on the 16 GB runner) for a net
+  ~+0.2% score, and it spends 0.29% of the 0.5% ppl budget (113.638 vs
+  113.966 — accumulation order differs even though the products are exact).
+  Below the frontier-noise bar with amplified runner risk. CLOSED as
+  measured; the exact-bf16-dequant fact may matter elsewhere.
+- **Custom-kernel math_mode (2026-08-06)**: mx.fast.metal_kernel compiles at
+  MathMode::Safe by default and compile_options={"math_mode": "relaxed"/
+  "fast"} is available per kernel — measured IDENTICAL (0.83x/0.83x/0.81x)
+  on the fused-MoE kernels. The ~17-20% custom-kernel deficit is not
+  compile flags; it sits at ISA/scheduling level. CLOSED.
+- **gs512 ternary scale regroup (2026-08-06)**: row-alpha scales are per-row
+  constant, so regrouping scales/biases gs128→gs512 (with a 2-line engine
+  patch adding `instantiate_quantized_types(512, 2)` to quantized.metal +
+  quantized_nax.metal) is bit-identical at every benchmark shape on both the
+  classic and NAX kernel paths — and decode-NEUTRAL: M4 Pro interleaved
+  ratios 0.983/0.988/1.025. The qmv-family kernels are not scale-fetch
+  limited, and M=1 decode never takes the NAX path (`get_qmv_batch_limit`
+  routes small M to the vector kernels). ~9% of ternary bytes are scale/bias
+  overhead, but cutting them buys nothing here. CLOSED. (Side finding: dense
+  qmm at M∈{3..8} picks different valid kernel variants per process — ~1-ulp
+  cross-process flicker exists in stock too.)
 
 ## 0002 measurements (M1 Ultra, interleaved whole-process A/B, official harness)
 
