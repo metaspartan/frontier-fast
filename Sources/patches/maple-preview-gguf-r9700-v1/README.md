@@ -74,6 +74,17 @@ K-quant model takes; the shift is an improvement in absolute ppl but the
 margin to the gate is thin. Greedy completions stay coherent (near-tie
 drift on long prompts only, as expected for changed prefill numerics).
 
+## 0019: mmvf single-warp decode block (the F32 router)
+
+Profiling the +399.81% frontier build showed the per-layer F32 router
+matvec ([2048->256], `mul_mat_vec_f`) still running the upstream
+256-thread block config: 11.5 us/launch, 220 us/token = 11.4% of kernel
+time at 178 GB/s. The laguna single-warp mmvf patch (excluded from the
+original port out of caution) applies cleanly and fixes exactly this.
+Measured: decode 288.7 -> 303.8-304.7 tok/s (+5.4%), prefill unchanged,
+ppl exactly 21.7004. Verified on the runner at **+415.68%** (294.4 tok/s,
+4.378x decode).
+
 ## 0020: untrim threshold default -> 0 (always trim)
 
 The laguna-tuned `GGML_MMVQ_UNTRIM_BLOCKS=4096` default (neutral on laguna,
