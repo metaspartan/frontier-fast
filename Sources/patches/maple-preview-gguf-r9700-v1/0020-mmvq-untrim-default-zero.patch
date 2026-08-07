@@ -1,0 +1,18 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 0ed180118..f0971b707 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -856,7 +856,12 @@ static __host__ int calc_nwarps_launched(const int ncols_x, const int nwarps, co
+ static int mmvq_untrim_below_blocks() {
+     static const int v = []() -> int {
+         const char * e = getenv("GGML_MMVQ_UNTRIM_BLOCKS");
+-        return e != nullptr ? std::atoi(e) : 4096;
++        // Maple: every mmvq launch on this model wins from the trim - the
++        // laguna-tuned 4096 default keeps extra warps on the [2048,8] and
++        // [512,8/16] TQ2_0 shapes and costs ~7.5% decode (swept 0 / 2048 /
++        // 4096 / always-untrim: 328.2 / 323.3 / 307.9 / 212.3 tok/s).
++        // Restoring or dropping zero-work warps is bit-identical either way.
++        return e != nullptr ? std::atoi(e) : 0;
+     }();
+     return v;
+ }

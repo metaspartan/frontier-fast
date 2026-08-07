@@ -74,6 +74,16 @@ K-quant model takes; the shift is an improvement in absolute ppl but the
 margin to the gate is thin. Greedy completions stay coherent (near-tie
 drift on long prompts only, as expected for changed prefill numerics).
 
+## 0020: untrim threshold default -> 0 (always trim)
+
+The laguna-tuned `GGML_MMVQ_UNTRIM_BLOCKS=4096` default (neutral on laguna,
+carried by 0014) keeps extra zero-work warps on maple's [2048,8] and
+[512,8/16] TQ2_0 launches. Swept on the frontier build: 0 / 2048 / 4096 /
+always-untrim = 328.2 / 323.3 / 307.9 / 212.3 tok/s. Toggle-isolated
+5-round A/B (env 4096 vs default 0, same binary): decode 305.3-305.9 ->
+**326.7-327.2 tok/s (+7.0%)**, prefill neutral, ppl exactly 21.7004 —
+restoring or dropping zero-work warps is bit-identical by construction.
+
 ## Open levers
 2. Sliding-window attention (3 of 4 layers, window 512) — untouched.
 3. Shared-launch/fusion ideas from laguna 0017/0018 do not apply (maple has
