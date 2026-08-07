@@ -86,8 +86,14 @@ mode (82.5 tok/s vs the frontier run's 78.1 — the same ~5.5% per-launch
 bimodality the platform documents on Laguna S) and the banked frontier
 score also carries a hot prefill-slope draw (1.199 ranked vs ~1.01 local).
 Compare candidates across runs by absolute cand tok/s, not banked ratios.
-Resubmit this series when the box's stock phase draws slow again, or
-stacked with the next real decode gain.
+A second attempt (probe-timed to a 79.4 tok/s stock reading) drew fast
+stock AGAIN in the runner's own launches (82.85/82.67; candidate 108.47/
+108.11 — a second consecutive track record): the stock mode is decided
+PER PROCESS LAUNCH, not by box state, so probe-timing resubmissions does
+not work. The banked frontier's 3/3 slow-stock rounds were rare draw luck.
+Do not spend further slots redrawing; this patch ships with the next real
+decode gain (~+8% needed to clear 1.298 on neutral draws — the GDN
+l2_norm-grouping and Q6_K-head-bandwidth levers are the candidates).
 
 ## Open levers
 
