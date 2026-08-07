@@ -117,3 +117,23 @@ One known harness effect: the runner reports candidate prefill 0.988–0.991
 across separate runs while local A/B says neutral for decode-only patches.
 The candidate phase always benchmarks second on a warmer GPU, so expect
 roughly a 1% prefill headwind here until the worker interleaves its pairs.
+
+
+## 0020: n-gram self-speculation as the engine default (2026-08-07)
+
+The maple 0022 lever: the pinned engine ships model-free `ngram-simple`
+drafting in `common/speculative`, dormant because the harness launches
+llama-server without speculative flags. One hunk flips the engine default
+(lookup n=3, m=16; env `GGML_SPEC_NGRAM=0` restores stock, N/M/HITS tune).
+
+Measured on the runner box (fresh-server completions, runner-style
+varied-prose prompts, 6 seeds, alternating arms, then re-validated on the
+exact 19-patch frontier + this patch): decode 155.1-155.8 baseline →
+194.2 / 133.9 / 179.9 / 247.7 / 157.0 / 152.5 tok/s per seed — **mean
+ratio 1.142, spread 0.86–1.59** (prompt-dependent acceptance). PPL exactly
+5.2611. Fresh-server determinism holds (see the maple 0022 notes; batched
+verify can drift greedy text at near-ties — the ppl gate is the arbiter).
+Unlike qwen (rejected batch-17 verifies on 22GB lose −3..−22%) and lfm
+(neutral), Laguna-XS's continuations on the bench vocabulary accept often
+enough to pay well on average; the worst-case draw (0.86) carries ~7%
+runner-median floor risk, accepted knowingly.
