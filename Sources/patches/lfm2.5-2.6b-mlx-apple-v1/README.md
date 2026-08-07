@@ -42,10 +42,15 @@ Accuracy gate: perplexity ≤ 0.5% — exact match (61.069 both).
   controller's ceiling is the per-box best fixed k - which the frontier
   already uses. Chain-depth tuning is closed unless the corpus or window
   changes.
-- Batched fused ShortConv for verify steps (L<=4 in-kernel sequential,
-  one dispatch per layer vs the five-op stock chain): isolated equivalence
-  passes (max|d| 0.002, state exact) but the live loop produces degenerate
-  repeating output with high self-acceptance and decode drops to 144 tok/s
-  (below unspeculated) - a state-interleaving bug the single-call test does
-  not exercise. Needs real diagnosis before retry; the stock-op verify path
-  in the verified series is correct and fast enough.
+- Batched fused ShortConv for verify steps (L<=4 in-kernel sequential, one
+  dispatch per layer vs the five-op stock chain): every isolation test
+  passes — per-L (1-4) equivalence max|d| <= 0.006, state exact, and full
+  interleaved chains (rejects, partial and full accepts) match stock — yet
+  the live loop shows in-process decay (253 -> 197 -> 124 -> 130 -> 144
+  tok/s across a 5-run harness process) with occasional degenerate output
+  on fresh caches. conv_mask is None at verify (branch fires legitimately).
+  The failure lives somewhere the single-module differentials cannot reach
+  (whole-model interaction, allocator, or kernel-compilation state).
+  Reproduction: per-run decode telemetry in one process, scseq=1. Two clean
+  bisection next-steps recorded: (a) fused-y with stock state management,
+  (b) stock-y with fused state. Parked; the stock verify path is correct.
