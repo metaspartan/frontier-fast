@@ -28,3 +28,7 @@ decode median ratio 0.996 over 5 interleaved rounds (75.6-76.5 both arms),
 prefill +0.4%. The launch saved per conv layer does not pay on this
 memory-latency-bound box — consistent with every other launch-class lever
 measured here (grouped-mmvf +0.5%, dedupe family +0.9%).
+
+
+- **ngram self-speculation measured-neutral** (2026-08-07): 74.9/73.8 ->
+  73.6/74.8 across two seeds. Same story as the R9700 twin.

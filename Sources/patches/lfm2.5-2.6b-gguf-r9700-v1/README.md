@@ -98,3 +98,13 @@ arms inside one process when you need finer resolution.
 
 Accuracy gate: perplexity within 0.5% of stock, measured by `llama-perplexity`
 on the fixed corpus. Build that target as well as `llama-server`.
+
+
+## Measured-neutral: ngram self-speculation (do not spend a slot)
+
+The maple 0022 lever ported and A/B'd 2026-08-07: decode 223.8->208.2 and
+222.5->236.6 across two seeds (-7%/+6%, net neutral with high prompt
+variance; ppl untouched at 22.5182). LFM's continuations accept
+inconsistently; the variance makes it unshippable against a +16.59%
+frontier. Maple-specific economics (its degenerate 2-bit loops accept
+~0.8+) do not transfer.

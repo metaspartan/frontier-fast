@@ -120,3 +120,15 @@ under a different draw; this build should exceed it on the runner).
    structure; `ssm` conv/scan ops may group the same way rms_norm did.
 3. MTP head is present in the GGUF but unused by `llama-server` b10237 —
    speculative decode via MTP is a structural lever if the harness allows it.
+
+
+## Measured-dead: ngram self-speculation (do not spend a slot)
+
+The maple 0022 lever (engine-default ngram-simple, exact-verify) was ported
+and 3-seed A/B'd 2026-08-07: decode 109.0-110.5 -> 85.9/106.9/96.3 (-3% to
+-22%). Precision tuning (n=4-5, m=8, min_hits=2-3) reaches parity at best.
+Qwen's greedy continuations are too diverse: proposals fire on the small
+bench vocabulary but reject at verify, and each rejected batch-17 forward
+on a 22GB model costs more than the accepted tokens repay. Consistent with
+the platform's laguna-vLLM ngram finding (acceptance ~0.25). Maple's win
+does not transfer here.

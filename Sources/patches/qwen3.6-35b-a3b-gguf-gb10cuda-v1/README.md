@@ -28,3 +28,7 @@ their verified sources; 0012 renumbered from the qwen r9700 series' 0014.
   rounds, prefill neutral, ppl 3.9367 (+0.11%, gate-fine). Removing ~90
   launches/token buys half a percent on a memory-latency/occupancy-bound
   box — consistent with the grouped-mmvq history on sm_121.
+
+
+- **ngram self-speculation measured-dead here too** (2026-08-07): decode
+  41.7 -> 37.5 (-10%), mirroring the R9700 twin. Same acceptance economics.
