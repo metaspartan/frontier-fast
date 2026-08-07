@@ -132,3 +132,19 @@ Build-test under nvcc before you submit. clang/HIP accepts a
 without `--expt-relaxed-constexpr`. The R9700 series' 0014 does exactly this,
 so it cannot compile here unmodified — mark such helpers
 `__host__ __device__`.
+
+
+## 0012-0014: topk sorted-list + SM121 mmvq tables (round 1 submission)
+
+The sm_121 family (0001-0011, bit-exact dedupe/fold/grouped-launch class)
+plus the topk sorted-list router and the two SM121 mmvq table patches
+validated on the qwen twin. XS shares qwen's MoE expert shapes
+([2048->512]x8 fused gate+up, [512->2048]x8 down), so the small_k deep-rows
+config transfers directly.
+
+Same-box A/B vs stock binary (whole-process, Laguna-XS-2.1-Q4_K_M):
+
+- decode 52.0-52.1 -> **56.0 tok/s (+7.7%)**
+- gate ppl **identical** (5.2709 both - the family is bit-exact, the tables
+  are decode-only)
+- server smoke clean
