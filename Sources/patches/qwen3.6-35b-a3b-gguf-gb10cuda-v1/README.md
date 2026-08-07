@@ -67,3 +67,18 @@ Remaining headroom on this track: the expert matvecs are still far off the
 ceiling - a custom mmid config (more rows per block / deeper unroll for the
 [2048->512]x8 and [512->2048]x8 shapes at ncols_dst=1) is the scoped next
 lever, worth up to ~+15% if they reach dense-mat efficiency.
+
+
+## 0015: dedicated SM121 mmvq table (deep rows for the expert shapes)
+
+Replaces 0014's Turing aliasing with a real SM121 table: nwarps=2 for
+K-quants (as 0014) plus **rows_per_block = 2*nwarps under small_k** - four
+independent dot products per thread off shared activation loads. All the
+MoE expert shapes take small_k at nwarps=2. Dense stays 1 row/block (the
+grouped-mmvq launch statically asserts blockIdx == row - the build fails
+loudly if violated, which is how this was discovered).
+
+45.2-45.4 -> **45.56-45.97 tok/s (+0.9%)**; ppl byte-unchanged. Cumulative
+stack vs stock toggle: **+9.4%** (42.0 -> 45.97). Expert matvecs still have
+headroom to the ~240 GB/s dense ceiling; next steps: rows=8 sweep, or a
+dedicated expert-batch kernel that walks all 8 experts per block.

@@ -1,0 +1,78 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH 15/15] cuda: dedicated sm_121 mmvq table - deeper rows-per-block for the expert shapes
+
+Replaces the 0014 Turing-table aliasing with a dedicated SM121 table: same
+Turing-style nwarps (2 for K-quants) but rows_per_block = 2*nwarps under
+small_k - each thread runs four independent dot products off the same
+activation loads, which is what the LPDDR5 latency wants. The MoE expert
+shapes ([2048->512]x8 gate+up fused, [512->2048]x8 down) all take the
+small_k path at nwarps=2. Dense ncols_dst==1 stays at 1 row/block (the
+grouped-mmvq launch statically requires blockIdx == row).
+
+Whole-process rounds: 45.2-45.4 -> 45.56-45.97 tok/s (+0.9%). Gate ppl
+byte-unchanged at 3.9306 (mmvq is decode-only). Cumulative same-binary
+stack vs stock toggles: 42.0 -> 45.97 (+9.4%).
+---
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index abea72f..10912b6 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -69,7 +69,8 @@ enum mmvq_parameter_table_id {
+     MMVQ_PARAMETERS_GCN,
+     MMVQ_PARAMETERS_RDNA2,
+     MMVQ_PARAMETERS_RDNA3_0,
+-    MMVQ_PARAMETERS_RDNA4
++    MMVQ_PARAMETERS_RDNA4,
++    MMVQ_PARAMETERS_SM121
+ };
+ 
+ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+@@ -85,9 +86,10 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+     return MMVQ_PARAMETERS_TURING;
+ #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1210
+     // GB10 (sm_121): LPDDR5 latency-bound decode measures the MoE expert
+-    // matvecs at 35-40% of achievable bandwidth under the GENERIC config;
+-    // the Turing table (2 warps for K-quants) trades warp count for ILP.
+-    return MMVQ_PARAMETERS_TURING;
++    // matvecs at 35-40% of achievable bandwidth under the GENERIC config.
++    // Dedicated table: Turing-style nwarps (2 for K-quants) with deeper
++    // rows-per-block (4 under small_k, 2 otherwise) for per-thread ILP.
++    return MMVQ_PARAMETERS_SM121;
+ #else
+     return MMVQ_PARAMETERS_GENERIC;
+ #endif
+@@ -110,7 +112,7 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+         return MMVQ_PARAMETERS_TURING;
+     }
+     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == 1210) {
+-        return MMVQ_PARAMETERS_TURING;
++        return MMVQ_PARAMETERS_SM121;
+     }
+     return MMVQ_PARAMETERS_GENERIC;
+ }
+@@ -435,7 +437,7 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+         }
+         return 1;
+     }
+-    if (table_id == MMVQ_PARAMETERS_TURING) {
++    if (table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_SM121) {
+         if (ncols_dst == 1) {
+             switch (type) {
+                 case GGML_TYPE_Q2_K:
+@@ -466,6 +468,16 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+ }
+ 
+ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
++    if (table_id == MMVQ_PARAMETERS_SM121) {
++        // sm_121: more rows per block = more independent dot products per
++        // thread and activation reuse - what the LPDDR5 latency wants.
++        if (ncols_dst == 1) {
++            // dense stays at 1 row/block (the grouped-mmvq launch requires
++            // blockIdx == row); the small_k expert shapes get the deep config
++            return small_k ? 2*nwarps : 1;
++        }
++        return 2;
++    }
+     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
+         switch (ncols_dst) {
+             case 1:
