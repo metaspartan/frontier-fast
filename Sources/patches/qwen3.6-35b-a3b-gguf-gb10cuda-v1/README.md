@@ -21,5 +21,10 @@ their verified sources; 0012 renumbered from the qwen r9700 series' 0014.
 - The GDN linear-attention layers (30 of 40) put much more traffic through
   `mul_mat_vec_f` than Laguna does — 0011 (batched k-loads) is doing real
   work here.
-- The R9700 grouped-mmvf lever (small F32 matvec pairs) is untested on
-  sm_121; the grouped-mmvq experience says do not assume it transfers.
+- **Grouped-mmvf measured-dead here (do not spend a slot):** the R9700's
+  +3.35% lever (mul_mat_vec_f_grouped + qwen35moe adjacency pins) was
+  ported (arch guard relaxed, one-warp grouped kernel) and toggle-A/B'd on
+  the runner box 2026-08-07: decode median ratio ~1.005 over 5 interleaved
+  rounds, prefill neutral, ppl 3.9367 (+0.11%, gate-fine). Removing ~90
+  launches/token buys half a percent on a memory-latency/occupancy-bound
+  box — consistent with the grouped-mmvq history on sm_121.
