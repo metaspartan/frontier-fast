@@ -1,4 +1,4 @@
-From f7cefdb99c129de5320cc5d49bb769be001b33dd Mon Sep 17 00:00:00 2001
+From 941c7edcd888f4291f2c177e30e23bdb60bd3a44 Mon Sep 17 00:00:00 2001
 From: Claude Fable 5 <noreply@anthropic.com>
 Date: Sat, 8 Aug 2026 18:19:58 +0000
 Subject: [PATCH] cuda/hip: a dedicated f32 GEMM for the skinny prefill matmuls
@@ -69,9 +69,9 @@ the control everywhere. pp4096 confirms it scales: 4118.35 -> 4360.01 (+5.87%).
 Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
 ---
  ggml/src/ggml-cuda/ggml-cuda.cu     |   8 +
- ggml/src/ggml-cuda/mmf32-skinny.cu  | 219 ++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmf32-skinny.cu  | 222 ++++++++++++++++++++++++++++
  ggml/src/ggml-cuda/mmf32-skinny.cuh |  10 ++
- 3 files changed, 237 insertions(+)
+ 3 files changed, 240 insertions(+)
  create mode 100644 ggml/src/ggml-cuda/mmf32-skinny.cu
  create mode 100644 ggml/src/ggml-cuda/mmf32-skinny.cuh
 
@@ -103,10 +103,10 @@ index 77cdede98..8899f7354 100644
  
 diff --git a/ggml/src/ggml-cuda/mmf32-skinny.cu b/ggml/src/ggml-cuda/mmf32-skinny.cu
 new file mode 100644
-index 000000000..f1afc7305
+index 000000000..cda1844ae
 --- /dev/null
 +++ b/ggml/src/ggml-cuda/mmf32-skinny.cu
-@@ -0,0 +1,219 @@
+@@ -0,0 +1,222 @@
 +#include "mmf32-skinny.cuh"
 +
 +#include <cstdlib>
@@ -230,7 +230,10 @@ index 000000000..f1afc7305
 +static int mmf32_skinny_max_rows() {
 +    static const int v = []() {
 +        const char * s = getenv("GGML_F32_SKINNY_MAX_ROWS");
-+        return s ? atoi(s) : 64;
++        // 256 covers both families this model has: the GDN alpha/beta projections
++        // (32 rows) and the MoE router (256). Measured 1.0392 with only alpha/beta
++        // routed here and 1.0727 with both.
++        return s ? atoi(s) : 256;
 +    }();
 +    return v;
 +}

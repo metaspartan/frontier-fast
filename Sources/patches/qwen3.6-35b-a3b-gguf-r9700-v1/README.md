@@ -2095,6 +2095,25 @@ counts, and it has to be re-measured after every non-byte-exact change.**
   and it is the only one of the six with enough tokens to reach the column
   threshold — a nice incidental confirmation that the gate does what it says
 
+### The shipped default did not match the measured arm — catch this with a no-env census
+
+The first version of this patch was committed with `GGML_F32_SKINNY_MAX_ROWS`
+defaulting to **64**, while every number above was measured with the env var set
+to 256. With no env set the router — 40 of the 100 launches, and the larger half
+of the win — was still going to rocBLAS. The A/B was honest about what it
+measured and the commit message said "MAX_ROWS=256 (shipped)"; the code simply
+did not agree with it, and nothing in the A/B could have noticed, because both
+of its arms set the variable explicitly.
+
+**A toggle-swept knob has to have its shipped default confirmed by a run with no
+environment at all**, and the check is the census, not the wall clock: with the
+default corrected to 256, a clean `llama-bench` shows 100 `mul_mat_f32_skinny_cuda`
+per pass and **zero** `Cijk_..._S_B_Bias_...` launches, 3.70 ms/pass against
+12.11. Re-measured on the corrected binary, no env set, 3 rounds vs the same
+0043 control: pp512 **4655.45 -> 5011.09, ratio 1.0765, 3/3 disjoint**
+(`min(cand) = 4986.09 > max(control) = 4682.60`), tg128 148.55 -> 148.40; gate
+ppl **3.9318 on both loads**, +0.010% against stock 3.9314.
+
 ### One unreproduced test-backend-ops failure, recorded rather than buried
 
 The first run of `test-backend-ops -o MUL_MAT` with the gates opened wide
