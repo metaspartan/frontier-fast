@@ -1,0 +1,71 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH 23/23] cuda: cap MMQ J tile near the expected MoE expert segment width
+
+mul_mat_q_switch_J picks J from ncols_max, the worst-case column count of
+a single expert segment (= n_tokens for mul_mat_id). With 256 experts and
+top-8 routing the segments average ncols_dst/nchannels_y columns - 16 at
+ub512, an 8x overshoot - so every expert's single J=128 tile is ~87%
+masked padding that the WMMA loop still computes. Q4_K gate/up and Q5_K
+down expert GEMMs are 43.6% of pp512 kernel time on this box.
+
+Cap J for the ids path at the smallest valid config >= 2x the expected
+segment width (2x headroom for routing imbalance; 16 floor). At ub512
+this selects J=32: expert tiles are mostly single, near-full column
+blocks. The grid still covers worst-case imbalance because ntx grows as J
+shrinks and out-of-range tiles exit before any tile work. Weight traffic
+is unchanged (a <=32-column expert still loads its slab once). Dense
+matmuls (ids_dst == null) are untouched; decode expert matvecs route via
+mmvq, not MMQ. GGML_CUDA_DISABLE_MMQ_MOE_J restores stock selection.
+
+Measured (runner box, pinned device 0). J sweep at pp512 (single process):
+stock-J 3197, J=16 3650, J=32 3911, J=48 3810, J=64 3728 tok/s. Same-
+binary toggle A/B, 5 interleaved rounds: pp512 3181-3225 off vs 3885-3933
+on, median per-round ratio 1.2216; tg128 identical (112.2-112.9 both
+arms). Whole-process stock-vs-cand A/B (full series): pp512 median ratio
+1.2226, tg128 1.389. Ranked-style llama-server uncached 533-token prompt:
+2065 -> 2525 tok/s prefill (+22.3% - holds at server level, kernel-time
+lever). Gate ppl (-c 512 --chunks 8): cand 3.9177/3.9180 vs stock
+3.9314x2 (-0.35%, band +/-0.5%; the cap itself moves the 0022 build only
++0.07%). Server greedy identity byte-exact off vs on, long and short
+prompts.
+---
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index 2eb15fdfa..360eff138 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -1493,6 +1493,35 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+         }
+     }
+ 
++    // MoE (mul_mat_id): J is otherwise chosen from ncols_max, the worst-case
++    // column count of a single expert segment. With many experts the segments
++    // average ncols_dst/nchannels_y columns - far below ncols_max - so a
++    // ncols_max-sized J tile is mostly masked padding that the MMA loop still
++    // computes. Cap J near the expected segment width (2x headroom for routing
++    // imbalance); the grid covers the worst case regardless because ntx grows
++    // as J shrinks, and out-of-range tiles exit before any tile work.
++    if (args.ids_dst != nullptr && args.nchannels_y > 1 &&
++        getenv("GGML_CUDA_DISABLE_MMQ_MOE_J") == nullptr) {
++        const int64_t cols_per_expert = (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y;
++        int64_t target = 2*cols_per_expert;
++        if (target < 16) {
++            target = 16;
++        }
++        if (target < J_best) {
++            for (int J = 8; J <= 128; J += 8) {
++                const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
++                if (config.type == GGML_TYPE_COUNT || J < target) {
++                    continue;
++                }
++                if (mmq_get_nbytes_shared(config, cc) > smpbo) {
++                    continue;
++                }
++                J_best = J;
++                break;
++            }
++        }
++    }
++
+     switch (J_best) {
+         case   8:
+             launch_mul_mat_q<type,   8, fallback>(ctx, args, stream);

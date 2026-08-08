@@ -269,3 +269,44 @@ Decode-side note: the conv-state fold done RIGHT (try_fuse, adjacent
 cpy/ssm_conv/silu pattern, byte-exact server identity) is performance-
 NEUTRAL - with HIP graphs replaying, sub-10us launch elimination is
 exhausted on this box. Kernel-time work only from here.
+
+
+## 0023: round 7 - MMQ MoE expert J-tile cap (+22% prefill)
+
+The round-7 map above paid off, but the win was not tile geometry in the
+RDNA4 config table - it was the J *selection* feeding it.
+`mul_mat_q_switch_J` picks J from `ncols_max`, the worst-case column count
+of one expert segment (= n_tokens for mul_mat_id). At pp512 the debug trace
+showed every expert GEMM (Q4_K gate/up [2048->512], Q5_K down [512->2048],
+256 experts) launching J=128 tiles while segments average
+`ncols_dst/nchannels_y` = 4096/256 = **16 columns**: ~87% of every WMMA
+column tile was masked padding, computed anyway. That, not tile shape, was
+the "~50% of int8 peak".
+
+0023 caps J for the ids path at the smallest valid config >= 2x the
+expected segment width (16 floor; 2x headroom for routing imbalance). At
+ub512 that selects J=32 - the measured sweep optimum (3197 stock-J / 3650
+J=16 / **3911 J=32** / 3810 J=48 / 3728 J=64 pp512 tok/s). Grid coverage
+of worst-case imbalance is preserved (ntx grows as J shrinks; out-of-range
+tiles exit early), weight traffic is unchanged, dense matmuls and the
+decode mmvq path are untouched. `GGML_CUDA_DISABLE_MMQ_MOE_J` restores
+stock selection.
+
+Measured (runner box):
+
+- same-binary toggle A/B, 5 interleaved rounds: pp512 3181-3225 off ->
+  3885-3933 on, median per-round ratio **1.2216**; tg128 identical
+  (112.2-112.9 both arms)
+- whole-process stock-vs-cand (full 23-patch series): pp512 median ratio
+  **1.2226**, tg128 **1.389** (stock 80.4-81.1, cand 112.0-112.6)
+- ranked-style llama-server, uncached 533-token prompt: 2065 -> 2525 tok/s
+  (**+22.3%** - the delta holds at server level; kernel-time lever, not
+  launch-count)
+- larger/smaller batches gain too: pp128 +33%, pp256 +27%, pp2048 +22%
+- gate ppl: cand 3.9177/3.9180 vs stock 3.9314x2 (**-0.35%**, band 0.5%);
+  the cap itself moves the 0022 build only +0.07%
+- server greedy identity: byte-exact off vs on, long + short prompts
+
+Projection at submission: decode ~1.389 (draw-dependent), prefill ~1.22,
+ttft following prefill -> score ~1.33 vs the 1.2980 bank even on a fast
+stock decode draw.
