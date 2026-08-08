@@ -3089,3 +3089,186 @@ over 32 consecutive elements. Because the element index is flat and contiguous,
 those 32-element groups stay warp-aligned under **any** host block size that is a
 multiple of 32, so relocating them into a foreign grid is bit-identical by
 construction, exactly as 0046's topk guest was.
+
+## 0047: the shared-expert down projection co-launched inside the routed expert-reduce (+2.6% decode, BIT-IDENTICAL)
+
+Round 34's fit prices a removed **matvec** dispatch at `2.99 + ~2.85 = 5.8 us`
+— it takes a bandwidth ramp with it — and ranked this first at ~+3.7%. It is
+the first patch in the series to build the **second vec_dot type in one
+launch** that rounds 31 and 32 both identified and neither built.
+
+### Why this pair and not another
+
+The shared-expert down projection and the routed `expert_reduce` have the
+**same output width** (n_embd = 2048 rows) and read entirely different
+activations. Q8_0 against Q5_K, 3.8 us against 13.4 us, 40 of each per token.
+
+Geometry is the part worth copying. The guest's standalone launch gives one row
+**two** warps (`calc_nwarps_launched` trims Q8_0/ncols=512 from 8 to 2), and the
+host block is `(32, n_slots=8)`. So `8/2 = 4` guest rows share a block and the
+merged grid is **512 guest + 2048 host blocks** — the guest contributes exactly
+the 4096 warps its own 2048x2 launch had, with no idle-warp tax. Getting this
+wrong is the easy way to give the whole win back: one row per block would have
+launched 2048 blocks of 8 warps with 6 of them dead.
+
+Bit-identity is by construction, the 0045 argument with a quantized body:
+
+- `blocks_per_iter` is derived from the guest type's **full compile-time
+  nwarps**, not from the trimmed launch, so no k-block moves between threads;
+- the cross-warp exchange keeps the trimmed warps' slots, which are exactly
+  `+0.0f` — for a `-0.0f` accumulator that addition is not the identity;
+- the 0035 shared-expert gate scalar is applied in the guest epilogue exactly
+  where `has_dst_scale` applies it in `mul_mat_vec_q`.
+
+### The graph half is an ALLOCATOR problem, and that decides where the tail goes
+
+Stock order runs the shared-expert tail **after** the routed reduction, and by
+then `ggml-alloc` has freed the expert ids (`+0x5880`) and routing weights
+(`+0x4500`) and hands `ffn_shexp` (8 KB) a block that covers both — which the
+merged launch is still reading. No backend change can fix that; the node has to
+be **allocated earlier**, while the ids and weights are still live.
+
+`build_moe_ffn` now relays a caller-supplied tail between the routed activation
+and the routed down projection (two optional `pin_pre_down` arguments; the
+routed activation is expanded first so the gate/up+GLU fusion stays adjacent).
+`qwen35moe.cpp` builds the whole shared-expert tail — sigmoid gate, swiglu, down
+projection, gate multiply — before calling `build_moe_ffn` and hands it over.
+Node order becomes:
+
+```
+74 ffn_moe_gate(id)  75 ffn_moe_up(id)  76 ffn_moe_swiglu
+77 shared_expert_gate_sigmoid   78 ffn_swiglu   79 ffn_shexp   80 ffn_shexp_gated
+81 ffn_moe_down(id) 82 ffn_moe_weighted  83-90 views  91-97 adds
+```
+
+which is what makes 79 and 81 adjacent **and** puts `ffn_shexp` on a block the
+allocator picks while ids/weights are live. Gated on `n_tokens == 1`: at prefill
+the graph is the stock build path, exactly as 0046 is.
+
+### Numbers
+
+Against a binary built from this patch's own parent commit, control RUNPATH
+verified by `ldd`, arms alternated, no env set on either arm:
+
+```
+candidate tg128 157.48 157.51 157.16 157.10   mean 157.31
+control   tg128 153.36 153.46 153.20 153.20   mean 153.31   -> +2.61%, 4/4 separated
+```
+
+Census: **681.1 -> 641.1 dispatches/token, exactly -40.0**; `mul_mat_vec_q`
+4585 -> 3185 per 35 tokens and **every other kernel count unchanged** — unlike
+0046's reorder, this one moves nothing onto a different kernel.
+
+Decode-path perplexity (`-b 512 -ub 1 --chunks 8`, runner corpus) is
+**bit-identical**: `3.9382` on both arms across three loads each.
+
+`GGML_CUDA_SHEXP_DOWN_COLAUNCH=0` restores the two separate launches;
+`GGML_QWEN_SHEXP_TAIL_PIN=0` restores stock node order.
+
+### Predicted +3.7%, measured +2.61% — read the gap as a correction to the model
+
+The dispatch removal is exactly the predicted -40.0, so the miss is in the
+per-matvec price, not in the count. `5.8 us x 40 = 232 us` predicted 158.7 tok/s
+from 153.0; the measured 157.3 corresponds to **~4.1 us per removed matvec**.
+The ramp is evidently only partly recovered: the guest still streams its own
+1.1 MB, and inside a foreign grid it starts that stream behind the host's. Price
+the next matvec merge at **4 us, not 5.8** — 0048 below is the elementwise class
+and came in at the elementwise rate, so the 2.99 us figure stands unchanged.
+
+## 0048: the shared-expert SwiGLU hidden inside the routed gate+up matvec (+1.5% decode, BIT-IDENTICAL)
+
+0047's reorder puts the shared-expert SwiGLU immediately after the routed
+gate+up `MUL_MAT_ID`, and the two are independent — the SwiGLU reads only the
+shared-expert gate/up pair, computed several dispatches earlier. This is 0046's
+move with an elementwise body, and it confirms 0046's rule: **for a tiny guest
+the predictor is capacity, not the time ratio.** 2 blocks joining 4096 never
+competes for the host's bandwidth.
+
+The body is warp-local — no `__shared__`, no `__syncthreads`, and its two
+reductions are `warp_reduce_*<QK8_1=32>` over 32 **consecutive** elements of a
+flat index — so it is bit-identical under any block shape whose thread count is
+a multiple of the warp size. It runs as one extra `blockIdx.x` slice of the
+routed matvec's grid, indexing its own blocks off the **channel axis it has no
+use for** (8 channels x 64 threads = 512 elements, exactly `k`). The body moved
+into `glu-quant-body.cuh` so the standalone kernel and the guest execute the
+same statements, exactly as 0046 did with `topk-moe-body.cuh`.
+
+One packaging detail worth stealing: the q8_1 destination is registered in the
+cache **before** the launch, so if the host geometry cannot carry the guest the
+fallback runs the standalone kernel into that same buffer. Without it a declined
+guest would leave the consumer an unwritten cache entry — a silent wrong-answer
+bug, not a crash.
+
+```
+candidate tg128 159.89 159.80 159.67 159.45   mean 159.70   (0047+0048)
+control   tg128 153.53 153.27 153.36 153.35   mean 153.38   -> +4.12%, 4/4 separated
+```
+
+Census: **641.1 -> 601.1 dispatches/token, exactly -40.0**;
+`unary_gated_op_quant` 2800 -> 1400 per 35 tokens (the GDN one remains).
+`-40 x 2.99 us = 120 us` predicts +1.9%; measured +1.47%. The elementwise rate
+is holding within 25%.
+
+`GGML_CUDA_MMVQ_GLU_COLAUNCH=0` restores the separate launch.
+
+### Correctness of the pair
+
+- decode-path perplexity **3.9382 on both arms, three loads each** — bit-identical;
+- server greedy at the decode shape, 6 prompts including a 1000-token one,
+  **6/6 byte-identical** against the same-binary toggle-off control, and the
+  same-arm-twice control is also a clean **6/6** (round 32's harness read 5/6
+  on the same-arm control — that noise was not reproduced here);
+- prefill flat (`pp512` within 0.5% both ways, and both halves are gated off the
+  prefill shape by construction).
+
+### Warning: the `-c 512` gate-shape perplexity was NOT reproducible this session
+
+The 0044 notes call `llama-perplexity -c 512 --chunks 8` "perfectly
+reproducible". It was not, on either arm, on this box today:
+
+```
+control    3.9247 3.9318 3.9318 3.9335 3.9320 3.9437 3.9318 3.9318 3.9362 3.9326
+candidate  3.9485 3.9312 3.9303 3.9312 3.9355 3.9318 3.9318 3.9368 3.9310 3.9324
+```
+
+Control spread alone is **0.48%**, five times the gate. Medians agree exactly
+(3.9318 vs 3.9318) and the means differ by 0.003%, so the reading is fine — but
+a single draw at this shape can no longer be used to accept or reject anything.
+**Read the decode-path shape (`-b 512 -ub 1`), which was exactly reproducible on
+both arms, and use the gate shape only as a median over >= 5 loads.**
+
+## Where the decode token is after 0047+0048
+
+601.1 dispatches/token, ~159.7 tok/s on llama-bench. Against round 34's model
+(`t(d) = 4448.4 + 2.991 d`) 601 predicts 6246 us / 160.1 tok/s — the measurement
+lands within 0.3% of the fit, so the model survives 80 dispatches of extrapolation.
+
+The MoE block is now **7 dispatches**, and what is left of it:
+
+```
+MoE 1 rms_norm_pre_add       1 blk   2.8us   post-attn norm + q8_1
+    2 mmvf_grouped         257 blk   4.7us   shexp_gate F32 + router F32
+    3 mmvq_grouped        1025 blk   5.2us   shexp gate/up Q8_0 + 0046 topk guest
+    4 mmvq                4104 blk  17.3us   routed gate+up + GLU + 0048 swiglu guest
+    5 quantize_q8_1         16 blk   1.3us   routed swiglu -> q8_1
+    6 mmvq_expert_reduce  2560 blk  13.4us   routed down + reduce + 0047 shexp down
+```
+
+**Round 34's row 3 (routed swiglu `quantize_q8_1` -> guest of the shexp down
+mmvq) is now arithmetically dead, and 0047 is why.** Its only possible host was
+the shared-expert down projection, which no longer exists as a separate launch —
+and the launch that absorbed it *reads* the buffer that quantize produces. The
+two were always alternatives (+3.7% against +1.8%); this records which one won.
+Nor can it fold into the routed GLU epilogue: in `mul_mat_vec_q` each block
+produces ONE output element, so the 32 consecutive elements a q8_1 block needs
+live in 32 different blocks. Do not re-open it.
+
+Remaining from the round-34 list, re-priced at the corrected 4 us/matvec:
+
+| move | class | x/token | est. |
+|---|---|---|---|
+| GDN `ssm_norm` + z-gate `unary_gated_op_quant` fused | elementwise | 30 | +1.4% |
+| attn k/v grouped mmvq merged into attn wq (needs 0047's machinery) | matvec | 10 | +0.6% |
+
+Both are still open. The realistic band from round 34 (**165-169 tok/s
+llama-bench**) is unchanged; 159.7 is 60% of the way there from 153.0.

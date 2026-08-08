@@ -1,0 +1,731 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sat, 8 Aug 2026 23:09:22 +0000
+Subject: [PATCH] cuda/hip: the shared-expert down projection co-launched
+ inside the routed expert-reduce (+2.6% decode)
+
+Round 34 measured t(d) = 4448 us + 2.99 us/dispatch and priced a removed
+MATVEC launch at 2.99 + ~2.85 = 5.8 us, because it takes a bandwidth ramp with
+it. The shared-expert down projection is 40 such launches per decoded token: a
+plain Q8_0 matvec whose output width is exactly the routed expert-reduce's
+(n_embd), over a completely independent activation.
+
+Merging the two needs the one piece of machinery the series did not have - a
+SECOND vec_dot type in one launch - and it is bit-identical by construction,
+exactly as the 0045 F32 tail is: the guest blocks run the
+mul_mat_vec_q<Q8_0, 1, ...> body verbatim, with the k-block assignment derived
+from the guest type's own compile-time nwarps, the cross-warp partial exchange
+including the identically-+0.0f slots the host warp trim leaves behind, the
+same warp_reduce_sum and the same 0035 dst-scale epilogue. Warps-per-row is
+whatever the standalone launch would use (2 here), so blockDim.y/2 = 4 rows
+share a block and the merged grid is 512 guest + 2048 host blocks with exactly
+the wave count the two separate launches had.
+
+The graph half is the harder half, and it is an ALLOCATOR problem rather than a
+detector problem (round 31's lesson). Stock order runs the shared-expert tail
+after the routed reduction, where ggml-alloc has already freed the expert ids
+and routing weights and hands the shared-expert output their block - which the
+merged launch would still be reading. build_moe_ffn now relays a caller-supplied
+tail between the routed activation and the routed down projection, so the whole
+shared-expert tail (sigmoid gate, swiglu, down projection, gate multiply) is
+emitted there: the two matvecs become adjacent AND the shared-expert output is
+allocated while the ids and weights are still live, which is what lets the
+cross-product disjointness check pass at all. Only node order moves - same ops,
+same operands, same kernels - and it is gated on n_tokens == 1, so prefill is
+the stock build path.
+
+Census: 681.1 -> 641.1 dispatches/token, exactly -40.0, mul_mat_vec_q 4585 ->
+3185 per 35 tokens and nothing else moved. tg128 157.31 vs 153.31 against a
+binary built from this patch's parent commit (control RUNPATH verified by ldd,
+arms alternated, no env set on either arm), 4/4 separated, +2.61%; pp512 flat.
+Decode-path perplexity (-b 512 -ub 1 --chunks 8, runner corpus) is
+BIT-IDENTICAL: 3.9382 on both arms across three loads each.
+
+GGML_CUDA_SHEXP_DOWN_COLAUNCH=0 restores the two separate launches;
+GGML_QWEN_SHEXP_TAIL_PIN=0 restores stock node order.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 138 +++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu      | 227 ++++++++++++++++++++++++++++++--
+ ggml/src/ggml-cuda/mmvq.cuh     |  22 +++-
+ src/llama-graph.cpp             |  28 +++-
+ src/llama-graph.h               |  12 +-
+ src/models/qwen35moe.cpp        |  43 +++++-
+ 6 files changed, 453 insertions(+), 17 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index e6cfc230b..ffd47cb1c 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3708,6 +3708,116 @@ static bool ggml_cuda_moe_expert_reduce_detect(
+ #undef GGML_MOE_REDUCE_DECLINE
+ }
+ 
++// ---- 0047: the shared-expert down projection hidden in the expert-reduce ----
++//
++// Round 34's t(d) fit prices a removed MATVEC dispatch at 2.99 us of replay gap
++// plus ~2.85 us of bandwidth ramp; the shared-expert down projection is 40 of
++// them per token. It is a plain Q8_0 matvec of exactly the routed reduce's
++// output width (n_embd) over an entirely independent activation, so the two
++// grids concatenate. Both stay bit-identical: the guest blocks run the
++// mul_mat_vec_q<Q8_0,...> body verbatim (see mmvq.cu).
++//
++// The graph half (qwen35moe.cpp + llama-graph.cpp) pins the shared-expert
++// swiglu, down projection and gate multiply between the routed gate+up and the
++// routed down, so that (a) the two matvecs are adjacent in node order and (b)
++// ggml-alloc places the shared-expert output while the expert ids and routing
++// weights are still live - which is what makes the disjointness check pass at
++// all (round 31: the allocator, not the detector, is the usual blocker).
++struct mmvq_shexp_down_colaunch_info {
++    mmvq_expert_reduce_guest guest;
++    const ggml_tensor * guest_mul   = nullptr; // 0035 gate multiply, absorbed
++    ggml_tensor *       host        = nullptr; // the routed MUL_MAT_ID
++    const ggml_tensor * host_weights = nullptr;
++    ggml_tensor *       host_out    = nullptr;
++    int                 host_idx    = -1;
++    int                 host_last   = -1;
++};
++
++static bool ggml_cuda_shexp_down_colaunch_detect(
++        const ggml_cgraph * cgraph, const int i, mmvq_shexp_down_colaunch_info * out) {
++    ggml_tensor * guest = cgraph->nodes[i];
++    if (guest->op != GGML_OP_MUL_MAT || guest->src[2] != nullptr) {
++        return false;
++    }
++    if (guest->src[0]->type != GGML_TYPE_Q8_0 || guest->ne[1] != 1 || guest->ne[2] != 1 || guest->ne[3] != 1) {
++        return false;
++    }
++    if (!ggml_cuda_should_fuse_mul_mat_vec_q(guest)) {
++        return false;
++    }
++
++    // the 0035 shared-expert gate multiply, if it is fused into this matvec
++    const ggml_tensor * g_mul   = nullptr;
++    const ggml_tensor * g_scale = nullptr;
++    int                 j       = i + 1;
++    if (ggml_cuda_moe_weight_fuse_detect(cgraph, i, &g_mul, &g_scale, GGML_OP_MUL_MAT)) {
++        j = i + 2;
++    } else {
++        g_mul   = nullptr;
++        g_scale = nullptr;
++    }
++
++    // the very next real node must be the routed expert-down matvec
++    while (j < cgraph->n_nodes && ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
++        ++j;
++    }
++    if (j >= cgraph->n_nodes || cgraph->nodes[j]->op != GGML_OP_MUL_MAT_ID) {
++        return false;
++    }
++
++    const ggml_tensor * host_w    = nullptr;
++    ggml_tensor       * host_out  = nullptr;
++    int                 host_last = -1;
++    if (!ggml_cuda_moe_expert_reduce_detect(cgraph, j, &host_w, &host_out, &host_last)) {
++        return false;
++    }
++
++    ggml_tensor * host = cgraph->nodes[j];
++    // What the guest writes: the gate multiply's destination when that is fused
++    // in, the matvec's own otherwise.
++    const ggml_tensor * g_dst = g_mul != nullptr ? g_mul : guest;
++
++    // The two halves run in ONE kernel with no ordering between them, so every
++    // guest write must be disjoint from every host read AND write, and the
++    // other way round. This is the check 0045 shipped without once, and the
++    // race it produced was visible only at long context.
++    const ggml_tensor * host_reads[3] = { host->src[0], host->src[2], host_w };
++    for (int k = 0; k < 3; ++k) {
++        if (host_reads[k] != nullptr && !ggml_cuda_mmvq_ranges_disjoint(g_dst, host_reads[k])) {
++            return false;
++        }
++    }
++    if (!ggml_cuda_mmvq_ranges_disjoint(g_dst, host_out)) {
++        return false;
++    }
++    const ggml_tensor * guest_reads[3] = { guest->src[0], guest->src[1], g_scale };
++    for (int k = 0; k < 3; ++k) {
++        if (guest_reads[k] != nullptr && !ggml_cuda_mmvq_ranges_disjoint(host_out, guest_reads[k])) {
++            return false;
++        }
++    }
++    // the guest's own scale is read by guest blocks while other guest blocks write
++    if (g_scale != nullptr && !ggml_cuda_mmvq_ranges_disjoint(g_dst, g_scale)) {
++        return false;
++    }
++    // NOTE: host->src[1] is deliberately not checked - the host reads only its
++    // q8_1 copy in the pool, and the quantize that produces it is a separate
++    // dispatch that has completed before this launch starts (same reasoning as
++    // ggml_cuda_moe_expert_reduce_detect).
++
++    out->guest.src0  = guest->src[0];
++    out->guest.src1  = guest->src[1];
++    out->guest.scale = g_scale;
++    out->guest.dst   = (ggml_tensor *) g_dst;
++    out->guest_mul   = g_mul;
++    out->host        = host;
++    out->host_weights = host_w;
++    out->host_out    = host_out;
++    out->host_idx    = j;
++    out->host_last   = host_last;
++    return true;
++}
++
+ static bool ggml_cuda_mmvq_hoist_legal(const ggml_cgraph * cgraph, const int start, const int j) {
+     const ggml_tensor * cand = cgraph->nodes[j];
+     for (int k = start + 1; k < j; ++k) {
+@@ -6408,6 +6518,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 const char * e = getenv("GGML_CUDA_MMVQ_F32_COLAUNCH");
+                 return e == nullptr || std::atoi(e) != 0;
+             }();
++            // 0047: shared-expert down projection co-launched inside the routed
++            // expert-reduce. GGML_CUDA_SHEXP_DOWN_COLAUNCH=0 restores the two
++            // separate launches.
++            static const bool shexp_down_colaunch_enabled = []() -> bool {
++                const char * e = getenv("GGML_CUDA_SHEXP_DOWN_COLAUNCH");
++                return e == nullptr || std::atoi(e) != 0;
++            }();
+             static const bool log_mmvq_group_stats = getenv("GGML_MMVQ_GROUP_STATS") != nullptr;
+             int64_t mmvq_group_stats_buf[2] = {0, 0};
+             int64_t * mmvq_group_stats = log_mmvq_group_stats ? mmvq_group_stats_buf : nullptr;
+@@ -6711,6 +6828,27 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     }
+                 }
+ 
++                // 0047: the shared-expert down projection co-launched inside the
++                // routed expert-reduce that follows it. Tried before the plain
++                // shared-expert gate fold below, which is the fallback.
++                if (shexp_down_colaunch_enabled && stream_ctx.concurrent_events.empty() &&
++                        node->op == GGML_OP_MUL_MAT && mmvq_grouped_done.count(node) == 0 &&
++                        grouped_done.count(node) == 0) {
++                    mmvq_shexp_down_colaunch_info ci;
++                    if (ggml_cuda_shexp_down_colaunch_detect(cgraph, i, &ci) &&
++                            ggml_cuda_mul_mat_vec_q_expert_reduce(*cuda_ctx,
++                                ci.host->src[0], ci.host->src[1], ci.host->src[2],
++                                ci.host_weights, ci.host_out, &ci.guest)) {
++                        if (ci.guest_mul != nullptr) {
++                            grouped_done.insert(ci.guest_mul);
++                        }
++                        for (int k = ci.host_idx; k <= ci.host_last; ++k) {
++                            grouped_done.insert(cgraph->nodes[k]);
++                        }
++                        continue;
++                    }
++                }
++
+                 if (!disable_shexp_gate_fuse && stream_ctx.concurrent_events.empty() &&
+                         node->op == GGML_OP_MUL_MAT && mmvq_grouped_done.count(node) == 0 &&
+                         grouped_done.count(node) == 0) {
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 74e483c88..006338221 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1696,14 +1696,28 @@ static void mul_mat_vec_q_switch_type(
+ // warps contribute; the slot results are then summed in slot order 0..n-1 in a
+ // single lane, which is the left-to-right fold launch_bin_bcast_pack applies to
+ // the fused ADD chain it replaces.
+-template <ggml_type type, int rpb>
++// 0047: the co-launched guest matvec (see mmvq.cuh). Blocks [0, nblocks) of the
++// merged grid run this instead of the expert-reduce body; `gw` is the number of
++// warps the guest's own standalone launch gives one row, so blockDim.y/gw rows
++// share a block and every warp keeps its stock thread->k-block mapping.
++struct mmvq_er_guest_args {
++    const void *  vx           = nullptr;
++    const void *  vy           = nullptr;
++    const float * scale        = nullptr;
++    float *       dst          = nullptr;
++    uint32_t      ncols_x      = 0;
++    uint32_t      stride_row_x = 0;
++    uint32_t      nblocks      = 0;
++};
++
++template <ggml_type type, int rpb, ggml_type type_g = GGML_TYPE_Q8_0, int gw = 1, bool has_guest = false>
+ __launch_bounds__(MMVQ_EXPERT_REDUCE_MAX_SLOTS*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q_expert_reduce(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr,
+         const float * dst_scale_ptr, float * dst_ptr,
+         const uint32_t ncols_x, const uint3 nchannels_y,
+         const uint32_t stride_row_x, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
+-        const uint32_t stride_channel_dst) {
++        const uint32_t stride_channel_dst, const mmvq_er_guest_args g = mmvq_er_guest_args()) {
+     const void    * GGML_CUDA_RESTRICT vx        = vx_ptr;
+     const void    * GGML_CUDA_RESTRICT vy        = vy_ptr;
+     const int32_t * GGML_CUDA_RESTRICT ids       = ids_ptr;
+@@ -1721,8 +1735,78 @@ static __global__ void mul_mat_vec_q_expert_reduce(
+     // one k-split warp per expert slot; the host gate guarantees a single pass
+     constexpr int blocks_per_iter = vdr * warp_size / qi;
+ 
++    // ---- 0047: the second-vec_dot-type guest, at the FRONT of the grid -------
++    // (0045 measured the small kernel's blocks must go first; re-confirmed at
++    // the 0046 site. Do not move this to the tail.)
++    // gw is chosen host-side from the guest type's own nwarps on THIS device;
++    // the other instantiations still have to compile for every arch the file is
++    // built for, so an impossible (gw, arch) pair compiles to nothing.
++    constexpr int nwarps_g = calc_nwarps(type_g, 1, table_id);
++    if constexpr (has_guest && gw >= 1 && gw <= nwarps_g) {
++        if (blockIdx.x < g.nblocks) {
++            constexpr int qk_g     = ggml_cuda_type_traits<type_g>::qk;
++            constexpr int qi_g     = ggml_cuda_type_traits<type_g>::qi;
++            constexpr int vdr_g    = get_vdr_mmvq(type_g, table_id);
++            constexpr vec_dot_q_cuda_t vec_dot_g = get_vec_dot_q_cuda(type_g);
++            // derived from the guest type's FULL compile-time nwarps, exactly as
++            // in mul_mat_vec_q: the host trim must not move a k-block between
++            // threads, or the accumulation order would change.
++            constexpr int blocks_per_iter_g = vdr_g * nwarps_g*warp_size / qi_g;
++
++            const uint32_t rows_per_block_g = blockDim.y / gw;
++            const uint32_t wr   = threadIdx.y / gw;   // which guest row in this block
++            const uint32_t wl   = threadIdx.y % gw;   // warp index within that row
++            const int      grow = (int) (blockIdx.x*rows_per_block_g + wr);
++            const int      ltid = warp_size*wl + threadIdx.x;
++            const int      blocks_per_row_g = g.ncols_x / qk_g;
++
++            ggml_cuda_pdl_sync();
++
++            float tmp_g = 0.0f;
++            const block_q8_1 * yg = (const block_q8_1 *) g.vy;
++            const int kbx_offset_g = grow*g.stride_row_x;
++            for (int kbx = ltid / (qi_g/vdr_g); kbx < blocks_per_row_g; kbx += blocks_per_iter_g) {
++                const int kby = kbx * (qk_g/QK8_1);
++                const int kqs = vdr_g * (ltid % (qi_g/vdr_g));
++                tmp_g += vec_dot_g(g.vx, &yg[kby], kbx_offset_g + kbx, kqs);
++            }
++
++            __shared__ float g_shared[MMVQ_EXPERT_REDUCE_MAX_SLOTS/gw][gw > 1 ? gw-1 : 1][warp_size];
++            if constexpr (gw > 1) {
++                if (wl > 0) {
++                    g_shared[wr][wl-1][threadIdx.x] = tmp_g;
++                }
++                __syncthreads();
++                if (wl > 0) {
++                    return;
++                }
++            }
++            // warp 0 of the standalone launch reduces slots 0..nwarps_g-2: the
++            // first gw-1 hold the launched warps' partials, the rest are the
++            // exact +0.0f the trimmed warps would have written.
++#pragma unroll
++            for (int l = 0; l < gw - 1; ++l) {
++                tmp_g += g_shared[wr][l][threadIdx.x];
++            }
++#pragma unroll
++            for (int l = gw - 1; l < nwarps_g - 1; ++l) {
++                tmp_g += 0.0f;
++            }
++            tmp_g = warp_reduce_sum<warp_size>(tmp_g);
++            if (threadIdx.x == 0) {
++                float result = tmp_g;
++                if (g.scale != nullptr) {
++                    result *= g.scale[0];
++                }
++                g.dst[grow] = result;
++            }
++            return;
++        }
++    }
++    const uint32_t host_block = has_guest ? blockIdx.x - g.nblocks : blockIdx.x;
++
+     const uint32_t channel_dst      = threadIdx.y;
+-    const int      row0             = rpb*blockIdx.x;
++    const int      row0             = rpb*host_block;
+     dst += row0;
+     const int      blocks_per_row_x = ncols_x / qk;
+ 
+@@ -1807,6 +1891,36 @@ static int mmvq_expert_reduce_rpb() {
+     return v;
+ }
+ 
++// Returns false (having launched nothing) when this type/shape does not reduce
++// to the single-k-split-warp launch the kernel above is byte-exact against.
++// 0047: warps per guest row = what the guest's OWN standalone launch would use
++// (calc_launch_params + the untrim rule), so the guest's thread->k-block map is
++// unchanged. Returns 0 when the guest cannot be expressed at this block shape.
++template <ggml_type type_g>
++static int mmvq_expert_reduce_guest_warps(const int ncols_g, const int nrows_g, const int n_slots,
++                                          const int warp_size, const mmvq_parameter_table_id table_id) {
++    constexpr int qk_g = ggml_cuda_type_traits<type_g>::qk;
++    const int nwarps_g = calc_nwarps(type_g, 1, table_id);
++    if (calc_rows_per_block(1, table_id, /*small_k=*/false, nwarps_g) != 1) {
++        return 0;
++    }
++    if (ncols_g % qk_g != 0) {
++        return 0;
++    }
++    int gw = calc_nwarps_launched<type_g>(ncols_g, nwarps_g, warp_size, table_id);
++    if ((int64_t) nrows_g < (int64_t) mmvq_untrim_below_blocks()) {
++        gw = nwarps_g;
++    }
++    if (gw < 1 || gw > nwarps_g || n_slots % gw != 0) {
++        return 0;
++    }
++    const int rows_per_block_g = n_slots / gw;
++    if (rows_per_block_g < 1 || nrows_g % rows_per_block_g != 0) {
++        return 0;
++    }
++    return gw;
++}
++
+ // Returns false (having launched nothing) when this type/shape does not reduce
+ // to the single-k-split-warp launch the kernel above is byte-exact against.
+ template <ggml_type type>
+@@ -1814,7 +1928,8 @@ static bool mul_mat_vec_q_expert_reduce_launch(
+         const void * vx, const void * vy, const int32_t * ids, const float * dst_scale, float * dst,
+         const int ncols_x, const int nrows_x, const int n_slots, const int nchannels_y,
+         const int stride_row_x, const int stride_channel_x, const int stride_channel_y,
+-        const int stride_channel_dst, cudaStream_t stream) {
++        const int stride_channel_dst, cudaStream_t stream,
++        const mmvq_er_guest_args * guest = nullptr, const int guest_gw = 0) {
+     constexpr int qk = ggml_cuda_type_traits<type>::qk;
+     constexpr int qi = ggml_cuda_type_traits<type>::qi;
+ 
+@@ -1858,7 +1973,8 @@ static bool mul_mat_vec_q_expert_reduce_launch(
+         rpb = 1;
+     }
+ 
+-    const dim3  block_nums(nrows_x / rpb, 1, 1);
++    const uint32_t g_blocks = guest != nullptr ? guest->nblocks : 0u;
++    const dim3  block_nums(nrows_x / rpb + g_blocks, 1, 1);
+     const dim3  block_dims(warp_size, n_slots, 1);
+     const uint3 nchannels_y_fd = init_fastdiv_values(nchannels_y);
+ 
+@@ -1867,7 +1983,28 @@ static bool mul_mat_vec_q_expert_reduce_launch(
+     ggml_cuda_kernel_launch((mul_mat_vec_q_expert_reduce<type, R>), launch_params,         \
+         vx, vy, ids, dst_scale, dst, (uint32_t) ncols_x, nchannels_y_fd,                   \
+         (uint32_t) stride_row_x, (uint32_t) stride_channel_x, (uint32_t) stride_channel_y, \
+-        (uint32_t) stride_channel_dst)
++        (uint32_t) stride_channel_dst, mmvq_er_guest_args())
++#define MMVQ_EXPERT_REDUCE_LAUNCH_G(R, W)                                                                     \
++    ggml_cuda_kernel_launch((mul_mat_vec_q_expert_reduce<type, R, GGML_TYPE_Q8_0, W, true>), launch_params,    \
++        vx, vy, ids, dst_scale, dst, (uint32_t) ncols_x, nchannels_y_fd,                                      \
++        (uint32_t) stride_row_x, (uint32_t) stride_channel_x, (uint32_t) stride_channel_y,                     \
++        (uint32_t) stride_channel_dst, *guest)
++    if (guest != nullptr) {
++        // Only the Q8_0 guest is instantiated: every co-launchable guest on this
++        // GGUF (the whole shared-expert trio, attn q/k/v/output) is Q8_0, and
++        // 0021 requantizes none of them into anything else.
++        if (rpb != 1) {
++            return false;
++        }
++        switch (guest_gw) {
++            case 1: MMVQ_EXPERT_REDUCE_LAUNCH_G(1, 1); break;
++            case 2: MMVQ_EXPERT_REDUCE_LAUNCH_G(1, 2); break;
++            case 4: MMVQ_EXPERT_REDUCE_LAUNCH_G(1, 4); break;
++            case 8: MMVQ_EXPERT_REDUCE_LAUNCH_G(1, 8); break;
++            default: return false;
++        }
++        return true;
++    }
+     switch (rpb) {
+         case 2:  MMVQ_EXPERT_REDUCE_LAUNCH(2); break;
+         case 4:  MMVQ_EXPERT_REDUCE_LAUNCH(4); break;
+@@ -1875,6 +2012,7 @@ static bool mul_mat_vec_q_expert_reduce_launch(
+         default: MMVQ_EXPERT_REDUCE_LAUNCH(1); break;
+     }
+ #undef MMVQ_EXPERT_REDUCE_LAUNCH
++#undef MMVQ_EXPERT_REDUCE_LAUNCH_G
+     return true;
+ }
+ 
+@@ -1883,12 +2021,13 @@ static bool mul_mat_vec_q_expert_reduce_switch_type(
+         const float * dst_scale, float * dst,
+         const int ncols_x, const int nrows_x, const int n_slots, const int nchannels_y,
+         const int stride_row_x, const int stride_channel_x, const int stride_channel_y,
+-        const int stride_channel_dst, cudaStream_t stream) {
++        const int stride_channel_dst, cudaStream_t stream,
++        const mmvq_er_guest_args * guest = nullptr, const int guest_gw = 0) {
+ #define MMVQ_EXPERT_REDUCE_CASE(t)                                                                  \
+     case t:                                                                                         \
+         return mul_mat_vec_q_expert_reduce_launch<t>(vx, vy, ids, dst_scale, dst, ncols_x, nrows_x, \
+             n_slots, nchannels_y, stride_row_x, stride_channel_x, stride_channel_y,          \
+-            stride_channel_dst, stream);
++            stride_channel_dst, stream, guest, guest_gw);
+     switch (type_x) {
+         MMVQ_EXPERT_REDUCE_CASE(GGML_TYPE_Q4_0)
+         MMVQ_EXPERT_REDUCE_CASE(GGML_TYPE_Q4_1)
+@@ -2054,7 +2193,8 @@ bool ggml_cuda_moe_reduce_per_slot_mode() {
+ 
+ bool ggml_cuda_mul_mat_vec_q_expert_reduce(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
+-        const ggml_tensor * ids, const ggml_tensor * weights, ggml_tensor * dst) {
++        const ggml_tensor * ids, const ggml_tensor * weights, ggml_tensor * dst,
++        const mmvq_expert_reduce_guest * guest) {
+     GGML_ASSERT(src1->type    == GGML_TYPE_F32);
+     GGML_ASSERT(dst->type     == GGML_TYPE_F32);
+     GGML_ASSERT(weights->type == GGML_TYPE_F32);
+@@ -2081,6 +2221,72 @@ bool ggml_cuda_mul_mat_vec_q_expert_reduce(
+ 
+     cudaStream_t stream = ctx.stream();
+ 
++    // ---- 0047: guest eligibility, decided BEFORE anything is launched --------
++    // The caller has already committed the guest node to this launch, so a
++    // guest that cannot be expressed must make the whole call decline rather
++    // than launch a host-only kernel that silently drops it.
++    mmvq_er_guest_args g_args{};
++    int                g_gw = 0;
++    if (guest != nullptr) {
++        const ggml_tensor * g0 = guest->src0;
++        const ggml_tensor * g1 = guest->src1;
++        const ggml_tensor * gd = guest->dst;
++        if (g0->type != GGML_TYPE_Q8_0 || g1->type != GGML_TYPE_F32 || gd->type != GGML_TYPE_F32) {
++            return false;
++        }
++        if (g0->nb[0] != ggml_type_size(g0->type) || g1->nb[0] != ggml_type_size(g1->type)) {
++            return false;
++        }
++        // plain 2D weight x single column, one channel, one sample
++        if (g0->ne[2] != 1 || g0->ne[3] != 1 || g1->ne[1] != 1 || g1->ne[2] != 1 || g1->ne[3] != 1 ||
++                gd->ne[1] != 1 || gd->ne[2] != 1 || gd->ne[3] != 1) {
++            return false;
++        }
++        if (g0->ne[0] != g1->ne[0] || g0->ne[1] != gd->ne[0]) {
++            return false;
++        }
++        if (guest->scale != nullptr &&
++                (guest->scale->type != GGML_TYPE_F32 || ggml_nelements(guest->scale) != 1)) {
++            return false;
++        }
++        const int device_g    = ggml_cuda_get_device();
++        const int warp_size_g = ggml_cuda_info().devices[device_g].warp_size;
++        const mmvq_parameter_table_id table_g = get_device_table_id(ggml_cuda_info().devices[device_g].cc);
++        if (!ggml_cuda_should_use_mmvq(g0->type, ggml_cuda_info().devices[device_g].cc, 1)) {
++            return false;
++        }
++        g_gw = mmvq_expert_reduce_guest_warps<GGML_TYPE_Q8_0>(
++            (int) g0->ne[0], (int) g0->ne[1], (int) n_slots, warp_size_g, table_g);
++        if (g_gw == 0) {
++            return false;
++        }
++        // the guest activation goes through the SAME shared q8_1 cache entry the
++        // standalone launch would have used, so a fold that already produced it
++        // (0010/0036) is hit rather than re-quantized
++        const size_t  ts_g1        = ggml_type_size(g1->type);
++        const int64_t g_ne10       = g1->ne[0];
++        const int64_t g_ne10_pad   = GGML_PAD(g_ne10, MATRIX_ROW_PADDING);
++        const int64_t g_s11        = g1->nb[1] / ts_g1;
++        const int64_t g_s12        = g1->nb[2] / ts_g1;
++        const int64_t g_s13        = g1->nb[3] / ts_g1;
++        const char *  g_q8_1 = ctx.quantized_src1_cache.find(g1, stream, g_ne10, g_s11, g_s12, g_s13, g_ne10_pad, 1, 1, 1);
++        if (g_q8_1 == nullptr) {
++            const size_t size_q8_1 = g_ne10_pad * sizeof(block_q8_1)/QK8_1;
++            char * dst_q8_1 = ctx.quantized_src1_cache.insert(
++                ctx.pool(), g1, stream, g_ne10, g_s11, g_s12, g_s13, g_ne10_pad, 1, 1, 1, size_q8_1);
++            quantize_row_q8_1_cuda((const float *) g1->data, nullptr, dst_q8_1, g0->type,
++                                   g_ne10, g_s11, g_s12, g_s13, g_ne10_pad, 1, 1, 1, stream);
++            g_q8_1 = dst_q8_1;
++        }
++        g_args.vx           = g0->data;
++        g_args.vy           = g_q8_1;
++        g_args.scale        = guest->scale != nullptr ? (const float *) guest->scale->data : nullptr;
++        g_args.dst          = (float *) gd->data;
++        g_args.ncols_x      = (uint32_t) g0->ne[0];
++        g_args.stride_row_x = (uint32_t) (g0->nb[1] / ggml_type_size(g0->type));
++        g_args.nblocks      = (uint32_t) (g0->ne[1] / ((int) n_slots / g_gw));
++    }
++
+     // If src0 is a temporary compute buffer it may have padding that mmvq reads.
+     if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
+         const size_t size_data  = ggml_nbytes(src0);
+@@ -2121,7 +2327,8 @@ bool ggml_cuda_mul_mat_vec_q_expert_reduce(
+     return mul_mat_vec_q_expert_reduce_switch_type(
+         src0->data, src0->type, src1_q8_1, (const int32_t *) ids->data,
+         (const float *) weights->data, (float *) dst->data,
+-        ne00, ne01, n_slots, ne11, s01, s02, s11, stride_channel_dst, stream);
++        ne00, ne01, n_slots, ne11, s01, s02, s11, stride_channel_dst, stream,
++        guest != nullptr ? &g_args : nullptr, g_gw);
+ }
+ 
+ void ggml_cuda_op_mul_mat_vec_q(
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index ac859bf2a..efad96e65 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -56,9 +56,29 @@ void ggml_cuda_mul_mat_vec_q_grouped(ggml_backend_cuda_context & ctx, ggml_tenso
+ // never happen. Returns false without launching anything if the shape/type does
+ // not reduce to the single-k-split-warp launch the fold is byte-exact against,
+ // in which case the caller must fall back to ggml_cuda_mul_mat_vec_q.
++// 0047: the shared-expert down projection is an independent quantized matvec of
++// exactly the same output width as the routed expert-reduce above, over a
++// different activation and a different quantization type. Merging the two costs
++// one dispatch AND one bandwidth ramp (the round-34 fit prices a removed matvec
++// launch at 5.8 us against 2.99 for an elementwise one), and needs the one piece
++// of machinery the series did not have: a SECOND vec_dot type in one launch.
++//
++// Bit-identity is by construction, exactly as for the 0045 F32 tail: the guest
++// blocks run the mul_mat_vec_q<type_g, 1, ...> body verbatim - same k-block to
++// thread assignment (derived from the guest type's own compile-time nwarps),
++// same cross-warp partial exchange including the identically-+0.0f slots the
++// host trim leaves behind, same warp_reduce_sum, same epilogue.
++struct mmvq_expert_reduce_guest {
++    const ggml_tensor * src0  = nullptr;  // guest weight matrix
++    const ggml_tensor * src1  = nullptr;  // guest activation (F32; quantized via the shared cache)
++    const ggml_tensor * scale = nullptr;  // optional broadcast dst scale (0035 shared-expert gate)
++    ggml_tensor *       dst   = nullptr;
++};
++
+ bool ggml_cuda_mul_mat_vec_q_expert_reduce(ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
+-    const ggml_tensor * weights, ggml_tensor * dst);
++    const ggml_tensor * weights, ggml_tensor * dst,
++    const mmvq_expert_reduce_guest * guest = nullptr);
+ 
+ // Bisect only: GGML_CUDA_MOE_REDUCE_PER_SLOT=1 keeps the new launch geometry but
+ // stores per expert slot into `dst` (the routing-weight MUL's destination),
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 985336f4d..04b4f193e 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1851,7 +1851,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * up_exps_s,
+          ggml_tensor * gate_exps_s,
+          ggml_tensor * down_exps_s,
+-         ggml_tensor * selected_experts_in) const {
++         ggml_tensor * selected_experts_in,
++         ggml_tensor * pin_pre_down_0,
++         ggml_tensor * pin_pre_down_1) const {
+     return build_moe_ffn(
+         cur,
+         gate_inp,  /* gate_inp_b  */ nullptr,
+@@ -1872,7 +1874,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         up_exps_s,
+         gate_exps_s,
+         down_exps_s,
+-        selected_experts_in
++        selected_experts_in,
++        pin_pre_down_0,
++        pin_pre_down_1
+     );
+ }
+ 
+@@ -1900,7 +1904,9 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * up_exps_s,
+          ggml_tensor * gate_exps_s,
+          ggml_tensor * down_exps_s,
+-         ggml_tensor * selected_experts_in) const {
++         ggml_tensor * selected_experts_in,
++         ggml_tensor * pin_pre_down_0,
++         ggml_tensor * pin_pre_down_1) const {
+     const int64_t n_embd   = cur->ne[0];
+     const int64_t n_tokens = cur->ne[1];
+     const bool weight_before_ffn = arch == LLM_ARCH_LLAMA4; // for llama4, we apply the sigmoid-ed weights before the FFN
+@@ -2175,6 +2181,22 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+             GGML_ABORT("fatal error");
+     }
+ 
++    // 0047: relay an independent tail (the shared-expert swiglu + down + gate
++    // multiply) between the routed activation and the routed down projection.
++    // The routed activation is expanded first so the caller's tail lands AFTER
++    // the gate/up matmuls and their GLU, keeping that fusion adjacent, and the
++    // tail's own output is allocated while the expert ids and routing weights
++    // are still live - which is what lets the backend merge the two matvecs.
++    if (pin_pre_down_0 != nullptr || pin_pre_down_1 != nullptr) {
++        ggml_build_forward_expand(gf, cur);
++        if (pin_pre_down_0 != nullptr) {
++            ggml_build_forward_expand(gf, pin_pre_down_0);
++        }
++        if (pin_pre_down_1 != nullptr) {
++            ggml_build_forward_expand(gf, pin_pre_down_1);
++        }
++    }
++
+     experts = build_lora_mm_id(down_exps, cur, selected_experts, down_exps_s); // [n_embd, n_expert_used, n_tokens]
+     cb(experts, "ffn_moe_down", il);
+ 
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index b67d2d1fe..776812fce 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1060,7 +1060,9 @@ struct llm_graph_context {
+              ggml_tensor * up_exps_s = nullptr,
+              ggml_tensor * gate_exps_s = nullptr,
+              ggml_tensor * down_exps_s = nullptr,
+-             ggml_tensor * selected_experts_in = nullptr) const;
++             ggml_tensor * selected_experts_in = nullptr,
++             ggml_tensor * pin_pre_down_0 = nullptr,
++             ggml_tensor * pin_pre_down_1 = nullptr) const;
+ 
+     ggml_tensor * build_moe_ffn(
+              ggml_tensor * cur,
+@@ -1086,7 +1088,13 @@ struct llm_graph_context {
+              ggml_tensor * up_exps_s = nullptr,
+              ggml_tensor * gate_exps_s = nullptr,
+              ggml_tensor * down_exps_s = nullptr,
+-             ggml_tensor * selected_experts_in = nullptr) const;
++             ggml_tensor * selected_experts_in = nullptr,
++             // 0047: emitted (in order) immediately after the routed activation
++             // and before the routed down projection, so an independent
++             // shared-expert tail can be co-launched with the routed reduce and
++             // is allocated while the expert ids/routing weights are still live.
++             ggml_tensor * pin_pre_down_0 = nullptr,
++             ggml_tensor * pin_pre_down_1 = nullptr) const;
+ 
+     //
+     // inputs
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 42aab3f14..8495f0ad5 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -597,6 +597,19 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
+         model.layers[il].ffn_down_shexp_s == nullptr &&
+         !(hparams.swiglu_clamp_shexp[il] > 1e-6f);
+ 
++    // 0047: with the pair pinned, the whole shared-expert TAIL (swiglu, down
++    // projection, gate multiply) is also independent of the routed subgraph
++    // right up to the final add. Relaying it through build_moe_ffn so it lands
++    // between the routed activation and the routed down projection makes the
++    // shared-expert down matvec adjacent to the routed expert-reduce - the
++    // backend then runs both in one launch - and, just as importantly, makes
++    // ggml-alloc place its output while the expert ids and routing weights are
++    // still live, so the co-launch disjointness check can pass at all.
++    static const bool shexp_tail_pin = [] {
++        const char * e = getenv("GGML_QWEN_SHEXP_TAIL_PIN");
++        return e == nullptr || atoi(e) != 0;
++    }();
++
+     ggml_tensor * moe_logits = nullptr;
+     ggml_tensor * shexp_gate = nullptr;
+     ggml_tensor * shexp_up   = nullptr;
+@@ -619,6 +632,26 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
+         ggml_build_forward_expand(gf, shexp_up);
+     }
+ 
++    // The tail is CREATED here (creation order does not set cgraph order) and
++    // EMITTED by build_moe_ffn between the routed activation and the routed
++    // down projection. Same ops, same operands, same kernels as the block
++    // below - only the position of four nodes in the list moves.
++    ggml_tensor * tail_gate    = nullptr;   // sigmoid(shared gate), pinned first (0035)
++    ggml_tensor * tail_gated   = nullptr;   // shexp down * sigmoid(shared gate)
++    ggml_tensor * tail_shexp   = nullptr;   // shexp down, before the gate multiply
++    if (shexp_manual && shexp_tail_pin && shared_gate_pre != nullptr) {
++        tail_gate  = ggml_sigmoid(ctx0, shared_gate_pre);
++        cb(tail_gate, "shared_expert_gate_sigmoid", il);
++
++        ggml_tensor * act = ggml_swiglu_split(ctx0, shexp_gate, shexp_up);
++        cb(act, "ffn_swiglu", il);
++        tail_shexp = build_lora_mm(model.layers[il].ffn_down_shexp, act);
++        cb(tail_shexp, "ffn_shexp", il);
++
++        tail_gated = ggml_mul(ctx0, tail_shexp, tail_gate);
++        cb(tail_gated, "ffn_shexp_gated", il);
++    }
++
+     ggml_tensor * moe_out =
+         build_moe_ffn(cur,
+             model.layers[il].ffn_gate_inp,
+@@ -633,9 +666,17 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
+             moe_logits, model.layers[il].ffn_gate_up_exps,
+             model.layers[il].ffn_up_exps_s,
+             model.layers[il].ffn_gate_exps_s,
+-            model.layers[il].ffn_down_exps_s);
++            model.layers[il].ffn_down_exps_s,
++            /* selected_experts_in */ nullptr,
++            tail_gate, tail_gated);
+     cb(moe_out, "ffn_moe_out", il);
+ 
++    if (tail_gated != nullptr) {
++        cur = ggml_add(ctx0, moe_out, tail_gated);
++        cb(cur, "ffn_out", il);
++        return cur;
++    }
++
+     // Add shared experts if present - following Qwen3Next reference implementation
+     if (model.layers[il].ffn_up_shexp != nullptr) {
+         // Apply shared expert gating as in the reference implementation
