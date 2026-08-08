@@ -564,3 +564,129 @@ GGML_CUDA_DISABLE_SSM_CONV_FOLD=1 restores stock.
   chain despite mirroring its source structure (tried register-array
   alignment; codegen context differs). Same ppl-gated class as
   0024/0026/0028.
+
+
+## Round-13 profile (read this before profiling again)
+
+**The fusions DO fire under llama-server.** Every grouped launch and inline
+fold in this series is gated on `stream_ctx.concurrent_events.empty()`, and
+round 10's note that "these graph sections carry concurrent events, which
+disable inline grouping" reads as if the whole stack were inert on the ranked
+path. It is not. A rocprofv3 kernel trace of `llama-server -ngl 99 -c 8192
+--parallel 1` serving a 64-token greedy completion shows
+`mul_mat_vec_q_grouped`, `mul_mat_vec_f_grouped`, `l2_norm_f32_grouped` and
+`ssm_conv_fold_f32` at the same per-token counts llama-bench shows. The
+concurrent-event pass only ever fires on a node **named `attn_norm` with
+fan-out exactly 3** (the Q/K/V fork); `qwen35moe` never builds that shape, so
+the map stays empty. Round 12's ranked +2.6% decode matching its +2.7% bench
+toggle is the independent confirmation. Profile llama-bench freely - but still
+verify anything that skips graph nodes at server level, as round 7 learned.
+
+Decode, 34 tokens, verified r12 build: 205.1 ms kernel = **6.03 ms/token**
+against a 7.58 ms wall token (131.4 tok/s), ~1085 dispatches/token.
+
+| share | kernel | note |
+|---|---|---|
+| 17.7% | mmvq_grouped Q6_K (qkv+z, 30x35.5us) | 581 GB/s - near the practical ceiling |
+| 11.9% | mmvq Q4_K ids (expert gate+up, 40x18.0us) | 524 GB/s |
+| 11.0% | mmvq Q6_K small_k (output head, 1x666us) | 627 GB/s = 97% of peak, done |
+| 8.1% | mmvq Q6_K ssm_out (30x16.4us) | 420 GB/s in-graph |
+| 8.0% | mmvq Q5_K ids (expert down) | ~445 GB/s, ONE warp per block |
+| 4.5% | mmvq_grouped Q8_0 (shexp, 50/token) | |
+| ~11% | **~500 elementwise launches/token** | 1.2-2.9us each; almost pure overhead |
+
+Prefill, pp512 (239.7 ms / 2 passes): mul_mat_q Q4_K 19.9% + Q5_K 13.8%,
+gated_delta_net 10.9%, rocBLAS GEMMs ~19.8%, **`concat_non_cont` 4.7%
+(30 x 188us)**, q6 dequant 3.6%, silu 1.9%, mm_ids_helper ~1.1%.
+
+The elementwise pool is the big remaining decode surface and the reason 0032
+exists. Per token, after 0032: rms_norm_pre_add 80 x 2.8us (a 2048-column norm
+in ONE 1024-thread workgroup - 23 GB/s, entirely launch/ramp), topk_moe
+40 x 2.7us, the MoE combine MUL/ADD glue 120 x ~1.5us, quantize_q8_1
+80 x 1.3us, l2_norm_grouped 30 x 1.9us, gated-norm rms_norm+silu 60 x ~1.5us.
+
+
+## 0032: GDN beta/alpha chains folded into the grouped-mmvf epilogue (+3.4% decode)
+
+Every GDN layer ran three elementwise launches over **32 floats** right after
+the grouped beta/alpha matvec: `sigmoid(beta)` 1.28us, `alpha + ssm_dt`
+1.60us, `softplus(...) * ssm_a` 1.47us. 0022's epilogue machinery could only
+match a sigmoid whose src IS the segment output, so it caught the shared-expert
+gate and never beta (which reaches its matvec through a `ggml_reshape` view).
+
+0032 adds a second epilogue form `softplus(sum + bias[row]) * scale[row]` (the
+same three f32 statements, same order, on the same accumulator value the stock
+kernels would have loaded), teaches the matcher to walk whole-tensor alias
+links, and - critically - **moves the beta/alpha matvecs and both chains ahead
+of the qkv/z projections** in `qwen35moe.cpp`.
+
+That reorder is most of the win, and the lesson generalises to every future
+epilogue fold on this track:
+
+> **A hoisted epilogue write is an allocation problem, not a matching
+> problem.** The write moves back to group-launch time, but ggml-alloc placed
+> that 128-byte result assuming it ran later - on whatever was dead by then.
+> With the chains emitted after the conv block, `gate` landed *inside* the
+> 128 KB conv-input concat and `beta_sigmoid` landed on the `attn_norm`
+> activation that the group kernel itself reads. Both are genuine races and
+> the hazard scan correctly declined them: **0 of 30 layers folded.** Emitting
+> the chains while `cur` is still live removes the aliasing entirely - 30/30,
+> and +2.13% becomes +3.35%.
+
+Two matcher rules were needed to stop the two folds blocking *each other*
+(they see-sawed: fixing beta broke alpha and vice versa):
+
+- the intermediate-hazard scan exempts group members' own matvec destinations
+  (a folded member never materialises its matvec dst; the member loop compares
+  EFFECTIVE destinations instead), and
+- it exempts nodes another accepted fold has already absorbed - their reads
+  happen from registers inside the group kernel, or not at all. Without this,
+  `gate` was rejected for aliasing the buffer `beta_sigmoid` "reads", when
+  `beta_sigmoid` no longer reads anything.
+- the scan runs three passes so a fold accepted late unblocks one rejected
+  early.
+
+`GGML_CUDA_MMVF_EPI_DEBUG=1` prints every accept/decline with the offending
+pointer pair. **Use it.** These declines are allocation-dependent and cannot
+be reasoned about from source - three rebuild cycles were spent guessing
+before the diagnostic was added, and it found both causes in one run.
+
+Measured (runner box, HIP_VISIBLE_DEVICES=0):
+
+- same-binary toggle A/B (`GGML_CUDA_DISABLE_MMVF_EPI_EXT=1` restores the
+  pre-patch matcher), 3 rounds: tg128 132.91-133.06 -> **137.28-137.50**
+  (+3.35%, 3/3 disjoint); pp512 neutral (4142-4191 off vs 4158-4186 on)
+- pre-reorder build, 5 rounds: +2.13% (132.52-132.98 -> 135.24-135.61)
+- whole-process stock vs cand, 5 rounds: tg128 80.50-81.16 -> 137.15-137.46
+  (ratio **1.698**), pp512 3177-3231 -> 4125-4156 (ratio **1.301**)
+- ppl 3.9271 / 3.9271 / 3.9283 vs stock 3.9314 (**-0.08 to -0.11%**, band 0.5%)
+- test-backend-ops MUL_MAT / ADD / MUL / UNARY / SSM_CONV / GATED_DELTA_NET
+  all OK; llama-server smoke coherent short / long / concurrent
+- `GGML_CUDA_DISABLE_MMVF_SIG_FUSE=1` still disables the whole epilogue pass
+
+
+## Round-14 map
+
+1. **Prefill: `concat_non_cont` is 4.7% of pp512** (30 x 188us). The GDN conv
+   input is built by transposing a [512, 8192] f32 activation into time-major
+   layout so `ggml_ssm_conv` can transpose it straight back - 32 MB of
+   scalar-indexed traffic at ~170 GB/s per layer, five times the cost of the
+   convolution itself. Extending the 0031 fold to `n_t > 1` (read `qkv_mixed`
+   in its natural channel-major layout plus the conv state, write the conv
+   output directly) deletes it. ~+4.5% prefill = ~+0.9% score, and it helps
+   ttft too. Highest-value untouched item.
+2. **`rms_norm_pre_add`: 80 launches/token at 2.8us** for a 2048-column norm
+   in a single 1024-thread workgroup (32 waves in the block reduction on
+   wave32). Try block 256 on RDNA4 - reassociation-class, ppl-gated. ~0.7%.
+3. **MoE combine glue**: `mul(experts, weights)` + 8-way `add` + `mul(shexp,
+   gate)` = 120 bin_bcast launches/token. Folding the weight multiply and the
+   expert reduction into one kernel is ~40 nodes + ~60us/token.
+4. **Q5_K expert-down mmvq runs ONE warp per block** (wg=(32,1)) at ~445 GB/s
+   while Q4_K gate/up runs two warps at 524. nwarps was swept for the dense
+   paths, not per-shape for the ids Q5_K path - worth one probe.
+5. Dense Q6_K bandwidth and mmvq geometry stay closed (round-11 corrections).
+   The output head at 97% of peak is done.
+6. The epilogue machinery now generalises: any (matvec -> elementwise chain)
+   on a grouped-mmvf segment is a candidate. Remember rule (1) of 0032 -
+   pin the chain adjacent to its matvec in the model graph FIRST, or the
+   allocator will make every fold illegal.

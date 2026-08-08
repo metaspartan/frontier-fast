@@ -1,0 +1,560 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH 32/32] cuda/hip: fold the GDN beta/alpha elementwise chains into the grouped-mmvf epilogue (+3.4% decode)
+
+Round-13 decode profile (rocprofv3, 34 tokens, verified r12 build, confirmed
+identical in shape under llama-server): 6.03 ms of kernel per token spread over
+~1085 dispatches, of which roughly 500 are elementwise kernels moving 32 to
+4096 floats. Each costs 1.2-1.7 us of GPU time plus ~1.5 us of graph-replay
+overhead for work that fits in one lane's registers.
+
+The densest cluster is the GDN gating prologue. Every one of the 30 linear
+layers runs, right after the grouped beta/alpha matvec:
+
+    beta  = sigmoid(ssm_beta @ x)                      1.28 us
+    tmp   = (ssm_alpha @ x) + ssm_dt                   1.60 us
+    gate  = softplus(tmp) * ssm_a                      1.47 us   (0012 fusion)
+
+Three launches over 32 floats each. 0022 already had the machinery to apply a
+sigmoid in the grouped-mmvf segment epilogue, but it matched only a sigmoid
+whose src IS the segment output, so it caught the shared-expert gate and never
+beta - which reaches its matvec through a ggml_reshape view. This patch:
+
+1. `mmvf.cu/.cuh`: the segment epilogue gains a second form,
+   `softplus(sum + bias[row]) * scale[row]`, evaluated as the same three f32
+   statements in the same order as the ADD / op_softplus / MUL kernels it
+   replaces, on the same accumulator value those kernels would have loaded.
+   Per-segment `bias` / `scale` pointers carry ssm_dt and ssm_a.
+2. `ggml-cuda.cu`: the matcher walks whole-tensor alias links (reshape/view,
+   equal element count, zero offset, single consumer at every step) back to the
+   segment, and recognises the ADD -> SOFTPLUS -> MUL chain as well as the bare
+   sigmoid. -90 launches and ~129 us of kernel per decoded token.
+3. `qwen35moe.cpp`: the beta/alpha matvecs and both chains are emitted BEFORE
+   the qkv/z projections, and each chain is pinned with
+   ggml_build_forward_expand. Ops, operands and shapes are unchanged; only the
+   position in the node list moves.
+
+(3) is not cosmetic - it is most of the win. The hoisted epilogue write has to
+be legal at group-launch time, and the graph allocator was handing these
+128-byte results the buffers of tensors that were still being read: with the
+chains emitted after the conv block, `gate` landed inside the 128 KB conv-input
+concat, and `beta_sigmoid` landed on the attn_norm activation that the group
+kernel itself reads. Both are genuine races, correctly declined. Emitting the
+chains while `cur` is still live removes the aliasing, and coverage goes from
+0/30 layers to 30/30 (+2.1% -> +3.4%).
+
+Two matcher rules were needed to stop the two folds blocking each other:
+the intermediate-hazard scan now exempts group members' own matvec
+destinations (a folded member never materialises its matvec dst; the member
+loop compares EFFECTIVE destinations instead), and it exempts nodes another
+accepted fold has already absorbed (their reads happen from registers, or not
+at all). The scan runs three passes so a fold accepted late unblocks one
+rejected early. `GGML_CUDA_MMVF_EPI_DEBUG=1` prints every accept/decline with
+the offending pointer pair - the allocation-dependent declines are impossible
+to reason about from source alone.
+
+Measured (runner box, R9700, HIP_VISIBLE_DEVICES=0):
+
+- same-binary toggle A/B (GGML_CUDA_DISABLE_MMVF_EPI_EXT=1 restores the
+  pre-patch direct-src-sigmoid-only matcher), 3 rounds:
+  tg128 132.91-133.06 off -> 137.28-137.50 on (**+3.35%**, 3/3 disjoint);
+  pp512 neutral (4142-4191 off vs 4158-4186 on)
+- an earlier build without the (3) reorder measured +2.13% over 5/5 disjoint
+  rounds - the reorder is worth the other +1.2%
+- whole-process stock vs cand, 5 rounds: tg128 80.50-81.16 -> 137.15-137.46
+  (ratio 1.694), pp512 3183-3231 -> 4125-4156 (ratio 1.298)
+- decode dispatch trace: the 30x sigmoid(32), 30x add(32) and 30x
+  softplus-mul(32) launches per token are gone
+- ppl on the runner corpus, 3 loads: see README (band 0.5% vs stock 3.9314)
+- test-backend-ops MUL_MAT / ADD / MUL / UNARY / SSM_CONV / GATED_DELTA_NET OK
+- llama-server smoke: coherent short, long and concurrent completions
+
+Arithmetic note: the folded expressions are the stock statements on the stock
+accumulator value, so the fold itself is exact. The node reordering in (3) does
+change which OTHER allocation-dependent fusions fire around the GDN block, so
+this ships as the same ppl-gated equivalence class as 0024/0026/0028/0031
+rather than as a byte-identity claim.
+---
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index a6d1121cb..b8c0f08fa 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3421,20 +3421,172 @@ static bool ggml_cuda_mmvf_can_group(const ggml_tensor * node, const int cc) {
+ }
+ 
+ 
+-// ----- sigmoid epilogue fusion for grouped mmvf -------------------------------
++// ----- epilogue fusion for grouped mmvf --------------------------------------
+ //
+-// beta = sigmoid(ssm_beta @ x) on the GDN layers and the shared-expert gate
+-// sigmoid on every layer consume grouped-mmvf segment outputs and nothing
+-// else. Applying the exact op_sigmoid expression in the segment epilogue
+-// removes ~70 elementwise launches per decoded token; outputs are
+-// byte-identical because the same accumulator value passes through the same
+-// expression the separate kernel would apply. GGML_CUDA_DISABLE_MMVF_SIG_FUSE
+-// disables.
+-static void ggml_cuda_mmvf_collect_sigmoid_epilogues(
++// Two tiny per-layer chains hang directly off grouped-mmvf segment outputs and
++// nothing else:
++//
++//   beta  = sigmoid(ssm_beta @ x)                       (30 GDN layers)
++//   gate  = softplus(ssm_alpha @ x + ssm_dt) * ssm_a    (30 GDN layers)
++//   shexp = sigmoid(gate_shexp @ x)                     (every layer)
++//
++// Each link is an elementwise op over 32 (or 1) floats: a whole kernel launch
++// plus ~1.5us of graph-replay overhead for work a single lane already holds in
++// a register. Applying the same expressions in the segment epilogue removes
++// them. The value that enters the epilogue is exactly the float the matvec
++// would have stored, and every step below is the statement the stock kernel
++// evaluates, in the same order, so the stored result is unchanged.
++//
++// The alpha chain reaches its member through a ggml_reshape view, which the
++// original (identity-only) matcher could not see through - hence
++// ggml_cuda_mmvf_epi_member, which walks whole-tensor alias links and requires
++// a single consumer at every step so nobody can observe a value the epilogue
++// no longer materialises. GGML_CUDA_DISABLE_MMVF_SIG_FUSE disables.
++static bool ggml_cuda_mmvf_epi_debug() {
++    static const bool on = getenv("GGML_CUDA_MMVF_EPI_DEBUG") != nullptr &&
++                           std::atoi(getenv("GGML_CUDA_MMVF_EPI_DEBUG"));
++    return on;
++}
++
++#define EPI_DBG(...) do { if (ggml_cuda_mmvf_epi_debug()) { fprintf(stderr, "EPIDBG " __VA_ARGS__); } } while (0)
++
++static bool ggml_cuda_mmvf_epi_ext_disabled() {
++    static const bool disabled = getenv("GGML_CUDA_DISABLE_MMVF_EPI_EXT") != nullptr &&
++                                 std::atoi(getenv("GGML_CUDA_DISABLE_MMVF_EPI_EXT"));
++    return disabled;
++}
++
++static int ggml_cuda_mmvf_epi_member(const ggml_cgraph * cgraph, const int start, const int limit,
++        const ggml_tensor * t, ggml_tensor * const * members, const int n_members) {
++    const ggml_tensor * cur = t;
++    if (cur == nullptr) {
++        return -1;
++    }
++    const int max_depth = ggml_cuda_mmvf_epi_ext_disabled() ? 1 : 4;
++    for (int depth = 0; depth < max_depth; ++depth) {
++        for (int m = 0; m < n_members; ++m) {
++            if (cur != members[m]) {
++                continue;
++            }
++            for (int k = start; k < limit; ++k) {
++                if (cgraph->nodes[k] == cur) {
++                    return ggml_node_get_use_count(cgraph, k) == 1 ? m : -1;
++                }
++            }
++            return -1;
++        }
++        // not a member: peel one whole-tensor alias link
++        if (cur->view_src == nullptr || !ggml_cuda_is_view_or_noop(cur) ||
++                cur->type != GGML_TYPE_F32 || cur->view_offs != 0 ||
++                !ggml_is_contiguous(cur) ||
++                ggml_nelements(cur) != ggml_nelements(cur->view_src)) {
++            return -1;
++        }
++        bool found = false;
++        for (int k = start; k < limit && !found; ++k) {
++            if (cgraph->nodes[k] == cur) {
++                if (ggml_node_get_use_count(cgraph, k) != 1) {
++                    return -1;
++                }
++                found = true;
++            }
++        }
++        if (!found) {
++            return -1;
++        }
++        cur = cur->view_src;
++    }
++    return -1;
++}
++
++// Hoisting the epilogue write to group-launch time must not conflict with
++// anything the intermediate nodes read or write, and must not overlap another
++// segment destination. The nodes the fold removes (skip_a / skip_b) no longer
++// write anything, so they are exempt.
++static bool ggml_cuda_mmvf_epi_legal(const ggml_cgraph * cgraph, const int start, const int j,
++        const ggml_tensor * out, ggml_tensor * const * members, const int n_members,
++        const mmvf_epilogue * epi, const int own, const ggml_tensor * skip_a, const ggml_tensor * skip_b) {
++    for (int k = start + 1; k < j; ++k) {
++        const ggml_tensor * mid = cgraph->nodes[k];
++        if (ggml_cuda_is_view_or_noop(mid) || mid == skip_a || mid == skip_b) {
++            continue;
++        }
++        // A node that another accepted fold already absorbed is not an
++        // intermediate any more: its reads happen from registers inside the
++        // group kernel (dst_node) or do not happen at all (skip[]), and a
++        // dst_node's write is compared against ours in the member loop below.
++        // Without this the folds block each other - the allocator gives one
++        // chain's result the buffer the sibling chain used to read from.
++        bool absorbed = false;
++        for (int mm = 0; mm < n_members; ++mm) {
++            absorbed = absorbed || mid == epi[mm].dst_node ||
++                       mid == epi[mm].skip[0] || mid == epi[mm].skip[1];
++        }
++        // the hoisted write must not land on anything a live intermediate reads
++        for (int si = 0; si < GGML_MAX_SRC && !absorbed; ++si) {
++            if (mid->src[si] != nullptr && !ggml_cuda_mmvq_ranges_disjoint(out, mid->src[si])) {
++                EPI_DBG("mid-src out=%s(%p+%zu) mid=%s src%d=%s(%p+%zu)\n", out->name, out->data,
++                        ggml_nbytes(out), mid->name, si, mid->src[si]->name, mid->src[si]->data,
++                        ggml_nbytes(mid->src[si]));
++                return false;
++            }
++        }
++        // ... nor on anything an intermediate writes. Group members are the
++        // exception: they are already issued at the same instant as this write,
++        // and a member whose own chain is folded never materialises its matvec
++        // dst at all - the member loop below compares against the EFFECTIVE
++        // destinations instead. (The graph allocator routinely places a folded
++        // chain's result on a sibling's dead matvec buffer, and treating that as
++        // a conflict rejected most of the folds this pass exists for.)
++        bool is_member = false;
++        for (int mm = 0; mm < n_members; ++mm) {
++            is_member = is_member || (mid == members[mm]);
++        }
++        if (!is_member && !absorbed && !ggml_cuda_mmvq_ranges_disjoint(out, mid)) {
++            EPI_DBG("mid-dst out=%s(%p+%zu) mid=%s(%p+%zu) op=%d\n", out->name, out->data,
++                    ggml_nbytes(out), mid->name, mid->data, ggml_nbytes(mid), (int) mid->op);
++            return false;
++        }
++    }
++    for (int mm = 0; mm < n_members; ++mm) {
++        // the fold's own segment never materialises its matvec dst, so the
++        // epilogue destination is allowed to alias it (the allocator commonly
++        // places the elementwise result in place over it)
++        if (mm == own) {
++            continue;
++        }
++        const ggml_tensor * other = epi[mm].dst_node != nullptr ? epi[mm].dst_node : members[mm];
++        if (other == out) {
++            continue;
++        }
++        if (!ggml_cuda_mmvq_ranges_disjoint(out, other)) {
++            EPI_DBG("other out=%s(%p+%zu) other=%s(%p+%zu)\n", out->name, out->data, ggml_nbytes(out),
++                    other->name, other->data, ggml_nbytes(other));
++            return false;
++        }
++    }
++    return true;
++}
++
++static bool ggml_cuda_mmvf_epi_shape_ok(const ggml_tensor * t, const ggml_tensor * ref) {
++    return t != nullptr && t->type == GGML_TYPE_F32 && ggml_is_contiguous(t) &&
++           ggml_nelements(t) == ggml_nelements(ref);
++}
++
++static int ggml_cuda_mmvf_next_compute(const ggml_cgraph * cgraph, const int from, const int end) {
++    for (int k = from; k < end; ++k) {
++        if (!ggml_cuda_is_view_or_noop(cgraph->nodes[k])) {
++            return k;
++        }
++    }
++    return -1;
++}
++
++static void ggml_cuda_mmvf_collect_epilogues(
+         const ggml_cgraph * cgraph, const int start,
+-        ggml_tensor * const * members, const int n_members, ggml_tensor ** sig_nodes) {
++        ggml_tensor * const * members, const int n_members, mmvf_epilogue * epi) {
+     for (int m = 0; m < n_members; ++m) {
+-        sig_nodes[m] = nullptr;
++        epi[m] = mmvf_epilogue{};
+     }
+     static const bool disabled = getenv("GGML_CUDA_DISABLE_MMVF_SIG_FUSE") != nullptr &&
+                                  std::atoi(getenv("GGML_CUDA_DISABLE_MMVF_SIG_FUSE"));
+@@ -3443,62 +3595,86 @@ static void ggml_cuda_mmvf_collect_sigmoid_epilogues(
+     }
+     constexpr int scan_window = 48;
+     const int end = std::min(cgraph->n_nodes, start + 1 + scan_window);
++    // Two passes: whether a candidate is legal depends on the effective
++    // destinations of the OTHER segments, so a fold accepted late in the scan
++    // can unblock one that was rejected early. Two passes reach the fixed point
++    // for the group sizes here (<= 4).
++    for (int pass = 0; pass < 3; ++pass) {
+     for (int j = start + 1; j < end; ++j) {
+         ggml_tensor * cand = cgraph->nodes[j];
+-        if (cand->op != GGML_OP_UNARY || ggml_get_unary_op(cand) != GGML_UNARY_OP_SIGMOID) {
++
++        // ---- sigmoid(sum) ----
++        if (cand->op == GGML_OP_UNARY && ggml_get_unary_op(cand) == GGML_UNARY_OP_SIGMOID) {
++            const int m = ggml_cuda_mmvf_epi_member(cgraph, start, j, cand->src[0], members, n_members);
++            if (m < 0 || epi[m].dst_node != nullptr) {
++                continue;
++            }
++            if (!ggml_cuda_mmvf_epi_shape_ok(cand, members[m])) {
++                continue;
++            }
++            if (!ggml_cuda_mmvf_epi_legal(cgraph, start, j, cand, members, n_members, epi, m, nullptr, nullptr)) {
++                EPI_DBG("sig-illegal %s\n", cand->name);
++                continue;
++            }
++            EPI_DBG("sig-OK %s\n", cand->name);
++            epi[m].dst_node = cand;
++            epi[m].kind     = 1;
+             continue;
+         }
+-        for (int m = 0; m < n_members; ++m) {
+-            if (cand->src[0] != members[m] || sig_nodes[m] != nullptr) {
++
++        // ---- softplus(sum + bias) * scale (the GDN alpha chain) ----
++        if (cand->op == GGML_OP_ADD && !ggml_cuda_mmvf_epi_ext_disabled()) {
++            const int m = ggml_cuda_mmvf_epi_member(cgraph, start, j, cand->src[0], members, n_members);
++            if (m < 0 || epi[m].dst_node != nullptr) {
+                 continue;
+             }
+-            if (cand->type != GGML_TYPE_F32 || !ggml_is_contiguous(cand) ||
+-                    !ggml_is_contiguous(members[m]) || !ggml_are_same_shape(cand, members[m])) {
++            const ggml_tensor * bias = cand->src[1];
++            if (!ggml_cuda_mmvf_epi_shape_ok(cand, members[m]) ||
++                    !ggml_cuda_mmvf_epi_shape_ok(bias, members[m]) ||
++                    cand->src[2] != nullptr ||
++                    ggml_node_get_use_count(cgraph, j) != 1) {
++                EPI_DBG("add-shape %s uc=%d\n", cand->name, ggml_node_get_use_count(cgraph, j));
+                 continue;
+             }
+-            // the segment output must have no consumer other than this sigmoid
+-            int member_idx = -1;
+-            for (int k = start; k < j; ++k) {
+-                if (cgraph->nodes[k] == members[m]) {
+-                    member_idx = k;
+-                    break;
+-                }
++            const int js = ggml_cuda_mmvf_next_compute(cgraph, j + 1, end);
++            if (js < 0) {
++                continue;
+             }
+-            if (member_idx < 0 || ggml_node_get_use_count(cgraph, member_idx) != 1) {
++            ggml_tensor * sp = cgraph->nodes[js];
++            if (sp->op != GGML_OP_UNARY || ggml_get_unary_op(sp) != GGML_UNARY_OP_SOFTPLUS ||
++                    sp->src[0] != cand || !ggml_cuda_mmvf_epi_shape_ok(sp, members[m]) ||
++                    ggml_node_get_use_count(cgraph, js) != 1) {
++                EPI_DBG("add-nosp %s next=%s op=%d\n", cand->name, sp->name, (int) sp->op);
+                 continue;
+             }
+-            // hoisting the sigmoid's write to group-launch time must not
+-            // conflict with anything the intermediate nodes read or write
+-            bool legal = true;
+-            for (int k = start + 1; k < j && legal; ++k) {
+-                const ggml_tensor * mid = cgraph->nodes[k];
+-                if (ggml_cuda_is_view_or_noop(mid) || mid == members[m]) {
+-                    continue;
+-                }
+-                for (int si = 0; si < GGML_MAX_SRC && legal; ++si) {
+-                    if (mid->src[si] != nullptr && !ggml_cuda_mmvq_ranges_disjoint(cand, mid->src[si])) {
+-                        legal = false;
+-                    }
+-                }
+-                if (legal && !ggml_cuda_mmvq_ranges_disjoint(cand, mid)) {
+-                    legal = false;
+-                }
++            const int jm = ggml_cuda_mmvf_next_compute(cgraph, js + 1, end);
++            if (jm < 0) {
++                continue;
+             }
+-            // the fused write must not overlap any other segment's destination
+-            for (int mm = 0; mm < n_members && legal; ++mm) {
+-                if (mm == m) {
+-                    continue;
+-                }
+-                const ggml_tensor * other = sig_nodes[mm] != nullptr ? sig_nodes[mm] : members[mm];
+-                if (!ggml_cuda_mmvq_ranges_disjoint(cand, other)) {
+-                    legal = false;
+-                }
++            ggml_tensor * mul = cgraph->nodes[jm];
++            if (mul->op != GGML_OP_MUL || mul->src[0] != sp) {
++                EPI_DBG("add-nomul %s next=%s op=%d\n", cand->name, mul->name, (int) mul->op);
++                continue;
+             }
+-            if (legal) {
+-                sig_nodes[m] = cand;
++            const ggml_tensor * scale = mul->src[1];
++            if (!ggml_cuda_mmvf_epi_shape_ok(mul, members[m]) ||
++                    !ggml_cuda_mmvf_epi_shape_ok(scale, members[m])) {
++                continue;
++            }
++            if (!ggml_cuda_mmvf_epi_legal(cgraph, start, jm, mul, members, n_members, epi, m, cand, sp)) {
++                EPI_DBG("alpha-illegal %s\n", mul->name);
++                continue;
+             }
++            EPI_DBG("alpha-OK %s\n", mul->name);
++            epi[m].dst_node = mul;
++            epi[m].bias     = bias;
++            epi[m].scale    = scale;
++            epi[m].skip[0]  = cand;
++            epi[m].skip[1]  = sp;
++            epi[m].kind     = 2;
+         }
+     }
++    }
+ }
+ 
+ static int ggml_cuda_mmvf_collect_group(const ggml_cgraph * cgraph, const int start, ggml_tensor ** members, const int cc) {
+@@ -5631,15 +5807,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     ggml_tensor * members[MMVF_MAX_GROUP_SIZE];
+                     const int n_members = ggml_cuda_mmvf_collect_group(cgraph, i, members, cc_mmvf_group);
+                     if (n_members >= 2) {
+-                        ggml_tensor * sig_nodes[MMVF_MAX_GROUP_SIZE];
+-                        ggml_cuda_mmvf_collect_sigmoid_epilogues(cgraph, i, members, n_members, sig_nodes);
+-                        ggml_cuda_mul_mat_vec_f_grouped(*cuda_ctx, members, sig_nodes, n_members);
++                        mmvf_epilogue epi[MMVF_MAX_GROUP_SIZE];
++                        ggml_cuda_mmvf_collect_epilogues(cgraph, i, members, n_members, epi);
++                        ggml_cuda_mul_mat_vec_f_grouped(*cuda_ctx, members, epi, n_members);
+                         for (int m = 1; m < n_members; ++m) {
+                             mmvq_grouped_done.insert(members[m]);
+                         }
+                         for (int m = 0; m < n_members; ++m) {
+-                            if (sig_nodes[m] != nullptr) {
+-                                mmvq_grouped_done.insert(sig_nodes[m]);
++                            if (epi[m].dst_node != nullptr) {
++                                mmvq_grouped_done.insert(epi[m].dst_node);
++                                for (int sk = 0; sk < 2; ++sk) {
++                                    if (epi[m].skip[sk] != nullptr) {
++                                        mmvq_grouped_done.insert(epi[m].skip[sk]);
++                                    }
++                                }
+                             }
+                         }
+                         continue;
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index 6f9c0c576..d78cd41a4 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -753,7 +753,9 @@ static void mul_mat_vec_f_cuda(
+ struct mmvf_grouped_args {
+     const float * vx[MMVF_MAX_GROUP_SIZE];
+     float       * dst[MMVF_MAX_GROUP_SIZE];
+-    uint8_t       postop[MMVF_MAX_GROUP_SIZE]; // 0 = none, 1 = sigmoid (exact op_sigmoid math)
++    const float * bias[MMVF_MAX_GROUP_SIZE];   // postop 2 only
++    const float * scale[MMVF_MAX_GROUP_SIZE];  // postop 2 only
++    uint8_t       postop[MMVF_MAX_GROUP_SIZE]; // 0 = none, 1 = sigmoid, 2 = softplus(sum+bias)*scale
+     uint32_t      seg_end[MMVF_MAX_GROUP_SIZE - 1];
+ };
+ 
+@@ -821,13 +823,19 @@ static __global__ void mul_mat_vec_f_grouped(
+         return;
+     }
+     float out = sumf;
+-    if (args.postop[seg] != 0) {
++    const uint8_t postop = args.postop[seg];
++    if (postop == 1) {
+         out = 1.0f / (1.0f + expf(-out)); // must match op_sigmoid in unary.cu exactly
++    } else if (postop == 2) {
++        // must match ADD -> op_softplus -> MUL: the same three f32 statements,
++        // evaluated in the same order the three stock kernels evaluate them
++        const float biased = out + args.bias[seg][row];
++        out = ggml_cuda_softplus_f32(biased) * args.scale[seg][row];
+     }
+     dst[row] = out;
+ }
+ 
+-void ggml_cuda_mul_mat_vec_f_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, ggml_tensor * const * sigmoid_nodes, int n_nodes) {
++void ggml_cuda_mul_mat_vec_f_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, const mmvf_epilogue * epilogues, int n_nodes) {
+     GGML_ASSERT(n_nodes >= 2 && n_nodes <= MMVF_MAX_GROUP_SIZE);
+ 
+     const ggml_tensor * src1       = nodes[0]->src[1];
+@@ -858,13 +866,20 @@ void ggml_cuda_mul_mat_vec_f_grouped(ggml_backend_cuda_context & ctx, ggml_tenso
+         GGML_ASSERT(dst->ne[1] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1);
+ 
+         args.vx[m]  = (const float *) src0->data;
+-        if (sigmoid_nodes != nullptr && sigmoid_nodes[m] != nullptr) {
+-            // fused epilogue: write sigmoid(sum) straight into the sigmoid
++        const mmvf_epilogue * epi = epilogues != nullptr ? &epilogues[m] : nullptr;
++        if (epi != nullptr && epi->dst_node != nullptr) {
++            // fused epilogue: the chain result is written straight into the last
+             // node's destination; the matvec's own dst is never materialized
+-            // (its only consumer is the fused sigmoid)
+-            GGML_ASSERT(sigmoid_nodes[m]->src[0] == dst);
+-            args.dst[m]    = (float *) sigmoid_nodes[m]->data;
+-            args.postop[m] = 1;
++            // (its only consumer is the folded chain)
++            GGML_ASSERT(epi->kind == 1 || epi->kind == 2);
++            GGML_ASSERT(ggml_nelements(epi->dst_node) == dst->ne[0]);
++            args.dst[m]    = (float *) epi->dst_node->data;
++            args.postop[m] = epi->kind;
++            if (epi->kind == 2) {
++                GGML_ASSERT(epi->bias != nullptr && epi->scale != nullptr);
++                args.bias[m]  = (const float *) epi->bias->data;
++                args.scale[m] = (const float *) epi->scale->data;
++            }
+         } else {
+             args.dst[m]    = (float *) dst->data;
+             args.postop[m] = 0;
+diff --git a/ggml/src/ggml-cuda/mmvf.cuh b/ggml/src/ggml-cuda/mmvf.cuh
+index 564c6c101..7bc7ed949 100644
+--- a/ggml/src/ggml-cuda/mmvf.cuh
++++ b/ggml/src/ggml-cuda/mmvf.cuh
+@@ -12,7 +12,20 @@
+ // warp reduction are copied from mul_mat_vec_f<float, float, 1, warp_size,
+ // false, false>; only the (weight, dst) base pointers and the local row index
+ // depend on the group segment, and both are integer-only.
+-void ggml_cuda_mul_mat_vec_f_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, ggml_tensor * const * sigmoid_nodes, int n_nodes);
++// Elementwise chain folded into a grouped-mmvf segment epilogue.
++//   kind 1: dst_node = sigmoid(sum)
++//   kind 2: dst_node = softplus(sum + bias[row]) * scale[row]
++// skip[] lists the intermediate nodes the fold removes (kind 2: the ADD and the
++// SOFTPLUS); the caller adds them to the grouped-done set.
++struct mmvf_epilogue {
++    ggml_tensor *       dst_node = nullptr;
++    const ggml_tensor * bias     = nullptr;
++    const ggml_tensor * scale    = nullptr;
++    ggml_tensor *       skip[2]  = { nullptr, nullptr };
++    uint8_t             kind     = 0;
++};
++
++void ggml_cuda_mul_mat_vec_f_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, const mmvf_epilogue * epilogues, int n_nodes);
+ 
+ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+     const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 763657938..61d0b9718 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -386,11 +386,13 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+     GGML_ASSERT(ubatch.equal_seqs());
+     GGML_ASSERT(ubatch.n_tokens == n_seq_tokens * n_seqs);
+ 
+-    // Input projections
+-    auto qkvz = build_qkvz(cur, il);
+-    ggml_tensor * qkv_mixed = qkvz.first;
+-    ggml_tensor * z         = qkvz.second;
+-
++    // The beta/alpha matvecs and their tiny elementwise chains are emitted
++    // BEFORE the qkv/z projections so that `cur` (attn_norm) is still live while
++    // the graph allocator places their 128-byte results: otherwise it hands them
++    // the activation's own buffer, and the backend must then decline to fold
++    // them into the grouped-matvec epilogue (the hoisted write would race the
++    // group kernel's own reads of that activation). Ops, operands and shapes are
++    // unchanged - only the position in the node list.
+     // beta and alpha are two tiny independent F32 matvecs over the same
+     // activation. Emitting them adjacently (sigmoid deferred below) lets the
+     // CUDA backend fold them into one grouped launch; the ops, operands and
+@@ -407,6 +409,12 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+ 
+     beta = ggml_sigmoid(ctx0, beta);
+     cb(beta, "beta_sigmoid", il);
++    // Pin the tiny post-matvec chains next to their matvecs. Without this the
++    // topological visit emits them AFTER the whole conv block, so the graph
++    // allocator hands them buffers that alias long-lived conv tensors and the
++    // backend cannot fold them into the grouped-matvec epilogue. Ops, operands
++    // and shapes are unchanged - only the position in the node list.
++    ggml_build_forward_expand(gf, beta);
+ 
+     alpha = ggml_reshape_3d(ctx0, alpha, num_v_heads, n_seq_tokens, n_seqs);
+     cb(alpha, "alpha", il);
+@@ -417,9 +425,16 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+ 
+     ggml_tensor * gate = ggml_mul(ctx0, alpha_softplus, model.layers[il].ssm_a);  // -A_log.exp() * softplus
+     cb(gate, "gate", il);
++    ggml_build_forward_expand(gf, gate);
+ 
+     gate = ggml_reshape_4d(ctx0, gate, 1, num_v_heads, n_seq_tokens, n_seqs);
+ 
++    // Input projections
++    auto qkvz = build_qkvz(cur, il);
++    ggml_tensor * qkv_mixed = qkvz.first;
++    ggml_tensor * z         = qkvz.second;
++
++
+     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
+     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
+ 
