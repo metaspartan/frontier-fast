@@ -788,3 +788,44 @@ contract(off)` (no effect).
 Projection with 0032: decode 1.6494 (r12 1.5959 x 1.0335), prefill
 1.2468 x 1.0355 = 1.2911, ttft following prefill -> score **~1.494-1.499**
 vs the 1.4525 bank (0032 alone projects ~1.484).
+
+
+## 0034: MoE routing-weight multiply folded into the mul_mat_id epilogue (+1.5% decode, BYTE-EXACT)
+
+`ggml_mul(experts[2048, 8], weights[1, 8])` is one launch per layer - 40/token,
+1.52us each - moving 128 KB to apply eight scalars, when the matvec that just
+produced those bytes has the value in a register and knows which expert slot
+(destination channel) it is writing. 0034 adds `dst_scale` to the mm-fusion
+struct: one f32 per destination channel, applied before the store, with the
+store redirected to the MUL's destination. `GGML_CUDA_DISABLE_MOE_WEIGHT_FUSE=1`
+restores the stock pair.
+
+- toggle A/B, 5 rounds: tg128 137.38-137.69 -> **139.47-139.73**, median ratio
+  **1.0152**, 5/5 disjoint; pp512 neutral (4322.6 vs 4323.4 median)
+- dispatches 941 -> 901/token; k_bin_bcast 121 -> 81/token
+- whole-process vs stock, 5 rounds: tg128 median ratio **1.7254** (0033: 1.6934),
+  pp512 **1.3489**
+- ppl 3.9254-3.9286 vs stock 3.9314; ops suites OK
+- **server greedy 6/6 BYTE-EXACT** vs the fold-off control (and 6/6 A/A)
+
+**The lesson worth carrying: do not reuse `has_fusion` for a cheap epilogue.**
+The first version routed `dst_scale` through the existing `has_fusion` template
+flag and measured only **+0.76%**, with 4/6 prompts drifting. Two separate
+causes, both invisible from the call site:
+
+- `has_fusion=true` also instantiates the gate path, and its `tmp_shared_gate`
+  array doubles the block's LDS footprint. The Q5_K expert-down launch
+  (nwarps=8 compile-time, one warp actually launched) is LDS-occupancy-limited,
+  so the fused matvec went **12.92 -> 14.72us** and ate most of the saving.
+- `has_fusion` applies `result += x_biases[j]` unconditionally. That is the
+  identity on every value except -0.0, which is exactly enough to lose
+  byte-exactness and drift the greedy output.
+
+A dedicated `has_dst_scale` template parameter fixes both: the expert-down
+matvec keeps its 12.9us and its bits, and the same fold measures +1.52%.
+
+Remaining `k_bin_bcast` after this: two 40/token populations over [2048], the
+larger being `ffn_shexp * shared_gate` (1.84us each). The shexp down projection
+is an INDIVIDUAL mmvq (b=2048x1, 40/token, 3.45us), so relaxing `dst_scale` to
+the plain-MUL_MAT case with a single-element factor folds it the same way -
+~134us/token, the next round-16 item.
