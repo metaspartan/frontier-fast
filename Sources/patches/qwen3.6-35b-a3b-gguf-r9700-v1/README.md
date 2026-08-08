@@ -2767,6 +2767,31 @@ the change. Record that: server greedy on this box is not a clean 6/6 oracle.
 `GGML_CUDA_MMVQ_TOPK_COLAUNCH=0` restores the separate launch;
 `GGML_QWEN_SHEXP_GATEUP_PIN=0` restores stock node order.
 
+### The artifact trap that cost this round a submission slot
+
+The first submission of 0046 was **ranked and scored 1.6225 — flat against the
+banked 1.6261 — because the shipped patch file contained only the new header**.
+`git add ggml/src/ggml-cuda/topk-moe-body.cuh` followed by `git commit -F msg`
+(no `-a`, no second `git add`) committed exactly one file; `git format-patch`
+faithfully emitted exactly one file; `git apply --index` applied it without
+error, because adding an unused header IS a valid patch. The runner then built
+and measured the banked stack with a spare header in it, and reported the truth.
+
+Two checks, both cheap, catch this and nothing else does:
+
+```
+git apply --stat Sources/patches/<track>/<new>.patch     # must list every file
+strings <tree>/build/bin/libggml-hip.so.0.18.0 | grep <YOUR_ENV_TOGGLE>
+```
+
+The second one is the general form: **every patch in this series carries a
+disable toggle, so the toggle's env-var string is a fingerprint of whether the
+patch is in a given binary.** `~/gainz-runner-rocm/work/<sha>/llama-tree/` keeps
+the runner's own tree and build; grepping its `.so` for the toggle string is how
+this was diagnosed. Do not grep the runner's *sources* for the change — the
+worktree is reset after the run, and an untracked added file survives that reset
+while tracked edits do not, which is exactly the misleading picture it gave here.
+
 ### What this leaves for the rest of the hide-pool
 
 The machinery built here is a *guest block* with its own body inside the grouped

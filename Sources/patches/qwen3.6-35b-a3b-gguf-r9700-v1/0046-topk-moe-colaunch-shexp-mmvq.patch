@@ -1,4 +1,4 @@
-From 2ffb22c770d14ea3bf0d26202564abed8ae236ab Mon Sep 17 00:00:00 2001
+From 279df22ada8ec5bab3ea440228bf8e34a8b4026a Mon Sep 17 00:00:00 2001
 From: Claude Fable 5 <noreply@anthropic.com>
 Date: Sat, 8 Aug 2026 21:22:24 +0000
 Subject: [PATCH] cuda/hip: the topk_moe router selection co-launched inside
@@ -88,10 +88,404 @@ GGML_CUDA_MMVQ_TOPK_COLAUNCH=0 restores the separate topk_moe launch;
 GGML_QWEN_SHEXP_GATEUP_PIN=0 restores stock node order (and with it the
 byte-exact decode path, at the cost of the whole gain).
 ---
+ ggml/src/ggml-cuda/ggml-cuda.cu      | 172 ++++++++++-
+ ggml/src/ggml-cuda/mmvq.cu           |  78 ++++-
+ ggml/src/ggml-cuda/mmvq.cuh          |  20 +-
  ggml/src/ggml-cuda/topk-moe-body.cuh | 417 +++++++++++++++++++++++++++
- 1 file changed, 417 insertions(+)
+ ggml/src/ggml-cuda/topk-moe.cu       | 396 +------------------------
+ src/models/qwen35moe.cpp             |  83 +++++-
+ 6 files changed, 752 insertions(+), 414 deletions(-)
  create mode 100644 ggml/src/ggml-cuda/topk-moe-body.cuh
 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index e834a4786..e6cfc230b 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4152,6 +4152,155 @@ static int ggml_cuda_mmvf_collect_group(const ggml_cgraph * cgraph, const int st
+     return n;
+ }
+ 
++// ----- 0046: topk_moe co-launch guest ----------------------------------------
++//
++// The fused softmax/top-k/get_rows router selection runs as ONE workgroup, 40
++// times per decoded token: 2.9 us of kernel plus a ~1.3 us replay gap, and
++// almost all of it is launch latency rather than work. Its body is entirely
++// warp-local - no shared memory, no __syncthreads, only __shfl_xor over the 32
++// lanes of one warp - so it can run as warp 0 of one extra block of a grouped
++// mmvq launch and produce bit-identical ids and weights.
++//
++// The host is the shared-expert gate/up pair (Q8_0, 1024 blocks, 5.5 us), which
++// reads the same activation as the router and is independent of the whole
++// routed subgraph. Stock node order emits it AFTER the routed reduction, so the
++// graph half of this patch pins it between the router matvec and the top-k
++// chain; the guest then hides inside a host with 1024 times its block count.
++
++struct mmvq_topk_colaunch_info {
++    mmvq_topk_guest guest;
++    int first = -1;   // graph index of the fusion head (the SOFT_MAX)
++    int n_ops = 0;    // number of nodes the fusion consumes
++};
++
++static bool ggml_cuda_mmvq_topk_colaunch_enabled() {
++    static const bool e = []() -> bool {
++        const char * v = getenv("GGML_CUDA_MMVQ_TOPK_COLAUNCH");
++        return v == nullptr || std::atoi(v) != 0;
++    }();
++    return e;
++}
++
++static bool ggml_cuda_mmvq_colaunch_find_topk(
++        const ggml_cgraph * cgraph, const int start,
++        ggml_tensor * const * members, const int n_members,
++        mmvq_topk_colaunch_info * out) {
++    // the first real node after the group must be the fusion head
++    constexpr int scan_window = 8;
++    const int end_scan = std::min(cgraph->n_nodes, start + 1 + scan_window);
++    int j = -1;
++    for (int k = start + 1; k < end_scan; ++k) {
++        ggml_tensor * cand = cgraph->nodes[k];
++        if (ggml_cuda_is_view_or_noop(cand)) {
++            continue;
++        }
++        bool owned = false;
++        for (int m = 0; m < n_members; ++m) {
++            if (members[m] == cand) { owned = true; break; }
++        }
++        if (owned) {
++            continue;
++        }
++        j = k;
++        break;
++    }
++    if (j < 0) {
++        return false;
++    }
++
++    ggml_tensor * head = cgraph->nodes[j];
++    if (head->op != GGML_OP_SOFT_MAX) {
++        return false;
++    }
++    ggml_cuda_topk_moe_args args;
++    if (!ggml_cuda_topk_moe_fusion(cgraph, j, args)) {
++        return false;
++    }
++    // the guest instantiation is softmax gating, no bias, no delayed softmax
++    if (!args.softmax || args.delayed_softmax || args.prob_bias || args.sigmoid || args.sqrt_softplus) {
++        return false;
++    }
++
++    // rebuild exactly the op list the standalone fusion consumes
++    std::vector<ggml_op> ops = { GGML_OP_SOFT_MAX };
++    const int i_probs = j + (int) ops.size() - 1;
++    ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_ARGSORT, GGML_OP_VIEW, GGML_OP_GET_ROWS });
++    int out_nodes[2];
++    out_nodes[0] = i_probs + 3;
++    if (out_nodes[0] >= cgraph->n_nodes) {
++        return false;
++    }
++    ggml_tensor * ids = cgraph->nodes[out_nodes[0]];
++    const ggml_tensor * clamp = nullptr;
++    const ggml_tensor * scale = nullptr;
++    if (args.norm) {
++        ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP, GGML_OP_DIV, GGML_OP_RESHAPE });
++        clamp = cgraph->nodes[j + (int) ops.size() - 3];
++    }
++    if (args.scale) {
++        ops.insert(ops.end(), { GGML_OP_SCALE });
++        scale = cgraph->nodes[j + (int) ops.size() - 1];
++    }
++    out_nodes[1] = j + (int) ops.size() - 1;
++    if (out_nodes[1] >= cgraph->n_nodes) {
++        return false;
++    }
++    ggml_tensor * weights = cgraph->nodes[out_nodes[1]];
++    const ggml_tensor * logits = head->src[0];
++
++    if (!ggml_can_fuse_subgraph(cgraph, j, ops.size(), ops.data(), out_nodes, 2) ||
++            !ggml_cuda_should_use_topk_moe(head, logits, weights, ids) ||
++            !ggml_cuda_check_fusion_memory_ranges(cgraph, j, ops.size(), out_nodes, 2, /*is_topk_moe=*/true)) {
++        return false;
++    }
++
++    // the single guest instantiation: 256 experts, one row, no bias
++    if (ids->nb[0] == 0 || (int) (ids->nb[1] / ids->nb[0]) != 256) {
++        return false;
++    }
++    if (logits->ne[1] != 1 || logits->ne[2] != 1 || logits->ne[3] != 1) {
++        return false;
++    }
++    if (weights->ne[1] < 1 || weights->ne[1] > 256) {
++        return false;
++    }
++    if (logits->type != GGML_TYPE_F32 || weights->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32) {
++        return false;
++    }
++
++    // The guest and the host run in ONE kernel with no ordering between them,
++    // where the separate launches were ordered by the stream. Everything the
++    // guest writes (ids, weights) must be disjoint from every host write and
++    // host input, and the guest input (the logits) from every host write. The
++    // graph allocator layout is shape-dependent, so this is checked on actual
++    // data ranges, not on names - see 0045, where skipping the equivalent check
++    // shipped a race visible only at long context.
++    for (int m = 0; m < n_members; ++m) {
++        const ggml_tensor * w = members[m];
++        if (!ggml_cuda_mmvq_ranges_disjoint(w, ids) ||
++                !ggml_cuda_mmvq_ranges_disjoint(w, weights) ||
++                !ggml_cuda_mmvq_ranges_disjoint(w, logits) ||
++                !ggml_cuda_mmvq_ranges_disjoint(ids, w->src[0]) ||
++                !ggml_cuda_mmvq_ranges_disjoint(ids, w->src[1]) ||
++                !ggml_cuda_mmvq_ranges_disjoint(weights, w->src[0]) ||
++                !ggml_cuda_mmvq_ranges_disjoint(weights, w->src[1])) {
++            return false;
++        }
++    }
++
++    out->guest.logits        = (const float *) logits->data;
++    out->guest.weights       = (float *) weights->data;
++    out->guest.ids           = (int32_t *) ids->data;
++    out->guest.clamp_val     = clamp != nullptr ? ggml_get_op_params_f32(clamp, 0) : -INFINITY;
++    out->guest.scale_val     = scale != nullptr ? ggml_get_op_params_f32(scale, 0) : 1.0f;
++    out->guest.n_expert_used = (int) weights->ne[1];
++    out->guest.with_norm     = clamp != nullptr;
++    out->guest.active        = true;
++    out->first               = j;
++    out->n_ops               = (int) ops.size();
++    return true;
++}
++
+ // ----- 0045: quantized/F32 matvec co-launch ----------------------------------
+ //
+ // Per-node HIP graph replay on gfx1201 costs ~1.3 us of exposed GPU time that no
+@@ -4284,6 +4433,16 @@ static int ggml_cuda_mmvq_colaunch_find_q(
+                 }
+             }
+         }
++        // 0046: if this quantized group can host the topk_moe guest instead,
++        // leave it alone. Merging it with the tiny F32 group removes the same
++        // one dispatch but measured flat (host/guest ratio 1.1); hosting the
++        // one-workgroup topk hides a whole 2.9 us launch in a 1024-block host.
++        if (ggml_cuda_mmvq_topk_colaunch_enabled() && q_members[0]->src[0]->type == GGML_TYPE_Q8_0) {
++            mmvq_topk_colaunch_info tk;
++            if (ggml_cuda_mmvq_colaunch_find_topk(cgraph, j, q_members, n_q, &tk)) {
++                return 0;
++            }
++        }
+         return n_q;
+     }
+     return 0;
+@@ -6529,7 +6688,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     ggml_tensor * members[MMVQ_MAX_GROUP_SIZE];
+                     const int n_members = ggml_cuda_mmvq_collect_group(cgraph, i, members);
+                     if (n_members >= 2) {
+-                        ggml_cuda_mul_mat_vec_q_grouped(*cuda_ctx, members, n_members);
++                        // 0046: hide the one-workgroup topk_moe fusion in this launch
++                        mmvq_topk_colaunch_info tk;
++                        const bool have_tk = ggml_cuda_mmvq_topk_colaunch_enabled() &&
++                                             node->src[0]->type == GGML_TYPE_Q8_0 &&
++                                             ggml_cuda_mmvq_colaunch_find_topk(cgraph, i, members, n_members, &tk);
++                        ggml_cuda_mul_mat_vec_q_grouped(*cuda_ctx, members, n_members, nullptr, nullptr, 0,
++                                                        have_tk ? &tk.guest : nullptr);
++                        if (have_tk) {
++                            for (int k = 0; k < tk.n_ops; ++k) {
++                                mmvq_grouped_done.insert(cgraph->nodes[tk.first + k]);
++                            }
++                        }
+                         for (int m = 1; m < n_members; ++m) {
+                             mmvq_grouped_done.insert(members[m]);
+                         }
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 0c81133bf..74e483c88 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1,5 +1,6 @@
+ #include "mmvq.cuh"
+ #include "mmvf.cuh"
++#include "topk-moe-body.cuh"
+ #include "quantize.cuh"
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
+@@ -984,9 +985,19 @@ struct mmvq_grouped_args {
+     uint32_t      f_ncols2;
+     uint32_t      f_stride_row;
+     uint8_t       f_postop[MMVQ_F32_TAIL_MAX];
++
++    // 0046 topk_moe co-launch guest. Runs as warp 0 of block 0 (the FRONT of
++    // the grid - see 0045 on block order); the quantized rows shift up by one.
++    const float * tk_logits;
++    float       * tk_weights;
++    int32_t     * tk_ids;
++    float         tk_clamp;
++    float         tk_scale;
++    int32_t       tk_n_expert_used;
++    uint8_t       tk_with_norm;
+ };
+ 
+-template <ggml_type type, bool small_k = false>
++template <ggml_type type, bool small_k = false, bool has_topk = false>
+ __launch_bounds__(calc_nwarps(type, 1, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q_grouped(
+         const mmvq_grouped_args args, const void * vy_ptr,
+@@ -1012,16 +1023,38 @@ static __global__ void mul_mat_vec_q_grouped(
+ 
+     const int tid = warp_size*threadIdx.y + threadIdx.x;
+ 
++    // ---- 0046: topk_moe co-launch guest --------------------------------------
++    // One warp of one block, the same 32 lanes the standalone launch gives it.
++    // The body is warp-local (no shared memory, no __syncthreads), so the ids
++    // and weights are bit-identical to the standalone kernel.
++    constexpr uint32_t tk_blocks = has_topk ? 1u : 0u;
++    if constexpr (has_topk) {
++        if (blockIdx.x == 0) {
++            if (threadIdx.y == 0) {
++                topk_moe_config cfg;
++                cfg.use_sigmoid       = false;
++                cfg.use_sqrt_softplus = false;
++                cfg.with_norm         = args.tk_with_norm != 0;
++                cfg.delayed_softmax   = false;
++                topk_moe_body<256, false>(args.tk_logits, args.tk_weights, args.tk_ids, nullptr,
++                                          /*n_rows=*/1, args.tk_n_expert_used, args.tk_clamp, args.tk_scale,
++                                          cfg, /*row=*/0);
++            }
++            return;
++        }
++    }
++    const uint32_t bx = blockIdx.x - tk_blocks;
++
+     // ---- 0045: F32 co-launch tail -------------------------------------------
+     // One warp per row, exactly as mul_mat_vec_f_grouped launches it: the same
+     // lane->column mapping (col = threadIdx.x + n*warp_size, ascending), the
+     // same two ggml_cuda_mad per float2, the same warp_reduce_sum and the same
+     // epilogue expressions. Bit-identical to the standalone grouped launch.
+-    if (args.f_nrows != 0 && blockIdx.x < args.f_nrows) {
++    if (args.f_nrows != 0 && bx < args.f_nrows) {
+         if (threadIdx.y != 0) {
+             return;
+         }
+-        const uint32_t brow = blockIdx.x;
++        const uint32_t brow = bx;
+         uint32_t fseg = 0, fstart = 0;
+ #pragma unroll
+         for (int s = 0; s < MMVQ_F32_TAIL_MAX - 1; ++s) {
+@@ -1063,7 +1096,7 @@ static __global__ void mul_mat_vec_q_grouped(
+ 
+     // Segment routing: uniform across the block (it depends only on blockIdx.x),
+     // integer-only, and the sole difference from the individual launch.
+-    const uint32_t qblk = blockIdx.x - args.f_nrows;
++    const uint32_t qblk = bx - args.f_nrows;
+     uint32_t seg       = 0;
+     uint32_t seg_start = 0;
+ #pragma unroll
+@@ -1159,7 +1192,7 @@ static __global__ void mul_mat_vec_q_grouped(
+     }
+ }
+ 
+-template <ggml_type type>
++template <ggml_type type, bool has_topk = false>
+ static void mul_mat_vec_q_grouped_launch(
+         const mmvq_grouped_args & args_in, const void * vy, const uint32_t total_rows,
+         const uint32_t ncols_x, const uint32_t stride_row_x, cudaStream_t stream) {
+@@ -1175,7 +1208,7 @@ static void mul_mat_vec_q_grouped_launch(
+     // the arch/type opts in and every segment row count divides evenly.
+     if constexpr (type == GGML_TYPE_Q6_K) {
+         constexpr int rpb = calc_rows_per_block(1, MMVQ_PARAMETERS_RDNA4, /*small_k=*/true, 8);
+-        if (rpb > 1 && table_id == MMVQ_PARAMETERS_RDNA4 && mmvq_r4_rpb_enabled() &&
++        if (rpb > 1 && table_id == MMVQ_PARAMETERS_RDNA4 && mmvq_r4_rpb_enabled() && !has_topk &&
+                 args_in.f_nrows == 0 &&
+                 (int) total_rows >= mmvq_r4_rpb_min_rows()) {
+             bool divisible = true;
+@@ -1203,16 +1236,24 @@ static void mul_mat_vec_q_grouped_launch(
+     // Same block shape (including the idle-warp trim, which depends only on the
+     // shared ncols_x) as each individual launch would use. The F32 co-launch
+     // tail only appends blocks; every quantized block keeps its own index.
+-    const dim3 block_nums(total_rows + args_in.f_nrows, 1, 1);
++    const dim3 block_nums(total_rows + args_in.f_nrows + (has_topk ? 1u : 0u), 1, 1);
+     const dim3 block_dims(warp_size, calc_nwarps_launched<type>(ncols_x, nwarps, warp_size, table_id), 1);
+ 
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+-    ggml_cuda_kernel_launch(mul_mat_vec_q_grouped<type>, launch_params, args_in, vy, ncols_x, stride_row_x);
++    ggml_cuda_kernel_launch(mul_mat_vec_q_grouped<type, false, has_topk>, launch_params, args_in, vy, ncols_x, stride_row_x);
+ }
+ 
+ static void mul_mat_vec_q_grouped_switch_type(
+         const ggml_type type, const mmvq_grouped_args & args, const void * vy, const uint32_t total_rows,
+-        const uint32_t ncols_x, const uint32_t stride_row_x, cudaStream_t stream) {
++        const uint32_t ncols_x, const uint32_t stride_row_x, cudaStream_t stream, const bool has_topk = false) {
++    if (has_topk) {
++        // 0046: exactly one extra instantiation - the shared-expert gate/up pair
++        // this GGUF ships as Q8_0. Every other type declines host-side, so the
++        // guest never enters an instantiation the rest of the graph runs.
++        GGML_ASSERT(type == GGML_TYPE_Q8_0);
++        mul_mat_vec_q_grouped_launch<GGML_TYPE_Q8_0, true>(args, vy, total_rows, ncols_x, stride_row_x, stream);
++        return;
++    }
+     switch (type) {
+ #define MMVQ_GROUPED_CASE(t) case t: mul_mat_vec_q_grouped_launch<t>(args, vy, total_rows, ncols_x, stride_row_x, stream); break;
+         MMVQ_GROUPED_CASE(GGML_TYPE_Q1_0)
+@@ -2115,7 +2156,8 @@ void ggml_cuda_op_mul_mat_vec_q(
+ }
+ 
+ void ggml_cuda_mul_mat_vec_q_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes,
+-                                     ggml_tensor * const * f32_nodes, const mmvf_epilogue * f32_epilogues, int n_f32_nodes) {
++                                     ggml_tensor * const * f32_nodes, const mmvf_epilogue * f32_epilogues, int n_f32_nodes,
++                                     const mmvq_topk_guest * topk_guest) {
+     GGML_ASSERT(n_nodes >= 2 && n_nodes <= MMVQ_MAX_GROUP_SIZE);
+ 
+     const ggml_tensor * src1       = nodes[0]->src[1];
+@@ -2239,5 +2281,19 @@ void ggml_cuda_mul_mat_vec_q_grouped(ggml_backend_cuda_context & ctx, ggml_tenso
+         args.f_stride_row = (uint32_t) f_stride_row;
+     }
+ 
+-    mul_mat_vec_q_grouped_switch_type(type, args, src1_q8_1, total_rows, (uint32_t) ne10, (uint32_t) stride_row_x, stream);
++    // ---- 0046: attach the topk_moe guest -----------------------------------
++    bool has_topk = false;
++    if (topk_guest != nullptr && topk_guest->active) {
++        GGML_ASSERT(n_f32_nodes == 0);
++        args.tk_logits        = topk_guest->logits;
++        args.tk_weights       = topk_guest->weights;
++        args.tk_ids           = topk_guest->ids;
++        args.tk_clamp         = topk_guest->clamp_val;
++        args.tk_scale         = topk_guest->scale_val;
++        args.tk_n_expert_used = topk_guest->n_expert_used;
++        args.tk_with_norm     = topk_guest->with_norm ? 1 : 0;
++        has_topk              = true;
++    }
++
++    mul_mat_vec_q_grouped_switch_type(type, args, src1_q8_1, total_rows, (uint32_t) ne10, (uint32_t) stride_row_x, stream, has_topk);
+ }
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index e47f85525..ac859bf2a 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -24,9 +24,27 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
+ // results are byte-identical to their own launch; only the dispatch is gone.
+ #define MMVQ_F32_TAIL_MAX 4
+ struct mmvf_epilogue;
++
++// 0046: the fused softmax/top-k/get_rows MoE router selection is one workgroup
++// of pure launch latency, 40 times a decoded token. Its body is entirely
++// warp-local (no shared memory, no __syncthreads, only __shfl_xor over 32
++// lanes), so it can run as warp 0 of ONE extra block of a grouped mmvq launch
++// with a bit-identical result. Filled in by the detector in ggml-cuda.cu.
++struct mmvq_topk_guest {
++    const float * logits        = nullptr;
++    float *       weights       = nullptr;
++    int32_t *     ids           = nullptr;
++    float         clamp_val     = 0.0f;
++    float         scale_val     = 1.0f;
++    int           n_expert_used = 0;
++    bool          with_norm     = false;
++    bool          active        = false;
++};
++
+ void ggml_cuda_mul_mat_vec_q_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes,
+                                      ggml_tensor * const * f32_nodes = nullptr,
+-                                     const mmvf_epilogue * f32_epilogues = nullptr, int n_f32_nodes = 0);
++                                     const mmvf_epilogue * f32_epilogues = nullptr, int n_f32_nodes = 0,
++                                     const mmvq_topk_guest * topk_guest = nullptr);
+ 
+ // Maximum number of MoE expert slots whose partial results the expert-reduce
+ // kernel below can fold into one store (n_expert_used).
 diff --git a/ggml/src/ggml-cuda/topk-moe-body.cuh b/ggml/src/ggml-cuda/topk-moe-body.cuh
 new file mode 100644
 index 000000000..11e9a09ba
@@ -515,6 +909,529 @@ index 000000000..11e9a09ba
 +    }
 +}
 +
+diff --git a/ggml/src/ggml-cuda/topk-moe.cu b/ggml/src/ggml-cuda/topk-moe.cu
+index d29967ba2..5f0e8bdb8 100644
+--- a/ggml/src/ggml-cuda/topk-moe.cu
++++ b/ggml/src/ggml-cuda/topk-moe.cu
+@@ -5,110 +5,8 @@
+ #include <cmath>
+ #include <initializer_list>
+ 
+-// Kernel config struct - passed by value to CUDA kernel
+-struct topk_moe_config {
+-    bool use_sigmoid;
+-    bool use_sqrt_softplus;
+-    bool with_norm;
+-    bool delayed_softmax;
+-};
++#include "topk-moe-body.cuh"
+ 
+-// Warp-local softmax used for both the pre-top-k logits and the post-top-k delayed path.
+-template <int experts_per_thread, bool use_limit>
+-__device__ void softmax_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
+-    float max_val = -INFINITY;
+-
+-#pragma unroll
+-    for (int i = 0; i < experts_per_thread; i++) {
+-        const int  idx    = lane + i * WARP_SIZE;
+-        const bool active = !use_limit || (idx < limit);
+-        if (active) {
+-            max_val = max(max_val, vals[i]);
+-        }
+-    }
+-
+-    max_val = warp_reduce_max(max_val);
+-
+-    float sum = 0.f;
+-
+-#pragma unroll
+-    for (int i = 0; i < experts_per_thread; i++) {
+-        const int  idx    = lane + i * WARP_SIZE;
+-        const bool active = !use_limit || (idx < limit);
+-        if (active) {
+-            const float val = expf(vals[i] - max_val);
+-            vals[i]         = val;
+-            sum += val;
+-        } else {
+-            vals[i] = 0.f;
+-        }
+-    }
+-
+-    sum = warp_reduce_sum(sum);
+-
+-    const float inv_sum = 1.0f / sum;
+-
+-#pragma unroll
+-    for (int i = 0; i < experts_per_thread; i++) {
+-        const int  idx    = lane + i * WARP_SIZE;
+-        const bool active = !use_limit || (idx < limit);
+-        if (active) {
+-            vals[i] *= inv_sum;
+-        }
+-    }
+-}
+-
+-template <int experts_per_thread, bool use_limit>
+-__device__ void sigmoid_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
+-#pragma unroll
+-    for (int i = 0; i < experts_per_thread; i++) {
+-        const int  idx    = lane + i * WARP_SIZE;
+-        const bool active = !use_limit || (idx < limit);
+-        vals[i]           = active ? 1.f / (1.f + expf(-vals[i])) : -INFINITY;
+-    }
+-}
+-
+-template <int experts_per_thread, bool use_limit>
+-__device__ void sqrt_softplus_warp_inplace(float (&vals)[experts_per_thread], const int limit, const int lane) {
+-#pragma unroll
+-    for (int i = 0; i < experts_per_thread; i++) {
+-        const int  idx    = lane + i * WARP_SIZE;
+-        const bool active = !use_limit || (idx < limit);
+-        vals[i]           = active ? sqrtf(vals[i] > 20.0f ? vals[i] : logf(1.0f + expf(vals[i]))) : -INFINITY;
+-    }
+-}
+-
+-
+-// Order-preserving unsigned image of a float: for any two non-NaN floats a, b
+-// (a > b) <=> (topk_moe_order(a) > topk_moe_order(b)). The selection value goes
+-// in the high word and the complement of the expert index in the low word, so a
+-// single unsigned 64-bit compare reproduces the stock comparison including its
+-// "on a tie the lower expert index wins" rule.
+-static __device__ __forceinline__ uint64_t topk_moe_key(float v, int expert) {
+-    uint32_t u = __float_as_uint(v);
+-    u = (u & 0x80000000u) ? ~u : (u | 0x80000000u);
+-    return ((uint64_t) u << 32) | (uint64_t) (0xFFFFFFFFu - (uint32_t) expert);
+-}
+-
+-static __device__ __forceinline__ int topk_moe_key_expert(uint64_t k) {
+-    return (int) (0xFFFFFFFFu - (uint32_t) k);
+-}
+-
+-static __device__ __forceinline__ uint64_t topk_moe_shfl_xor(uint64_t v, int mask) {
+-    const int lo = __shfl_xor_sync(0xFFFFFFFF, (int) (uint32_t) (v & 0xFFFFFFFFu), mask, WARP_SIZE);
+-    const int hi = __shfl_xor_sync(0xFFFFFFFF, (int) (uint32_t) (v >> 32),         mask, WARP_SIZE);
+-    return ((uint64_t) (uint32_t) hi << 32) | (uint64_t) (uint32_t) lo;
+-}
+-
+-/*
+-    This kernel does the following:
+-    1. optionally softmax over the logits per token [n_experts, n_tokens]
+-    2. argmax reduce over the top-k (n_experts_used) logits
+-    3. write weights + ids to global memory
+-    4. optionally normalize the weights or apply softmax over the selected logits
+-
+-    It is intended as fusion of softmax->top-k->get_rows pipeline for MoE models
+-*/
+ template <int n_experts, bool has_bias>
+ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float *         logits,
+                                                                   float *               weights,
+@@ -119,296 +17,8 @@ __launch_bounds__(4 * WARP_SIZE, 1) __global__ void topk_moe_cuda(const float *
+                                                                   const float           clamp_val,
+                                                                   const float           scale_val,
+                                                                   const topk_moe_config config) {
+-    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+-    if (row >= n_rows) {
+-        return;
+-    }
+-
+-    logits += n_experts * row;
+-    weights += n_expert_used * row;
+-    ids += n_experts * row;
+-
+-    constexpr int experts_per_thread = (n_experts > WARP_SIZE) ? n_experts / WARP_SIZE : 1;
+-
+-    float wt[experts_per_thread];
+-
+-    // Initialize all slots to -INFINITY
+-#pragma unroll
+-    for (int i = 0; i < experts_per_thread; i++) {
+-        wt[i] = -INFINITY;
+-    }
+-
+-    ggml_cuda_pdl_sync();
+-#pragma unroll
+-    for (int i = 0; i < n_experts; i += WARP_SIZE) {
+-        const int expert  = i + threadIdx.x;
+-        wt[i / WARP_SIZE] = (n_experts % WARP_SIZE == 0 || expert < n_experts) ? logits[expert] : -INFINITY;
+-    }
+-
+-    if (!config.delayed_softmax) {
+-        if (config.use_sigmoid) {
+-           sigmoid_warp_inplace<experts_per_thread, false>(wt, n_experts, threadIdx.x);
+-        } else if (config.use_sqrt_softplus) {
+-           sqrt_softplus_warp_inplace<experts_per_thread, false>(wt, n_experts, threadIdx.x);
+-        } else {
+-           softmax_warp_inplace<experts_per_thread, false>(wt, n_experts, threadIdx.x);
+-        }
+-    }
+-
+-    // Sanitize NaN to -FLT_MAX so the iterative argmax produces unique expert IDs.
+-    // NaN comparisons always return false, which would cause the same expert to be
+-    // selected repeatedly. -FLT_MAX compares normally and is still excluded by the
+-    // -INFINITY sentinel used after each selection round.
+-    // More relevant for the cuBLAS path. See https://github.com/ggml-org/llama.cpp/issues/19659
+-#pragma unroll
+-    for (int i = 0; i < experts_per_thread; i++) {
+-        if (__isnanf(wt[i])) {
+-            wt[i] = -FLT_MAX;
+-        }
+-    }
+-
+-    // selection_wt is only needed when bias is present (selection uses wt + bias)
+-    // when no bias, we use wt directly for both selection and weight values
+-    [[maybe_unused]] float selection_wt[has_bias ? experts_per_thread : 1];
+-
+-    if constexpr (has_bias) {
+-#pragma unroll
+-        for (int i = 0; i < experts_per_thread; i++) {
+-            selection_wt[i] = -INFINITY;
+-        }
+-#pragma unroll
+-        for (int i = 0; i < n_experts; i += WARP_SIZE) {
+-            const int expert = i + threadIdx.x;
+-            selection_wt[i / WARP_SIZE] =
+-                (n_experts % WARP_SIZE == 0 || expert < n_experts) ? wt[i / WARP_SIZE] + bias[expert] : -INFINITY;
+-        }
+-    }
+-
+-    //at this point, each thread holds either a portion of the softmax distribution
+-    //or the raw logits. We do the argmax reduce over n_expert_used, each time marking
+-    //the expert weight as -inf to exclude from the next iteration
+-
+-    ggml_cuda_pdl_lc();
+-
+-    // Sorted-list top-k.
+-    //
+-    // The argmax loop below runs one full 5-step __shfl_xor butterfly per
+-    // selected expert, and every step waits on the previous one, so selecting
+-    // top-8 on wave32 is a chain of 40 dependent cross-lane round trips with
+-    // almost no work between them. This kernel is launched as a single
+-    // workgroup (one row per decoded token), so that chain is the whole kernel:
+-    // 39 launches per token on this model, ~3.4% of decode kernel time.
+-    //
+-    // Same result, fixed depth: sort the experts each lane holds into a
+-    // descending list (lane-local, no cross-lane traffic), then run a 5-round
+-    // xor butterfly where each round merges the two partner lists and keeps the
+-    // larger half (bitonic half-cleaner + merge). The shuffles inside a round
+-    // are independent, so the dependent depth is 5 rounds instead of 40, and
+-    // the butterfly leaves every lane holding the same sorted top list.
+-    //
+-    // Selection is by the same values with the same tie-break as the loop
+-    // below, the weights are the same floats, and the normalisation sum is
+-    // rebuilt with the stock per-lane partials and the stock warp butterfly, so
+-    // the kernel is bit-identical to the one it replaces.
+-    if (!config.delayed_softmax && n_expert_used <= experts_per_thread) {
+-        uint64_t key[experts_per_thread];
+-        float    wv[experts_per_thread];
+-
+-#pragma unroll
+-        for (int i = 0; i < experts_per_thread; i++) {
+-            const int expert = threadIdx.x + i * WARP_SIZE;
+-            float     sel;
+-            if constexpr (has_bias) {
+-                sel = selection_wt[i];
+-            } else {
+-                sel = wt[i];
+-            }
+-            key[i] = topk_moe_key(sel, expert);
+-            wv[i]  = wt[i];
+-        }
+-
+-        // lane-local bitonic sort, descending
+-#pragma unroll
+-        for (int k = 2; k <= experts_per_thread; k <<= 1) {
+-#pragma unroll
+-            for (int j = k >> 1; j > 0; j >>= 1) {
+-#pragma unroll
+-                for (int i = 0; i < experts_per_thread; i++) {
+-                    const int l = i ^ j;
+-                    if (l > i) {
+-                        const bool desc = ((i & k) == 0);
+-                        const bool sw   = desc ? (key[i] < key[l]) : (key[i] > key[l]);
+-                        if (sw) {
+-                            const uint64_t tk = key[i]; key[i] = key[l]; key[l] = tk;
+-                            const float    tw = wv[i];  wv[i]  = wv[l];  wv[l]  = tw;
+-                        }
+-                    }
+-                }
+-            }
+-        }
+-
+-        // butterfly: merge partner lists, keep the larger half, re-sort
+-#pragma unroll
+-        for (int mask = 1; mask < WARP_SIZE; mask <<= 1) {
+-            uint64_t pk[experts_per_thread];
+-            float    pw[experts_per_thread];
+-#pragma unroll
+-            for (int i = 0; i < experts_per_thread; i++) {
+-                pk[i] = topk_moe_shfl_xor(key[i], mask);
+-                pw[i] = __shfl_xor_sync(0xFFFFFFFF, wv[i], mask, WARP_SIZE);
+-            }
+-#pragma unroll
+-            for (int i = 0; i < experts_per_thread; i++) {
+-                const int j = experts_per_thread - 1 - i;
+-                if (pk[j] > key[i]) {
+-                    key[i] = pk[j];
+-                    wv[i]  = pw[j];
+-                }
+-            }
+-#pragma unroll
+-            for (int j = experts_per_thread >> 1; j > 0; j >>= 1) {
+-#pragma unroll
+-                for (int i = 0; i < experts_per_thread; i++) {
+-                    const int l = i ^ j;
+-                    if (l > i && key[i] < key[l]) {
+-                        const uint64_t tk = key[i]; key[i] = key[l]; key[l] = tk;
+-                        const float    tw = wv[i];  wv[i]  = wv[l];  wv[l]  = tw;
+-                    }
+-                }
+-            }
+-        }
+-
+-        float inv_sum = 1.0f;
+-        if (config.with_norm) {
+-            // Reproduce the stock normalisation sum exactly: each lane adds the
+-            // weights of the selected experts it owns, in increasing k, and the
+-            // 32 partials go through the same warp butterfly. Same addends, same
+-            // per-lane order, same reduction -> bit-identical wt_sum.
+-            float contrib = 0.f;
+-#pragma unroll
+-            for (int i = 0; i < experts_per_thread; i++) {
+-                if (i < n_expert_used) {
+-                    const int e = topk_moe_key_expert(key[i]);
+-                    if ((e & (WARP_SIZE - 1)) == (int) threadIdx.x) {
+-                        contrib += wv[i];
+-                    }
+-                }
+-            }
+-            float sum = warp_reduce_sum(contrib);
+-            sum       = max(sum, clamp_val);
+-            inv_sum   = 1.0f / sum;
+-        }
+-
+-        // every lane holds the same list; lane i publishes slot i
+-#pragma unroll
+-        for (int i = 0; i < experts_per_thread; i++) {
+-            if ((int) threadIdx.x == i && i < n_expert_used) {
+-                ids[i]     = topk_moe_key_expert(key[i]);
+-                weights[i] = (config.with_norm ? wv[i] * inv_sum : wv[i]) * scale_val;
+-            }
+-        }
+-        return;
+-    }
+-
+-    float wt_sum = 0.f;
+-
+-    float output_weights[experts_per_thread];
+-
+-#pragma unroll
+-    for (int i = 0; i < experts_per_thread; i++) {
+-        output_weights[i] = 0.f;
+-    }
+-
+-    for (int k = 0; k < n_expert_used; k++) {
+-        float max_val    = wt[0];
+-        int   max_expert = threadIdx.x;
+-
+-        if constexpr (has_bias) {
+-            float max_val_s = selection_wt[0];
+-
+-#pragma unroll
+-            for (int i = 1; i < experts_per_thread; i++) {
+-                const int expert = threadIdx.x + i * WARP_SIZE;
+-                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && selection_wt[i] > max_val_s) {
+-                    max_val    = wt[i];
+-                    max_val_s  = selection_wt[i];
+-                    max_expert = expert;
+-                }
+-            }
+-
+-#pragma unroll
+-            for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
+-                const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
+-                const float val_s  = __shfl_xor_sync(0xFFFFFFFF, max_val_s, mask, WARP_SIZE);
+-                const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
+-                if (val_s > max_val_s || (val_s == max_val_s && expert < max_expert)) {
+-                    max_val    = val;
+-                    max_val_s  = val_s;
+-                    max_expert = expert;
+-                }
+-            }
+-
+-            if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
+-                selection_wt[max_expert / WARP_SIZE] = -INFINITY;
+-            }
+-        } else {
+-#pragma unroll
+-            for (int i = 1; i < experts_per_thread; i++) {
+-                const int expert = threadIdx.x + i * WARP_SIZE;
+-                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && wt[i] > max_val) {
+-                    max_val    = wt[i];
+-                    max_expert = expert;
+-                }
+-            }
+-
+-#pragma unroll
+-            for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
+-                const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
+-                const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
+-                if (val > max_val || (val == max_val && expert < max_expert)) {
+-                    max_val    = val;
+-                    max_expert = expert;
+-                }
+-            }
+-
+-            if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
+-                wt[max_expert / WARP_SIZE] = -INFINITY;
+-            }
+-        }
+-
+-        if ((k & (WARP_SIZE - 1)) == threadIdx.x) {
+-            output_weights[k / WARP_SIZE] = max_val;
+-        }
+-
+-        if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
+-            ids[k] = max_expert;
+-            if (config.with_norm) {
+-                wt_sum += max_val;
+-            }
+-        }
+-    }
+-
+-    if (config.with_norm) {
+-        wt_sum              = warp_reduce_sum(wt_sum);
+-        wt_sum              = max(wt_sum, clamp_val);
+-        const float inv_sum = 1.0f / wt_sum;
+-
+-        for (int i = 0; i < experts_per_thread; i++) {
+-            output_weights[i] *= inv_sum;
+-        }
+-    }
+-
+-    if (config.delayed_softmax) {
+-        softmax_warp_inplace<experts_per_thread, true>(output_weights, n_expert_used, threadIdx.x);
+-    }
+-
+-#pragma unroll
+-    for (int i = 0; i < experts_per_thread; i++) {
+-        const int idx = i * WARP_SIZE + threadIdx.x;
+-        if (idx < n_expert_used) {
+-            weights[idx] = output_weights[i] * scale_val;
+-        }
+-    }
++    topk_moe_body<n_experts, has_bias>(logits, weights, ids, bias, n_rows, n_expert_used, clamp_val, scale_val,
++                                       config, blockIdx.x * blockDim.y + threadIdx.y);
+ }
+ 
+ template<bool has_bias>
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 5824fe827..42aab3f14 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -562,6 +562,63 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
+         ggml_build_forward_expand(gf, shared_gate_pre);
+     }
+ 
++    // 0046: the shared expert gate/up pair reads the same activation as the
++    // router and is independent of the whole routed subgraph, but stock order
++    // emits it AFTER the routed reduction. That costs twice: it is its own
++    // launch, and ggml-alloc - which assigns buffers from node order - hands it
++    // the block the expert-id list has just freed, so the backend co-launch
++    // check correctly refuses to merge the two (the shared gate output would
++    // alias the ids the routed launch still reads).
++    //
++    // Emitting the router matvec here and the shared gate/up right behind it
++    // fixes both. The two F32 rows (shared-expert gate + router) group as
++    // before, the quantized pair now sits immediately after them with nothing
++    // in between, and the 0045 F32/quantized co-launch merges all four into one
++    // dispatch. Nothing but node order changes: same ops, same operands, same
++    // kernels, so the result is byte-identical.
++    static const bool shexp_gateup_pin = [] {
++        const char * e = getenv("GGML_QWEN_SHEXP_GATEUP_PIN");
++        return e == nullptr || atoi(e) != 0;
++    }();
++
++    // Decode shape only. At prefill the gate/up pair is adjacent to its GLU and
++    // llama.cpp fuses the three into one GEMM+GLU launch; moving the pair away
++    // breaks that fusion and costs ~0.9% pp512. The co-launch this reorder
++    // exists for is a decode-only path anyway, so gate the whole thing on
++    // n_tokens == 1 and prefill stays byte-identical to stock.
++    const bool shexp_manual =
++        shexp_gateup_pin &&
++        n_tokens == 1 &&
++        model.layers[il].ffn_up_shexp     != nullptr &&
++        model.layers[il].ffn_gate_shexp   != nullptr &&
++        model.layers[il].ffn_down_shexp   != nullptr &&
++        model.layers[il].ffn_up_shexp_s   == nullptr &&
++        model.layers[il].ffn_gate_shexp_s == nullptr &&
++        model.layers[il].ffn_down_shexp_s == nullptr &&
++        !(hparams.swiglu_clamp_shexp[il] > 1e-6f);
++
++    ggml_tensor * moe_logits = nullptr;
++    ggml_tensor * shexp_gate = nullptr;
++    ggml_tensor * shexp_up   = nullptr;
++
++    if (shexp_manual) {
++        // identical to the matvec build_moe_ffn would emit first; handed back to
++        // it through probs_in, which it uses as the logits verbatim
++        moe_logits = build_lora_mm(model.layers[il].ffn_gate_inp, cur);
++        cb(moe_logits, "ffn_moe_logits", il);
++        ggml_build_forward_expand(gf, moe_logits);
++
++        // build_ffn emits gate before up (the swiglu visits src0 first); keep
++        // that order so the pair is the same group the backend saw before
++        shexp_gate = build_lora_mm(model.layers[il].ffn_gate_shexp, cur);
++        cb(shexp_gate, "ffn_gate", il);
++        ggml_build_forward_expand(gf, shexp_gate);
++
++        shexp_up = build_lora_mm(model.layers[il].ffn_up_shexp, cur);
++        cb(shexp_up, "ffn_up", il);
++        ggml_build_forward_expand(gf, shexp_up);
++    }
++
+     ggml_tensor * moe_out =
+         build_moe_ffn(cur,
+             model.layers[il].ffn_gate_inp,
+@@ -573,7 +630,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
+             LLM_FFN_SILU, true,
+             hparams.expert_weights_scale,
+             LLAMA_EXPERT_GATING_FUNC_TYPE_SOFTMAX, il,
+-            nullptr, model.layers[il].ffn_gate_up_exps,
++            moe_logits, model.layers[il].ffn_gate_up_exps,
+             model.layers[il].ffn_up_exps_s,
+             model.layers[il].ffn_gate_exps_s,
+             model.layers[il].ffn_down_exps_s);
+@@ -607,13 +664,23 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
+             ggml_build_forward_expand(gf, shared_gate);
+         }
+ 
+-        ggml_tensor * ffn_shexp =
+-            build_ffn(cur,
+-                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+-                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+-                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+-                NULL,
+-                LLM_FFN_SILU, LLM_FFN_PAR, il);
++        ggml_tensor * ffn_shexp = nullptr;
++        if (shexp_manual) {
++            // the exact op sequence build_ffn emits for LLM_FFN_SILU/LLM_FFN_PAR
++            // with no bias, no scale and no shexp swiglu clamp, reusing the
++            // gate/up matvecs pinned above
++            ggml_tensor * act = ggml_swiglu_split(ctx0, shexp_gate, shexp_up);
++            cb(act, "ffn_swiglu", il);
++            ffn_shexp = build_lora_mm(model.layers[il].ffn_down_shexp, act);
++        } else {
++            ffn_shexp =
++                build_ffn(cur,
++                    model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
++                    model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
++                    model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
++                    NULL,
++                    LLM_FFN_SILU, LLM_FFN_PAR, il);
++        }
+         cb(ffn_shexp, "ffn_shexp", il);
+ 
+         // Apply the gate to the shared expert output
 -- 
 2.53.0
 
