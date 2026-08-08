@@ -1,0 +1,67 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH 16/16] cuda: cap the MMQ MoE J tile at 64 on sm_121
+
+Port-with-inversion of the R9700 round-7 lever (0023 there). For
+mul_mat_id, mul_mat_q_switch_J picks J from ncols_max = n_tokens, landing
+at J=128 for prefill batches, while the 256-expert top-8 segments average
+~16 columns at ub512. On RDNA4, capping J near the segment width (J=32)
+bought +22% prefill by cutting masked-padding work. On the GB10 the same
+rule LOSES 9%: sm_121 tensor-core MMQ amortizes per-tile fixed cost over
+wide column tiles, so the padding-vs-tile-cost sweet spot sits at J=64,
+not at the segment width. Cap the mmid path at the smallest valid config
+>= 64 (arch-guarded to sm_121; dense matmuls untouched; decode expert
+matvecs route via mmvq, not MMQ). GGML_CUDA_DISABLE_MMQ_MOE_J restores
+stock selection.
+
+Measured (runner box gx10-838f, healthy clocks 2405 MHz). Target sweep at
+pp512, single process each: 16/32/48/56/64/72/80/96/112/128 read
+1597/2101/2272/2375/2370/2358/2352/2350/2328/2297 tok/s; stock-J control
+2297-2308. Same-binary toggle A/B, 5 interleaved rounds: pp512 2250-2292
+off vs 2350-2372 on, median per-round ratio 1.0332; follow-up 2-round
+confirm 2303-2308 -> 2353-2360 (+2.2%). Decode unchanged: tg64 72.4-72.8
+both arms (expert decode is mmvq). Gate ppl -c 512 --chunks 8: 3.9306 on
+and off, byte-identical, vs stock 3.9322 (-0.04%, band +/-0.5%).
+llama-server greedy identity byte-exact off vs on (367-token corpus
+prompt, n_predict 64); server-level uncached prefill on that prompt
+940.9 -> 986.9 tok/s.
+---
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index 2eb15fd..9fafd5c 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -1493,6 +1493,35 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args,
+         }
+     }
+
++    // MoE (mul_mat_id) on sm_121: J is otherwise chosen from ncols_max, the
++    // worst-case column count of a single expert segment (= n_tokens for
++    // mul_mat_id), which lands at J=128 for prefill batches. The GB10
++    // tensor-core MMQ measures fastest for the 256-expert top-8 segment mix
++    // at J=56-64: the target sweep 16/32/48/56/64/72/80/96/112/128 read
++    // 1597/2101/2272/2375/2370/2358/2352/2350/2328/2297 pp512 tok/s
++    // (stock-J control 2297-2303). The RDNA4-style near-segment-width cap
++    // (J=32 there, +22% prefill) LOSES 9% here - the tensor cores amortize
++    // per-tile fixed cost over wide tiles, so the sweet spot between that
++    // and masked-padding waste sits at 64, not at the segment width. Toggle
++    // A/B (5 interleaved rounds): pp512 2250-2292 -> 2350-2372, median
++    // per-round ratio 1.0332; decode unchanged (mmvq path, not MMQ).
++    // GGML_CUDA_DISABLE_MMQ_MOE_J restores stock selection.
++    if (args.ids_dst != nullptr && args.nchannels_y > 1 && J_best > 64 &&
++        GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == 1210 &&
++        getenv("GGML_CUDA_DISABLE_MMQ_MOE_J") == nullptr) {
++        for (int J = 64; J < J_best; J += 8) {
++            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
++            if (config.type == GGML_TYPE_COUNT) {
++                continue;
++            }
++            if (mmq_get_nbytes_shared(config, cc) > smpbo) {
++                continue;
++            }
++            J_best = J;
++            break;
++        }
++    }
++
+     switch (J_best) {
+         case   8:
+             launch_mul_mat_q<type,   8, fallback>(ctx, args, stream);

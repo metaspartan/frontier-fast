@@ -82,3 +82,36 @@ loudly if violated, which is how this was discovered).
 stack vs stock toggle: **+9.4%** (42.0 -> 45.97). Expert matvecs still have
 headroom to the ~240 GB/s dense ceiling; next steps: rows=8 sweep, or a
 dedicated expert-batch kernel that walks all 8 experts per block.
+
+
+## 0016: cap the MMQ MoE J tile at 64 on sm_121 (prefill)
+
+Port-with-inversion of the R9700 round-7 J-cap (its 0023). The RDNA4
+near-segment-width rule (J=32) **loses 9%** on sm_121 - tensor-core MMQ
+wants wide column tiles - but stock J=128 overshoots too. The healthy-box
+target sweep (16/32/48/56/64/72/80/96/112/128 -> 1597/2101/2272/2375/2370/
+2358/2352/2350/2328/2297 pp512 tok/s, stock 2297-2308) peaks at J=56-64;
+the patch caps the mmid path at the smallest valid config >= 64,
+arch-guarded to sm_121, `GGML_CUDA_DISABLE_MMQ_MOE_J` restores stock.
+
+- pp512 toggle A/B, 5 interleaved rounds: 2250-2292 -> 2350-2372, median
+  per-round ratio **1.0332**; 2-round confirm +2.2%
+- decode unchanged (tg64 72.4-72.8 both arms; expert decode is mmvq)
+- gate ppl 3.9306 on and off, byte-identical (-0.04% vs stock)
+- server greedy identity byte-exact; server uncached prefill 941 -> 987 tok/s
+
+## Measured dead ends (healthy box, 2026-08-08, do not re-buy)
+
+- **Q6_K mmvq load-path engineering is FLAT (+-0.1%)**: vdr=2 and vdr=4
+  variants (2/4 adjacent quant ints per vec_dot call, shared scale/ds/offset
+  loads, exact integer dp4a combine) and `__ldcs` evict-first streaming on
+  ql/qh all measured neutral in interleaved whole-process tg32 A/B (6-round
+  ldcs median +0.07%). block_q6_K is 210 B = 2-byte aligned, so wide
+  vectorized or cp.async loads are structurally impossible; issue-side MLP
+  is NOT the limiter - the kernel rate is DRAM-side-determined.
+- **Output-head requant is decode-NEUTRAL**: head Q6_K->Q5_K (68 MB/token
+  cut, ppl +0.40% - inside band but thin margin) and Q6_K->Q5_1 (36
+  MB/token, ppl -0.33%) both measured +0.0-0.2% tg32. The byte cut is
+  exactly eaten by the target types' lower dense-shape kernel efficiency
+  (Q6_K dense mmvq runs near the LPDDR5 ceiling; Q5_K/Q5_1 dense do not).
+  Byte cuts only pay when the destination kernel is at least as efficient.
