@@ -86,7 +86,13 @@ def one_run(model, tok, prompt_ids, decode_tokens):
 
 def bench(model, tok, corpus, prompt_tokens, decode_tokens, runs):
     full = tok.encode(corpus)
-    if len(full) < prompt_tokens * 2:
+    # Repeating the token list verbatim turns a long prompt into a lookup-cache
+    # measurement, so record whether it happened rather than letting it pass
+    # silently — supply a corpus sized to make this branch dead. Note the
+    # threshold is 2x the prompt in TOKENS: sizing a corpus by an assumed
+    # characters-per-token ratio can miss it and repeat without anyone noticing.
+    repeated = len(full) < prompt_tokens * 2
+    if repeated:
         full = full * (prompt_tokens * 2 // max(len(full), 1) + 2)
 
     ttfts, decodes, prefills, peaks, text = [], [], [], [], ""
@@ -112,6 +118,10 @@ def bench(model, tok, corpus, prompt_tokens, decode_tokens, runs):
         "prefillSecondsPerToken": 1.0 / prefill_tps,
         "ttftSeconds": statistics.median(ttfts),
         "peakMemoryGB": round(max(peaks), 3),
+        # What was actually fed, not what was asked for, so a reported context
+        # length is always the measured one.
+        "promptTokens": len(full[0:prompt_tokens]),
+        "corpusRepeated": repeated,
         "text": text,
     }
 
