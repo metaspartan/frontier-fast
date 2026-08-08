@@ -1,17 +1,22 @@
 # laguna-xs-2.1-gguf-gb10cuda-v1 — patch series
 
-Eleven patches, applied to llama.cpp `b10237` and built
-`GGML_CUDA=ON, CMAKE_CUDA_ARCHITECTURES=121, Release`. Frontier **+2.01%**
-(92.93 tok/s decode against a 90.62 tok/s baseline); the current top entry is
-`MoE router: sorted-list top-k selection`.
+**Sixteen** patches, applied in order against pinned llama.cpp `b10237` and
+built `GGML_CUDA=ON, CMAKE_CUDA_ARCHITECTURES=121, Release`. Verified bank on
+this track is **1.0276**.
 
-0001-0009 are the CUDA port of the R9700 dedupe/group/fold family; 0010 turns
-the grouped-mmvq path off by default (it loses on this device); 0011 batches
-k-loads in `mul_mat_vec_f`.
+| # | Patch | Measured on this track |
+| --- | --- | --- |
+| 0001–0011 | R9700 dedupe/group/fold family, CUDA port. 0010 turns grouped-mmvq off by default (it loses on this device); 0011 batches k-loads in `mul_mat_vec_f` | bit-exact engine family |
+| 0012–0014 | topk sorted-list router + the two SM121 mmvq tables | round-1 submission, **verified 1.0276**; +0.4% decode vs stock on the healthy box (the +7.7% first reading was a degraded-era artifact) |
+| 0015 | `sm121-mmq-moe-j64-cap` | **+5.7% prefill** (5 interleaved toggle rounds), decode neutral |
+| 0016 | `cuda-sm121-wide-q4k-mmvq-vecdot` | **+9.51% decode** — the largest decode lever measured on this track |
 
-Numbers here are from the trusted runner and the findings API as of
-2026-08-04. `curl -s "https://frontier.fast/api/findings?track=laguna-xs-2.1-gguf-gb10cuda-v1"`
-is authoritative.
+0016 is banked and unsubmitted. See the healthy-box status section below —
+the calibration warning that used to sit there is **withdrawn**, XS is
+submittable.
+
+`curl -s "https://frontier.fast/api/findings?track=laguna-xs-2.1-gguf-gb10cuda-v1"`
+is authoritative for anything not measured here.
 
 ## This device is not the R9700
 
@@ -174,13 +179,19 @@ box** (tg64 95.61 -> 96.02; the +7.7% round-1 delta was a degraded-era
 artifact, see the `gb10-box-recovered-degraded-era-tunings` finding). With
 0015 the series is decode +0.4% / prefill +5.5% vs stock.
 
-**Calibration trap is still live**: the track calibration pins stock decode
-at 90.62 tok/s with an acceptance band topping out at 1.053x = 95.4, but
-the healthy box reads stock tg64 at 95.4-95.8 and tg128 up to 97. Any
-submission before the owner recalibrates the track fails the "pinned
-calibration band" gate (round-1 verified at 1.0465 but sits ineligible on
-exactly this mechanism). Do not spend an XS submission slot until the
-calibration is refreshed.
+**CORRECTION (2026-08-08): the calibration trap is NOT live on this track —
+XS is fully submittable.** The paragraph that used to sit here said the
+stale 90.62 tok/s stock pin made every XS submission ineligible. That was
+wrong, on two counts:
+
+1. The acceptance band is only enforced when the calibration's
+   `corpusVersion` matches the current corpus. XS's calibration is
+   `corpusVersion 1`; the current corpus is 2, so the band is not applied.
+2. It was falsified empirically the same night: **an XS submission verified
+   at +2.76%**.
+
+Treat XS as a first-class submission target, not a deferred one. With 0016
+banked it is the highest-value item on GB10.
 
 ## sm_121 mmvq geometry is CLOSED (qwen-twin sweeps, 2026-08-08)
 
