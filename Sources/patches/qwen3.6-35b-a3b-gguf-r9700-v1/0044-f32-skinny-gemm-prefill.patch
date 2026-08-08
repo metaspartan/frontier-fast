@@ -1,0 +1,347 @@
+From f7cefdb99c129de5320cc5d49bb769be001b33dd Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sat, 8 Aug 2026 18:19:58 +0000
+Subject: [PATCH] cuda/hip: a dedicated f32 GEMM for the skinny prefill matmuls
+ (+7.3% prefill)
+
+qwen35moe issues three plain f32 matmuls per layer that the vendor BLAS handles
+badly at prefill: the MoE router [2048 -> 256] on all 40 layers, and ssm_alpha
+and ssm_beta [2048 -> 32] on the 30 linear-attention layers. rocBLAS picks a
+64x64x16 macro tile for all of them, and with 32 or 256 output rows that is
+**8 and 32 workgroups on a 64 CU part**. Measured at pp512: 60 launches of
+119.4 us and 40 of 124.3 us, 12.1 ms of a 106.8 ms pass - 11.4%, against a
+memory floor of roughly 9 us and 27 us respectively.
+
+The problem is parallelism, not arithmetic, and the diagnostic is the dispatch
+dimensions rather than the kernel time: divide the grid by the workgroup size
+before assuming a vendor kernel is doing something clever.
+
+mul_mat_f32_skinny_cuda gives one wave an NT x MT tile of the output and splits
+k across its 32 lanes. The grid is (N/NT) x (M/(MT*nwarps)), so the alpha/beta
+shape launches 256 waves instead of 16. Each lane accumulates a k-strided
+partial and one warp reduction per output element finishes it - NT*MT reductions
+against K/32 iterations of NT*MT fmas each, so the reduction amortises away.
+Waves inside a block share n0 and differ in m0, which keeps the src0 rows a
+block touches resident in that CU's L1 while the src1 rows stream.
+
+Per kernel: alpha/beta **119.4 -> 23.8 us (5.0x)**, router **126.1 -> 57.0 us
+(2.2x)**; the group goes 12.1 -> 3.7 ms per pass. NT/MT were swept
+(4x8, 8x4, 8x8, 8x16, 16x8) and are indistinguishable at the wall - 8x8 ships.
+
+mmf, llama.cpp's own tiled f32/f16 matmul, cannot serve these: on RDNA4 its
+WMMA path is compiled out for T=float, and its non-ids path does not tile
+columns at all. It never fires anywhere in this model, at either shape.
+
+Measured (runner box, HIP_VISIBLE_DEVICES=0, whole-process interleaved A/B
+against a control binary built from the parent commit - LD_LIBRARY_PATH set to
+the snapshot and verified with ldd - rotated order, 5 rounds):
+
+  arm                       pp512 med   vs control   tg128 med   vs control
+  control (0043 binary)       4625.45      -          148.60       -
+  MAX_ROWS=0 (off)            4643.48    0.9967       148.42     1.0003
+  MAX_ROWS=64 (alpha/beta)    4822.83    1.0392       148.60     1.0003
+  MAX_ROWS=256 (shipped)      4957.11    1.0727       148.48     1.0002
+
+pp arms disjoint 5/5 (min 4941.07 above max control 4697.00); tg arms overlap
+the control everywhere. pp4096 confirms it scales: 4118.35 -> 4360.01 (+5.87%).
+
+- gate ppl -c 512 --chunks 8, 3 loads: median **3.9309 vs stock 3.9314**,
+  -0.013%. The 0043 stack alone reads -0.262%, so this round's ULP draw moved
+  the reading back toward stock rather than further from it - more evidence
+  that the shift is a random walk through the router's top-8, not damage
+- decode-path ppl -b 512 -ub 1 --chunks 8: 3.9338 both arms - M = 1 is below
+  the column threshold, so the kernel is gated off the decode shape
+- ragged ubatches, which take the bounds-checked instantiation: -b 500 -ub 100
+  4.7366 -> 4.7300, -ub 48 4.7679 -> 4.7719
+- test-backend-ops MUL_MAT 1186/1186, seven runs, four of them with the row and
+  column gates opened wide so every eligible shape in the suite takes this
+  kernel. One earlier run reported a ROCm backend failure and never reproduced;
+  see the README
+- firing proven by census diff: 200 Cijk_..._S_B_Bias_..._MT64x64x16 launches
+  become 200 mul_mat_f32_skinny_cuda
+- long context neutral: tg128 @ d16384 136.61 -> 136.55, @ d32768 126.79 -> 126.80
+- llama-server greedy 5/6 byte-identical against the off arm; only the long
+  prompt differs, which is the only one of the six with enough tokens to reach
+  the column threshold
+- GGML_F32_SKINNY_MAX_ROWS=0 disables it, 64 restricts it to alpha/beta;
+  GGML_F32_SKINNY_MIN_COLS and GGML_F32_SKINNY_TILE re-sweep the gate and tile
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu     |   8 +
+ ggml/src/ggml-cuda/mmf32-skinny.cu  | 219 ++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmf32-skinny.cuh |  10 ++
+ 3 files changed, 237 insertions(+)
+ create mode 100644 ggml/src/ggml-cuda/mmf32-skinny.cu
+ create mode 100644 ggml/src/ggml-cuda/mmf32-skinny.cuh
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 77cdede98..8899f7354 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -29,6 +29,7 @@
+ #include "ggml-cuda/getrows.cuh"
+ #include "ggml-cuda/im2col.cuh"
+ #include "ggml-cuda/mmf.cuh"
++#include "ggml-cuda/mmf32-skinny.cuh"
+ #include "ggml-cuda/mmq.cuh"
+ #include "ggml-cuda/mmvf.cuh"
+ #include "ggml-cuda/mmvq.cuh"
+@@ -2196,6 +2197,13 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
+         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+         return;
+     }
++    // Skinny f32 GEMMs (the MoE router and the GDN alpha/beta projections at
++    // prefill) are handed to rocBLAS with a macro tile that leaves only 8 to 32
++    // workgroups resident on a 64 CU part. See mmf32-skinny.cu.
++    if (ggml_cuda_should_use_mmf32_skinny(src0, src1, dst, cc)) {
++        ggml_cuda_mul_mat_f32_skinny(ctx, src0, src1, dst);
++        return;
++    }
+     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
+ }
+ 
+diff --git a/ggml/src/ggml-cuda/mmf32-skinny.cu b/ggml/src/ggml-cuda/mmf32-skinny.cu
+new file mode 100644
+index 000000000..f1afc7305
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmf32-skinny.cu
+@@ -0,0 +1,219 @@
++#include "mmf32-skinny.cuh"
++
++#include <cstdlib>
++
++// f32 GEMM for skinny weight matrices.
++//
++// qwen35moe issues three plain f32 matmuls per layer that the vendor BLAS handles
++// badly at prefill: the MoE router [2048 -> 256] and, on the 30 linear-attention
++// layers, ssm_alpha and ssm_beta [2048 -> 32]. rocBLAS picks a 64x64x16 macro tile
++// for all of them, so a [512 tokens] x [2048] x [32 rows] GEMM launches with
++// **8 workgroups** and a [.. x 256 rows] one with 32 - on a 64 CU part. Measured on
++// the runner box at pp512: 60 launches x 119.4 us and 40 x 124.3 us, 12.1 ms of a
++// 106.8 ms pass (11.4%), against a memory floor of roughly 9 us and 27 us.
++//
++// The fix is parallelism, not arithmetic. One wave owns an NT x MT tile of the
++// output and splits k across its lanes; the grid is (N/NT) x (M/(MT*nwarps)), which
++// for the alpha/beta shape is 256 waves instead of 16. Lanes accumulate a k-strided
++// partial and one warp reduction per output element finishes it - NT*MT reductions
++// for K/32 iterations of NT*MT fmas each, so the reduction is amortised away.
++//
++// Waves inside a block share n0 and differ in m0, so the src0 rows a block touches
++// stay in that CU's L1 while the src1 rows stream.
++
++#if defined(GGML_USE_HIP) && (defined(__gfx1200__) || defined(__gfx1201__))
++#define MMF32_DPP_REDUCE 1
++#endif
++
++static __device__ __forceinline__ float mmf32_warp_reduce_sum(float x) {
++#ifdef MMF32_DPP_REDUCE
++    union fi_t { float f; int i; };
++    fi_t a, b;
++    a.f = x;
++    b.i  = __builtin_amdgcn_update_dpp(0, a.i, 0xB1, 0xF, 0xF, true);
++    a.f += b.f;
++    b.i  = __builtin_amdgcn_update_dpp(0, a.i, 0x4E, 0xF, 0xF, true);
++    a.f += b.f;
++    b.i  = __builtin_amdgcn_update_dpp(0, a.i, 0x141, 0xF, 0xF, true);
++    a.f += b.f;
++    b.i  = __builtin_amdgcn_update_dpp(0, a.i, 0x140, 0xF, 0xF, true);
++    a.f += b.f;
++    b.i  = __builtin_amdgcn_permlanex16(a.i, a.i, 0x76543210, 0xFEDCBA98, false, false);
++    a.f += b.f;
++    return a.f;
++#else
++    return warp_reduce_sum<32>(x);
++#endif
++}
++
++template <int NT, int MT, int nwarps, bool exact>
++__launch_bounds__(32 * nwarps, 1)
++static __global__ void mul_mat_f32_skinny_cuda(
++        const float * __restrict__ x, const float * __restrict__ y, float * __restrict__ dst,
++        const int K, const int N, const int M,
++        const int stride_row_x, const int stride_col_y, const int stride_col_dst) {
++    const int lane = threadIdx.x;
++    const int n0   = blockIdx.x * NT;
++    const int m0   = (blockIdx.y * nwarps + threadIdx.y) * MT;
++
++    float acc[NT][MT];
++#pragma unroll
++    for (int t = 0; t < NT; t++) {
++#pragma unroll
++        for (int u = 0; u < MT; u++) {
++            acc[t][u] = 0.0f;
++        }
++    }
++
++    // `exact` means the tile is fully inside the matrix and k is a multiple of 32,
++    // so the whole main loop drops its bounds checks. Every launch this patch cares
++    // about takes that path; the checked instantiation is only there so the kernel
++    // is correct for arbitrary shapes.
++    const float * xp = x + (int64_t) n0 * stride_row_x + lane;
++    const float * yp = y + (int64_t) m0 * stride_col_y + lane;
++
++    for (int k0 = 0; k0 < K; k0 += 32) {
++        const int k = k0 + lane;
++
++        float xv[NT];
++        float yv[MT];
++#pragma unroll
++        for (int t = 0; t < NT; t++) {
++            if constexpr (exact) {
++                xv[t] = xp[(int64_t) t * stride_row_x + k0];
++            } else {
++                xv[t] = (n0 + t < N && k < K) ? xp[(int64_t) t * stride_row_x + k0] : 0.0f;
++            }
++        }
++#pragma unroll
++        for (int u = 0; u < MT; u++) {
++            if constexpr (exact) {
++                yv[u] = yp[(int64_t) u * stride_col_y + k0];
++            } else {
++                yv[u] = (m0 + u < M && k < K) ? yp[(int64_t) u * stride_col_y + k0] : 0.0f;
++            }
++        }
++#pragma unroll
++        for (int t = 0; t < NT; t++) {
++#pragma unroll
++            for (int u = 0; u < MT; u++) {
++                acc[t][u] += xv[t] * yv[u];
++            }
++        }
++    }
++
++    // Every lane ends up holding the finished value, so the store lane is free to
++    // pick; spreading it over the wave keeps one lane from serialising NT*MT stores.
++#pragma unroll
++    for (int t = 0; t < NT; t++) {
++#pragma unroll
++        for (int u = 0; u < MT; u++) {
++            const float s = mmf32_warp_reduce_sum(acc[t][u]);
++            if (lane == ((t * MT + u) & 31)) {
++                if (exact || (n0 + t < N && m0 + u < M)) {
++                    dst[(int64_t) (m0 + u) * stride_col_dst + n0 + t] = s;
++                }
++            }
++        }
++    }
++}
++
++static int mmf32_skinny_max_rows() {
++    static const int v = []() {
++        const char * s = getenv("GGML_F32_SKINNY_MAX_ROWS");
++        return s ? atoi(s) : 64;
++    }();
++    return v;
++}
++
++static int mmf32_skinny_min_cols() {
++    static const int v = []() {
++        const char * s = getenv("GGML_F32_SKINNY_MIN_COLS");
++        return s ? atoi(s) : 32;
++    }();
++    return v;
++}
++
++bool ggml_cuda_should_use_mmf32_skinny(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc) {
++    if (!GGML_CUDA_CC_IS_RDNA4(cc)) {
++        return false;
++    }
++    if (mmf32_skinny_max_rows() <= 0) {
++        return false;
++    }
++    if (src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
++        return false;
++    }
++    // 2D only: no channel or sample broadcasting, which keeps the indexing a plain
++    // row stride and the kernel free of the batched cases cuBLAS already handles.
++    if (src0->ne[2] != 1 || src0->ne[3] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
++        return false;
++    }
++    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(dst)) {
++        return false;
++    }
++    const int64_t K = src0->ne[0];
++    const int64_t N = src0->ne[1];
++    const int64_t M = src1->ne[1];
++    if (K % 32 != 0 || K < 256) {
++        return false;
++    }
++    // Only the regime the vendor BLAS under-parallelises: few rows, many columns.
++    if (N > mmf32_skinny_max_rows() || M < mmf32_skinny_min_cols()) {
++        return false;
++    }
++    return true;
++}
++
++template <int NT, int MT, int nwarps>
++static void mmf32_skinny_launch(const float * x, const float * y, float * dst,
++        int K, int N, int M, int s01, int s11, int s1, cudaStream_t stream) {
++    const dim3 block(32, nwarps, 1);
++    const dim3 grid((N + NT - 1) / NT, (M + MT * nwarps - 1) / (MT * nwarps), 1);
++    const bool exact = (N % NT == 0) && (M % (MT * nwarps) == 0) && (K % 32 == 0);
++    if (exact) {
++        mul_mat_f32_skinny_cuda<NT, MT, nwarps, true><<<grid, block, 0, stream>>>(
++            x, y, dst, K, N, M, s01, s11, s1);
++    } else {
++        mul_mat_f32_skinny_cuda<NT, MT, nwarps, false><<<grid, block, 0, stream>>>(
++            x, y, dst, K, N, M, s01, s11, s1);
++    }
++}
++
++void ggml_cuda_mul_mat_f32_skinny(ggml_backend_cuda_context & ctx,
++        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
++    const int64_t K = src0->ne[0];
++    const int64_t N = src0->ne[1];
++    const int64_t M = src1->ne[1];
++
++    const int s01 = src0->nb[1] / sizeof(float);
++    const int s11 = src1->nb[1] / sizeof(float);
++    const int s1  =  dst->nb[1] / sizeof(float);
++
++    const float * x = (const float *) src0->data;
++    const float * y = (const float *) src1->data;
++    float       * d = (float *)       dst->data;
++
++    cudaStream_t stream = ctx.stream();
++
++    static const int tile = []() {
++        const char * s = getenv("GGML_F32_SKINNY_TILE");
++        return s ? atoi(s) : 0;
++    }();
++
++    // NT trades src1 re-reads against register pressure and against launching too
++    // few block rows when N is small; MT does the same for src0. GGML_F32_SKINNY_TILE
++    // sweeps it.
++    if (tile == 4 && N % 4 == 0) {
++        mmf32_skinny_launch<4, 8, 4>(x, y, d, K, N, M, s01, s11, s1, stream);
++    } else if (tile == 16 && N % 16 == 0) {
++        mmf32_skinny_launch<16, 8, 4>(x, y, d, K, N, M, s01, s11, s1, stream);
++    } else if (tile == 84 && N % 8 == 0) {
++        mmf32_skinny_launch<8, 4, 4>(x, y, d, K, N, M, s01, s11, s1, stream);
++    } else if (tile == 816 && N % 8 == 0) {
++        mmf32_skinny_launch<8, 16, 4>(x, y, d, K, N, M, s01, s11, s1, stream);
++    } else {
++        mmf32_skinny_launch<8, 8, 4>(x, y, d, K, N, M, s01, s11, s1, stream);
++    }
++    CUDA_CHECK(cudaGetLastError());
++}
+diff --git a/ggml/src/ggml-cuda/mmf32-skinny.cuh b/ggml/src/ggml-cuda/mmf32-skinny.cuh
+new file mode 100644
+index 000000000..4b141e803
+--- /dev/null
++++ b/ggml/src/ggml-cuda/mmf32-skinny.cuh
+@@ -0,0 +1,10 @@
++#pragma once
++
++#include "common.cuh"
++
++// A dedicated f32 GEMM for the shapes where the vendor BLAS under-parallelises:
++// few output rows (ne01), many columns (ne11), long k. See mmf32-skinny.cu.
++bool ggml_cuda_should_use_mmf32_skinny(const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * dst, int cc);
++
++void ggml_cuda_mul_mat_f32_skinny(ggml_backend_cuda_context & ctx,
++    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst);
+-- 
+2.53.0
+

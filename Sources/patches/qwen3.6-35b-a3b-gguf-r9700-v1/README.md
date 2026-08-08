@@ -1824,7 +1824,8 @@ first-touch weight bandwidth, and never from re-read elimination.
 2. **The MoE expert matvecs' locality at decode** (Q5_K down 444 GB/s, 499
    us/token) — every tuning axis is closed, so this needs a layout idea
    (interleaving the 8 routed slabs, or a different expert-major ordering),
-   which on a pinned GGUF means the 0021 load-time hook.
+   which on a pinned GGUF means the 0021 load-time hook. **This is now the top
+   open lever**, and it is the only one left that moves decode.
 3. `unary_gated_op_quant` (71/token, 101 us + ~114 us of bubble) cannot fold into
    the gate/up matvec epilogue: the q8_1 block max spans 32 output rows and each
    matvec block owns one row, so it would need a cross-block reduction.
@@ -2002,15 +2003,123 @@ of a top-8 router (0031 and 0033 are the precedents in this series), but it does
 mean **byte-exact greedy is no longer available as this round's safety net** —
 the decode-path perplexity reading and the census diff are.
 
+## 0044: the vendor BLAS was running three matmuls per layer on 8 of 64 CUs (+7.3% prefill)
+
+After 0043 the largest non-MoE prefill item is a group of **fp32 rocBLAS GEMMs**:
+200 launches per two passes of `Cijk_Alik_Bljk_S_B_Bias_HA_S_SAV_..._MT64x64x16`,
+**12.1 ms of a 106.8 ms pass (11.4%)**. They are qwen35moe's three plain f32
+matmuls: the MoE router `[2048 -> 256]` on all 40 layers, and `ssm_alpha` and
+`ssm_beta` `[2048 -> 32]` on the 30 linear-attention layers — 100 per pass.
+
+**The diagnostic was the dispatch dimensions, not the kernel time.** Group the
+kernel trace by workgroup count and the answer is immediate:
+
+| launches/pass | shape | macro tile | workgroups | each |
+|---|---|---|---|---|
+| 60 | alpha+beta, N=32 | 64x64x16 | **8** | 119.4 us |
+| 40 | router, N=256 | 64x64x16 | **32** | 124.3 us |
+
+Eight workgroups of 64 threads on a 64 CU part. rocBLAS picks one macro tile for
+the whole family and with 32 output rows the N dimension does not even fill a
+single tile column, so the GEMM runs on an eighth of the GPU. The memory floor
+for the alpha/beta shape is about 9 us and for the router about 27 us; they were
+taking 119 and 124.
+
+### The kernel
+
+`mul_mat_f32_skinny_cuda` gives one **wave** an `NT x MT` tile of the output and
+splits k across its 32 lanes. The grid is `(N/NT) x (M/(MT*nwarps))`, so the
+alpha/beta shape launches **256 waves instead of 16**. Each lane accumulates a
+k-strided partial; one warp reduction per output element finishes it, and since
+that is `NT*MT` reductions against `K/32` iterations of `NT*MT` fmas each, the
+reduction amortises away. Waves inside a block share `n0` and differ in `m0`, so
+the src0 rows a block touches stay in that CU's L1 while the src1 rows stream.
+
+| | before | after | |
+|---|---|---|---|
+| alpha/beta | 119.4 us | **23.8 us** | 5.0x |
+| router | 126.1 us | **57.0 us** | 2.2x |
+| group total | 12.1 ms/pass | **3.7 ms/pass** | |
+
+`NT x MT` was swept at 4x8, 8x4, 8x8, 8x16 and 16x8: the per-kernel times move
+(alpha/beta 21.3-28.8 us, router 57.0-71.9 us) but **every arm lands inside the
+wall-clock noise**, so 8x8 ships and `GGML_F32_SKINNY_TILE` re-sweeps it. The
+router is still ~2x off its floor; closing that needs LDS staging and a real
+GEMM, which is a separate round.
+
+**mmf cannot serve these, and it is worth knowing why before reaching for it:**
+on RDNA4 `mul_mat_f`'s WMMA path is compiled out for `T = float`
+(`if constexpr (!(half2 || nv_bfloat162)) { NO_DEVICE_CODE; }`), and its non-ids
+path does not tile columns at all — only the `has_ids` branch computes
+`col_tiles`, so plain MUL_MAT is capped at `cols_per_block <= 16` by
+construction, which is what `should_use_mmf`'s `src1_ncols > 16` rejection is
+really encoding. A census confirms it: **mmf fires nowhere in this model, at
+either shape**, so the new kernel is additive and shares nothing.
+
+| arm | pp512 med | vs control | tg128 med | vs control |
+|---|---|---|---|---|
+| control (0043 binary) | 4625.45 | — | 148.60 | — |
+| `MAX_ROWS=0` (off) | 4643.48 | 0.9967 | 148.42 | 1.0003 |
+| `MAX_ROWS=64` (alpha/beta only) | 4822.83 | 1.0392 | 148.60 | 1.0003 |
+| **`MAX_ROWS=256` (shipped)** | **4957.11** | **1.0727** | 148.48 | 1.0002 |
+
+pp arms disjoint 5/5 (`min = 4941.07 > max(control) = 4697.00`); tg arms overlap
+the control everywhere. It scales past pp512: **pp4096 4118.35 -> 4360.01
+(+5.87%)**. Long context neutral (d16384 136.61 -> 136.55, d32768 126.79 ->
+126.80).
+
+### Perplexity: the second draw came back
+
+This is the second consecutive non-byte-exact prefill patch, and 0043's section
+warned that the budget is shared. It landed the other way:
+
+| stack | gate ppl median (3 loads) | vs stock 3.9314 |
+|---|---|---|
+| 0043 (this round's off arm) | 3.9211 | -0.262% |
+| **0043 + 0044** | **3.9309** | **-0.013%** |
+
+Reassociating the router's own dot products moved the gate reading *back* to
+stock. That is the clearest possible demonstration of the point 0043 made: the
+shift is a random walk through a top-8-of-256 selection, not accumulating
+damage, and it does not compound in a predictable direction. **It also means the
+budget cannot be reasoned about patch by patch — only the whole stack's reading
+counts, and it has to be re-measured after every non-byte-exact change.**
+
+- decode-path ppl `-b 512 -ub 1 --chunks 8`: **3.9338** in both arms — `M = 1`
+  is below the column threshold, so the kernel is gated off the decode shape
+- ragged ubatches, which take the bounds-checked instantiation rather than the
+  unguarded one: `-b 500 -ub 100` 4.7366 -> 4.7300, `-ub 48` 4.7679 -> 4.7719
+- firing proven by census diff: 200 `Cijk_..._MT64x64x16` become 200
+  `mul_mat_f32_skinny_cuda`
+- `llama-server` greedy **5/6 byte-identical**; only the long prompt differs,
+  and it is the only one of the six with enough tokens to reach the column
+  threshold — a nice incidental confirmation that the gate does what it says
+
+### One unreproduced test-backend-ops failure, recorded rather than buried
+
+The first run of `test-backend-ops -o MUL_MAT` with the gates opened wide
+(`MAX_ROWS=4096 MIN_COLS=2`, forcing every eligible shape in the suite through
+the new kernel) reported `1/2 backends passed FAIL`. It has **not reproduced in
+seven subsequent runs** — four of them with the same forced gates, one
+deliberately run back-to-back after a model job to reproduce the memory
+pressure of the original context — all `1186/1186 tests passed`, and the
+failure printed no failing case line. The most likely explanation is an
+allocation failure under memory pressure from the perplexity processes that ran
+immediately before it in the same script. It is written down because an
+intermittent op-test failure is exactly the kind of thing the next agent should
+know to re-check if anything here ever looks wrong.
+
 ## Recommended firing order
 
 The runner applies the whole patch directory, so the series is a ladder rather
-than a choice; **0001-0043** is the verified set and every patch that carries
+than a choice; **0001-0044** is the verified set and every patch that carries
 speed has a disable toggle. Two do not carry speed: **0038** is 0037's kernel
 made bit-identical and must not be applied without 0037; **0039** is 0031's
 kernel made sign-of-zero-exact and must not be applied without 0031
 (`GGML_SSM_CONV_FOLD_STOCK_SHAPE=0` falls back to the 0031 kernel in place).
-If a ranked run has to be pared back, drop from the end: 0043 (prefill only,
+If a ranked run has to be pared back, drop from the end: 0044 (prefill only,
+a new kernel plus one dispatch branch, independent of everything —
+`GGML_F32_SKINNY_MAX_ROWS=0` disables it), then 0043 (prefill only,
 independent of everything, and the one patch that spends real perplexity
 budget — `GGML_GDN_COLS_PER_WAVE=2` is the half-measure), then 0042 (a
 one-constant change, independent of everything), then 0041 (needs 0031+0039,
@@ -2023,13 +2132,20 @@ combine as n_expert_used-1 separate adds. 0041 likewise has two halves (the
 in-place norm in `qwen35moe.cpp` and the CUDA epilogue) and the CUDA half
 declines without the graph half.
 
-**Projection after 0043: ~1.609-1.628 vs the 1.4525 bank.** Decode 1.7536 ->
+**Projection after 0044: ~1.632-1.668 vs the 1.4525 bank.** Decode 1.7536 ->
 **1.7893** (x1.0133 from 0041, x1.0070 from 0042); prefill 1.2911 -> 1.3205
-(x1.0228 from 0040) -> **1.3959** (x1.0571 from 0043); ttft moves with
-prefill for prompt processing, so the band spans ttft flat (1.609) to ttft
-carrying the full prefill ratio (1.628). Every ratio here is measured against a
-binary built from the patch's own parent commit, not against a toggle — and
-from 0043 on, against one whose `ldd` was checked.
+(x1.0228 from 0040) -> 1.3959 (x1.0571 from 0043) -> **1.4974** (x1.0727 from
+0044); ttft moves with prefill for prompt processing, so the band spans ttft
+flat (1.632) to ttft carrying the full prefill ratio (1.668). Every ratio here
+is measured against a binary built from the patch's own parent commit, not
+against a toggle — and from 0043 on, against one whose `ldd` was checked.
+
+Prefill has gone 1.3205 -> 1.4974 in two rounds, and the reason both were there
+to take is the same: **a big kernel slice is not evidence that the kernel is
+working hard.** 0043's gated_delta_net had the right wave count and was spending
+half its issue slots on a reduction; 0044's GEMMs were spending 88% of the GPU
+on nothing at all. Divide the grid by the workgroup size before you profile
+anything else.
 
 Rounds 21 and 22 bought correctness; 23, 24 and 25 are the first speed since
 0037 — one on the prefill side, two on the decode side.
