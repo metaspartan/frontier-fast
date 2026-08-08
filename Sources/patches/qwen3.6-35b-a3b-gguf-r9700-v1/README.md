@@ -2693,3 +2693,84 @@ perplexity number taken at the shape where it actually runs.
    in the same binary, so any cost the edit imposes on the un-toggled path is
    subtracted from both and cancels; 0040's first version read +1.55% on the
    toggle and 1.0013 against a real control.
+
+## 0046: the topk_moe router selection hidden inside the shared-expert mmvq (+1.9% decode)
+
+Round 31 ranked the hide-pool by host/guest time ratio and this is its top
+entry. It is also the only candidate whose guest is not a matvec, and that
+turned out to be the reason it is the cheapest to build: **`topk_moe_cuda` has
+no `__shared__` and no `__syncthreads`** — the whole top-8-of-256 selection is
+`__shfl_xor` over the 32 lanes of one warp. A kernel like that can be dropped
+into warp 0 of one extra block of a foreign launch with nothing to reconcile:
+same lane→expert mapping, same bitonic butterfly, same normalisation
+reduction. Bit-identity is by construction, not by inspection — the body was
+refactored into a `topk_moe_body` device template that the standalone kernel
+and the guest both call.
+
+**The ratio is not 2.1, it is 1024.** Reading the census row (`topk_moe` 2.9 us
+against a 5.5 us host) as a 1.9 ratio would have declined this by round 31's own
+rule. The rule is about *capacity*, and the right measure here is blocks: the
+guest is ONE workgroup joining 1024. It never competes for the host's bandwidth,
+so it retires inside the host's memory time and costs nothing. Time ratio is the
+correct predictor only when both sides are shaped like matvecs.
+
+### The graph half, and why prefill has to be excluded
+
+Stock order emits the shared expert after the routed reduction, so `ggml-alloc`
+hands `ffn_gate_shexp` the block the expert-id list just freed and the
+disjointness check correctly refuses. Pinning the router matvec and the
+shared-expert gate/up ahead of the top-k chain (handing the logits back through
+`build_moe_ffn`'s `probs_in`) relays them out tightly packed and provably
+disjoint: gate `[+0x4880,+0x5080)`, up `[+0x5080,+0x5880)`, argsort
+`[+0x5880,+0x5c80)`, weights `[+0x4500,+0x4520)`.
+
+The reorder must be **gated on `n_tokens == 1`**. Un-gated it also fires at
+prefill, where the gate/up pair is adjacent to its GLU and llama.cpp fuses the
+three into one GEMM+GLU launch; breaking that read **−0.94% pp512** in the first
+paired measurement. Gated, prefill is flat (+0.07% over six interleaved rounds)
+*and* the whole official gate shape becomes the stock build path.
+
+### Numbers
+
+Against a binary built from the patch's own parent commit, control RUNPATH
+verified by `ldd`, arm order alternated, no env set on either arm:
+
+```
+candidate tg128 152.58 152.47 152.23 152.22   mean 152.38
+control   tg128 149.66 149.46 149.27 149.50   mean 149.47   -> +1.94%, 4/4 separated
+```
+
+Census diff: 25238 → 23838 dispatches / 35 tokens = **exactly −40.0/token**,
+`topk_moe_cuda` 1400 → 0, total kernel 194.72 → 192.44 ms (**−65.1 us/token**).
+The kernel saving alone is −113 us/token of `topk_moe`; the grouped mmvq grows
+because 19 layers also move onto it from the fused path (below).
+
+Perplexity on the **runner corpus** — the shape distinction is the whole story:
+
+| | stock | banked (0045) | with 0046 |
+|---|---|---|---|
+| gate shape `-c 512` | 3.9314 | 3.9317 | 3.9314–3.9318 |
+| decode path `-b 512 -ub 1` | 3.9409 | 3.9338 (−0.180%) | 3.9382 (**−0.069%**) |
+
+The reorder is not byte-exact — it moves 19 of 40 layers off llama.cpp's fused
+gate+up+GLU mmvq onto grouped mmvq + `unary_gated_op_quant`, two kernels
+computing the same SwiGLU. But it moves the stack **toward** stock on the decode
+path, and at the gate shape the graph is literally the stock build path. Toggled
+off, the binary reproduces the control's 8.8713 (gainz-corpus) exactly, so the
+co-launch half carries no numeric change at all.
+
+Server greedy at the decode shape: **6/6 byte-identical** co-launch on vs off
+(6 prompts, every completion ≥ 276 B, including the 1000-token prompt), against
+a **same-arm-twice control that reads 5/6** — the harness itself is noisier than
+the change. Record that: server greedy on this box is not a clean 6/6 oracle.
+
+`GGML_CUDA_MMVQ_TOPK_COLAUNCH=0` restores the separate launch;
+`GGML_QWEN_SHEXP_GATEUP_PIN=0` restores stock node order.
+
+### What this leaves for the rest of the hide-pool
+
+The machinery built here is a *guest block* with its own body inside the grouped
+mmvq, plus a cross-product disjointness check between the two merged groups. The
+remaining three rows of the round-31 table (shexp gate/up → routed gate+up,
+shexp down → expert_reduce, attn k/v → attn wq) all need the other machinery —
+a **second vec_dot type in one launch** — which this patch does not build.
