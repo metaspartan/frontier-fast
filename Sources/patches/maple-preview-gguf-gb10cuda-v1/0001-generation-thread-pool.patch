@@ -1,0 +1,86 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index da4087474..390e38913 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -830,9 +830,19 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
+     // parse all CLI args now, so that -hf is available below for remote preset resolution
+     parse_cli_args();
+ 
++    // -t unset means "pick a default"; remember that before it is resolved.
++    const bool n_threads_explicit = params.cpuparams.n_threads > 0;
++
+     postprocess_cpu_params(params.cpuparams,       nullptr);
+     postprocess_cpu_params(params.cpuparams_batch, &params.cpuparams);
+ 
++    // The batch pool has already inherited the full math-core count above, so
++    // narrowing the generation pool here leaves prefill untouched. Only applies
++    // when the caller did not ask for a specific thread count.
++    if (!n_threads_explicit) {
++        params.cpuparams.n_threads = common_cpu_get_num_generate(params.cpuparams.n_threads);
++    }
++
+     postprocess_cpu_params(params.speculative.draft.cpuparams,       &params.cpuparams);
+     postprocess_cpu_params(params.speculative.draft.cpuparams_batch, &params.cpuparams_batch);
+ 
+diff --git a/common/common.cpp b/common/common.cpp
+index ffe3e7761..70a42aee0 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -227,6 +227,43 @@ int32_t common_cpu_get_num_math() {
+     return common_cpu_get_num_physical_cores();
+ }
+ 
++/**
++ * Number of CPUs to use for the token-by-token GENERATION phase.
++ *
++ * Batched work (prefill) is compute bound and scales with the core count, so it
++ * keeps common_cpu_get_num_math(). Generation is a different regime: every op is
++ * a matvec that streams weights once and reuses nothing, so it saturates the
++ * memory system long before it saturates the cores — and ggml puts a threadpool
++ * barrier after every op, so the whole graph runs at the speed of the slowest
++ * thread in each of ~1000 barriers per token. Past the saturation point each
++ * extra thread adds barrier latency and cache-coherency traffic while adding no
++ * bandwidth, so generation gets SLOWER as threads are added.
++ *
++ * That regression is severe on aarch64 hybrid CPUs, where common_cpu_get_num_math()
++ * has no way to exclude the efficiency cores: the x86 path drops them explicitly
++ * ("efficiency cores harm lockstep threading", cpu_count_math_cpus above) but the
++ * aarch64 path falls through to the physical core count and hands lockstep work
++ * to cores that cannot keep up.
++ *
++ * Measured on a GB10 (10x Cortex-X925 @ 3.9 GHz + 10x Cortex-A725 @ 2.8 GHz),
++ * Maple-Preview TQ2_0 20B-A1B, llama-bench tg128 tok/s by thread count:
++ *
++ *     2 -> 63.4   4 -> 96.0   5 -> 101.6   6 -> 104.2   7 -> 106.4
++ *     8 -> 100.1  9 -> 101.3  10 -> 94.5   12 -> 72.5   20 -> 59.5
++ *
++ * The optimum is a broad plateau at 6-8 and the default of 20 costs 1.8x. Prefill
++ * over the same sweep goes the other way (222 tok/s at 4 -> 548 at 20), which is
++ * why this applies to the generation pool only.
++ */
++int32_t common_cpu_get_num_generate(int32_t n_math) {
++#if defined(__aarch64__) && defined(__linux__)
++    // Conservative: never raise the thread count, only cap it.
++    return std::max(1, std::min(n_math, 7));
++#else
++    return n_math;
++#endif
++}
++
+ // Helper for setting process priority
+ 
+ #if defined(_WIN32)
+diff --git a/common/common.h b/common/common.h
+index 2e15ec3f8..6b2ee3f25 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -76,6 +76,9 @@ struct common_cpu_params {
+ int32_t common_cpu_get_num_physical_cores();
+ int32_t common_cpu_get_num_math();
+ 
++// Thread count for the token-by-token generation phase (see common.cpp).
++int32_t common_cpu_get_num_generate(int32_t n_math);
++
+ //
+ // Common params
+ //
