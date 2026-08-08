@@ -1,0 +1,77 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH 29/30] cuda/hip: RDNA4 per-shape small_k routing (head-only rpb=2)
+
+Round-11 re-profile of the 28-patch state (rocprofv3 in-graph, tg32): with
+the 0028 wide vec_dots in place, the 0024 rpb=2 small_k geometry only still
+pays on the 248320-row output head (667.7us vs 672.4). The small dense Q6_K
+projections regressed under it and now run faster at one row per block:
+
+- qkv/attn_q [2048->8192]: 24.77us rpb=1 vs 29.36us rpb=2 (469 -> 555 GB/s)
+- grouped qkv+z (12288 rows): 35.82 vs 36.38us
+- ssm_out [4096->2048]: 19.57 vs 20.20us
+- blanket-rpb2 total kernel time is now NET-NEGATIVE (215.04 vs 213.96ms)
+
+Gate small_k on nrows_x >= GGML_MMVQ_R4_RPB_MIN_ROWS (default 65536: only
+the head qualifies); the grouped launch gets the same total_rows threshold,
+restoring its stock one-row geometry. Byte-identical either way (per-thread
+k-block assignment per row is unchanged; only launch geometry moves) -
+server greedy identity vs the 28-patch control bin dir is byte-exact on
+long and short prompts.
+
+Same-binary toggle A/B (GGML_MMVQ_R4_RPB_MIN_ROWS=0 restores 0028
+behavior), 5 interleaved rounds: tg128 119.02-119.55 -> 119.76-120.03
+(+0.55%, 5/5 rounds separated). ppl in the verified cluster.
+
+Also measured this round and recorded as findings: dense Q6_K is
+insensitive to vec_dot load width (narrow-vdr probe: qkv/ssm_out/head all
+flat; only the ids expert paths respond - do not widen further), and the
+apparent 42% dense-Q6_K decode share was partly overlap-attribution
+(serialized ssm_out is 14.35us vs 20.2 in-graph; its neighbor kernels
+drain into its window).
+---
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index d1de35df1..43f58b5eb 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -898,6 +898,21 @@ static bool mmvq_r4_rpb_enabled() {
+     return v;
+ }
+ 
++// Round-11 refinement: with the 0028 wide vec_dots in place, the rpb=2 small_k
++// geometry only still pays on the output head (248320 rows: 667.7us vs 672.4).
++// The small dense projections now run FASTER at one row per block
++// (qkv [2048->8192]: 24.77us rpb=1 vs 29.36us rpb=2; grouped qkv+z 35.82 vs
++// 36.38; ssm_out 19.57 vs 20.20 - rocprofv3 in-graph, tg32). Routing is
++// byte-identical either way (per-thread k-block assignment per row is
++// unchanged); only launch geometry moves.
++static int mmvq_r4_rpb_min_rows() {
++    static const int v = []() -> int {
++        const char * e = getenv("GGML_MMVQ_R4_RPB_MIN_ROWS");
++        return e != nullptr ? std::atoi(e) : 65536;
++    }();
++    return v;
++}
++
+ template<ggml_type type>
+ static std::pair<dim3, dim3> calc_launch_params(
+         const int ncols_dst, const int ncols_x, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
+@@ -1079,7 +1094,8 @@ static void mul_mat_vec_q_grouped_launch(
+     // the arch/type opts in and every segment row count divides evenly.
+     if constexpr (type == GGML_TYPE_Q6_K) {
+         constexpr int rpb = calc_rows_per_block(1, MMVQ_PARAMETERS_RDNA4, /*small_k=*/true, 8);
+-        if (rpb > 1 && table_id == MMVQ_PARAMETERS_RDNA4 && mmvq_r4_rpb_enabled()) {
++        if (rpb > 1 && table_id == MMVQ_PARAMETERS_RDNA4 && mmvq_r4_rpb_enabled() &&
++                (int) total_rows >= mmvq_r4_rpb_min_rows()) {
+             bool divisible = true;
+             uint32_t prev = 0;
+             mmvq_grouped_args args_blk = args_in;
+@@ -1268,7 +1284,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         // +3.1%/+1.9%/+0.8% decode for Q6_K; Q5_K was neutral and Q4_K/Q8_0
+         // and the MUL_MAT_ID expert paths regressed, so only dense Q6_K opts in.
+         if (GGML_CUDA_CC_IS_RDNA4(cc) && ncols_dst == 1 && !has_ids &&
+-                type == GGML_TYPE_Q6_K && mmvq_r4_rpb_enabled()) {
++                type == GGML_TYPE_Q6_K && mmvq_r4_rpb_enabled() &&
++                nrows_x >= mmvq_r4_rpb_min_rows()) {
+             use = true;
+         }
+ 

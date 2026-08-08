@@ -455,3 +455,72 @@ archs keep stock vdr, CUDA path unchanged.
   small_k rpb=4, and dense-stream insensitivity to load widening
   (isolated MALL-warm ssm_out shape only reaches 410 GB/s - the small
   dense matvec is latency/ramp-bound, not issue-bound)
+
+## Round-11 profile corrections (read before touching dense Q6_K again)
+
+The round-8 "42% dense Q6_K at 351-528 GB/s" map overstates the pool:
+
+- In-graph per-kernel times include neighbor-kernel drain (kernels on the
+  same queue overlap start/drain). Serialized (rocprofv3 PMC mode) ssm_out
+  is 14.35us (479 GB/s), not the 20.2us the in-graph trace shows; the
+  extra 6us belongs to the (post-0026, much faster) GDN kernel's tail.
+- The output head runs 625-626 GB/s = 97% of peak in every configuration
+  measured. Done.
+- Dense Q6_K does NOT respond to vec_dot load width: a narrow-vdr probe
+  (Q6_K vdr back to 1 everywhere) left qkv/ssm_out/head byte-flat while
+  regressing the ids expert path 13.8 -> 17.8us. 0028's wide vec_dots are
+  ids-path medicine only. Do not widen further (vdr=4 quad) - and RDNA4
+  dual-issue is dead-on-arrival: the head kernel is ~8% VALU-busy.
+- rocprofv3 DERIVED counters (VALUUtilization, MemUnitStalled, FetchSize,
+  L2CacheHit...) silently read 0.0 on gfx1201 with this ROCm; only raw
+  SQ_WAVES / SQ_BUSY_CYCLES / GRBM_GUI_ACTIVE collect. Do not trust a
+  counter run without checking for nonzero values.
+- Remaining dense pool after 0029 is ~120us/token against a realistic
+  ~620 GB/s ceiling (grouped qkv+z at 567, qkv at 555) - latency/ramp
+  class, geometry and load-width both exhausted.
+
+## 0029: per-shape small_k routing (head-only rpb=2)
+
+Post-0028 re-profile: blanket rpb=2 is net-negative. qkv dense wants rpb=1
+(24.77 vs 29.36us), grouped qkv+z wants rpb=1 (35.82 vs 36.38), only the
+248320-row head still wants rpb=2 (667.7 vs 672.4). small_k now requires
+nrows_x >= 65536 (GGML_MMVQ_R4_RPB_MIN_ROWS; 0 restores 0028 behavior).
+Byte-identical; server greedy byte-exact vs 28-patch control. Toggle A/B:
+tg128 +0.55% (5/5 rounds separated).
+
+## 0030: recurrent-state identity view (+6.6% decode, +5.1% @16k)
+
+The big one this round. Every GDN layer gathered its 2 MB ssm state
+(get_rows_float_vec 4.93us) and conv window (k_get_rows_float 1.65us)
+before gated_delta_net - ~197us of copy kernel plus 60 launches per decode
+token, purely to materialize bytes at a new address for the common case
+where the source slot IS the destination slot. build_rs now detects the
+identity mapping side-effect-free at graph build (cells[head+i].src0 ==
+head+i, no rollback restore pending) and hands the consumer a contiguous
+view of the cache rows instead.
+
+Traps burned (do not re-buy):
+
+- **Graph reuse bakes view offsets.** The fork reuses built graphs across
+  decode steps (~27 builds serve a 256-token completion; build_rs runs at
+  BUILD time only, while get_rows stays fresh through the s_copy input
+  tensor). A view that could point at a non-zero row can go stale under
+  reuse. Fix: restrict the view to n_seqs==1 && head==0 && n_rs==1 (the
+  ranked serving shape) so the baked offset is row 0 always.
+- **Build-time memory state is not settled.** At graph build, cells[].src0
+  is often still -1 (prompt-phase builds); set_input later sees the real
+  mapping. The identity check must treat unsettled as non-identity and
+  fall back (it does; verified with per-build logging).
+- **The engine's greedy output is NOT run-to-run stable on near-tie
+  prompts, including the verified frontier binary.** In-process repeats of
+  the same 2k-token greedy request on the UNMODIFIED 28-patch control
+  produced 3 different completions (drift at a near-tie token, ~77%
+  common prefix). Do not burn a session chasing "nondeterminism" that a
+  candidate build merely re-exposes; characterize drift per-prompt against
+  control and gate on ppl, as 0024/0026/0028 did.
+
+Measured: decode kernel/33-tok 215.04 -> 203.78ms; tg128 119.9 -> 127.8
+(+6.6%, 8/8 rounds); tg64@16k 111.7 -> 117.4 (+5.1%); pp512 neutral; ppl
+3.9271/3.9301/3.9297 (band 0.5%); 5/6 greedy prompts byte-exact vs
+control, 8-request concurrent smoke coherent; MUL_MAT suite OK.
+LLAMA_DISABLE_RS_STATE_VIEW=1 restores stock.
