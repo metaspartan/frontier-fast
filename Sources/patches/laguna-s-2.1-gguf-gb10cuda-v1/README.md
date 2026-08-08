@@ -6,6 +6,45 @@ Applied in order against pinned llama.cpp **b10237**
 | # | Patch | Measured on this track |
 | --- | --- | --- |
 | 0001 | `cuda-mmvq-group-same-activation-matvecs` | **+1.868% decode** (in-process paired A/B, 12 rotated cycles, no-op floor 0.99994) |
+| 0002 | `sm121-mmq-moe-j64-cap` | **+4.05% prefill** (median of 3 interleaved toggle rounds; decode neutral — the cap is MMQ/prefill-only) |
+
+## 0002: cap the MMQ MoE J tile at 64 on sm_121 (prefill)
+
+Third verified port of the sm_121 J-cap (qwen gb10 0016: ranked prefill
+1.0369; laguna-xs gb10 0015: ranked prefill 1.0741). For `mul_mat_id`,
+stock picks J from `ncols_max = n_tokens` (J=128 at pp512) while the
+256-expert top-8 segments average ~16 columns; the GB10 tensor-core MMQ
+sweet spot for that segment mix is J=56-64 (target-swept on qwen, which
+shares the routing). Arch-guarded to sm_121; `GGML_CUDA_DISABLE_MMQ_MOE_J`
+restores stock selection.
+
+### Correctness
+
+- **ppl** `-c 512 --chunks 8` on the runner corpus: **4.7508 ± 0.27989 with
+  the cap on, 4.7508 ± 0.27989 with it off**, both equal to the stock gate
+  value. Identical to five significant figures *including the error bar* —
+  at `-c 512` this is a 512-token-batch comparison, i.e. exactly the MMQ
+  path the cap changes, so it is a logit-level identity result, not a
+  coincidence of rounding. The track gate is ≤0.1% relative; this is 0.0%.
+- **Server greedy identity**: byte-exact between arms, 790 bytes over three
+  prompts (`temperature 0`, `top_k 1`, `cache_prompt false`), non-emptiness
+  asserted. Caveat, stated because it matters: those prompts are ~8 tokens,
+  so `mul_mat_q_switch_J` never picks J>64 on them and **they do not
+  exercise the capped path**. The evidence that the capped path is
+  arithmetically identical is the ppl result above, which does.
+- **Provenance**: the measured binary was verified byte-identical to
+  `git archive b10237 | 0001 | 0002` across all four touched CUDA sources —
+  the tree that produced the timings *is* this patch series, not a superset.
+  Series applies clean on pristine b10237.
+
+**Do not verify greedy identity with `llama-cli` on this model.** Redirected
+to a file it emits zero bytes, so `cmp -s on off` compares two empty files
+and prints a pass; that false pass reached this README once already. A retry
+with `--no-display-prompt` then span 78 minutes at 98.7% CPU holding 119 GB
+of GPU memory outside the lock while writing a 27 GB loading-spinner
+animation to `/tmp`. Use `llama-server` + `POST /completion`, assert
+non-empty, and wrap every invocation in `timeout`. Recorded as the
+`empty-file-greedy-identity-false-pass` finding.
 
 The frontier is **+1.459%** (score 1.014589, decode 24.01 tok/s) from
 `0001-cuda-mmvq-group-same-activation-matvecs.patch`, verified on the trusted
