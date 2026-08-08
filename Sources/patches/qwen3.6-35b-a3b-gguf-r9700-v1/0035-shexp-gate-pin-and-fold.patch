@@ -1,0 +1,215 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH 35/35] cuda/hip: pin the shared-expert gate and fold it into the down projection (+1.6% decode, byte-exact)
+
+After 0034, `k_bin_bcast` is down to 81 launches per decode token, and 40 of
+them are one line:
+
+    ffn_shexp = ggml_mul(ffn_shexp[2048], sigmoid(shared_gate)[1])
+
+A 2048-element pass over the shared expert's output to apply ONE scalar,
+once per layer: 1.84 us of kernel plus ~1.5 us of graph-replay overhead each.
+0034's `dst_scale` epilogue already knows how to apply exactly this - a plain
+matvec has one destination channel, so the "per-channel factor" is a single
+broadcast scalar - and the shared-expert down projection is an individual mmvq
+launch (2048 rows, 40/token, 3.45 us), not a grouped one.
+
+The fold nevertheless did not fire, and the reason is graph ORDER rather than
+anything about the kernels. Built in source order the layer emits
+
+    ... ffn_shexp (MUL_MAT) , shared_expert_gate_sigmoid (UNARY) , MUL ...
+
+because the sigmoid is created after the shared-expert FFN and the topological
+visit reaches it through the multiply. The pair is not adjacent, so no
+two-node subgraph matches - and, worse, the scalar is not even computed yet
+when the projection runs, so folding it there would have been a read of stale
+memory. Creating the gate before the FFN and pinning it with
+`ggml_build_forward_expand` (the 0018/0032 trick - creation order does not set
+cgraph order, the pins do) puts the sigmoid ahead of the projection and leaves
+`MUL_MAT, MUL` adjacent. Ops, operands and shapes are unchanged; only the
+position of one node moves.
+
+So this patch is two halves that only work together:
+
+1. `qwen35moe.cpp`: pin `shared_expert_gate_sigmoid` ahead of the shared-expert
+   FFN. `GGML_QWEN_SHEXP_GATE_PIN=0` restores the stock order.
+2. `ggml-cuda.cu` / `mmvq.cu`: extend the 0034 detector to plain `MUL_MAT`
+   (one token, one channel, a single contiguous f32 factor), placed AFTER the
+   grouped-mmvq collector so a groupable matvec still prefers grouping.
+   `GGML_CUDA_DISABLE_SHEXP_GATE_FUSE=1` disables it.
+
+Bit-exact for the same reason 0034 is: the multiplicand is the same rounded
+f32 the stock kernel would have written and the MUL would have read back, and
+the light `has_dst_scale` instantiation avoids the `result += bias` that costs
+-0.0 (see 0034).
+
+Measured (runner box, HIP_VISIBLE_DEVICES=0), both halves toggled together:
+
+- same-binary toggle A/B, 5 interleaved rounds: tg128 139.40-139.70 off ->
+  **141.64-141.94** on, median per-round ratio **1.0161**, 5/5 disjoint;
+  pp512 neutral (4285-4324 off vs 4287-4330 on)
+- dispatches 901 -> 861 per token; k_bin_bcast 81 -> 41
+- whole-process stock vs cand, 5 rounds: see README
+- ppl 3.9271/3.9264/3.9277/3.9262 vs stock 3.9314 (-0.09 to -0.13%);
+  control same session 3.9271-3.9297
+- test-backend-ops MUL_MAT / MUL_MAT_ID / MUL / SSM_CONV / GATED_DELTA_NET OK
+- server greedy **6/6 BYTE-EXACT** vs the pin-off/fold-off control
+
+Measurement note burned into this round: a `python3 edit.py && make` that is
+piped through `tail` hides both a failed edit and a skipped build, and the
+next A/B then measures the PREVIOUS binary. That produced a full round of
+"the reorder alone is worth +1.7%, the fold is worth nothing" before the .so
+timestamp gave it away. Check the artifact mtime, not the console tail.
+
+---
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 20738ec6d..50c313aa7 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1831,13 +1831,26 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
+ // Bit-exact: the multiplicand is the same rounded f32 the stock kernel would
+ // have written and re-read.
+ static bool ggml_cuda_moe_weight_fuse_detect(const ggml_cgraph * cgraph, const int i,
+-        const ggml_tensor ** out_mul, const ggml_tensor ** out_weights) {
++        const ggml_tensor ** out_mul, const ggml_tensor ** out_weights, ggml_op want_op) {
+     const ggml_tensor * mm = cgraph->nodes[i];
+-    if (mm->op != GGML_OP_MUL_MAT_ID || i + 1 >= cgraph->n_nodes) {
++    if (mm->op != want_op || i + 1 >= cgraph->n_nodes) {
+         return false;
+     }
+-    if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL }, { i + 1 })) {
+-        return false;
++    if (want_op == GGML_OP_MUL_MAT_ID) {
++        if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL }, { i + 1 })) {
++            return false;
++        }
++    } else {
++        if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL, GGML_OP_MUL }, { i + 1 }) &&
++            !ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT, GGML_OP_MUL }, { i + 1 })) {
++            return false;
++        }
++        // plain matvec: one channel, so the factor is a single broadcast scalar
++        // (the shared-expert gate). ne[1] == 1 is enforced by
++        // ggml_cuda_should_fuse_mul_mat_vec_q below.
++        if (mm->ne[1] != 1) {
++            return false;
++        }
+     }
+     const ggml_tensor * mul = cgraph->nodes[i + 1];
+     const ggml_tensor * w   = mul->src[0] == mm ? mul->src[1] : mul->src[0];
+@@ -5681,6 +5694,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_SSM_CONV_FOLD_SEQ"));
+             static const bool disable_moe_weight_fuse = getenv("GGML_CUDA_DISABLE_MOE_WEIGHT_FUSE") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_MOE_WEIGHT_FUSE"));
++            static const bool disable_shexp_gate_fuse = getenv("GGML_CUDA_DISABLE_SHEXP_GATE_FUSE") != nullptr &&
++                                                   std::atoi(getenv("GGML_CUDA_DISABLE_SHEXP_GATE_FUSE"));
+             const bool mmvq_group_enabled = !disable_mmvq_group && stream_ctx.concurrent_events.empty();
+             static const bool log_mmvq_group_stats = getenv("GGML_MMVQ_GROUP_STATS") != nullptr;
+             int64_t mmvq_group_stats_buf[2] = {0, 0};
+@@ -5747,7 +5762,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                         node->op == GGML_OP_MUL_MAT_ID) {
+                     const ggml_tensor * f_mul = nullptr;
+                     const ggml_tensor * f_w   = nullptr;
+-                    if (ggml_cuda_moe_weight_fuse_detect(cgraph, i, &f_mul, &f_w)) {
++                    if (ggml_cuda_moe_weight_fuse_detect(cgraph, i, &f_mul, &f_w, GGML_OP_MUL_MAT_ID)) {
+                         ggml_cuda_mm_fusion_args_host fusion_data{};
+                         fusion_data.dst_scale = f_w;
+                         ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], node->src[2],
+@@ -5935,6 +5950,24 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     }
+                 }
+ 
++                if (!disable_shexp_gate_fuse && stream_ctx.concurrent_events.empty() &&
++                        node->op == GGML_OP_MUL_MAT && mmvq_grouped_done.count(node) == 0 &&
++                        grouped_done.count(node) == 0) {
++                    // the shared-expert gate: sigmoid(gate) is a single scalar the
++                    // down projection can apply in its own epilogue. Ordered after
++                    // the grouped-mmvq collector so a groupable matvec still groups.
++                    const ggml_tensor * f_mul = nullptr;
++                    const ggml_tensor * f_w   = nullptr;
++                    if (ggml_cuda_moe_weight_fuse_detect(cgraph, i, &f_mul, &f_w, GGML_OP_MUL_MAT)) {
++                        ggml_cuda_mm_fusion_args_host fusion_data{};
++                        fusion_data.dst_scale = f_w;
++                        ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], nullptr,
++                                                (ggml_tensor *) f_mul, &fusion_data);
++                        grouped_done.insert(f_mul);
++                        continue;
++                    }
++                }
++
+                 if (mmvf_group_enabled && ggml_cuda_mmvf_can_group(node, cc_mmvf_group)) {
+                     ggml_tensor * members[MMVF_MAX_GROUP_SIZE];
+                     const int n_members = ggml_cuda_mmvf_collect_group(cgraph, i, members, cc_mmvf_group);
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index ca782ed7b..e3e7ab423 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1602,7 +1602,8 @@ void ggml_cuda_mul_mat_vec_q(
+             // per-destination-channel factor: the MoE routing weight vector
+             GGML_ASSERT(fusion->dst_scale->type == GGML_TYPE_F32);
+             GGML_ASSERT(ggml_is_contiguous(fusion->dst_scale));
+-            GGML_ASSERT(ids != nullptr);
++            // MUL_MAT_ID: one factor per expert slot (dst->ne[1] == nchannels_dst).
++            // MUL_MAT:    one token, one channel, so a single broadcast factor.
+             GGML_ASSERT(ggml_nelements(fusion->dst_scale) == dst->ne[1]);
+             fusion_local.dst_scale = fusion->dst_scale->data;
+         }
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 61d0b9718..05923b274 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -1,6 +1,8 @@
+ #include "models.h"
+ #include "llama-memory-recurrent.h"
+ 
++#include <cstdlib>
++
+ void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
+     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+@@ -562,15 +564,6 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
+ 
+     // Add shared experts if present - following Qwen3Next reference implementation
+     if (model.layers[il].ffn_up_shexp != nullptr) {
+-        ggml_tensor * ffn_shexp =
+-            build_ffn(cur,
+-                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
+-                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
+-                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
+-                NULL,
+-                LLM_FFN_SILU, LLM_FFN_PAR, il);
+-        cb(ffn_shexp, "ffn_shexp", il);
+-
+         // Apply shared expert gating as in the reference implementation
+         // The shared expert has its own gate that is sigmoided
+         // Note: ffn_gate_inp_shexp is the shared expert gate (outputs 1 value per token)
+@@ -582,6 +575,29 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_ffn(ggml_tensor * cur, c
+         shared_gate = ggml_sigmoid(ctx0, shared_gate);
+         cb(shared_gate, "shared_expert_gate_sigmoid", il);
+ 
++        // Pin the gate ahead of the shared-expert FFN. Creation order does not
++        // set cgraph order - the topological visit does - so built in source
++        // order this sigmoid lands BETWEEN the shared-expert down projection
++        // and the multiply that consumes it. The backend only fuses a pair it
++        // sees as adjacent, so the multiply stays a separate 2048-element
++        // launch. Ops, operands and shapes are unchanged; only the position of
++        // the node in the list moves.
++        static const bool pin_shexp_gate = [] {
++            const char * e = getenv("GGML_QWEN_SHEXP_GATE_PIN");
++            return e == nullptr || atoi(e) != 0;
++        }();
++        if (pin_shexp_gate) {
++            ggml_build_forward_expand(gf, shared_gate);
++        }
++
++        ggml_tensor * ffn_shexp =
++            build_ffn(cur,
++                model.layers[il].ffn_up_shexp, NULL, model.layers[il].ffn_up_shexp_s,
++                model.layers[il].ffn_gate_shexp, NULL, model.layers[il].ffn_gate_shexp_s,
++                model.layers[il].ffn_down_shexp, NULL, model.layers[il].ffn_down_shexp_s,
++                NULL,
++                LLM_FFN_SILU, LLM_FFN_PAR, il);
++        cb(ffn_shexp, "ffn_shexp", il);
+ 
+         // Apply the gate to the shared expert output
+         ffn_shexp = ggml_mul(ctx0, ffn_shexp, shared_gate);

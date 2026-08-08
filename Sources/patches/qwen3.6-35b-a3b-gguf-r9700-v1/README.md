@@ -829,3 +829,48 @@ larger being `ffn_shexp * shared_gate` (1.84us each). The shexp down projection
 is an INDIVIDUAL mmvq (b=2048x1, 40/token, 3.45us), so relaxing `dst_scale` to
 the plain-MUL_MAT case with a single-element factor folds it the same way -
 ~134us/token, the next round-16 item.
+
+
+## 0035: shared-expert gate pinned and folded into the down projection (+1.6% decode, BYTE-EXACT)
+
+After 0034, 40 of the remaining 81 `k_bin_bcast` launches per token are
+`ggml_mul(ffn_shexp[2048], sigmoid(shared_gate)[1])` - a full 2048-element pass
+to apply ONE scalar, once per layer, 1.84us each. 0034's `dst_scale` epilogue
+already applies exactly this shape (a plain matvec has one destination channel,
+so the per-channel factor is a single broadcast scalar) and the shared-expert
+down projection is an individual mmvq launch, not a grouped one.
+
+It still did not fire, for a reason that is pure graph ORDER: built in source
+order the layer emits `ffn_shexp (MUL_MAT), shared_expert_gate_sigmoid (UNARY),
+MUL`, because the sigmoid is created after the shared-expert FFN and the
+topological visit only reaches it through the multiply. The pair is not
+adjacent - and the scalar is not even computed when the projection runs, so
+folding it there would have read stale memory. Creating the gate before the FFN
+and pinning it with `ggml_build_forward_expand` (the 0018/0032 trick) fixes
+both. Two halves, only useful together:
+
+1. `qwen35moe.cpp`: pin `shared_expert_gate_sigmoid` ahead of the shexp FFN.
+   `GGML_QWEN_SHEXP_GATE_PIN=0` restores the stock order.
+2. the 0034 detector extended to plain `MUL_MAT`, placed AFTER the grouped-mmvq
+   collector so a groupable matvec still prefers grouping.
+   `GGML_CUDA_DISABLE_SHEXP_GATE_FUSE=1` disables it.
+
+- toggle A/B (both halves), 5 rounds: tg128 139.40-139.70 -> **141.64-141.94**,
+  median ratio **1.0161**, 5/5 disjoint; pp512 neutral
+- dispatches 901 -> 861/token; k_bin_bcast 81 -> 41/token
+- whole-process vs stock, 5 rounds: tg128 median ratio **1.7542**
+  (0034: 1.7254, 0033: 1.6934), pp512 **1.3418**
+- ppl 3.9262-3.9277 vs stock 3.9314; ops suites OK
+- **server greedy 6/6 BYTE-EXACT** vs the pin-off/fold-off control
+
+**Measurement trap burned here, and it cost a full round.** A
+`python3 edit.py && make ... | tail -N` hides BOTH a failed edit and the
+skipped build behind it, and the A/B that follows then measures the PREVIOUS
+binary. That produced a confident, completely wrong conclusion ("the reorder
+alone is worth +1.7%, the fold is worth nothing") which survived two follow-up
+experiments before the `.so` mtime gave it away. **Check the artifact
+timestamp, not the console tail**, whenever a toggle unexpectedly reads zero.
+
+Projection with 0033+0034+0035: decode 1.5959 x 1.0335 x 1.0152 x 1.0161 =
+**1.7015**, prefill 1.2468 x 1.0355 = **1.2911**, ttft following prefill ->
+score **~1.529** vs the 1.4525 bank.
