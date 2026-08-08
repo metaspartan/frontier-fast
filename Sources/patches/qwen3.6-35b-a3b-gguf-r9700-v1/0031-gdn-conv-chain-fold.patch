@@ -1,0 +1,300 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH 31/31] cuda/hip: GDN conv-chain fold - concat + conv + silu + state writeback in one kernel (+2.7% decode)
+
+Round-12 profiling put numbers on the wall-vs-kernel gap: decode runs
+~1085 kernels/token (6.1ms busy) inside a 7.8ms token - ~1.5us of
+replay/dispatch overhead per node (hipGraphLaunch alone is ~500us of CPU
+per token, submission scaling with node count). Node-count reduction is
+therefore worth ~1.5us/node on top of any kernel time saved.
+
+Every GDN layer runs a three-kernel conv chain per decode token:
+CONCAT(state_window, x_t) materializes a [4, 8192] window (1.77us),
+SSM_CONV(+fused SILU) convolves it (1.58us), and a CPY writes the shifted
+window back to the conv cache (2.03us). All three collapse into one
+1.6us kernel: each thread owns a channel, reads the 3-value state window
+and x_t into registers (making the in-place cache writeback alias-safe by
+construction), computes the conv with the stock loop structure, applies
+silu, and stores the shifted window. 60 launches and ~92us of kernel time
+per token disappear.
+
+Detection (eval-loop, done-set pattern like the grouped launches): a
+dim-0 F32 CONCAT of [3, nr] with [1, nr] whose only consumers in the
+layer window are one SSM_CONV and one CPY of the concat tail view
+(positions 1..3) onto a contiguous f32 cache view. View/metadata nodes
+over the concat are skipped; any other consumer declines. n_t == 1 only
+(prefill keeps stock nodes), d_conv == 4, no conv bias, single writeback
+(rollback-snapshot graphs decline via the extra CPY consumers).
+GGML_CUDA_DISABLE_SSM_CONV_FOLD=1 restores stock.
+
+Measured (runner box, same-binary toggle, 30-patch base):
+
+- decode trace: concat_cont, fused ssm_conv_f32 and the conv writeback
+  cpy_scalar (990 dispatches each) all replaced by 990x ssm_conv_fold_f32
+  (1.60us); total decode kernel 201.9 -> 198.9ms per 33 tokens
+- tg128 toggle A/B, 5 rounds: 127.68-128.11 -> 131.33-131.41 tok/s
+  (+2.7%, 5/5 rounds separated, arms fully disjoint)
+- pp512: neutral (4239-4266 off vs 4204-4259 on, overlapping; the fold
+  cannot fire at prefill by the n_t gate)
+- ppl (runner corpus, 3 loads): 3.9271/3.9283/3.9256 vs stock 3.9314
+  (-0.08..-0.15%, band 0.5%)
+- test-backend-ops SSM_CONV and CONCAT suites OK (fold does not touch
+  the generic ops); concurrent 8-request greedy smoke coherent
+- greedy identity, fold on vs off (same binary): short/math prompts
+  byte-exact; mid/code/long drift mid-completion at 53-77% common
+  prefixes. Both arms are individually run-to-run DETERMINISTIC
+  (A/A byte-exact on every prompt); the fused kernel's accumulation
+  contracts differently than the stock three-kernel chain (same
+  expression, different codegen context) - the same ppl-gated
+  reassociation class as 0024/0026/0028, disclosed and verified on
+  this track three times.
+---
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 2d0553b2d..a6d1121cb 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3993,6 +3993,119 @@ static int ggml_cuda_set_rows_collect_group(const ggml_cgraph * cgraph, const in
+ // destination - so the stored result is unchanged, and the norm then consumes
+ // the same float values it would have read back from that store.
+ 
++
++// GDN conv-chain fold: CONCAT(state_window, x_t) feeding SSM_CONV(+SILU) plus
++// the conv-state writeback CPY of the concat tail. Decode shape only
++// (n_t == 1, d_conv == 4, no conv bias, single writeback = no rollback
++// snapshots). Returns true and fills the member pointers when the whole
++// pattern is present and the concat has no other consumer in the layer
++// window; the fused kernel then computes conv+silu straight from the two
++// concat sources and performs the (register-buffered, alias-safe) state
++// writeback, eliminating the concat and cpy launches and their bytes.
++static bool ggml_cuda_ssm_conv_fold_detect(const ggml_cgraph * cgraph, const int i,
++        const ggml_tensor ** out_ssm_conv, const ggml_tensor ** out_silu, const ggml_tensor ** out_wb_cpy) {
++    const ggml_tensor * concat = cgraph->nodes[i];
++    if (concat->op != GGML_OP_CONCAT || concat->type != GGML_TYPE_F32) {
++        return false;
++    }
++    const ggml_tensor * state = concat->src[0];
++    const ggml_tensor * x     = concat->src[1];
++    if (state == nullptr || x == nullptr) {
++        return false;
++    }
++    // dim-0 concat of a [3, nr] window with a [1, nr] token column
++    if (ggml_get_op_params_i32(concat, 0) != 0) {
++        return false;
++    }
++    if (state->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (state->ne[0] != 3 || x->ne[0] != 1 || concat->ne[0] != 4 ||
++            state->ne[1] != concat->ne[1] || x->ne[1] != concat->ne[1] ||
++            concat->ne[2] != 1 || concat->ne[3] != 1) {
++        return false;
++    }
++    if (!ggml_is_contiguous(state) || state->nb[0] != sizeof(float) || x->nb[0] == 0) {
++        return false;
++    }
++
++    const ggml_tensor * ssm_conv = nullptr;
++    const ggml_tensor * silu     = nullptr;
++    const ggml_tensor * wb_cpy   = nullptr;
++
++    const int window = std::min(i + 48, cgraph->n_nodes);
++    for (int j = i + 1; j < window; ++j) {
++        const ggml_tensor * cand = cgraph->nodes[j];
++        bool consumes = false;
++        for (int k = 0; k < GGML_MAX_SRC; ++k) {
++            const ggml_tensor * src = cand->src[k];
++            if (src == nullptr) {
++                continue;
++            }
++            if (src == concat || src->view_src == concat) {
++                consumes = true;
++                // pure view/metadata nodes over the concat are not consumers;
++                // their real consumers are caught through src->view_src below
++                if (cand->op == GGML_OP_VIEW || cand->op == GGML_OP_RESHAPE ||
++                        cand->op == GGML_OP_PERMUTE || cand->op == GGML_OP_TRANSPOSE ||
++                        cand->op == GGML_OP_NONE) {
++                    continue;
++                }
++                // classify
++                if (cand->op == GGML_OP_SSM_CONV && k == 0 && src == concat) {
++                    if (ssm_conv != nullptr) { return false; }
++                    ssm_conv = cand;
++                } else if (cand->op == GGML_OP_CPY && k == 0 && src->view_src == concat) {
++                    if (wb_cpy != nullptr) { return false; }
++                    // the tail view: positions [1, 3] of every channel
++                    if (src->ne[0] != 3 || src->ne[1] != concat->ne[1] ||
++                            (const char *) src->data != (const char *) concat->data + sizeof(float) ||
++                            src->nb[1] != concat->nb[1]) {
++                        return false;
++                    }
++                    // writeback target must be a contiguous f32 view
++                    const ggml_tensor * dst_v = cand->src[1];
++                    if (dst_v == nullptr || dst_v->type != GGML_TYPE_F32 ||
++                            dst_v->nb[0] != sizeof(float) || !ggml_is_contiguous(dst_v) ||
++                            ggml_nelements(dst_v) != 3 * concat->ne[1]) {
++                        return false;
++                    }
++                    wb_cpy = cand;
++                } else {
++                    return false; // unexpected consumer
++                }
++            }
++        }
++        GGML_UNUSED(consumes);
++    }
++    if (ssm_conv == nullptr || wb_cpy == nullptr) {
++        return false;
++    }
++    // conv weights: [4, nr] f32, no bias fusion (decline if an ADD consumes the conv)
++    const ggml_tensor * w = ssm_conv->src[1];
++    if (w == nullptr || w->type != GGML_TYPE_F32 || w->ne[0] != 4 || w->ne[1] != concat->ne[1] ||
++            w->nb[0] != sizeof(float)) {
++        return false;
++    }
++    // the conv output must be consumed by exactly one SILU (the stock fused shape here)
++    const int idx_conv = [&]() { for (int j = i + 1; j < window; ++j) { if (cgraph->nodes[j] == ssm_conv) return j; } return -1; }();
++    if (idx_conv < 0 || idx_conv + 1 >= cgraph->n_nodes) {
++        return false;
++    }
++    const ggml_tensor * cand_silu = cgraph->nodes[idx_conv + 1];
++    if (cand_silu->op != GGML_OP_UNARY || ggml_get_unary_op(cand_silu) != GGML_UNARY_OP_SILU ||
++            cand_silu->src[0] != ssm_conv || cand_silu->type != GGML_TYPE_F32 ||
++            !ggml_is_contiguous(cand_silu) || ggml_nelements(cand_silu) != concat->ne[1]) {
++        return false;
++    }
++    silu = cand_silu;
++
++    *out_ssm_conv = ssm_conv;
++    *out_silu     = silu;
++    *out_wb_cpy   = wb_cpy;
++    return true;
++}
++
+ static int ggml_cuda_rms_norm_pre_add_chain_len(const ggml_cgraph * cgraph, const int i) {
+     // mirrors the multi-add fusion loop in ggml_cuda_try_fuse
+     int     n_fuse = 0;
+@@ -5283,6 +5396,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_MMVQ_GROUP"));
+             static const bool disable_softplus_mul = getenv("GGML_CUDA_DISABLE_SOFTPLUS_MUL") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_SOFTPLUS_MUL"));
++            static const bool disable_ssm_conv_fold = getenv("GGML_CUDA_DISABLE_SSM_CONV_FOLD") != nullptr &&
++                                                   std::atoi(getenv("GGML_CUDA_DISABLE_SSM_CONV_FOLD"));
+             const bool mmvq_group_enabled = !disable_mmvq_group && stream_ctx.concurrent_events.empty();
+             static const bool log_mmvq_group_stats = getenv("GGML_MMVQ_GROUP_STATS") != nullptr;
+             int64_t mmvq_group_stats_buf[2] = {0, 0};
+@@ -5345,6 +5460,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue; // already computed as part of a grouped rms_norm / rope launch
+                 }
+ 
++                if (!disable_ssm_conv_fold && stream_ctx.concurrent_events.empty() && node->op == GGML_OP_CONCAT) {
++                    const ggml_tensor * f_conv = nullptr;
++                    const ggml_tensor * f_silu = nullptr;
++                    const ggml_tensor * f_cpy  = nullptr;
++                    if (ggml_cuda_ssm_conv_fold_detect(cgraph, i, &f_conv, &f_silu, &f_cpy)) {
++                        ggml_cuda_op_ssm_conv_fold(*cuda_ctx, node, f_conv, f_silu, f_cpy);
++                        grouped_done.insert(f_conv);
++                        grouped_done.insert(f_silu);
++                        grouped_done.insert(f_cpy);
++                        continue;
++                    }
++                }
++
+                 if (!disable_norm_group && stream_ctx.concurrent_events.empty() &&
+                         node->op == GGML_OP_RMS_NORM && ggml_cuda_rms_norm_pair_groupable(cgraph, i)) {
+                     ggml_tensor * norms[RMS_NORM_MAX_GROUP_SIZE];
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index 1463169cf..515b8d8da 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -157,6 +157,79 @@ static void ssm_conv_f32_cuda(const float * src0, const float * src1, const floa
+     }
+ }
+ 
++
++// Decode-shape fold of the GDN conv chain: CONCAT(state_window, x_t) ->
++// SSM_CONV -> SILU plus the conv-state writeback CPY collapse into one
++// kernel. One thread owns one channel: the state window and x_t are read
++// into registers before the writeback stores, so the (aliasing) in-place
++// cache update is safe, and the accumulation loop matches the stock
++// ssm_conv_f32 order exactly (same expression, same contraction), so the
++// conv output is byte-identical. n_t == 1, d_conv == 4, no bias.
++static __global__ void ssm_conv_fold_f32(const float * __restrict__ state, const float * __restrict__ x,
++                                         const float * __restrict__ w_all, float * __restrict__ y,
++                                         float * __restrict__ wb, const int nr, const int state_nb1,
++                                         const int x_nb1, const int w_nb1) {
++    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
++    if (ch >= nr) {
++        return;
++    }
++
++    const float * st = (const float *) ((const char *) state + ch * state_nb1);
++    const float * wc = (const float *) ((const char *) w_all + ch * w_nb1);
++    const float   xv = *(const float *) ((const char *) x + ch * x_nb1);
++
++    // mirror the stock ssm_conv_f32 register structure exactly (preloaded w[]
++    // and x[] arrays, same loop shape) so the compiler contracts the
++    // accumulation identically and the conv output stays byte-exact
++    float w[4];
++#pragma unroll
++    for (size_t j = 0; j < 4; j++) {
++        w[j] = wc[j];
++    }
++
++    float x_r[4];
++    x_r[0] = st[0];
++    x_r[1] = st[1];
++    x_r[2] = st[2];
++    x_r[3] = xv;
++
++    float sumf = 0.0f;
++#pragma unroll
++    for (size_t j = 0; j < 4; j++) {
++        sumf += x_r[(0 + j) % 4] * w[j];
++    }
++
++    y[ch] = ggml_cuda_op_silu_single(sumf);
++
++    float * wbc = wb + ch * 3;
++    wbc[0] = x_r[1];
++    wbc[1] = x_r[2];
++    wbc[2] = xv;
++}
++
++void ggml_cuda_op_ssm_conv_fold(ggml_backend_cuda_context & ctx,
++        const ggml_tensor * concat, const ggml_tensor * ssm_conv,
++        const ggml_tensor * silu, const ggml_tensor * wb_cpy) {
++    const ggml_tensor * state = concat->src[0];   // [d_conv-1, nr] (view of the cache or the get_rows copy)
++    const ggml_tensor * x     = concat->src[1];   // [1, nr] transposed view of the qkv projection
++    const ggml_tensor * w     = ssm_conv->src[1]; // [d_conv, nr]
++    const ggml_tensor * wb    = wb_cpy->src[1];   // [3*nr] contiguous view of the conv cache row
++
++    const int64_t nr = concat->ne[1];
++
++    const float * state_d = (const float *) state->data;
++    const float * x_d     = (const float *) x->data;
++    const float * w_d     = (const float *) w->data;
++    float       * y_d     = (float *) silu->data;
++    float       * wb_d    = (float *) wb->data;
++
++    const int block = 256;
++    const int grid  = (int) ((nr + block - 1) / block);
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dim3(grid, 1, 1), dim3(block, 1, 1), 0, ctx.stream());
++    ggml_cuda_kernel_launch(ssm_conv_fold_f32, launch_params,
++        state_d, x_d, w_d, y_d, wb_d, (int) nr, (int) state->nb[1], (int) x->nb[1], (int) w->nb[1]);
++}
++
+ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
+     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
+     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cuh b/ggml/src/ggml-cuda/ssm-conv.cuh
+index 8514ca849..b32a58ba7 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cuh
++++ b/ggml/src/ggml-cuda/ssm-conv.cuh
+@@ -1,3 +1,8 @@
+ #include "common.cuh"
+ 
+ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node = nullptr, ggml_tensor * silu_dst = nullptr);
++
++// GDN conv-chain fold (concat + conv + silu + state writeback in one kernel).
++void ggml_cuda_op_ssm_conv_fold(ggml_backend_cuda_context & ctx,
++        const ggml_tensor * concat, const ggml_tensor * ssm_conv,
++        const ggml_tensor * silu, const ggml_tensor * wb_cpy);

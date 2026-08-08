@@ -524,3 +524,43 @@ Measured: decode kernel/33-tok 215.04 -> 203.78ms; tg128 119.9 -> 127.8
 3.9271/3.9301/3.9297 (band 0.5%); 5/6 greedy prompts byte-exact vs
 control, 8-request concurrent smoke coherent; MUL_MAT suite OK.
 LLAMA_DISABLE_RS_STATE_VIEW=1 restores stock.
+RANKED (r11): VERIFIED 1.4324 (+43.24%) - decode 128.55 = 1.5575, prefill
+1.2569, ttft 1.1860.
+
+## Round-12 overhead map (the node-count ledger)
+
+HIP API trace of steady decode (rocprofv3 --hip-trace): one hipGraphLaunch
+per token costs ~500us of CPU submission (scales with node count), and the
+GPU spends ~0.9ms/token in inter-kernel dispatch gaps inside the replay.
+Decode = ~1085 kernels/token at 6.1ms busy in a 7.8ms wall token: every
+node removed is worth ~1.5us of overhead PLUS its kernel time. The
+scheduler itself is clean (2 splits; the 16 syncs/token are the graph-exec
+wait + input/logits copies). Node classes remaining (per token): quantize
+81, bin_bcast MUL 80, rms_norm family ~130, unary/gated ~140, mmvf grouped
+70, Q8_0 shexp 90, cpy ~50, GDN misc. The conv chain (below) took the
+first 60. Next largest coherent cuts: the remaining y-quantizes (81, the
+use_count-blocked and ids-path cases), the ssm-state writeback cpy
+(30 x 2MB - needs in-place GDN state write, an op-signature change), and
+the MUL/ADD glue around the MoE combine.
+
+## 0031: GDN conv-chain fold (+2.7% decode)
+
+CONCAT(state_window, x_t) + SSM_CONV(+SILU) + conv-state writeback CPY
+collapse into one 1.6us kernel per GDN layer (was 3 kernels, 5.4us):
+per-channel thread reads window+x into registers (alias-safe in-place
+cache writeback), stock accumulation loop, silu epilogue. -60 nodes and
+-92us kernel per token. Decode-shape gated (n_t==1, d_conv==4, no bias,
+single writeback; prefill keeps stock nodes). Detection at the eval loop
+with the done-set pattern; view/metadata nodes over the concat are
+skipped during consumer classification (the first version aborted on the
+conv_state_last VIEW node itself - fixed).
+GGML_CUDA_DISABLE_SSM_CONV_FOLD=1 restores stock.
+
+- tg128 toggle: 127.9 -> 131.37 (+2.7%, 5/5 rounds disjoint); pp512
+  neutral; ppl 3.9256-3.9283 in band; SSM_CONV/CONCAT suites OK.
+- greedy identity fold-on/off: 2/6 byte-exact, 4/6 drift at 53-77%
+  prefixes; BOTH arms individually deterministic (A/A byte-exact) - the
+  fused kernel contracts the accumulation differently than the stock
+  chain despite mirroring its source structure (tried register-array
+  alignment; codegen context differs). Same ppl-gated class as
+  0024/0026/0028.
