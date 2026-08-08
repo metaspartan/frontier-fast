@@ -6,7 +6,7 @@ Applied in order against pinned llama.cpp **b10237**
 | # | Patch | Measured on this track |
 | --- | --- | --- |
 | 0001 | `cuda-mmvq-group-same-activation-matvecs` | **+1.868% decode** (in-process paired A/B, 12 rotated cycles, no-op floor 0.99994) |
-| 0002 | `sm121-mmq-moe-j64-cap` | **+4.05% prefill** (median of 3 interleaved toggle rounds; decode neutral — the cap is MMQ/prefill-only) |
+| 0002 | `sm121-mmq-moe-j64-cap` | **+4.47% prefill** (median of same-mode interleaved toggle rounds; decode neutral — the cap is MMQ/prefill-only) |
 
 ## 0002: cap the MMQ MoE J tile at 64 on sm_121 (prefill)
 
@@ -36,6 +36,49 @@ restores stock selection.
   `git archive b10237 | 0001 | 0002` across all four touched CUDA sources —
   the tree that produced the timings *is* this patch series, not a superset.
   Series applies clean on pristine b10237.
+
+### Timing: the per-launch lottery moves PREFILL too, so pair by mode
+
+Same binary, `GGML_CUDA_DISABLE_MMQ_MOE_J` toggled, whole-process
+`llama-bench -p 512 -n 64 -r 3`, arms alternated within each round (ABBA):
+
+| round | off pp512 | off tg64 | on pp512 | on tg64 | ratio | |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | 608.72 | 24.31 | 636.71 | 24.27 | **1.0460** | same mode |
+| 2 | 610.33 | 24.19 | 635.05 | 24.27 | **1.0405** | same mode |
+| 3 | 627.78 | 25.90 | 600.52 | 24.45 | 0.9566 | mixed — OFF drew fast |
+| 4 | 615.59 | 24.39 | 642.31 | 24.32 | **1.0434** | same mode |
+| 5 | 602.97 | 24.03 | 635.88 | 24.26 | **1.0546** | same mode |
+| 6 | 631.20 | 25.78 | 631.51 | 24.16 | 1.0005 | mixed — OFF drew fast |
+| 7 | 616.80 | 24.29 | 663.25 | 25.93 | 1.0753 | mixed — ON drew fast |
+
+Same-mode rounds: **median 1.0447**, mean 1.0461, range 1.0405–1.0546.
+Decode is unchanged in every round (24.0–24.4 slow / 25.8–25.9 fast on both
+arms) — expected, since decode expert matvecs route through mmvq and the cap
+only touches MMQ.
+
+**The important correction to this track's protocol section.** The README
+already documented a per-launch decode lottery. This run shows it is not a
+decode-only artifact: launches that drew the fast mode read **1.031x on
+pp512** as well (fast-mode launches mean 640.7 vs slow 621.5). So a
+whole-process A/B round whose two arms landed in *different* modes is
+comparing a fast launch against a slow one, and its ratio is meaningless in
+either direction. That single fact explains all three outliers, and it
+predicts them quantitatively:
+
+- round 7 (ON fast): predicted 1.0447 × 1.031 = 1.077, observed **1.0753**
+- round 6 (OFF fast): predicted 1.0447 / 1.031 = 1.013, observed 1.0005
+
+The effect is therefore ~+4.5% prefill, and the three "contradictory" rounds
+are the artifact behaving exactly as modelled — including one inflated round
+that would have *overstated* the win had it been kept. **Classify every
+launch by its tg64 and discard mixed-mode rounds** before taking a median;
+do not simply drop rounds that look inconvenient.
+
+Prior round 3 had been dismissed in this README as "lottery-contaminated"
+on intuition. That call was right, but it was made from two clean rounds and
+a hunch; it now rests on four clean rounds plus a confound model validated
+in both directions.
 
 **Do not verify greedy identity with `llama-cli` on this model.** Redirected
 to a file it emits zero bytes, so `cmp -s on off` compares two empty files
