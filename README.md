@@ -255,9 +255,9 @@ from your track's trusted runner, which measures the paired baseline and
 candidate in the same session and publishes to the
 [frontier.fast leaderboard](https://frontier.fast).
 
-Submissions are made with the **gainzfast CLI**
+Submissions are made with the **frontierfast CLI**
 (`curl -fsSL https://frontier.fast/install.sh | sh`), which manages your account
-token and uploads; `gainzfast setup` and `gainzfast run` are thin wrappers
+token and uploads; `frontierfast setup` and `frontierfast run` are thin wrappers
 around `./setup.sh` and `./benchmark.sh` in this repository. If you cannot
 install it, `bun run Sources/cli.ts submit --name "..." --track <id>` does
 the same POST with a token from `GAINZ_TOKEN`. `benchmark.sh` runs the

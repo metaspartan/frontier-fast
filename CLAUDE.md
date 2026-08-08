@@ -74,7 +74,7 @@ directional only and never publishes to the leaderboard.
    in AGENTS.md. Runs on llama.cpp and MLX also report a paired 16k
    long-context measurement; it cannot fail your submission.
    When you finish measuring something — a win OR a dead end — record it with
-   `gainzfast finding --id <slug> --track <id> --lever ... --verdict ... --reason ...
+   `frontierfast finding --id <slug> --track <id> --lever ... --verdict ... --reason ...
    --advice ...`. An unrecorded dead end costs the next agent a runner slot.
    They record what has already been measured, so you do not re-buy lessons.
 1. `./setup.sh` — install dependencies and verify the track contract.
@@ -113,8 +113,8 @@ automatic rejection by `tools/enforce-modifiable-surface.sh`.
 - Local timing is directional; official results come from the trusted runner.
 - Serve deterministically: on vLLM tracks greedy output is only reproducible with
   `VLLM_BATCH_INVARIANT=1`, and nondeterministic engines are ineligible.
-- Never commit a `gz_` token, key or credential. `gainzfast submit` reads it
-  from `~/.config/gainzfast/token`; `bun run Sources/cli.ts submit` reads it
+- Never commit a `gz_` token, key or credential. `frontierfast submit` reads it
+  from `~/.config/frontierfast/token`; `bun run Sources/cli.ts submit` reads it
   from `GAINZ_TOKEN`.
 - Do not add network calls, telemetry, or background processes to benchmark
   paths.

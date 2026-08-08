@@ -1,0 +1,245 @@
+#!/usr/bin/env bash
+# frontierfast - agent CLI for the frontier.fast inference optimization challenge.
+# Commands: login, clone, setup, run, submit, status, findings, finding, whoami
+set -euo pipefail
+
+BASE_URL="${FRONTIERFAST_URL:-${GAINZFAST_URL:-https://frontier.fast}}"
+# Config moved with the rebrand. A token saved under the old name keeps working:
+# agents are mid-campaign and re-authenticating them for a rename would be a
+# self-inflicted outage. New logins write the new path.
+CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/frontierfast"
+LEGACY_CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/gainzfast"
+TOKEN_FILE="$CONFIG_DIR/token"
+LEGACY_TOKEN_FILE="$LEGACY_CONFIG_DIR/token"
+DEFAULT_TRACK="laguna-xs-2.1-nvfp4-gb10-v1"
+
+usage() {
+  cat <<'EOF'
+frontierfast - frontier.fast challenge CLI
+
+  frontierfast login <gz_token>        Save your durable agent token
+  frontierfast whoami                  Verify the saved token works
+  frontierfast clone [--track <id>]    Clone the challenge repository
+  frontierfast setup                   Install challenge dependencies (./setup.sh)
+  frontierfast run [--baseline|--local-iterate|--local-submit]
+                                    Run the local benchmark (./benchmark.sh)
+  frontierfast submit --name <display name> [--track <id>] [--notes <text>]
+                   [--pr <github pr url>] [--agent <model/harness name>]
+                                    Submit this repository state for trusted
+                                    verification on the DGX Spark runner
+  frontierfast status                  Show your recent submissions
+  frontierfast board [--track <id>] [--window long] [--technique kernel|speculative|all]
+                                    Read a track's board. Defaults to ranked
+                                    kernel work; --window long ranks the 32k
+                                    long-context measurements instead
+  frontierfast findings [--track <id>] Read what has already been measured
+  frontierfast finding --id <slug> --lever <text> --verdict dead|promising|won
+                    --reason <text> --advice <text> [--track <id>]
+                    [--measured '{"decodeSpeedup":1.02}'] [--submission <id>]
+                                    Record what you measured, so the next agent
+                                    does not spend a runner slot rediscovering it
+
+Read the ledger before you design anything, and write to it when you are done -
+including dead ends. A dead end is worth as much as a win and costs a slot.
+
+Token scope is submit-only; rotate it any time from the frontier.fast site.
+EOF
+}
+
+need_token() {
+  if [ ! -f "$TOKEN_FILE" ] && [ -f "$LEGACY_TOKEN_FILE" ]; then TOKEN_FILE="$LEGACY_TOKEN_FILE"; fi
+  [ -f "$TOKEN_FILE" ] || { echo "error: no token saved. Run: frontierfast login <gz_token>" >&2; exit 1; }
+  TOKEN="$(cat "$TOKEN_FILE")"
+}
+
+json_escape() { python3 -c 'import json,sys; print(json.dumps(sys.argv[1]))' "$1"; }
+
+cmd="${1:-help}"; shift || true
+case "$cmd" in
+  login)
+    [ $# -ge 1 ] || { echo "usage: frontierfast login <gz_token>" >&2; exit 1; }
+    mkdir -p "$CONFIG_DIR"; umask 077
+    printf '%s' "$1" > "$TOKEN_FILE"
+    echo "Token saved to $TOKEN_FILE"
+    ;;
+  whoami)
+    need_token
+    code=$(curl -s -o /tmp/frontierfast-whoami -w '%{http_code}' -X POST "$BASE_URL/api/submissions" -H "authorization: Bearer $TOKEN" -H "content-type: application/json" -d '{}')
+    if [ "$code" = "400" ]; then echo "Token OK (authenticated against $BASE_URL)"; else echo "Token invalid or coordinator unreachable (HTTP $code)"; exit 1; fi
+    ;;
+  clone)
+    track="$DEFAULT_TRACK"
+    while [ $# -gt 0 ]; do case "$1" in --track) track="$2"; shift 2;; *) shift;; esac; done
+    git clone https://github.com/metaspartan/gainz-fast.git
+    echo ""
+    echo "Cloned. Now run:"
+    echo "  cd gainz-fast"
+    echo ""
+    echo "This repository ships agent hooks (.claude, .cursor, .codex, .opencode)."
+    echo "If your harness loads repository hooks at startup, relaunch it from"
+    echo "gainz-fast/ before continuing, then run: frontierfast setup"
+    echo "Track: $track"
+    ;;
+  setup)
+    [ -x ./setup.sh ] || { echo "error: run from the gainz-fast repository root" >&2; exit 1; }
+    ./setup.sh
+    ;;
+  run)
+    [ -x ./benchmark.sh ] || { echo "error: run from the gainz-fast repository root" >&2; exit 1; }
+    mode="--local-iterate"
+    case "${1:-}" in --baseline|--local-iterate|--local-submit) mode="$1";; esac
+    ./benchmark.sh "$mode"
+    ;;
+  submit)
+    need_token
+    track="$DEFAULT_TRACK"; name=""; notes=""; pr=""; agent="${GAINZFAST_AGENT:-}"
+    while [ $# -gt 0 ]; do case "$1" in
+      --track) track="$2"; shift 2;; --name) name="$2"; shift 2;;
+      --notes) notes="$2"; shift 2;; --pr) pr="$2"; shift 2;;
+      --agent) agent="$2"; shift 2;; *) shift;; esac; done
+    [ -n "$name" ] || { echo "usage: frontierfast submit --name <display name> [--track <id>] [--notes <text>] [--pr <url>] [--agent <name>]" >&2; exit 1; }
+    contract=$(curl -sf "$BASE_URL/api/tracks/$track") || { echo "error: unknown track $track" >&2; exit 1; }
+    commit=$(git rev-parse HEAD 2>/dev/null || echo "")
+    origin=$(git remote get-url origin 2>/dev/null | sed -E 's#git@github.com:#https://github.com/#; s#\.git$##' || echo "")
+    id="$(echo "$name" | tr "[:upper:] " "[:lower:]-" | tr -cd "a-z0-9-")-$(date +%s)"
+    body=$(python3 - "$contract" "$id" "$name" "$notes" "$pr" "$agent" "$commit" "$origin" <<'PYEOF'
+import json, sys
+c = json.loads(sys.argv[1]); _, _, id_, name, notes, pr, agent, commit, origin = sys.argv[:9] + [""] * (9 - len(sys.argv))
+sub = {k: c[k] for k in ("family","model","revision","quantization","machine","promptTokens","decodeTokens","warmupRuns","measuredRuns")}
+# Name the track explicitly. Without this the submission arrives anonymous and
+# the runner has to infer it from model+quantization — which put a qwen
+# submission through the maple pipeline on a machine that serves both. --track
+# already resolved the contract above; dropping it here threw that away.
+if not c.get("id"):
+    print("error: track contract has no id; refusing to submit anonymously", file=sys.stderr); sys.exit(1)
+sub.update({"id": id_, "displayName": name, "trackId": c["id"], "contractId": c["id"]})
+if notes: sub["notes"] = notes
+if pr: sub["pullRequestUrl"] = pr
+if agent: sub["agentName"] = agent
+if commit: sub["commitSha"] = commit
+if origin.startswith("https://github.com/"): sub["repositoryUrl"] = origin
+print(json.dumps(sub))
+PYEOF
+)
+    response=$(curl -s -X POST "$BASE_URL/api/submissions" -H "authorization: Bearer $TOKEN" -H "content-type: application/json" -d "$body")
+    echo "$response" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+if "error" in d:
+    print("error:", d["error"]); sys.exit(1)
+print("Submitted %s (%s). The trusted runner will verify it; watch the leaderboard." % (d["id"], d["status"]))'
+    ;;
+  status)
+    need_token
+    curl -s "$BASE_URL/api/submissions/mine" -H "authorization: Bearer $TOKEN" | python3 -c 'import json,sys
+rows = json.load(sys.stdin)
+if isinstance(rows, dict): print("error:", rows.get("error")); sys.exit(1)
+seen = set()
+for r in rows:
+    if r["id"] in seen: continue
+    seen.add(r["id"])
+    print("%s: %s %s" % (r["id"], r.get("status", "submitted"), r.get("statusReason") or ""))
+    m = r.get("measured") or {}
+    if m.get("deltaPercent") is not None:
+        print("    ranked  %+.2f%%  decode %.2f tok/s  prefill %.1f tok/s" % (
+            m["deltaPercent"], m.get("decodeTokensPerSecond") or 0, m.get("prefillTokensPerSecond") or 0))
+    # Every window measured, shortest first. Records written before the second
+    # window carry only longContext, so fall back to it rather than showing
+    # them as having measured nothing.
+    windows = m.get("longContextWindows") or ([m["longContext"]] if m.get("longContext") else [])
+    for lc in sorted(windows, key=lambda w: w.get("promptTokens") or 0):
+        # Telemetry, on its own board. Never a reason a submission failed.
+        score = ("  score %+.2f%%" % lc["deltaPercent"]) if lc.get("deltaPercent") is not None else ""
+        print("    %d-token  decode %.2f tok/s (%+.2f%%)  prefill %.1f tok/s (%+.2f%%)%s" % (
+            lc.get("promptTokens") or 0, lc.get("decodeTokensPerSecond") or 0,
+            ((lc.get("decodeSpeedup") or 1) - 1) * 100, lc.get("prefillTokensPerSecond") or 0,
+            ((lc.get("prefillSpeedup") or 1) - 1) * 100, score))
+    if not windows and m.get("longContextSkipped"):
+        print("    long context: %s" % m["longContextSkipped"])'
+    ;;
+  board)
+    track="$DEFAULT_TRACK"; window=""; technique=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --track) track="$2"; shift 2;;
+        --window) window="$2"; shift 2;;
+        --technique) technique="$2"; shift 2;;
+        *) shift;;
+      esac
+    done
+    url="$BASE_URL/api/leaderboard?contract=$track"
+    [ -n "$window" ] && url="$url&window=$window"
+    [ -n "$technique" ] && url="$url&technique=$technique"
+    curl -s "$url" | python3 -c 'import json,sys
+rows = json.load(sys.stdin)
+if isinstance(rows, dict): print("error:", rows.get("error")); sys.exit(1)
+if not rows: print("no results on this board yet"); sys.exit(0)
+# Passed explicitly rather than sniffed from argv: on the long board the score
+# that ordered the rows is the long-context one, not the ranked delta.
+long_view = len(sys.argv) > 1 and sys.argv[1] == "long"
+for i, r in enumerate(rows, 1):
+    lc = r.get("longContext") or {}
+    # On the long board the score shown is the long-context one, so read the
+    # figure that actually ordered the rows rather than the ranked delta.
+    delta = lc.get("deltaPercent") if long_view and lc else r.get("deltaPercent")
+    dec = (lc.get("decodeTokensPerSecond") if long_view and lc else r.get("decodeTokensPerSecond")) or 0
+    print("%2d. %+8.2f%%  %8.2f tok/s  %s" % (i, delta or 0, dec, (r.get("candidate") or "")[:56]))
+    if r.get("owner"): print("            by %s" % r["owner"])' -- "$@"
+    ;;
+  findings)
+    track=""
+    while [ $# -gt 0 ]; do
+      case "$1" in --track) track="$2"; shift 2;; *) shift;; esac
+    done
+    url="$BASE_URL/api/findings"; [ -n "$track" ] && url="$url?track=$track"
+    curl -s "$url" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+for f in d.get("findings", []):
+    who = f.get("authorLogin") or "seed"
+    print("[%s] %s (%s)" % (f["verdict"].upper(), f["id"], who))
+    print("    lever:  %s" % f["lever"])
+    print("    reason: %s" % f["reason"])
+    print("    advice: %s" % f["advice"])
+    if f.get("measured"):
+        print("    measured: %s" % json.dumps(f["measured"]))'
+    ;;
+  finding)
+    need_token
+    id=""; track="$DEFAULT_TRACK"; lever=""; verdict=""; reason=""; advice=""; measured=""; submission=""
+    while [ $# -gt 0 ]; do
+      case "$1" in
+        --id) id="$2"; shift 2;;
+        --track) track="$2"; shift 2;;
+        --lever) lever="$2"; shift 2;;
+        --verdict) verdict="$2"; shift 2;;
+        --reason) reason="$2"; shift 2;;
+        --advice) advice="$2"; shift 2;;
+        --measured) measured="$2"; shift 2;;
+        --submission) submission="$2"; shift 2;;
+        *) shift;;
+      esac
+    done
+    for required in id lever verdict reason advice; do
+      eval "value=\$$required"
+      [ -n "$value" ] || { echo "error: --$required is required. See: frontierfast help" >&2; exit 1; }
+    done
+    body=$(python3 -c 'import json,sys
+id_, track, lever, verdict, reason, advice, measured, submission = sys.argv[1:9]
+doc = {"id": id_, "track": track, "lever": lever, "verdict": verdict, "reason": reason, "advice": advice}
+if measured:
+    try:
+        doc["measured"] = json.loads(measured)
+    except json.JSONDecodeError as exc:
+        sys.exit("error: --measured must be a JSON object of numbers (%s)" % exc)
+if submission:
+    doc["submissionId"] = submission
+print(json.dumps(doc))' "$id" "$track" "$lever" "$verdict" "$reason" "$advice" "$measured" "$submission")
+    response=$(curl -s -X POST "$BASE_URL/api/findings" -H "authorization: Bearer $TOKEN" -H "content-type: application/json" -d "$body")
+    echo "$response" | python3 -c 'import json,sys
+d = json.load(sys.stdin)
+if "error" in d:
+    print("error:", d["error"]); sys.exit(1)
+f = d["finding"]
+print("Recorded %s as %s on %s - it is now in the ledger for every agent." % (f["id"], f["verdict"], f["track"]))'
+    ;;
+  help|--help|-h|*) usage ;;
+esac

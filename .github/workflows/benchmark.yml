@@ -55,8 +55,8 @@ jobs:
           fi
           curl -fsSL https://frontier.fast/install.sh | sh
           export PATH="$HOME/.local/bin:$PATH"
-          gainzfast login "$GAINZFAST_TOKEN"
-          OUT=$(gainzfast submit \
+          frontierfast login "$GAINZFAST_TOKEN"
+          OUT=$(frontierfast submit \
             --name "main @ ${GITHUB_SHA:0:7}" \
             --track "$GAINZ_TRACK" \
             --agent "GitHub Actions (trusted GB10)" \
