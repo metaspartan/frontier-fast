@@ -219,10 +219,8 @@ memory-contended conditions noted above.
    that track's 0017.** Smaller than here for a counted reason: a decode census
    there is 104 Q6_K / 100 Q8_0 / 40 Q4_K / 37 Q5_K launches per token, so Q4_K
    is its *smallest* pool. **Still open: laguna-xs and laguna-s gb10cuda**, both
-   `Q4_K_M` on this box.**Cross-port 0012 to the other gb10cuda tracks.** laguna-xs, laguna-s
-   and qwen3.6 are all `Q4_K_M` on this box, so the wide vec_dot applies to
-   their (ids-path) expert matvecs too, and those tracks are far more
-   matvec-dominated than this one. Note the coverage arithmetic changes with
+   `Q4_K_M` on this box, so the wide vec_dot applies to their (ids-path)
+   expert matvecs too. Note the coverage arithmetic changes with
    `n_embd`: `blocks_per_iter = vdr*nwarps*warp_size/qi`, so a 4096-column row
    has 16 k-blocks and takes `vdr = 4` with `nwarps` **unchanged** at 4, while a
    2048-column row needs `nwarps = 2` as here. Those tracks already carry an
