@@ -2128,6 +2128,72 @@ immediately before it in the same script. It is written down because an
 intermittent op-test failure is exactly the kind of thing the next agent should
 know to re-check if anything here ever looks wrong.
 
+## Round-29 map: what prefill is now, and the two ceilings that bound it
+
+Fresh census of the shipped 0044 build, `llama-bench -p 512 -n 0 -r 1`,
+normalised per pass (the trace covers a warmup pass and a measured one).
+**~99.8 ms of kernel per pass.** Two structural facts come first, because they
+bound everything anyone can still do here.
+
+**1. Prefill is 97.6% kernel-occupied.** pp512 = 5011 tok/s is 102.2 ms per pass
+against 99.8 ms of kernel, so there is only ~2.4 ms of gap across 2236
+dispatches. **Launch count is not a prefill lever on this box** — every win in
+this series that came from removing dispatches (~1.5% per 40 removed) was a
+*decode* win, and that intuition does not transfer to this shape. Prefill wins
+have to come out of kernel time.
+
+**2. The MoE experts are 44% of the pass and are a streaming read of the whole
+model.** At 512 tokens with top-8 of 256, every expert is selected by ~16
+tokens, so a pass reads essentially the entire quantised model once:
+
+```
+per layer:  2 x [2048 x 512 x 256] Q4_K (gate, up) = 302 MB
+            1 x [512 x 2048 x 256] Q5_K (down)     = 185 MB
+per pass:   487 MB x 40 layers = 19.5 GB
+measured:   43.5 ms  ->  448 GB/s  and  23.7 TFLOP/s-equivalent
+```
+
+448 GB/s against the R9700's ~640 GB/s of GDDR6 is **70% of peak** — leaning
+memory-bound but not pinned to the wall, and about 16% of what DP4A should give
+on the arithmetic side (each weight byte is reused by 16 tokens here, so unlike
+decode this is not a pure stream). Round 26 closed every tile-geometry axis and
+0023 fixed the J tile, so this is not a tuning lever; but 44% of the pass at 70%
+of peak is where the remaining prefill headroom actually lives, and nobody has
+attacked it from the memory side.
+
+| ms/pass | % | n/pass | each | kernel |
+|---|---|---|---|---|
+| 24.43 | 24.2 | 80 | 305.4us | `mul_mat_q` Q4_K experts (gate, up) |
+| 19.06 | 18.8 | 40 | 476.5us | `mul_mat_q` Q5_K expert-down |
+| 8.41 | 8.3 | 30 | 280.3us | `gated_delta_net_mc` (0043) |
+| 5.82 | 5.8 | 40 | 145.5us | `Cijk` HSS GEMM — the 0021 Q6_K dequant+GEMM route |
+| 3.59 | 3.6 | 10 | 359.2us | `flash_attn_tile<256,256,4,8>` |
+| 3.70 | 3.7 | 100 | ~37us | `mul_mat_f32_skinny_cuda` (0044) |
+| 3.41 | 3.4 | 40 | 85.4us | `Cijk` HSS GEMM (bias variant) |
+| 3.01 | 3.0 | 100 | 30.1us | `mul_mat_q` small |
+| 2.28 | 2.3 | 81 | 28.1us | `k_bin_bcast` op_add |
+| 2.24+1.96 | 4.2 | 110 | | `dequantize_block_q6_K` — the 0021 route's conversion cost |
+| 2.23 | 2.2 | 30 | 74.4us | `Cijk` HSS GEMM |
+| 2.21 | 2.2 | 80 | 27.6us | `unary_gated_op_kernel` |
+
+### Re-confirmed this round: 0021's Q6_K dequant+GEMM route is still right
+
+The prefill pass has got 12% faster since 0021 chose fp16 dequant+GEMM over MMQ
+for the dense Q6_K matmuls, so the trade was re-run — it is a single env var and
+costs one bench:
+
+| `GGML_Q6K_MMQ_MAX_BATCH` | pp512 |
+|---|---|
+| 64 (shipped) | 5000.5 / 5003.3 |
+| 32 | 4995.8 / 4978.6 |
+| 128 | 5000.1 / 4968.0 |
+| **0 (force MMQ)** | **4418.2 / 4369.1 (-12.5%)** |
+
+The batch threshold itself is flat between 32 and 128; forcing MMQ costs 12.5%.
+**Do not "fix" the dequant+GEMM route back to MMQ** — and note the conversion
+overhead it carries (4.2 ms/pass of `dequantize_block_q6_K` plus ~1.4 ms of
+`convert_unary`) is already priced into that comparison.
+
 ## Recommended firing order
 
 The runner applies the whole patch directory, so the series is a ladder rather

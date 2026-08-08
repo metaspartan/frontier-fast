@@ -1,0 +1,137 @@
+From 66d64ed36793cd78155f3941202933251ae02773 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sat, 8 Aug 2026 12:26:08 -0600
+Subject: [PATCH] CUDA: sm_121 one-warp block for the Q5_K expert-down shape
+
+The qwen3.6-35b-a3b Q5_K tensors are the 37 ffn_down_exps at
+[512 x 2048] x 256, so ncols_x = 512 = exactly two Q5_K superblocks per row.
+One warp at vdr = 2 already covers vdr*warp_size/qi = 2 blocks, but the
+sm_121 table (0014/0015) gives every K-quant two warps, so blocks_per_iter
+= 4 while blocks_per_row_x = 2: **half of every thread block has no k-block
+to read for the entire kernel**.
+
+Upstream's small_k does not fix this. It fires on exactly this condition
+(blocks_per_row_x < nwarps * blocks_per_iter_1warp) but only compensates
+with more rows per block - it never shrinks the block. That is why 0015's
+deep rows helped and why the follow-up rows = 8 sweep measured neutral
+(72.4 -> 72.1 tg64): the ILP dimension was already saturated, the waste was
+thread slots.
+
+This runs the shape as a one-warp block that keeps the same 4-row tile:
+
+- calc_nwarps returns 1 for Q5_K at ncols_dst == 1 under the sm_121 table
+- calc_rows_per_block keeps 4 rows when the small_k block is one warp
+  (halving the block must not halve per-thread ILP)
+- the host should_use_small_k predicate, which assumes nwarps > 1 because
+  only then can lanes idle, also fires for a one-warp config whose single
+  iteration already covers the row
+
+Every lane now works and the cross-warp shared-memory reduction disappears.
+The lanes that were idle contributed only exact zeros to that reduction, so
+the summation order is untouched and the result is bit-identical.
+
+Measured on the runner box gx10-838f (parked vllm container), against a
+binary built from this patch's own parent commit (0017):
+
+- firing proof, nsys geometry census: the Q5_K kernel
+  mul_mat_vec_q<(ggml_type)13, 1, false, true> goes from block 32 2 1 to
+  32 1 1 at the same grid 512 8 1, and every other kernel in the census is
+  identical in geometry. Its GPU time 12.36 ms -> 11.59 ms (-6.3%), 8.6% ->
+  8.0% of decode kernel time.
+- decode tg128: 72.33/72.41/72.51/72.30/72.53 -> 72.56/72.63/72.74/72.85/
+  72.81, 5/5 interleaved rounds disjoint, median ratio 1.0032
+- prefill pp512: neutral (2325-2351 vs 2334-2347, overlapping) - prefill
+  takes MMQ
+- ppl bit-identical both ways, as the mechanism predicts: gate
+  -c 512 --chunks 8 3.9306 vs 3.9306; decode-path -b 512 -ub 1 --chunks 16
+  3.9657 vs 3.9657
+
+GGML_CUDA_DISABLE_SM121_ONE_WARP_ROW restores the stock two-warp config.
+---
+ ggml/src/ggml-cuda/mmvq.cu | 42 ++++++++++++++++++++++++++++++++++----
+ 1 file changed, 38 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 664d57a..b479543 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -134,6 +134,27 @@ static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type, mmvq_param
+     return get_vdr_mmvq(type);
+ }
+ 
++// sm_121 one-warp row config. The Q5_K expert-down shape on qwen3.6-35b-a3b is
++// [512 x 2048] x 256, i.e. ncols_x = 512 = exactly two Q5_K superblocks per row,
++// and a single warp at vdr = 2 already covers vdr*warp_size/qi = 2 blocks. The
++// SM121 table gives K-quants two warps, so for this shape the second warp has
++// no k-block to read and half of every thread block idles for the whole kernel.
++// Upstream's small_k only compensates with more rows per block - it never
++// shrinks the block, which is why the rows = 8 sweep measured neutral here.
++// Run this shape as a one-warp block that keeps the same deep 4-row tile:
++// every lane works, the cross-warp shared-memory reduction disappears, and
++// per-thread ILP is unchanged. Define GGML_CUDA_DISABLE_SM121_ONE_WARP_ROW to
++// fall back to the stock two-warp config.
++static constexpr __host__ __device__ bool sm121_one_warp_row(
++        ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id) {
++#ifdef GGML_CUDA_DISABLE_SM121_ONE_WARP_ROW
++    (void) type; (void) ncols_dst; (void) table_id;
++    return false;
++#else
++    return table_id == MMVQ_PARAMETERS_SM121 && ncols_dst == 1 && type == GGML_TYPE_Q5_K;
++#endif
++}
++
+ // Per-architecture maximum batch size for which MMVQ should be used for MUL_MAT_ID.
+ // Returns a value <= MMVQ_MAX_BATCH_SIZE. Default is MMVQ_MAX_BATCH_SIZE.
+ // Check https://github.com/ggml-org/llama.cpp/pull/20905#issuecomment-4145835627 for details
+@@ -456,6 +477,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+     }
+     if (table_id == MMVQ_PARAMETERS_TURING || table_id == MMVQ_PARAMETERS_SM121) {
+         if (ncols_dst == 1) {
++            if (sm121_one_warp_row(type, ncols_dst, table_id)) {
++                return 1;
++            }
+             switch (type) {
+                 case GGML_TYPE_Q2_K:
+                 case GGML_TYPE_Q3_K:
+@@ -490,8 +514,11 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
+         // thread and activation reuse - what the LPDDR5 latency wants.
+         if (ncols_dst == 1) {
+             // dense stays at 1 row/block (the grouped-mmvq launch requires
+-            // blockIdx == row); the small_k expert shapes get the deep config
+-            return small_k ? 2*nwarps : 1;
++            // blockIdx == row); the small_k expert shapes get the deep config.
++            // A one-warp small_k config (sm121_one_warp_row) keeps the very same
++            // 4-row tile the two-warp config had - halving the block must not
++            // halve per-thread ILP, only stop wasting the idle lanes.
++            return small_k ? (nwarps == 1 ? 4 : 2*nwarps) : 1;
+         }
+         return 2;
+     }
+@@ -985,7 +1012,9 @@ static bool mmvq_may_use_small_k(const int ncols_x, const mmvq_parameter_table_i
+     const int blocks_per_iter_1warp = vdr * warp_size / qi;
+     const int nwarps                = calc_nwarps(type, 1, table_id);
+ 
+-    return nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
++    return nwarps > 1
++        ? blocks_per_row_x < nwarps * blocks_per_iter_1warp
++        : (sm121_one_warp_row(type, 1, table_id) && blocks_per_row_x <= blocks_per_iter_1warp);
+ }
+ 
+ bool ggml_cuda_mmvq_group_shape_matches(const ggml_type type, const int64_t ncols_x) {
+@@ -1147,7 +1176,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         const int     blocks_per_row_x      = ncols_x / qk;
+         const int     blocks_per_iter_1warp = vdr * warp_size / qi;
+         const int     nwarps                = calc_nwarps(type, c_ncols_dst, table_id);
+-        bool          use                   = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
++        // Upstream's predicate assumes nwarps > 1, because only then can lanes
++        // go idle. A one-warp sm_121 config still wants the deep row tile when
++        // its single iteration already covers the row (<=, not <).
++        bool          use                   = nwarps > 1
++            ? blocks_per_row_x < nwarps * blocks_per_iter_1warp
++            : (sm121_one_warp_row(type, c_ncols_dst, table_id) && blocks_per_row_x <= blocks_per_iter_1warp);
+ 
+         constexpr std::array<ggml_type, 2> iq_slow_turing = {
+             GGML_TYPE_IQ3_XXS,
+-- 
+2.43.0
+
