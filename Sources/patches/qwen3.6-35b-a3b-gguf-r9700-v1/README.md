@@ -1005,3 +1005,115 @@ server greedy is the measurement that confirms it.
 Projection with 0033+0034+0035+0036: decode 1.5959 x 1.0335 x 1.0152 x 1.0161
 x 1.0147 = **1.7265**, prefill 1.2468 x 1.0355 = **1.2911**, ttft following
 prefill (1.1838 x 1.0355 = 1.2258) -> score **~1.547** vs the 1.4525 bank.
+
+
+## Round-19 map (post-0036 census — start here)
+
+Fresh rocprofv3 kernel trace of the 0036 build, `llama-bench -p 0 -n 34 -r 1`.
+Normalize by **35** tokens: the run's total dispatch count divides exactly
+(28738/35 = 821.0 with the fold on, 30138/35 = 861.0 with it off), which is the
+cheapest available check that the window is a whole number of tokens — do this
+before trusting any per-token number, because a naive "last 70% of dispatches"
+slice lands mid-token and reads ~25% low.
+
+**821 dispatches, 5.72 ms kernel, in a 6.96 ms wall token (143.6 tok/s).**
+The 1.24 ms that is not kernel is ~1.5 us of bubble per dispatch, and it is why
+every dispatch-removing round in this series has paid about **1.5% per 40
+launches removed** (0034, 0035, 0036 each removed exactly 40 and each measured
++1.5-1.6%). Dispatch count remains the single best predictor of decode gain on
+this track.
+
+| us/token | n/token | kernel | note |
+|---|---|---|---|
+| 1063 | 30 | mmvq_grouped Q6_K qkv+z (35.4us) | 581 GB/s, practical ceiling |
+| 717 | 40 | mmvq Q4_K MoE gate+up (17.9us) | 527 GB/s |
+| 666 | 1 | mmvq Q6_K output head | 621 GB/s = 96% of peak, done |
+| 486 | 30 | mmvq Q6_K ssm_out (16.2us) | 425 GB/s in-graph — **at its isolated ceiling**, see round 11 |
+| 481 | 37 | mmvq Q5_K expert down (13.0us) | **444 GB/s — still the weakest big matvec** |
+| 327 | 70 | mmvf_grouped | dominated by the F32 router (2 MB/layer) |
+| 267 | 50 | mmvq_grouped Q8_0 shexp | |
+| 246 | 10 | mmvq Q6_K attn wq, 8192 rows (24.6us) | 560 GB/s |
+| 225 | 80 | rms_norm_pre_add (2.8us) | **closed this round, see below** |
+| 152 | 30 | gated_delta_net | 0026 territory; ~394 GB/s on 2 MB of state |
+| 149 | 40 | mmvq Q8_0 shexp down (3.7us) | |
+| 138 | 10 | mmvq Q6_K attn wo (13.8us) | 249 GB/s — small and latency-bound |
+| 115 | 40 | topk_moe (2.7us) | ONE warp, 256 experts; pure launch floor |
+| 109 | 80 | unary_gated_op_quant | after 0036 |
+| 86 | 51 | rms_norm_f32 | |
+| 71 | 41 | k_bin_bcast | the fused 8-way MoE expert reduction, 1.7us each |
+| 60 | 41 | quantize_q8_1 | the MoE-swiglu 40 are structurally dead (round 17) |
+| 51 | 13 | `__amd_rocclr_copyBuffer` | unattributed; worth one probe |
+
+### Measured dead this round: rms_norm_pre_add at block 256
+
+Round-14 map item 2 proposed dropping the 2048-column folded norm from a
+1024-thread workgroup to 256 on RDNA4, on the theory that a 32-wave LDS block
+reduction is the cost. **It is a 4.0% decode REGRESSION** (tg128 143.91/143.95
+at 1024 vs 138.09/138.10 at 256, interleaved, arms disjoint). Both
+instantiations already exist upstream, so this cost only a build.
+
+The premise is backwards. At decode the grid is one block for one row, so the
+kernel is bound by memory latency on the row loads, not by reduction depth:
+1024 threads x 2 columns issues the 8 KB row in two rounds of loads, 256
+threads x 8 columns serializes eight. Block size here is a memory-parallelism
+knob and bigger wins — and 1024 is already the hardware maximum, so there is
+nothing above it and nothing between that can beat it. The kernel's real cost
+is a launch plus ~2 dependent memory round trips (2.8us for 40 KB = 14 GB/s on
+one CU); the only lever left would be grouping the launches, and that is
+structurally blocked — the 80 norms per token are strictly sequential in the
+graph (norm -> attn -> norm -> ffn, twice per layer over 40 layers), so there
+is never a same-shape pair in flight to collect. Treat this whole kernel as
+closed.
+
+### Best remaining candidate: fold the 8-way expert reduction into the down matvec
+
+Round-14 item 3, still open and now the largest clean structural win. After
+0034 the expert-down `mul_mat_id` writes `[2048, 8]` (one slice per expert
+slot, routing weight already applied by `dst_scale`), and a fused multi-add
+`k_bin_bcast` then sums the eight slices — 40 launches/token, 1.7us each, 71
+us/token, moving 64 KB of reads and 64 KB of writes per layer to produce 8 KB.
+
+The design that preserves the matvec's parallelism, which is the whole
+difficulty: today `blockIdx.y` IS the expert slot (`channel_dst`, and
+`ids[channel_dst]` selects the weight slab), so 2048 rows x 8 slots = 16384
+warps are in flight. Do **not** make one warp loop over the eight experts —
+these matvecs are latency-bound (see the ssm_out/wo rows above), and cutting
+warps in flight 8x will cost more than the fold saves. Instead launch
+`blockDim.y = n_expert_used` with each warp y taking `channel_dst = y` for the
+same row, then reduce the eight partials through LDS and store once. Same 16384
+warps, one store instead of eight, and the `k_bin_bcast` disappears. `nwarps`
+is 1 for this shape today (the launch is `wg=32`), so `threadIdx.y` is free —
+but note `blocks_per_iter` and the warp-trimming logic both derive from the
+compile-time `nwarps`, so they need to stay keyed to k-splitting rather than to
+the new expert dimension.
+
+Byte-exactness is available if wanted: reduce the eight partials **in slot
+order 0..7 in a single lane** rather than as an LDS tree, which is the order
+the ggml add chain uses. Expected ~71 us (the bin_bcast) + ~10 us (traffic) +
+40 fewer dispatches at ~1.5 us of bubble = **~2% decode**.
+
+Ranked after that: (2) the Q5_K expert-down at 444 GB/s against the 527 the
+Q4_K gate/up achieves — per-shape rows-per-block, never blanket (0024/0028
+recorded blanket rpb on the ids path as a regression); (3) attributing the 13
+`__amd_rocclr_copyBuffer` launches per token (51 us) — 0030 killed the state
+gathers, so it is not obvious what is left copying.
+
+### Prefill: the Q6_K dequant+GEMM route is deliberate, not a bug
+
+A fresh pp512 trace shows `dequantize_block_q6_K` (3.8%) + `convert_unary`
+(1.4%) + the rocBLAS `Cijk_*` GEMMs (~18.2%) = ~23% of the pass. That is 0021's
+**intentional** routing: RDNA4 Q6_K MMQ tiles cost ~20% more than the fp16
+dequant+GEMM path at prefill batches. Do not "fix" it back to MMQ — that was
+measured and ranked 0.9476. The genuinely open prefill items are `mul_mat_q`
+(41.3%, MoE experts, J-tile geometry already swept dead at J=32),
+`gated_delta_net` (11.8%, 440us x 30/pass) and `k_bin_bcast` (4.7%, 663
+launches) — the last being the prefill analogue of 0034, since at prefill
+shapes MUL_MAT_ID takes MMQ and the routing-weight multiply is not folded.
+
+## Recommended firing order
+
+The runner applies the whole patch directory, so the series is a ladder rather
+than a choice; 0001-0036 is the verified set and every patch has a disable
+toggle. If a ranked run has to be pared back, drop from the end: 0036, 0035,
+0034 are independent +1.5% decode folds; 0033 is the prefill fold; 0032 and
+0030 are the two largest decode wins and should be the last to go.
