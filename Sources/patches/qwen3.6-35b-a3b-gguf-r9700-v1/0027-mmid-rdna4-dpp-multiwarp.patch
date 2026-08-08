@@ -1,0 +1,317 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH 27/28] cuda/hip: RDNA4 DPP scan + multi-warp token chunking in mm_ids_helper
+
+mm_ids_helper (4.5% of pp512 kernel time after the 0026-state profile,
+48.1us avg at 512 tokens) runs one warp per expert with a serial loop
+over all tokens. Each 4-token iteration issues seven __shfl-class ops -
+warp_reduce_any<8>, a 3-step __shfl_up scan over the 8-lane token
+groups, and a final broadcast - and on gfx1201 every one lowers to
+ds_bpermute_b32 behind a full s_wait_dscnt: ~900 serialized LDS
+round-trips per block at 512 tokens. The same pathology the 0026 patch
+removed from gated_delta_net.
+
+Two changes:
+
+1. RDNA4 wave32 DPP forms (guarded to gfx120x, generic path untouched):
+   the 8-lane any-reduce becomes quad_perm xor1/xor2 + row_half_mirror
+   ORs, and the group scan + total broadcast become row_shr:8/row_shl:8
+   partial sums combined through one v_permlanex16 - VALU-only, no LDS,
+   no waits. The trailing nex_prev warp_reduce_sum uses the 0026-style
+   5-op DPP butterfly.
+
+2. Multi-warp token chunking (all archs, engaged at n_tokens >= 128):
+   the serial token loop splits into nwarps=4 contiguous chunks, each
+   warp compacting its chunk into a disjoint shared-memory slice; the
+   per-warp counts and nex_prev partials merge through 2*nwarps ints of
+   shared memory after one __syncthreads. Chunks are contiguous, so the
+   concatenated slices ARE the single-warp output: the kernel is pure
+   integer bookkeeping and the result is bit-identical by construction.
+   nwarps=8 measured slightly worse (12.1us vs 10.7us), decode-sized
+   calls (n_tokens < 128) keep the single-warp launch.
+
+Measured on the R9700 box (Qwen3.6-35B-A3B-UD-Q4_K_M, HIP_VISIBLE_DEVICES=0):
+
+- kernel: mm_ids_helper<8> 48.12us -> 10.68us avg at pp512 (4.5x),
+  4.62% -> 1.04% of pp512 kernel time (rocprofv3, 240 calls).
+- model (5-round interleaved whole-process A/B vs the 26-patch control
+  binary): pp512 4054.0 -> 4183.8 (+3.20%), arms fully separated;
+  tg128 119.99 vs 119.98 (flat). pp16384 2791 -> 2840 (+1.8%).
+- correctness: test-backend-ops MUL_MAT_ID all OK at nwarps 1/4/8
+  (the qwen3-moe cases n_mats=128/n_used=8/bs up to 512 exercise the
+  DPP + chunked path); server greedy identity vs control BYTE-EXACT
+  (integer kernel, no float change); ppl 3.9251/3.9304/3.9271 vs
+  control cluster 3.9257-3.9292 on the same session (stock 3.9314,
+  all deltas within +-0.16%).
+---
+diff --git a/ggml/src/ggml-cuda/mmid.cu b/ggml/src/ggml-cuda/mmid.cu
+index f80442fbe..d43b217f4 100644
+--- a/ggml/src/ggml-cuda/mmid.cu
++++ b/ggml/src/ggml-cuda/mmid.cu
+@@ -1,6 +1,49 @@
+ #include "common.cuh"
+ #include "mmid.cuh"
+ 
++#if defined(GGML_USE_HIP) && (defined(__gfx1200__) || defined(__gfx1201__))
++// RDNA4 wave32: VALU-only warp reductions/scans via DPP + permlanex16.
++// The generic __shfl-based helpers lower to ds_bpermute_b32, which round-trips through
++// the LDS unit with a full s_wait_dscnt after every step. The templated token loop below
++// runs 7 such round-trips per 4-token iteration (any-reduce over 8 lanes, 3-step
++// shfl_up scan, final broadcast); at 512 tokens that is ~900 serialized LDS waits per
++// block. The DPP forms issue on the VALU with no LDS traffic (same medicine as the
++// gated-delta-net reduction patch).
++#define MMID_DPP_REDUCE 1
++#endif
++
++#ifdef MMID_DPP_REDUCE
++// OR-reduce over each group of 8 lanes (butterfly: xor1, xor2, xor4-within-8).
++static __device__ __forceinline__ int mmid_dpp_or8(int x) {
++    x |= __builtin_amdgcn_update_dpp(0, x, 0xB1, 0xF, 0xF, true);  // quad_perm [1,0,3,2]: | lane^1
++    x |= __builtin_amdgcn_update_dpp(0, x, 0x4E, 0xF, 0xF, true);  // quad_perm [2,3,0,1]: | lane^2
++    x |= __builtin_amdgcn_update_dpp(0, x, 0x141, 0xF, 0xF, true); // row_half_mirror: | other quad
++    return x;
++}
++
++// Full wave32 integer sum.
++static __device__ __forceinline__ int mmid_dpp_sum32(int x) {
++    x += __builtin_amdgcn_update_dpp(0, x, 0xB1, 0xF, 0xF, true);  // quad_perm [1,0,3,2]
++    x += __builtin_amdgcn_update_dpp(0, x, 0x4E, 0xF, 0xF, true);  // quad_perm [2,3,0,1]
++    x += __builtin_amdgcn_update_dpp(0, x, 0x141, 0xF, 0xF, true); // row_half_mirror
++    x += __builtin_amdgcn_update_dpp(0, x, 0x140, 0xF, 0xF, true); // row_mirror
++    x += __builtin_amdgcn_permlanex16(x, x, 0x76543210, 0xFEDCBA98, false, false); // other row
++    return x;
++}
++
++// s must be uniform within each group of 8 lanes (one value per token position).
++// Returns the exclusive prefix over the four 8-lane groups in `lower` and the
++// whole-wave total in `total`. Replaces the 3-step shfl_up scan + shfl broadcast.
++static __device__ __forceinline__ void mmid_dpp_scan8(const int s, const int lane, int & lower, int & total) {
++    const int shr8      = __builtin_amdgcn_update_dpp(0, s, 0x118, 0xF, 0xF, true); // row_shr:8 (0-fill)
++    const int shl8      = __builtin_amdgcn_update_dpp(0, s, 0x108, 0xF, 0xF, true); // row_shl:8 (0-fill)
++    const int row_total = s + shr8 + shl8; // uniform within each row of 16
++    const int other_row = __builtin_amdgcn_permlanex16(row_total, row_total, 0x76543210, 0xFEDCBA98, false, false);
++    lower = shr8 + ((lane & 16) ? other_row : 0);
++    total = row_total + other_row;
++}
++#endif // MMID_DPP_REDUCE
++
+ // To reduce shared memory use, store "it" and "iex_used" with 22/10 bits each.
+ struct mm_ids_helper_store {
+     uint32_t data;
+@@ -23,26 +66,39 @@ static_assert(sizeof(mm_ids_helper_store) == 4, "unexpected size for mm_ids_help
+ // ids_src1 describes how to permute the flattened column indices of src1 in order to get a compact src1 tensor sorted by expert.
+ // ids_dst describes the same mapping but for the dst tensor.
+ // The upper and lower bounds for the ith expert in the compact src1 tensor are stored in expert_bounds[i:i+1].
+-template <int n_expert_used_template>
+-__launch_bounds__(ggml_cuda_get_physical_warp_size(), 1)
++// nwarps > 1 splits the (serial) token loop into per-warp chunks; per-warp counts are
++// combined through shared memory so the output is bit-identical to the single-warp form.
++template <int n_expert_used_template, int nwarps>
++__launch_bounds__(ggml_cuda_get_physical_warp_size()*nwarps, 1)
+ static __global__ void mm_ids_helper(
+         const int32_t * __restrict__ ids, int32_t * __restrict__ ids_src1, int32_t * __restrict__ ids_dst, int32_t * __restrict__ expert_bounds,
+         const int n_tokens, const int n_expert_used_var, const int nchannels_y, const int si1, const int sis1, const bool write_inverse) {
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    static_assert(nwarps == 1 || n_expert_used_template != 0, "multi-warp requires a templated expert count");
+     const int n_expert_used = n_expert_used_template == 0 ? n_expert_used_var : n_expert_used_template;
+     const int expert = blockIdx.x;
+ 
++    const int warp = nwarps == 1 ? 0 : (int) threadIdx.x / warp_size;
++    const int lane = nwarps == 1 ? (int) threadIdx.x : (int) threadIdx.x % warp_size;
++
++    // Token range owned by this warp. Chunks are contiguous so the per-expert output
++    // (sorted by token) is the concatenation of the per-warp compact slices.
++    const int chunk_len = nwarps == 1 ? n_tokens : (n_tokens + nwarps - 1) / nwarps;
++    const int tok_beg   = nwarps == 1 ? 0 : warp*chunk_len;
++    const int tok_end   = nwarps == 1 ? n_tokens : min(tok_beg + chunk_len, n_tokens);
++
+     extern __shared__ char data_mm_ids_helper[];
+-    mm_ids_helper_store * store = (mm_ids_helper_store *) data_mm_ids_helper;
++    // Warp w compacts into entries [tok_beg, tok_beg + cnt_w); regions are disjoint.
++    mm_ids_helper_store * store = ((mm_ids_helper_store *) data_mm_ids_helper) + tok_beg;
+ 
+-    int nex_prev   = 0; // Number of columns for experts with a lower index.
+-    int it_compact = 0; // Running index for the compact slice of this expert.
++    int nex_prev   = 0; // Number of columns for experts with a lower index (this warp's partial).
++    int it_compact = 0; // Running index for the compact slice of this warp's chunk.
+ 
+     if constexpr (n_expert_used_template == 0) {
+         // Generic implementation:
+-        for (int it = 0; it < n_tokens; ++it) {
++        for (int it = tok_beg; it < tok_end; ++it) {
+             int iex_used = -1; // The index at which the expert is used, if any.
+-            for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
++            for (int iex = lane; iex < n_expert_used; iex += warp_size) {
+                 const int expert_used = ids[it*si1 + iex];
+                 nex_prev += expert_used < expert;
+                 if (expert_used == expert) {
+@@ -61,49 +117,95 @@ static __global__ void mm_ids_helper(
+     } else {
+         // Implementation optimized for specific numbers of experts used:
+         static_assert(n_expert_used == 6 || warp_size % n_expert_used == 0, "bad n_expert_used");
+-        const int neu_padded = n_expert_used == 6 ? 8 : n_expert_used; // Padded to next higher power of 2.
+-        for (int it0 = 0; it0 < n_tokens; it0 += warp_size/neu_padded) {
+-            const int it = it0 + threadIdx.x / neu_padded;
++        constexpr int neu_padded = n_expert_used == 6 ? 8 : n_expert_used; // Padded to next higher power of 2.
++#ifdef MMID_DPP_REDUCE
++        constexpr bool use_dpp = neu_padded == 8 && warp_size == 32;
++#else
++        constexpr bool use_dpp = false;
++#endif
++        for (int it0 = tok_beg; it0 < tok_end; it0 += warp_size/neu_padded) {
++            const int it = it0 + lane / neu_padded;
+ 
+-            const int iex = threadIdx.x % neu_padded; // The index at which the expert is used, if any.
+-            const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < n_tokens ?
++            const int iex = lane % neu_padded; // The index at which the expert is used, if any.
++            const int expert_used = (neu_padded == n_expert_used || iex < n_expert_used) && it < tok_end ?
+                 ids[it*si1 + iex] : INT_MAX;
+             const int iex_used = expert_used == expert ? iex : -1;
+             nex_prev += expert_used < expert;
+ 
+-            // Whether the threads at this token position have used the expert:
+-            const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
++            if constexpr (use_dpp) {
++#ifdef MMID_DPP_REDUCE
++                // Whether each token position in the wave used the expert (uniform per 8-lane group):
++                const int used = mmid_dpp_or8(iex_used != -1);
++                int add_lower, add_total;
++                mmid_dpp_scan8(used, lane, add_lower, add_total);
++                if (iex_used != -1) {
++                    store[it_compact + add_lower] = mm_ids_helper_store(it, iex_used);
++                }
++                it_compact += add_total;
++#endif
++            } else {
++                // Whether the threads at this token position have used the expert:
++                const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
+ 
+-            // Do a scan over threads at lower token positions in warp to get the correct index for writing data:
+-            int it_compact_add_lower = 0;
++                // Do a scan over threads at lower token positions in warp to get the correct index for writing data:
++                int it_compact_add_lower = 0;
+ #pragma unroll
+-            for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
+-                const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self, offset, warp_size);
+-                if (threadIdx.x >= static_cast<unsigned int>(offset)) {
+-                    it_compact_add_lower += tmp;
++                for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
++                    const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self, offset, warp_size);
++                    if (lane >= offset) {
++                        it_compact_add_lower += tmp;
++                    }
+                 }
+-            }
+ 
+-            if (iex_used != -1) {
+-                store[it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
+-            }
++                if (iex_used != -1) {
++                    store[it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
++                }
+ 
+-            // The thread with the highest index in the warp always has the sum over the whole warp, use it to increment all threads:
+-            it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
++                // The thread with the highest index in the warp always has the sum over the whole warp, use it to increment all threads:
++                it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
++            }
+         }
+     }
++#ifdef MMID_DPP_REDUCE
++    if constexpr (warp_size == 32) {
++        nex_prev = mmid_dpp_sum32(nex_prev);
++    } else {
++        nex_prev = warp_reduce_sum<warp_size>(nex_prev);
++    }
++#else
+     nex_prev = warp_reduce_sum<warp_size>(nex_prev);
++#endif
++
++    int cnt_lower = 0;          // Compact entries in chunks of lower warps.
++    int cnt_total = it_compact; // Compact entries in the whole block.
++    if constexpr (nwarps > 1) {
++        int * warp_meta = (int *) (data_mm_ids_helper + (size_t)(nwarps*chunk_len)*sizeof(mm_ids_helper_store));
++        if (lane == 0) {
++            warp_meta[warp]          = it_compact;
++            warp_meta[nwarps + warp] = nex_prev;
++        }
++        __syncthreads();
++        nex_prev  = 0;
++        cnt_total = 0;
++#pragma unroll
++        for (int v = 0; v < nwarps; v++) {
++            const int c = warp_meta[v];
++            cnt_lower += v < warp ? c : 0;
++            cnt_total += c;
++            nex_prev  += warp_meta[nwarps + v];
++        }
++    }
+ 
+-    for (int itc = threadIdx.x; itc < it_compact; itc += warp_size) {
++    for (int itc = lane; itc < it_compact; itc += warp_size) {
+         const mm_ids_helper_store store_it = store[itc];
+         const int it       = store_it.it();
+         const int iex_used = store_it.iex_used();
+-        ids_dst[nex_prev + itc] = it*n_expert_used + iex_used;
++        ids_dst[nex_prev + cnt_lower + itc] = it*n_expert_used + iex_used;
+         // ids_src1 holds the forward map, or the inverse map (token slot -> compact row) for quant dedup
+         if (write_inverse) {
+-            ids_src1[it*n_expert_used + iex_used] = nex_prev + itc;
++            ids_src1[it*n_expert_used + iex_used] = nex_prev + cnt_lower + itc;
+         } else {
+-            ids_src1[nex_prev + itc] = it*sis1 + iex_used % nchannels_y;
++            ids_src1[nex_prev + cnt_lower + itc] = it*sis1 + iex_used % nchannels_y;
+         }
+     }
+ 
+@@ -117,7 +219,7 @@ static __global__ void mm_ids_helper(
+         return;
+     }
+ 
+-    expert_bounds[gridDim.x] = nex_prev + it_compact;
++    expert_bounds[gridDim.x] = nex_prev + cnt_total;
+ }
+ 
+ template <int n_expert_used_template>
+@@ -130,14 +232,37 @@ static void launch_mm_ids_helper(
+     const int id = ggml_cuda_get_device();
+     const int warp_size = ggml_cuda_info().devices[id].warp_size;
+     const size_t smpbo = ggml_cuda_info().devices[id].smpbo;
+-    CUDA_SET_SHARED_MEMORY_LIMIT(mm_ids_helper<n_expert_used_template>, smpbo);
++
++    // The token loop is serial per expert; for prefill-sized batches split it across
++    // warps and merge the per-warp counts through shared memory.
++    int nwarps = 1;
++    if constexpr (n_expert_used_template != 0) {
++        if (n_tokens >= 128) {
++            nwarps = 4; // 8 measured slightly worse on gfx1201 (12.1us vs 10.7us at 512 tokens)
++        }
++    }
+ 
+     const dim3 num_blocks(n_experts, 1, 1);
+-    const dim3 block_size(warp_size, 1, 1);
+-    const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
++    const dim3 block_size(warp_size*nwarps, 1, 1);
++    const int chunk_len = nwarps == 1 ? n_tokens : (n_tokens + nwarps - 1)/nwarps;
++    const size_t nbytes_shared = (size_t)(nwarps*chunk_len)*sizeof(mm_ids_helper_store) + (nwarps > 1 ? 2*nwarps*sizeof(int) : 0);
+     GGML_ASSERT(nbytes_shared <= smpbo);
+-    mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
+-        (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
++    bool launched = false;
++    if constexpr (n_expert_used_template != 0) {
++        if (nwarps == 4) {
++            auto * kernel = mm_ids_helper<n_expert_used_template, 4>;
++            CUDA_SET_SHARED_MEMORY_LIMIT(kernel, smpbo);
++            kernel<<<num_blocks, block_size, nbytes_shared, stream>>>
++                (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
++            launched = true;
++        }
++    }
++    if (!launched) {
++        auto * kernel = mm_ids_helper<n_expert_used_template, 1>;
++        CUDA_SET_SHARED_MEMORY_LIMIT(kernel, smpbo);
++        kernel<<<num_blocks, block_size, nbytes_shared, stream>>>
++            (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
++    }
+ }
+ 
+ void ggml_cuda_launch_mm_ids_helper(

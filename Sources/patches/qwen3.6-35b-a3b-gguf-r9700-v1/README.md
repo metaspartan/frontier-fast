@@ -409,3 +409,49 @@ s_wait_dscnt) plus 11 scalar global_load_b32. Two HIP-guarded changes
   (same class as 0024's multi-row reduction change; ppl-gated)
 - long windows: GDN is 9.2% of the 16k phase, kernel uniformly faster,
   no KV/attention path touched
+
+## 0027: RDNA4 mm_ids_helper DPP scan + multi-warp token chunking
+
+mm_ids_helper (4.5% pp512, 48.1us avg at 512 tokens) ran one warp per
+expert with a serial all-token loop paying ~7 ds_bpermute LDS round-trips
+per 4-token iteration (any-reduce over 8 lanes, 3-step shfl_up scan,
+broadcast) - the 0026 pathology in the MoE ids bookkeeping kernel. Fixes:
+
+1. RDNA4 DPP forms (gfx120x-guarded): quad_perm/row_half_mirror OR-reduce,
+   row_shr:8 + row_shl:8 + one v_permlanex16 for the group prefix scan AND
+   the warp total (replaces 4 LDS ops), 0026-style DPP butterfly for the
+   final nex_prev sum. VALU-only, zero LDS traffic.
+2. Multi-warp chunking (all archs, n_tokens >= 128, nwarps=4): each warp
+   compacts a contiguous token chunk into a disjoint LDS slice; counts and
+   nex_prev partials merge after one __syncthreads. Pure integer kernel,
+   output bit-identical by construction (verified byte-exact at server).
+
+- kernel: 48.12 -> 10.68us at pp512 (4.5x); nwarps=8 tested worse (12.1us)
+- model A/B vs 26-patch control: pp512 4054.0 -> 4183.8 (+3.20%, arms
+  fully separated), tg128 flat, pp16384 +1.8%
+- MUL_MAT_ID suite OK at nwarps 1/4/8; server greedy identity BYTE-EXACT;
+  ppl in band (control cluster reproduced same-session)
+
+## 0028: RDNA4 wide mmvq vec_dots (Q6_K vdr=2, Q4_K vdr=4)
+
+Decode is 64%+ mmvq at 54-89% of DRAM peak. Wider per-lane column
+footprint on RDNA4: Q6_K pairs (iqs, iqs+1) share scales/q8-blocks/d8/qh
+shift and fetch ql/qh/q8 as b64 (2-byte aligned, hardware-handled); Q4_K
+vdr 2->4 shares bq8_offset + unpacked scale/min across the column pair
+with all loads staying 16B-aligned (144-byte blocks). Host/device vdr
+agreement via a table-aware get_vdr_mmvq(type, table_id) overload; other
+archs keep stock vdr, CUDA path unchanged.
+
+- kernels (tg32 profile): Q4_K expert gate+up 19.97 -> 18.22us (473->519
+  GB/s), Q6_K expert down 17.55 -> 13.82us (472->599 GB/s), attn_output
+  14.59 -> 14.11us, dense Q6_K flat (lm head already 626 GB/s = 97%)
+- model A/B (combined with 0027) vs 26-patch control: tg128 119.77 ->
+  120.18 (+0.34%), pp512 +3.24%, pp16384 +1.6%
+- full test-backend-ops OK; ppl 3.9256/3.9294/3.9271 in band; greedy
+  drifts mid-completion on long prompts (reassociation class, as
+  0024/0026: d8*(sc*(a+b)) vs two FMAs) - ppl-gated
+- dead ends recorded as findings: Q4_K vdr=8 (per-row wave parallelism
+  loss at k=2048), Q5_K vdr=4 (k=512 = 2 blocks/row), Q6_K nwarps 4,
+  small_k rpb=4, and dense-stream insensitivity to load widening
+  (isolated MALL-warm ssm_out shape only reaches 410 GB/s - the small
+  dense matvec is latency/ramp-bound, not issue-bound)

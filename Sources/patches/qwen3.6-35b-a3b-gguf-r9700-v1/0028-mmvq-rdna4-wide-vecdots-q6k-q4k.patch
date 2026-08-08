@@ -1,0 +1,293 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH 28/28] cuda/hip: RDNA4 wide mmvq vec_dots (Q6_K vdr=2, Q4_K vdr=4)
+
+Decode is 64%+ mmvq and every K-quant path runs at 54-89% of the 644
+GB/s DRAM peak. This widens the per-lane column footprint of the Q6_K
+and Q4_K mmvq vec_dots on RDNA4 so consecutive 32-bit quant words are
+fetched with one 8-byte load and the per-column bookkeeping is shared:
+
+- Q6_K vdr 1 -> 2: the (iqs, iqs+1) word pair shares its scale pair,
+  q8_1 blocks, d8 factors and qh shift, so those fetches halve and
+  ql/qh/q8 move as b64 loads (block_q6_K is 210 bytes, the loads are
+  2-byte aligned; gfx12 handles that in hardware).
+- Q4_K vdr 2 -> 4: the (iqs, iqs+2) column pair shares bq8_offset and
+  the unpacked scale/min pair, and the 144-byte block keeps every q4/q8
+  b64 load 16-byte aligned.
+
+Host launch math (calc_nwarps_launched trim, should_use_small_k) and the
+device kernels must agree on vdr, so both route through a new
+table-aware get_vdr_mmvq(type, table_id) overload; non-RDNA4 tables keep
+stock vdr everywhere and the CUDA path compiles unchanged.
+
+Swept and rejected on the same box, recorded as findings: Q4_K vdr=8
+(b128 loads, 21.4us - the k=2048 expert rows lose too much per-row wave
+parallelism), Q5_K vdr=4 (14.0us vs 13.2 - k=512 is 2 blocks/row),
+Q6_K nwarps 8 -> 4 (attn_output 14.1 -> 21.1us), small_k rpb 2 -> 4
+(everything flat-to-worse). Dense Q6_K streams (lm head 626 GB/s = 97%
+of peak) do not respond to load widening; the expert (MUL_MAT_ID)
+gathers do.
+
+Measured on the R9700 box (Qwen3.6-35B-A3B-UD-Q4_K_M):
+
+- kernels (rocprofv3, tg32): Q4_K expert gate+up 19.97 -> 18.22us
+  (473 -> 519 GB/s); Q6_K expert down 17.55 -> 13.82us (472 -> 599
+  GB/s); attn_output 14.59 -> 14.11us; dense Q6_K flat.
+- model (5-round interleaved A/B vs 26-patch control, combined with
+  0027): tg128 119.77 -> 120.18 (+0.34%), pp512 +3.24% (0027-dominated),
+  pp16384 +1.6%.
+- correctness: full test-backend-ops suite all OK; ppl
+  3.9256/3.9294/3.9271 (stock 3.9314, all deltas within +-0.15%, same
+  cluster as the control binary in the same session). The merged
+  integer dot products reassociate the per-column float accumulation
+  (d8*(sc*(a+b)) vs d8*sc*a + d8*sc*b): greedy drifts mid-completion on
+  long prompts as with 0024/0026 - reassociation class, ppl-gated.
+  Short-prompt batched server smoke (4 concurrent greedy requests)
+  coherent and consistent.
+---
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 417d82235..d1de35df1 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -111,6 +111,22 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+     return MMVQ_PARAMETERS_GENERIC;
+ }
+ 
++// Table-aware vdr: RDNA4 runs the Q6_K mmvq vec_dot two words wide (see the
++// vec_dot_q6_K_q8_1 RDNA4 variant in vecdotq.cuh). Host launch math and device
++// kernels must agree, so both route through this overload with their table id.
++static constexpr __host__ __device__ int get_vdr_mmvq(ggml_type type, mmvq_parameter_table_id table_id) {
++#if defined(GGML_USE_HIP)
++    if (table_id == MMVQ_PARAMETERS_RDNA4) {
++        switch (type) {
++            case GGML_TYPE_Q6_K: return 2;
++            case GGML_TYPE_Q4_K: return 4;
++            default: break;
++        }
++    }
++#endif // defined(GGML_USE_HIP)
++    return get_vdr_mmvq(type);
++}
++
+ // Per-architecture maximum batch size for which MMVQ should be used for MUL_MAT_ID.
+ // Returns a value <= MMVQ_MAX_BATCH_SIZE. Default is MMVQ_MAX_BATCH_SIZE.
+ // Check https://github.com/ggml-org/llama.cpp/pull/20905#issuecomment-4145835627 for details
+@@ -503,8 +519,8 @@ static __global__ void mul_mat_vec_q(
+ 
+     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+-    constexpr int vdr = get_vdr_mmvq(type);
+     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
++    constexpr int vdr = get_vdr_mmvq(type, table_id);
+     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
+     constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+@@ -756,7 +772,7 @@ static __global__ void mul_mat_vec_q_moe(
+ 
+     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+-    constexpr int vdr = get_vdr_mmvq(type);
++    constexpr int vdr = get_vdr_mmvq(type, get_device_table_id());
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+ 
+     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+@@ -817,10 +833,10 @@ static __global__ void mul_mat_vec_q_moe(
+ // construction. Only valid while blocks_per_row_x <= blocks_per_iter (a single k-loop pass), which
+ // is exactly the case in which idle warps exist.
+ template<ggml_type type>
+-static __host__ int calc_nwarps_launched(const int ncols_x, const int nwarps, const int warp_size) {
++static __host__ int calc_nwarps_launched(const int ncols_x, const int nwarps, const int warp_size, const mmvq_parameter_table_id table_id) {
+     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+-    constexpr int vdr = get_vdr_mmvq(type);
++    const     int vdr = get_vdr_mmvq(type, table_id);
+ 
+     if (nwarps <= 1 || vdr <= 0 || qi % vdr != 0) {
+         return nwarps;
+@@ -890,7 +906,7 @@ static std::pair<dim3, dim3> calc_launch_params(
+     const int rpb = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+     const int64_t nblocks = (nrows_x + rpb - 1) / rpb;
+     const dim3 block_nums(nblocks, nchannels_dst, nsamples_or_ntokens);
+-    int nwarps_launched = calc_nwarps_launched<type>(ncols_x, nwarps, warp_size);
++    int nwarps_launched = calc_nwarps_launched<type>(ncols_x, nwarps, warp_size, table_id);
+     const int64_t total_blocks = (int64_t) block_nums.x * block_nums.y * block_nums.z;
+     if (total_blocks < (int64_t) mmvq_untrim_below_blocks()) {
+         nwarps_launched = nwarps;
+@@ -932,8 +948,8 @@ static __global__ void mul_mat_vec_q_grouped(
+     constexpr int ncols_dst = 1;
+     constexpr int qk  = ggml_cuda_type_traits<type>::qk;
+     constexpr int qi  = ggml_cuda_type_traits<type>::qi;
+-    constexpr int vdr = get_vdr_mmvq(type);
+     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
++    constexpr int vdr = get_vdr_mmvq(type, table_id);
+     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
+     constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
+     // seg_end is given in block units, so the segment scan works for any
+@@ -1078,7 +1094,7 @@ static void mul_mat_vec_q_grouped_launch(
+             }
+             if (divisible) {
+                 const dim3 block_nums(total_rows / rpb, 1, 1);
+-                const dim3 block_dims(warp_size, calc_nwarps_launched<type>(ncols_x, nwarps, warp_size), 1);
++                const dim3 block_dims(warp_size, calc_nwarps_launched<type>(ncols_x, nwarps, warp_size, table_id), 1);
+                 const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+                 ggml_cuda_kernel_launch(mul_mat_vec_q_grouped<type, true>, launch_params, args_blk, vy, ncols_x, stride_row_x);
+                 return;
+@@ -1089,7 +1105,7 @@ static void mul_mat_vec_q_grouped_launch(
+     // Same block shape (including the idle-warp trim, which depends only on the
+     // shared ncols_x) as each individual launch would use.
+     const dim3 block_nums(total_rows, 1, 1);
+-    const dim3 block_dims(warp_size, calc_nwarps_launched<type>(ncols_x, nwarps, warp_size), 1);
++    const dim3 block_dims(warp_size, calc_nwarps_launched<type>(ncols_x, nwarps, warp_size, table_id), 1);
+ 
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+     ggml_cuda_kernel_launch(mul_mat_vec_q_grouped<type>, launch_params, args_in, vy, ncols_x, stride_row_x);
+@@ -1213,7 +1229,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         // Trigger when the full thread block covers all K blocks in a single loop iteration and few threads remain idle.
+         constexpr int qk                    = ggml_cuda_type_traits<type>::qk;
+         constexpr int qi                    = ggml_cuda_type_traits<type>::qi;
+-        constexpr int vdr                   = get_vdr_mmvq(type);
++        const     int vdr                   = get_vdr_mmvq(type, table_id);
+         const int     blocks_per_row_x      = ncols_x / qk;
+         const int     blocks_per_iter_1warp = vdr * warp_size / qi;
+         const int     nwarps                = calc_nwarps(type, c_ncols_dst, table_id);
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index 0f039c735..5d454ba32 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -907,6 +907,66 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
+     return vec_dot_q3_K_q8_1_impl_mmvq(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
+ }
+ 
++#if defined(GGML_USE_HIP) && defined(RDNA4)
++// RDNA4 wide variant: one call covers the column pair (iqs, iqs+2) of the vdr = 2 form
++// (vdr = 4, iqs is a multiple of 4). The pair shares bq8_offset, the unpacked
++// scale/min pair and d8, so that work is done once, and every q4/q8 fetch becomes an
++// 8-byte load (block_q4_K is 144 bytes, so the loads stay 16-byte aligned).
++static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++
++    const block_q4_K * bq4_K = (const block_q4_K *) vbq + kbx;
++
++    const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
++    const int i0         = (iqs/2) % 4; // {0, 2}: columns i0 and i0+1
++
++    const int * q4 = (const int *)(bq4_K->qs + 16*bq8_offset);
++    int2 va, vb;
++    __builtin_memcpy(&va, q4 + i0,     sizeof(va));
++    __builtin_memcpy(&vb, q4 + i0 + 4, sizeof(vb));
++
++    const uint16_t * scales = (const uint16_t *)bq4_K->scales;
++    uint16_t aux[2];
++    const int j = bq8_offset/2;
++    if (j < 2) {
++        aux[0] = scales[j+0] & 0x3f3f;
++        aux[1] = scales[j+2] & 0x3f3f;
++    } else {
++        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
++        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
++    }
++    const uint8_t * sc = (const uint8_t *)aux;
++    const uint8_t * m  = sc + 2;
++
++    float sumf_d = 0.0f;
++    float sumf_m = 0.0f;
++#pragma unroll
++    for (int i = 0; i < QR4_K; ++i) {
++        const block_q8_1 * bq8i = bq8_1 + bq8_offset + i;
++        const float d8 = __low2float(bq8i->ds);
++        const int * q8 = (const int *)bq8i->qs;
++        int2 ua, ub;
++        __builtin_memcpy(&ua, q8 + i0,     sizeof(ua));
++        __builtin_memcpy(&ub, q8 + i0 + 4, sizeof(ub));
++
++        const int vax = (va.x >> (4*i)) & 0x0F0F0F0F;
++        const int vay = (va.y >> (4*i)) & 0x0F0F0F0F;
++        const int vbx = (vb.x >> (4*i)) & 0x0F0F0F0F;
++        const int vby = (vb.y >> (4*i)) & 0x0F0F0F0F;
++
++        int dot1 = ggml_cuda_dp4a(vbx, ub.x, ggml_cuda_dp4a(vax, ua.x, 0));
++        dot1     = ggml_cuda_dp4a(vby, ub.y, ggml_cuda_dp4a(vay, ua.y, dot1));
++        int dot2 = ggml_cuda_dp4a(0x01010101, ub.x, ggml_cuda_dp4a(0x01010101, ua.x, 0));
++        dot2     = ggml_cuda_dp4a(0x01010101, ub.y, ggml_cuda_dp4a(0x01010101, ua.y, dot2));
++
++        sumf_d += d8 * (dot1 * sc[i]);
++        sumf_m += d8 * (dot2 * m[i]);
++    }
++
++    const float2 dm4f = __half22float2(bq4_K->dm);
++    return dm4f.x*sumf_d - dm4f.y*sumf_m;
++}
++#else
+ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
+     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+ 
+@@ -952,6 +1012,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
+ 
+     return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
+ }
++#endif // defined(GGML_USE_HIP) && defined(RDNA4)
+ 
+ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
+     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+@@ -999,6 +1060,54 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
+     return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
+ }
+ 
++#if defined(GGML_USE_HIP) && defined(RDNA4)
++// RDNA4 wide variant: one call consumes TWO consecutive 32-bit words of ql (vdr = 2,
++// iqs is even). The pair shares its scale pair, q8_1 blocks, d8 factors and qh shift,
++// so those fetches are issued once instead of twice, and the ql/qh/q8 fetches become
++// 8-byte loads. Q6_K blocks are 210 bytes so the 8-byte loads are only 2-byte aligned;
++// gfx12 global loads support that in hardware.
++static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
++    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
++
++    const block_q6_K * bq6_K = (const block_q6_K *) vbq + kbx;
++
++    const int bq8_offset   = 2 * QR6_K * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/4);
++    const int scale_offset = (QI6_K/4) * (iqs / (QI6_K/2)) + (iqs % (QI6_K/2)) / (QI6_K/8);
++    const int vh_shift     = 2 * ((iqs % (QI6_K/2)) / (QI6_K/4));
++    const int vh_idx       = (QI6_K/4) * (iqs / (QI6_K/2)) + iqs % (QI6_K/4);
++
++    int2 vl2, vh2;
++    __builtin_memcpy(&vl2, bq6_K->ql + sizeof(int)*iqs,    sizeof(vl2));
++    __builtin_memcpy(&vh2, bq6_K->qh + sizeof(int)*vh_idx, sizeof(vh2));
++    const int vh2x = vh2.x >> vh_shift;
++    const int vh2y = vh2.y >> vh_shift;
++
++    const int   sc0 = bq6_K->scales[scale_offset];
++    const int   sc1 = bq6_K->scales[scale_offset + 4];
++    const float d   = bq6_K->d;
++
++    float sumf = 0.0f;
++#pragma unroll
++    for (int i = 0; i < QR6_K; ++i) {
++        const int sc = i == 0 ? sc0 : sc1;
++
++        int2 u2;
++        __builtin_memcpy(&u2, bq8_1[bq8_offset + 2*i].qs + sizeof(int)*(iqs % QI8_1), sizeof(u2));
++        const float d8 = __low2float(bq8_1[bq8_offset + 2*i].ds);
++
++        const int vi0 = __vsubss4(((vl2.x >> (4*i)) & 0x0F0F0F0F) | (((vh2x >> (4*i)) << 4) & 0x30303030), 0x20202020);
++        const int vi1 = __vsubss4(((vl2.y >> (4*i)) & 0x0F0F0F0F) | (((vh2y >> (4*i)) << 4) & 0x30303030), 0x20202020);
++
++        int sumi = 0;
++        sumi = ggml_cuda_dp4a(vi0, u2.x, sumi);
++        sumi = ggml_cuda_dp4a(vi1, u2.y, sumi);
++
++        sumf += d8 * (sumi * sc);
++    }
++
++    return d * sumf;
++}
++#else
+ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
+     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+ 
+@@ -1024,6 +1133,7 @@ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
+ 
+     return vec_dot_q6_K_q8_1_impl_mmvq(vl, vh, u, scales, bq6_K->d, d8);
+ }
++#endif // defined(GGML_USE_HIP) && defined(RDNA4)
+ 
+ #define VDR_IQ2_XXS_Q8_1_MMVQ 2
+ #define VDR_IQ2_XXS_Q8_1_MMQ  2
