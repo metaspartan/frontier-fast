@@ -148,3 +148,47 @@ Same-box A/B vs stock binary (whole-process, Laguna-XS-2.1-Q4_K_M):
 - gate ppl **identical** (5.2709 both - the family is bit-exact, the tables
   are decode-only)
 - server smoke clean
+
+
+## 0015: cap the MMQ MoE J tile at 64 on sm_121 (prefill)
+
+Port of the qwen3.6 gb10cuda 0016 (verified there). XS shares qwen's
+256-expert top-8 routing and expert shapes, so the qwen J sweep (peak at
+56-64, stock J=128 overshoots, RDNA4-style J=32 loses) transfers directly.
+Measured on the HEALTHY box (2405 MHz, 2026-08-08):
+
+- pp512 same-binary toggle A/B, 5 interleaved rounds: 2443.9-2459.8 ->
+  **2583.1-2597.1 tok/s (+5.7% median per-round)** — larger than the qwen
+  twin's +3.3% (XS prefill is more MoE-dominated)
+- decode unchanged: tg64 95.9-96.2 both arms (expert decode is mmvq)
+- whole-process vs stock binary (3 rounds): pp512 2459-2462 -> 2591-2599;
+  tg64 95.45-95.80 -> 95.99-96.10
+- gate ppl 5.2709 on and off, byte-identical (equals the stock gate value)
+- llama-cli greedy identity byte-exact on vs off
+- `GGML_CUDA_DISABLE_MMQ_MOE_J` restores stock selection
+
+## Healthy-box status (2026-08-08) — READ BEFORE SUBMITTING
+
+The 14-patch series measures only **+0.4% decode vs stock on the healthy
+box** (tg64 95.61 -> 96.02; the +7.7% round-1 delta was a degraded-era
+artifact, see the `gb10-box-recovered-degraded-era-tunings` finding). With
+0015 the series is decode +0.4% / prefill +5.5% vs stock.
+
+**Calibration trap is still live**: the track calibration pins stock decode
+at 90.62 tok/s with an acceptance band topping out at 1.053x = 95.4, but
+the healthy box reads stock tg64 at 95.4-95.8 and tg128 up to 97. Any
+submission before the owner recalibrates the track fails the "pinned
+calibration band" gate (round-1 verified at 1.0465 but sits ineligible on
+exactly this mechanism). Do not spend an XS submission slot until the
+calibration is refreshed.
+
+## sm_121 mmvq geometry is CLOSED (qwen-twin sweeps, 2026-08-08)
+
+Measured on the qwen twin (identical expert shapes, findings recorded on
+that track): dense Q6_K multi-row (R9700 0024 port) is monotonically
+NEGATIVE on sm_121 (rpb 2 -> -2.8%, rpb 4 -> -3.9%); expert small_k
+depth 8 (4*nwarps) is flat-to-negative (-0.4%) vs the shipped 2*nwarps;
+CUDA graphs already capture at decode (+1.1% over disabled — no launch
+pool). Dense large-K matvecs on LPDDR5 want maximum resident blocks, not
+per-thread ILP. Remaining decode surface is byte volume / DRAM access
+order, not launch shape.

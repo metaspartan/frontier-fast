@@ -1,0 +1,61 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH 15/15] cuda: cap the MMQ MoE J tile at 64 on sm_121
+
+Port of the qwen3.6 gb10cuda series 0016 (verified there at +2.2-3.3%
+prefill). For mul_mat_id, mul_mat_q_switch_J picks J from ncols_max =
+n_tokens, landing at J=128 for prefill batches, while the 256-expert top-8
+segments average ~16 columns at ub512. Laguna-XS shares qwen3.6's expert
+shapes ([2048->512]x8 fused gate+up, [512->2048]x8 down) and top-8-of-256
+routing, so the qwen target sweep (J 16..128 peaked at 56-64; the
+RDNA4-style near-segment-width J=32 loses 9%) transfers directly: sm_121
+tensor-core MMQ amortizes per-tile fixed cost over wide column tiles, so
+the padding-vs-tile-cost sweet spot sits at J=64, not at the segment
+width. Cap the mmid path at the smallest valid config >= 64 (arch-guarded
+to sm_121; dense matmuls untouched; decode expert matvecs route via mmvq,
+not MMQ). GGML_CUDA_DISABLE_MMQ_MOE_J restores stock selection.
+
+Measured (runner box gx10-838f, healthy clocks 2405 MHz), same-binary
+toggle A/B, 5 interleaved rounds: pp512 2443.9-2459.8 -> 2583.1-2597.1
+tok/s, median per-round ratio +5.7%. Decode unchanged: tg64 95.9-96.2
+both arms (expert decode is mmvq). Whole-process vs stock binary (3
+rounds): pp512 2459-2462 -> 2591-2599, tg64 95.45-95.80 -> 95.99-96.10.
+Gate ppl -c 512 --chunks 8: 5.2709 on and off, byte-identical, equal to
+the stock gate value. llama-cli greedy identity byte-exact on vs off
+(--temp 0, n 64).
+---
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -1493,6 +1493,32 @@
+         }
+     }
+
++    // MoE (mul_mat_id) on sm_121: J is otherwise chosen from ncols_max, the
++    // worst-case column count of a single expert segment (= n_tokens for
++    // mul_mat_id), which lands at J=128 for prefill batches. The GB10
++    // tensor-core MMQ measures fastest for the 256-expert top-8 segment mix
++    // at J=56-64 (target sweep on the qwen3.6 twin, which shares the expert
++    // shapes and top-8-of-256 routing; see that track series 0016). The
++    // RDNA4-style near-segment-width cap (J=32 there) LOSES here - the
++    // tensor cores amortize per-tile fixed cost over wide tiles, so the
++    // sweet spot between that and masked-padding waste sits at 64, not at
++    // the segment width. GGML_CUDA_DISABLE_MMQ_MOE_J restores stock.
++    if (args.ids_dst != nullptr && args.nchannels_y > 1 && J_best > 64 &&
++        GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == 1210 &&
++        getenv("GGML_CUDA_DISABLE_MMQ_MOE_J") == nullptr) {
++        for (int J = 64; J < J_best; J += 8) {
++            const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
++            if (config.type == GGML_TYPE_COUNT) {
++                continue;
++            }
++            if (mmq_get_nbytes_shared(config, cc) > smpbo) {
++                continue;
++            }
++            J_best = J;
++            break;
++        }
++    }
++
+     switch (J_best) {
+         case   8:
+             launch_mul_mat_q<type,   8, fallback>(ctx, args, stream);

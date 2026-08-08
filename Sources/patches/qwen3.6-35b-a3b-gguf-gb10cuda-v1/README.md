@@ -102,6 +102,27 @@ arch-guarded to sm_121, `GGML_CUDA_DISABLE_MMQ_MOE_J` restores stock.
 
 ## Measured dead ends (healthy box, 2026-08-08, do not re-buy)
 
+- **Dense Q6_K multi-row mmvq (R9700 0024 port) is NEGATIVE on sm_121**:
+  opting dense Q6_K (ncols_dst==1, no ids) into the small_k route, swept
+  rows_per_block 2 and 4 at nwarps=2, same-binary toggle A/B 5 interleaved
+  rounds at 2405 MHz: rpb=2 tg64 72.51 -> 70.51 (-2.8%), rpb=4 72.47 ->
+  69.67 (-3.9%), monotonic 1>2>4. ppl byte-identical 3.9306 all arms
+  (correct, just slower). Exact inversion of the RDNA4 +3.0% verified win:
+  dense large-K matvecs on LPDDR5 hide latency with many resident blocks,
+  not per-thread ILP; deep rows only pay for the tiny-K expert shapes
+  (blocks_per_row ~2) that the 0015 small_k config already covers.
+- **Expert small_k rows=8 (4*nwarps) is flat-to-negative**: the 0015
+  README's "rows=8 sweep" next step, measured cross-binary vs the 0016
+  control, 5 rounds: rows4 tg64 median 72.43 vs rows8 72.12 (-0.4%). The
+  shipped 2*nwarps depth is the optimum; sm_121 mmvq geometry is closed in
+  both directions (see also grouped-mmvq/mmvf history).
+- **CUDA graphs already capture at decode — no launch-overhead pool**:
+  MUL_MAT_ID only blocks capture when src0 is unquantized or
+  ne[2] > mmvq_mmid_max (decode has ne[2]=1, quantized experts).
+  GGML_CUDA_DISABLE_GRAPHS=1 A/B, 3 rounds: graphs-on tg64 72.32-72.56 vs
+  off 71.61-71.92 — capture is live and worth its ~1.1%; decode is
+  DRAM-side, not launch-side.
+
 - **Q6_K mmvq load-path engineering is FLAT (+-0.1%)**: vdr=2 and vdr=4
   variants (2/4 adjacent quant ints per vec_dot call, shared scale/ds/offset
   loads, exact integer dp4a combine) and `__ldcs` evict-first streaming on
