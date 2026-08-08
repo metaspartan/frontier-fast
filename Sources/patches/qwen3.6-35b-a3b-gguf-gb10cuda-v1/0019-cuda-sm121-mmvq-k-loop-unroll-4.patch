@@ -1,0 +1,91 @@
+From f745f4b1efa5150e8e5ea946739d74b9b529b44f Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sat, 8 Aug 2026 12:46:32 -0600
+Subject: [PATCH] CUDA: sm_121 mmvq k-loop unroll 4
+
+An nsys decode census on this track puts ~50% of decode kernel time in the
+Q6_K dense matvecs (attn_qkv 18.2%, the [2048 x 248320] output head 13.0%,
+attn_out 7.7%, attn_gate 7.0%, shexp 3.0%), all running at 170-200 GB/s
+against the 251.6 GB/s this box's mmvq-geometry DRAM probe measured.
+
+Q6_K cannot be helped on the load side - block_q6_K is 210 bytes, so ql/qh
+are only 2-byte aligned and no wider load exists (see the "Q6_K mmvq
+load-path engineering is FLAT" entry, which also measured vdr = 2 and 4
+neutral). But that entry tested wider *calls*; it did not test getting more
+*iterations* in flight. At vdr = 1 a Q6_K lane issues one 4-byte ql load,
+one qh load and two q8_1 loads per k-loop iteration and then waits on them,
+and because blocks_per_row_x is a runtime value nvcc leaves the loop rolled
+and never overlaps a second iteration's loads.
+
+A partial unroll of the mmvq k loop fixes exactly that. The accumulation
+order into tmp[][] is unchanged, so the result is bit-exact.
+
+4 is the optimum, and the shapes say why: at ncols_x = 2048 with vdr = 1 and
+nwarps = 2, blocks_per_iter = 2 and blocks_per_row_x = 8 - exactly 4
+iterations, so unroll 4 turns the dominant Q6_K kernels into one straight-line
+body with four independent load chains and no loop at all.
+
+Sweep against a binary built from this patch's own parent commit (0018),
+interleaved whole-process rounds on the runner box gx10-838f (parked vllm
+container, 2405-2548 MHz):
+
+- unroll 2: 72.67/72.47/72.60/72.62 vs control 72.75/72.75/72.63/72.65 -
+  neutral-to-negative. Halving 4 iterations to 2 leaves the same stall.
+- unroll 4: session A 73.28/73.27/73.24/73.01 vs 72.75/72.75/72.63/72.65
+  (median ratio 1.0072); session B 73.13/73.17/73.24/73.24 vs 72.66/72.75/
+  72.71/72.66 (median ratio 1.0071). **8/8 rounds across two independent
+  sessions disjoint, +0.71%**
+- unroll 8: 71.82/71.52/71.50/71.62, **-1.5%** (register pressure)
+- unroll 16: 56.45/56.33/56.48/56.45, **-22%** (spills)
+
+- prefill pp512 neutral at unroll 4 (2332-2355 vs 2338-2353, overlapping)
+- ppl identical to the control both ways: gate -c 512 --chunks 8 3.9306 vs
+  3.9306, decode-path -b 512 -ub 1 --chunks 16 3.9657 vs 3.9657
+
+GGML_CUDA_DISABLE_SM121_MMVQ_UNROLL restores the rolled loop.
+---
+ ggml/src/ggml-cuda/mmvq.cu | 21 +++++++++++++++++++++
+ 1 file changed, 21 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index b479543..0291459 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -155,6 +155,24 @@ static constexpr __host__ __device__ bool sm121_one_warp_row(
+ #endif
+ }
+ 
++// sm_121 mmvq k-loop unroll factor. On this device the dominant decode kernels
++// are the Q6_K dense matvecs (~50% of decode kernel time in an nsys census):
++// Q6_K has vdr = 1 and its 210-byte block forbids any wider load, so a lane
++// issues exactly one 4-byte ql load, one qh load and two q8_1 loads per k-loop
++// iteration and then waits on them. The trip count is a runtime value, so nvcc
++// leaves the loop rolled and never gets a second iteration's loads in flight.
++// A partial unroll batches N iterations' independent load chains per lane; the
++// accumulation order into tmp[][] is unchanged, so results stay bit-exact.
++// Define GGML_CUDA_DISABLE_SM121_MMVQ_UNROLL to restore the rolled loop.
++static constexpr __host__ __device__ int sm121_mmvq_k_unroll(mmvq_parameter_table_id table_id) {
++#ifdef GGML_CUDA_DISABLE_SM121_MMVQ_UNROLL
++    (void) table_id;
++    return 1;
++#else
++    return table_id == MMVQ_PARAMETERS_SM121 ? 4 : 1;
++#endif
++}
++
+ // Per-architecture maximum batch size for which MMVQ should be used for MUL_MAT_ID.
+ // Returns a value <= MMVQ_MAX_BATCH_SIZE. Default is MMVQ_MAX_BATCH_SIZE.
+ // Check https://github.com/ggml-org/llama.cpp/pull/20905#issuecomment-4145835627 for details
+@@ -655,6 +673,9 @@ static __global__ void mul_mat_vec_q(
+     const block_q8_1 * y = ((const block_q8_1 *) vy) + sample_y*stride_sample_y + channel_y*stride_channel_y;
+     const int kbx_offset = sample_x*stride_sample_x + channel_x*stride_channel_x + row0*stride_row_x;
+ 
++    constexpr int k_unroll = sm121_mmvq_k_unroll(table_id);
++
++#pragma unroll k_unroll
+     for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
+         const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
+ 
+-- 
+2.43.0
+

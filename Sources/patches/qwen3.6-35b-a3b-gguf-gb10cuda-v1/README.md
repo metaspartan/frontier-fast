@@ -168,8 +168,88 @@ R9700 twin measured Q5_K `vdr = 4` dead at k=512, where a row is only 2
 k-blocks and most lanes go idle. Q6_K is structurally closed (see below), and
 Q8_0 already uses wide accessors.
 
+## 0018: sm_121 one-warp block for the Q5_K expert-down shape (+0.32% decode)
+
+The answer to 0017's "next candidate is Q5_K" question above, and it is not
+the `int2` widening. **Q5_K `vdr = 4` is dead-by-construction here**, for a
+reason the shape census makes exact: this model's only Q5_K tensors are the
+37 `ffn_down_exps` at `[512 x 2048] x 256`, so `ncols_x` = 512 = **two**
+Q5_K superblocks per row. A single warp at the stock `vdr = 2` already
+covers `vdr*warp_size/qi` = 2 blocks, so there is no k left to widen into —
+`vdr = 4` would give the row 8 block-slots for 2 blocks and idle 48 of 64
+lanes. This is the same k=512 wall the R9700 twin measured, confirmed by
+static shape analysis rather than re-bought on the runner.
+
+The real defect at this shape is the opposite of a load-width problem. The
+sm_121 table gives K-quants `nwarps = 2`, so `blocks_per_iter` = 4 against
+`blocks_per_row_x` = 2 and **half of every thread block has no k-block to
+read for the whole kernel**. Upstream's `small_k` fires on exactly this
+condition but only compensates with more rows — it never shrinks the block,
+which is why 0015's deep rows paid and the follow-up rows = 8 sweep was
+neutral. 0018 runs the shape as a one-warp block that keeps the same 4-row
+tile (`calc_nwarps` -> 1 for Q5_K, `calc_rows_per_block` keeps 4 rows when
+the small_k block is one warp, and the host `should_use_small_k` predicate —
+which assumes `nwarps > 1` because only then can lanes idle — also fires for
+a one-warp config whose single iteration already covers the row).
+
+- **firing proof (nsys geometry census)**: `mul_mat_vec_q<(ggml_type)13, 1,
+  false, true>` block `32 2 1` -> `32 1 1` at the same grid `512 8 1`, every
+  other kernel identical. Its GPU time 12.36 -> 11.59 ms (**-6.3%**)
+- decode tg128 72.33/72.41/72.51/72.30/72.53 -> 72.56/72.63/72.74/72.85/
+  72.81, **5/5 rounds disjoint, median ratio 1.0032**
+- prefill pp512 neutral; **ppl bit-identical** (gate 3.9306 = 3.9306,
+  decode-path `-b 512 -ub 1 --chunks 16` 3.9657 = 3.9657) — the idle lanes
+  contributed only exact zeros to the cross-warp reduction, so the summation
+  order never moved
+- `GGML_CUDA_DISABLE_SM121_ONE_WARP_ROW` restores the two-warp config
+
+## 0019: sm_121 mmvq k-loop unroll 4 (+0.71% decode)
+
+The decode census puts **~50% of decode kernel time in Q6_K dense matvecs**
+(attn_qkv 18.2%, the `[2048 x 248320]` output head 13.0%, attn_out 7.7%,
+attn_gate 7.0%, shexp 3.0%) at 170-200 GB/s against this box's 251.6 GB/s
+mmvq-geometry probe. The "Q6_K load-path is FLAT" entry below is still
+right that no wider *call* helps — but it tested wider calls, not more
+*iterations in flight*. At `vdr = 1` a Q6_K lane issues one ql, one qh and
+two q8_1 loads per k-loop iteration and then waits, and since
+`blocks_per_row_x` is a runtime value nvcc leaves the loop rolled.
+
+4 is the optimum and the shapes say why: at `ncols_x` = 2048 with `vdr = 1`,
+`nwarps = 2`, `blocks_per_iter` = 2 against `blocks_per_row_x` = 8 is
+**exactly 4 iterations**, so unroll 4 turns the dominant Q6_K kernels into
+one straight-line body with four independent load chains and no loop.
+
+| unroll | tg128 | vs 0018 |
+|---|---|---|
+| 2 | 72.47-72.67 | neutral |
+| **4** | **73.01-73.28** | **+0.71%, 8/8 rounds disjoint over two sessions** |
+| 8 | 71.50-71.82 | -1.5% (register pressure) |
+| 16 | 56.33-56.48 | -22% (spills) |
+
+Accumulation order into `tmp[][]` is unchanged, so the result is bit-exact:
+gate ppl 3.9306 and decode-path 16-chunk ppl 3.9657, both identical to the
+0018 control. Prefill neutral. `GGML_CUDA_DISABLE_SM121_MMVQ_UNROLL`
+restores the rolled loop.
+
+**Firing order** (each measured against a binary built from its own parent):
+0013 requant +5.7% -> 0014 Turing table +1.9% -> 0015 deep rows +0.9% ->
+0016 MMQ J=64 +3.3% prefill -> 0017 wide Q4_K +1.77% -> 0018 Q5_K one-warp
++0.32% -> 0019 k-loop unroll 4 +0.71%.
+
 ## Measured dead ends (healthy box, 2026-08-08, do not re-buy)
 
+- **sm_121 deep-row tile for the Q4_K expert gate/up shape is NEGATIVE**:
+  the natural sequel to 0018 — at 0017's `vdr = 4` the Q4_K exps
+  (`[2048 x 512] x 256`, `blocks_per_row_x` = 8 = `blocks_per_iter`) consume
+  the row in one iteration, so rows are the only remaining source of
+  per-lane MLP. Routing the ids matvecs of that shape into `small_k`
+  (rows_per_block 1 -> 4) **fired exactly as intended** — nsys shows the
+  Q4_K kernel grid `512 8 1` -> `128 8 1` — and cost decode: tg128 median
+  72.24 vs 72.74 for the 0018 control (**-0.7%**), that kernel's own GPU
+  time 20.87 -> 20.98 ms. ppl byte-identical (correct, just slower).
+  Together with the rows = 8 result below this closes the rows dimension in
+  both directions: on sm_121 the deep tile only ever pays when it is
+  *rescuing idle lanes*, never as added ILP on a block that is already full.
 - **Dense Q6_K multi-row mmvq (R9700 0024 port) is NEGATIVE on sm_121**:
   opting dense Q6_K (ncols_dst==1, no ids) into the small_k route, swept
   rows_per_block 2 and 4 at nwarps=2, same-binary toggle A/B 5 interleaved
