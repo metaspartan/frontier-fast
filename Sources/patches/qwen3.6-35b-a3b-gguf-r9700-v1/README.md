@@ -665,6 +665,41 @@ Measured (runner box, HIP_VISIBLE_DEVICES=0):
 - `GGML_CUDA_DISABLE_MMVF_SIG_FUSE=1` still disables the whole epilogue pass
 
 
+## BLOCKED: the trusted runner cannot boot a bench server (read first)
+
+**As of round 13 no submission on this track can be measured.** Both round-13
+attempts were closed with:
+
+    infrastructure fault (not your submission): a previous benchmark server
+    would not release the GPU, so this run was stopped rather than measured
+    beside it - <pid> /bin/sh -c pgrep -af "llama-server .*--port 8005" | head -1
+
+The quoted process is the guard itself. `benchServerAlive()` in the runner's
+`app/src/rocm-worker.ts` runs
+
+    pgrep -f "llama-server .*--port 8005" | head -1
+
+through a shell. `pgrep` excludes itself but **not its parent `/bin/sh -c`**,
+whose argv contains the pattern - so the guard always finds a "survivor",
+`waitForBenchServerGone()` always returns false, and `serverUp()` throws
+before anything is measured. Reproduced on a completely idle box (no
+llama-server anywhere, `rocm-smi` VRAM 0%): the guard command prints its own
+shell PID. The escalation `pkill -9 -f "llama-server .*--port 8005"` has the
+same defect. Two submissions x two internal retries, identical signature -
+this is deterministic, not a flaky box.
+
+Do not spend slots retrying. The fix is one line and the same file already
+gets it right one function away (`pgrep -af "bin/llama-server|bin/llama-perplexity" | grep -v pgrep`):
+match on `bin/llama-server` and append `| grep -v pgrep` in
+`benchServerAlive()`, in the diagnostic pgrep in `serverUp()`, and in both
+`pkill` calls. Verify on an idle box by running the guard command and
+confirming it prints nothing. **This is the trusted measurement
+infrastructure - it is the operator's to change, not a participant's.**
+
+Round 13's patch (0032) is committed, locally measured and gated; it needs a
+ranked run once the runner boots again.
+
+
 ## Round-14 map
 
 1. **Prefill: `concat_non_cont` is 4.7% of pp512** (30 x 188us). The GDN conv
