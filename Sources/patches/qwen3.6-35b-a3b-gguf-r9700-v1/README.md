@@ -380,3 +380,32 @@ non-concurrent-events dispatch.
 Projection at submission: decode ~1.447 local ratio (server +3.0% over the
 0023 state that ranked 1.3955), prefill ~1.186-1.22 unchanged, ttft
 following prefill -> score ~1.34-1.35 vs the 1.3103 frontier.
+
+## 0026: GDN RDNA4 DPP reductions + float4 vectorization
+
+The gated_delta_net recurrence (13.1% pp512 / ~4.8% decode / 9.2% @16k in
+the 0023-state profile) runs one warp per state column with a serial token
+loop. gfx1201 ISA showed each token paying ten ds_bpermute_b32 LDS
+round-trips (two 5-step __shfl_xor reductions, each step behind a full
+s_wait_dscnt) plus 11 scalar global_load_b32. Two HIP-guarded changes
+(gfx120x only, CUDA path untouched):
+
+1. Wave32 DPP butterfly sum: quad_perm xor1/xor2, row_half_mirror,
+   row_mirror, v_permlanex16 across the 16-lane rows - 5 VALU adds per
+   reduction, zero LDS traffic, generic warp_reduce_sum fallback.
+2. Lane row-ownership remap (i = lane*4 + r) for S_v==128 so state/k/q
+   loads and state stores issue as dwordx4 (11 loads/token -> 5);
+   host-gated on 16B alignment of all row bases/strides with scalar
+   template fallback.
+
+- kernel (test-backend-ops perf): TG 33.96 -> 18.65 us (1.82x),
+  PP-512 610.7 -> 489.6 us (1.25x), PP-1024 1245 -> 996 us
+- model A/B vs 25-patch control (5 interleaved rounds): pp512
+  3926.0 -> 4038.7 (+2.87%), tg128 117.33 -> 119.99 (+2.26%)
+- ppl 3.9271/3.9271/3.9278 (-0.11% vs stock 3.9314, band 0.5%)
+- GATED_DELTA_NET correctness suite all OK (both mappings + DPP path);
+  server greedy smoke coherent, 3/6 prompts drift mid-completion vs
+  control - expected reassociation from the changed reduction tree
+  (same class as 0024's multi-row reduction change; ppl-gated)
+- long windows: GDN is 9.2% of the 16k phase, kernel uniformly faster,
+  no KV/attention path touched
