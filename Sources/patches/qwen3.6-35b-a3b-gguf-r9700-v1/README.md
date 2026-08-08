@@ -2799,3 +2799,136 @@ mmvq, plus a cross-product disjointness check between the two merged groups. The
 remaining three rows of the round-31 table (shexp gate/up → routed gate+up,
 shexp down → expert_reduce, attn k/v → attn wq) all need the other machinery —
 a **second vec_dot type in one launch** — which this patch does not build.
+
+## Round 33: can this box reach 200 tok/s? Measured, and the answer is no
+
+The owner asked for 200 tok/s decode with numbers attached rather than a
+feeling. This section answers it from the post-0046 census and two new probes,
+not from projection. Figures are on the **llama-bench scale** (152.4 tok/s with
+0046); the ranked server path runs ~2 tok/s below at the same ratio, so 200
+ranked is ~205 here.
+
+### Where the 6563 us token goes now
+
+`rocprofv3 --kernel-trace`, `llama-bench -p 0 -n 34 -r 1`: 23838 dispatches over
+35 tokens = **681.1/token, 5498 us of kernel in a 6563 us token**.
+
+| component | us/token | share | basis |
+|---|---|---|---|
+| weight streaming | 3742 | 57% | 2.35 GB at the 627 GB/s the lm head proves reachable |
+| matvec launch ramp | 829 | 13% | 291 matvec launches x 2.85 us (round 29's `T = c + bytes/627` fit) |
+| small-kernel time | 927 | 14% | the other 390 launches |
+| exposed replay gap | 1064 | 16% | 681 dispatches x 1.56 us |
+
+**200 tok/s is a 5000 us token: 1563 us has to come out of the 2820 us that is
+not streaming.**
+
+### 1. The dispatch floor is 502 — computed, not guessed
+
+A decode token is one serial chain, so the minimum number of launches is the
+**longest chain of cross-block dependencies**: independent nodes can share a
+launch, dependent ones cannot without a grid barrier. Computed directly from a
+node dump by walking data ranges (a node depends on the most recent earlier node
+whose destination overlaps one of its sources):
+
+| a boundary is required at | floor | per layer |
+|---|---|---|
+| matmul + attention + scan + norm + softmax + argsort | **502** | 12.6 |
+| same, but norms/softmax fold into the consumer by recompute | **301** | 7.5 |
+
+Against 681.1 today that is **179 removable dispatches** with folds of the kind
+this series already ships, or 380 with a recompute program that does not exist.
+At the 3.2 us/dispatch that 0046 actually bought (127 us for 40) and 2.4 us for
+the elementwise class:
+
+- the whole conservative co-launch/fold program: **166-171 tok/s**
+- plus a full recompute program at the aggressive floor: **~185 tok/s**
+
+Round 31's four ranked candidates are worth about +3% of that (~157 tok/s), and
+**row 1 conflicts with 0046**: if the shexp gate/up pair merges into the routed
+gate+up host it stops being available as the topk guest's host, so those two are
+alternatives, not additions.
+
+### 2. The persistent multi-op kernel is dead — by a factor of 16
+
+Round 30's no-go was reasoned from hiding. A persistent kernel attacks the
+budget differently: it replaces a launch boundary with a grid barrier, removing
+the replay gap **and** the ramp rather than hiding one inside the other. So it
+deserved a measurement, and the break-even is arithmetic:
+
+```
+overhead after every fold  = 462 x 1.56 (gap) + 291 x 2.85 (ramp) = 1550 us
+persistent equivalent      =  41 x 4.41 (per-layer launches) + 462 x B
+break-even barrier cost B  = 2.96 us
+```
+
+A standalone HIP probe (sense-reversing barrier, `atomicAdd` + `__threadfence`,
+all blocks resident, 2000 iterations) measures B on gfx1201:
+
+| resident blocks | barrier |
+|---|---|
+| 64 | 5.59 us |
+| 128 | 20.47 us |
+| 256 (the residency limit) | **48.9 us** (47.9 on the repeat) |
+
+**Even the 64-block case is 1.9x over break-even; the real case is 16x over.**
+The cost roughly quadruples per doubling — it is an L2 atomic ping-pong with no
+hardware grid-sync behind it. Two further facts close it:
+
+- `hipOccupancyMaxActiveBlocksPerMultiprocessor` gives **8 blocks/CU x 32 =
+  256 resident blocks** for a 256-thread kernel. The shipped matvecs launch
+  1024-4096 blocks, so a persistent grid must loop 4-16x over logical blocks —
+  serializing what the hardware scheduler currently overlaps.
+- Measured directly: 8 passes over distinct 20 MB slabs (past the 64 MB
+  Infinity Cache), one launch per pass **42.96 us/pass (488 GB/s)** against a
+  persistent grid with barriers **65.60 us/pass (320 GB/s)**, +22.6 us/pass.
+  At 6 MB and 2 MB the persistent arm is 9x and 14x slower.
+
+Substituting the measured B into the budget: a persistent design lands at
+**37 tok/s** at the real residency and **138 tok/s** even at the 64-block best
+case. **Go/no-go: NO-GO, now on measurement rather than on argument.** Do not
+re-open it on this architecture; it needs a hardware grid barrier that gfx1201
+does not have.
+
+### 3. The byte side is closed — no requantization survives 0.1%
+
+Streaming alone is 3742 us of the 5000 us a 200 tok/s token allows. With the
+co-launch/fold floor's 1550 us of overhead the two do not fit: bytes would have
+to fall to 3450 us = 2.16 GB, an **8% cut**. The 0021 table, re-read against
+0.1% instead of the 0.5% band it was measured in, says every available step is
+5-9x too coarse:
+
+| step | measured ppl move | vs a 0.1% gate |
+|---|---|---|
+| 5 dense families Q6_K -> Q5_1 | -0.72% | 7x over |
+| qkv Q5_1, rest Q6_K | -0.9% | 9x over |
+| qkv Q6_K, rest Q5_1 | +0.6-0.85% | 6-8x over |
+| shexp trio requantized at all | +0.5% AND slower decode | excluded twice |
+| output head routed/altered | 3.908-3.924, straddles the band edge | noisy, excluded |
+
+The elasticity is roughly **0.7% perplexity per bit** off the dense projections.
+There is no upcast left to harvest: 0021 already took the one that existed (the
+UD export shipping projections as Q8_0), the experts are Q4_K/Q5_K and the head
+is Q6_K. The only untouched precision is the **F32 routers and alpha/beta, 104
+MB/token (4.5%)** — F16 would buy ~81 us (+1.2%) — but those logits drive
+top-8-of-256 selection, where even a float32 regrouping reroutes an expert. One
+experiment at most; it cannot approach 200.
+
+### The honest answer
+
+**200 tok/s is not reachable on this box with byte-preserving kernel work.**
+
+| path | ceiling | status |
+|---|---|---|
+| round 31's four ranked co-launch candidates | ~157 tok/s | 0046 shipped one of them |
+| every co-launch and fold down to the 502 floor | 166-171 tok/s | open, incremental |
+| plus a norm/softmax recompute program (301 floor) | ~185 tok/s | open, large |
+| persistent multi-op kernels | 37-138 tok/s | **measured dead** |
+| requantization | any target | **gate-dead** |
+| zero-overhead asymptote (2.35 GB at 627 GB/s) | 267 tok/s | physics, not reachable |
+
+The realistic ceiling is **170-185 tok/s on llama-bench, ~165-180 ranked**, and
+getting there means folding essentially every elementwise and norm launch into
+an adjacent matvec — roughly 180 more dispatches removed at ~2.5 us each, or
+about fifteen more rounds at this round's rate. 200 needs either a quantization
+that fails the gate or a part with more bandwidth.
