@@ -192,3 +192,70 @@ CUDA graphs already capture at decode (+1.1% over disabled — no launch
 pool). Dense large-K matvecs on LPDDR5 want maximum resident blocks, not
 per-thread ILP. Remaining decode surface is byte volume / DRAM access
 order, not launch shape.
+
+
+## 0016: the sm_121 wide Q4_K mmvq vec_dot (+9.51% decode)
+
+**The largest decode lever ever measured on this track**, and the answer to
+the section above it: "remaining decode surface is byte volume / DRAM access
+order, not launch shape" was half right. It is not launch shape and it is not
+byte volume either — it is **issue-side load width**, which no sweep in this
+family had varied.
+
+A standalone probe on this box (`~/bwprobe.cu`) puts GB10's achievable DRAM
+read rate at **251.6 GB/s** for exactly the mmvq access geometry — one
+128-thread block per ~1.1 KB row, which is also the *best* of the patterns
+measured, so the block-per-row shape is not a handicap. The stock Q4_K matvec
+was running its weights at ~205 GB/s. At the stock `vdr = 2` every lane
+fetches its weights as two separate 4-byte loads; `block_q4_K` is 144 bytes
+with `qs` at offset 16 and a row is a whole number of blocks, so `qs` is
+16-byte aligned and the fetch can become an 8-byte `int2`.
+
+`get_vdr_mmvq(type, table_id)` returns 4 for Q4_K under the sm_121 table
+0013/0014 already established, and the sm_121 `vec_dot_q4_K_q8_1` covers the
+column pair `(iqs, iqs+2)`, sharing `bq8_offset`, the unpacked scale/min pair
+and `d8`. Only the **device** kernels route through the table-aware overload —
+the host `should_use_small_k` / `mmvq_may_use_small_k` predicates keep the
+stock vdr on purpose, so 0014's `rows_per_block` tuning does not move at the
+same time. nwarps is untouched (already 2 for K-quants here), so
+`blocks_per_iter` doubles from 4 to 8 and the k-loop makes half as many passes.
+
+Measured on the runner box (vllm container parked), 5 interleaved
+whole-process rounds against the 15-patch build:
+
+| round | 0015 tg128 | 0016 tg128 | 0015 pp512 | 0016 pp512 |
+| --- | --- | --- | --- | --- |
+| 1 | 94.43 | **103.40** | 2559.98 | 2565.03 |
+| 2 | 94.35 | **103.41** | 2574.09 | 2560.57 |
+| 3 | 94.59 | **103.30** | 2567.78 | 2572.06 |
+| 4 | 94.37 | **103.55** | 2561.07 | 2564.84 |
+| 5 | 94.52 | **103.49** | 2556.07 | 2553.79 |
+
+decode median ratio **1.0951**, 5/5 arms disjoint; pp512 overlapping in both
+directions, i.e. neutral (prefill takes MMQ and never enters this kernel).
+
+- gate ppl `-c 512 --chunks 8`: **bit-identical 5.2709 +/- 0.35519** on both
+  arms and reproducible across loads — but that is a blind spot, not a pass:
+  the gate's shapes never enter mmvq.
+- **decode-path ppl, and the sample-size trap.** At `-b 512 -ub 1 --chunks 8`
+  it reads **+0.912%**, which would be outside the band. At `--chunks 16` it
+  is **6.3390 → 6.3597, +0.327%** — comfortably inside — and both arms
+  reproduce digit-for-digit across separate loads, so this is a small-sample
+  artifact and not instability. **Take the 16-chunk reading on this model, and
+  do not accept an 8-chunk decode-path number on this track again.**
+- server greedy, 6 prompts, `temperature 0`, non-emptiness asserted (6/6
+  completions, 3768 and 3916 bytes): **1/6 byte-exact**. Expected: Laguna
+  routes top-8 of 256 experts, so any float regrouping reroutes an expert and
+  diverges the greedy text within about a token. Perplexity is the arbiter.
+- the full 16-patch series applies clean to pristine `b10237` and the tree is
+  `diff -r` identical to the measured tree.
+
+Projection: **~1.090** against the **1.0276** bank. Note the calibration trap
+documented above is unrelated to this patch and still applies to submissions.
+
+Cross-track: the same patch is that track's 0012 on lfm2.5 gb10cuda (+7.76%)
+and 0017 on qwen3.6 gb10cuda (+1.77%). The spread is explained by how much of
+each model's decode is Q4_K: nearly all of LFM's, and only 40 of ~280 mmvq
+launches per token on qwen. **Q6_K cannot be widened at all** (210-byte
+blocks, 2-byte aligned `ql`/`qh`) and was measured neutral; **Q5_K should be
+widenable** (176-byte blocks, `qs` at offset 48) and is the open follow-up.
