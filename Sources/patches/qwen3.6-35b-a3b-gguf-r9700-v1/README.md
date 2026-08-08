@@ -2313,6 +2313,12 @@ for pure kernel work on this box is **185-200 tok/s**; 210+ needs fewer BYTES,
 and the only lever that reduces bytes is requantization, which the 0.1%
 perplexity gate makes a coin flip (see the 0021 table).
 
+**Amended by round 31: "the launch count must fall" is the wrong way to say
+this.** A merge that removed exactly 40 dispatches/token measured +0.05%,
+because the kernel time it added cancelled the replay gap it removed. Read
+round 31 before picking a co-launch: the predictor is the host/guest time
+ratio, not the dispatch delta.
+
 ## 0045: the GDN F32 matvec group co-launched with the qkv+z grouped mmvq (+1.3% decode, BYTE-EXACT)
 
 Given round 30, the only lever left is merging launches. Every GDN layer emits
@@ -2417,6 +2423,200 @@ way round only because I mis-aligned the per-token window. Detection has to run
 at the mmvf site and pull the quantized group down into it. **Dump the node
 list (`name`, `op`) around the site before writing a directional detector** -
 the kernel order in a rocprofv3 trace is not the node order.
+
+## Round 31: removing a dispatch is not the lever - hiding one is (no patch shipped)
+
+Round 30 concluded that dispatch count is the whole story of this track's decode
+and that the job is to keep merging launches. This round built a merge that
+removes **exactly 40.0 dispatches/token** and measured it at **+0.05% - flat**.
+The heuristic the series has run on for eleven rounds ("~1.5% per 40 launches
+removed") is wrong as stated, and this round replaces it with one that predicts
+both this result and every earlier one.
+
+### The post-0045 census (start here; supersedes the round-23 map)
+
+`rocprofv3 --kernel-trace`, `llama-bench -p 0 -n 34 -r 1`, 25238 dispatches /35
+tokens = **721.1/token, 5564 us of kernel in a ~6.72 ms token**.
+
+| n/tok | us/tok | each | kernel |
+|---|---|---|---|
+| 150 | 2515 | 16.77 | `mul_mat_vec_q` (all dense/id matvecs) |
+| 61 | 1275 | 20.90 | `mul_mat_vec_q_grouped` |
+| 61 | 86 | 1.40 | `unary_gated_op_quant` |
+| 60 | 77 | 1.29 | `quantize_q8_1` |
+| 50 | 85 | 1.70 | `rms_norm_f32<256>` |
+| 40 | 197 | 4.93 | `mul_mat_vec_f_grouped<16>` |
+| 40 | 117 | 2.92 | `topk_moe_cuda<256>` (ONE workgroup) |
+| 40 | 543 | 13.56 | `mul_mat_vec_q_expert_reduce` |
+| 80 | 231 | 2.89 | `rms_norm_pre_add_f32<1024,{1,2,3}>` |
+| 30 | 66 | 2.19 | `ssm_conv_fold_l2_f32` |
+| 30 | 153 | 5.09 | `gated_delta_net_cuda` |
+| 20 | 39 | 1.96 | `rope_multi` |
+| 12.6 | 52 | 4.09 | `__amd_rocclr_copyBuffer` |
+| 10+10+10 | 95 | | flash_attn_tile / combine / cpy_scalar |
+
+Split by grid geometry, the `mul_mat_vec_q` bucket is: 40 routed gate+up+GLU
+(4096 blocks, 18.07us), 40 ssm_out + attn_wo (18.07), 40 shexp down (2048
+blocks, 3.57), 19 shexp gate+up fused (512 blocks, 6.01), 10 attn wq (24.51),
+1 lm head (665.15). The grouped bucket is 30 qkv+z (36.78) + 21 shexp gate/up
+(5.54) + 10 attention k/v (5.54).
+
+### The per-token dispatch sequence (aligned to the node dump)
+
+A **GDN layer is 14 dispatches**, an **attention layer 22**, of which the MoE
+block is 8 in both:
+
+```
+ 1 mmvf_grouped(shexp_gate + router)   257 blk    4.42us
+ 2 topk_moe                              1 blk    2.68us
+ 3 mmvq routed gate+up+GLU  (Q4_K,id) 4096 blk   17.89us
+ 4 quantize_q8_1 (routed swiglu)         2x8      0.91us
+ 5 mmvq_expert_reduce (Q5_K down)     2048 blk   13.19us
+ 6 mmvq_grouped shexp gate/up (Q8_0)  1024 blk    5.54us
+ 7 unary_gated_op_quant (shexp swiglu)   2 blk    1.16us
+ 8 mmvq shexp down (Q8_0)             2048 blk    3.60us
+```
+
+Nodes 1-5 are the routed branch and 6-8 the shared-expert branch; **the two are
+completely independent** - both read only `attn_post_norm` - and the whole
+remaining decode opportunity lives in that fact. Get the node list with a
+one-shot `fprintf(stderr, ...)` over `cgraph->nodes` in
+`ggml_cuda_graph_evaluate_and_capture` (print `name`, `op`, `ne`, every `src`
+and `data`); `llama-bench` silences `GGML_LOG_*` but not stderr.
+
+### What was built, and why it was blocked in stock order
+
+Stock order emits the shared expert AFTER the routed reduction. `ggml-alloc`
+assigns buffers from node order, so `ffn_gate_shexp`'s output lands on the block
+the **expert-id list has just freed** (`ffn_gate-0` at `0x...404480 + 2 KB`
+straddles `ffn_moe_topk-0` at `0x...404880`). 0045's cross-product disjointness
+check sees that and correctly refuses the merge - the shared gate would
+overwrite ids the routed launch still reads. **The refusal is the allocator's
+doing, not the detector's**, which is why no backend-side change can fix it.
+
+The fix is entirely in `src/models/qwen35moe.cpp` and needs no change to
+`llama-graph.cpp`: `build_moe_ffn` already takes `probs_in` and uses it **as the
+logits verbatim**, so the router matvec can be emitted by the caller. Emit it
+right after the shared-expert gate (keeping the F32 pair the backend groups),
+then pin the shared expert's gate/up behind it, and hand the logits back through
+`probs_in`. Node order becomes 59 shared_gate(F32), 60 router(F32), 61
+ffn_gate_shexp(Q8_0), 62 ffn_up_shexp(Q8_0), then the topk chain. The allocator
+then gives `ffn_gate-0` `0x...404880` and moves argsort to `0x...405880`, all
+four are live at once, and **0045's existing detector fires unchanged**.
+
+Verified by census diff, not by a print: **721.1 -> 681.1 dispatches/token,
+exactly -40.0**, `mul_mat_vec_f_grouped` goes 40 -> 0 and `mul_mat_vec_q_grouped`
+40 -> 80, in all 40 MoE layers.
+
+### The result: flat
+
+Five interleaved rounds, arm order alternated (`GGML_QWEN_SHEXP_GATEUP_PIN`):
+
+```
+on  149.80 149.86 149.92 150.01 149.87   mean 149.89
+off 149.96 149.86 149.93 149.71 149.64   mean 149.82   -> +0.05%, arms interleaved
+```
+
+Kernel time explains it exactly. Total kernel went **5564 -> 5602 us/token, UP
+38 us**, while 40 removed dispatches are worth about 40 x 1.3 = 52 us of exposed
+replay gap. The merged launch costs **11.65 us against 4.93 + 5.54 = 10.47 us
+run separately** - the guest did not hide at all, and cost 1.18 us extra on top.
+
+### The corrected predictor: host/guest ratio, not dispatch count
+
+0045 is the contrast, and its numbers are already in this file. Its host (qkv+z
+grouped) went **35.5 -> 36.78 us** while absorbing a **4.7 us** guest: **73% of
+the guest hid**, host/guest ratio 7.5. This round's ratio was 1.1 and 0% hid.
+
+> A merged launch is worth the guest's whole time plus one replay gap **only
+> when the host is much larger and memory-bound**. Merging two small
+> latency-bound launches buys the replay gap and gives it straight back in
+> kernel time. **Rank co-launch candidates by host/guest time ratio, never by
+> dispatches removed.**
+
+That also re-reads round 30's arithmetic. The token is 3610 us of irreducible
+weight streaming + ~700 us of matvec launch ramp + ~1020 us of small-kernel time
++ ~1110 us of replay gap. The last two pools (2130 us, 32% of the token) are only
+attackable **together**, by hiding small work inside big matvecs; attacking the
+gap alone just moves the cost.
+
+### Block order re-tested at the new site - front is right everywhere
+
+0045 found the F32 tail must go at the FRONT of the merged grid. Re-tested here
+with a switchable split (`GGML_CUDA_MMVQ_F32_AT_END`), 4 interleaved rounds:
+
+```
+front 150.01 150.04 150.07 149.93
+end   144.70 144.84 144.57 144.51    -> -3.5%, 4/4 separated
+```
+
+So ordering is not the explanation for the flat result, and **front is the only
+shipping arrangement** - do not re-derive this.
+
+### The reorder is NOT byte-exact - know why before building on it
+
+Decode-path perplexity (`-b 512 -ub 1 --chunks 8`, gainz-corpus), two loads per
+arm, perfectly reproducible: **8.8679 pinned vs 8.8713 stock, -0.038%**. Well
+inside the 0.1% gate but not identity. The cause is visible in the census: 19 of
+the 40 layers were taking llama.cpp's **fused gate+up+GLU mmvq** (512 blocks,
+6.01us) for the shared expert, and the reorder moves all 40 onto the grouped
+mmvq plus a separate `unary_gated_op_quant` (`mul_mat_vec_q` 150 -> 131,
+`unary_gated_op_quant` 61 -> 80, `quantize_q8_1` 60 -> 41). Two different
+kernels compute the same SwiGLU. Any future patch that keeps this reorder either
+has to preserve the fusion or be gated as a non-byte-exact change.
+
+The reorder is preserved on the box as branch **`r31-shexp-reorder`** (commit
+`be6537cd2` in `~/fable-qwen/cand`, diff at `~/fable-qwen/r31-shexp-reorder.diff`,
+102 lines). It is not in the series: neutral speed is not worth a shipped
+numeric change.
+
+### The remaining hide-pool, ranked - and the one piece of machinery it needs
+
+Every guest worth hiding is now identified, with its host and the measured
+ratio. **All four need the same missing capability: two quantization types in
+one launch.** The 0045 tail already proves a foreign block range inside
+`mul_mat_vec_q_grouped` can be bit-identical (it runs the mmvf body verbatim for
+F32 rows); this is that, with a quantized body.
+
+| guest | host | ratio | x/token | projected |
+|---|---|---|---|---|
+| shexp gate/up Q8_0, 5.5us | routed gate+up+GLU Q4_K/id, 17.9us | 3.3 | 40 | ~+2.0% |
+| shexp down Q8_0, 3.6us | `expert_reduce` Q5_K, 13.4us | 3.7 | 40 | ~+1.5% |
+| attn k/v Q8_0, 5.6us | attn wq Q6_K, 24.5us | 4.4 | 10 | ~+0.6% |
+| `topk_moe`, 2.7us, ONE workgroup | shexp gate/up group, 1024 blk | - | 40 | ~+2.6% |
+
+Two things make this cheaper than it looks:
+
+1. **Every guest is Q8_0.** The GGUF ships `attn_{q,k,v,output}` and the whole
+   shexp trio as Q8_0, and 0021 requants only `attn_q`/`attn_output` (and not
+   the shexp trio - that variant measured slower and was excluded). So the
+   second template parameter only ever needs `GGML_TYPE_Q8_0`: one extra
+   instantiation family, guarded host-side, not a `type x type` explosion.
+   This is also why the round-1 note "shared-expert ninth-channel fold is
+   structurally impossible on this GGUF" needs re-reading: the type mismatch is
+   real, but a **second vec_dot template parameter does not forfeit bit-identity**
+   the way that note assumes - each row keeps its own thread geometry, k-block
+   assignment and reduction order, exactly as the 0045 F32 tail does.
+2. The graph reorder that makes rows 1 and 2 legal is already written and
+   measured (above), and the same `probs_in` trick can place the shared expert
+   anywhere in the MoE block.
+
+Row 4 is the largest single number and the only one whose guest is not a matvec:
+`topk_moe` is one workgroup of pure launch latency, 40 times a token. It would
+have to run as one block of the grouped mmvq kernel, which means its body must
+work at the host's block shape (32x8 = 256 threads, against its own 32x4) with
+warps 4-7 participating in its `__syncthreads()` and doing nothing - and that
+changes its reduction unless the extra warps are excluded from the reduction
+tree. Scope it after rows 1-2.
+
+### Go/no-go on the persistent multi-op kernel (round-30 idea 3)
+
+**No-go as stated, go as the tail generalisation above.** A single kernel
+covering a whole layer section would have to serialise what the graph currently
+overlaps, and this round measured what actually pays: not fewer kernels, but
+more work per kernel *in the shadow of a large memory-bound one*. The tail
+mechanism reaches the entire 2130 us pool incrementally, patch by patch, with a
+bit-identity argument at every step; a persistent kernel does not.
 
 ## Recommended firing order
 
