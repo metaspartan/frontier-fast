@@ -2220,6 +2220,204 @@ actual constraint of the AMD MMA instances at that head size, not a tuning
 guess. Reverted; no patch. If anyone revisits this, the abort is the thing to
 read first, not the timings.
 
+## Round 30: where the decode token actually goes (read before picking a lever)
+
+This round instrumented the token instead of guessing at it, and three of the
+four results close doors rather than open them. All of it is on the shipped
+0044 build.
+
+**1. The CPU is not in the loop.** A `rocprofv3 --hip-trace` over 50 steady
+decode tokens: the token period is 6.715 ms and **6.655 ms of it is spent
+inside `hipStreamSynchronize`**. Time outside any HIP API call is **46
+us/token — 0.7%**. `hipGraphLaunch` is 4.9 us and happens once per token;
+`hipLaunchKernel` does not appear in steady state at all, so replay really is
+one graph launch. llama.cpp's graph reuse is already doing its job
+(`LLAMA_GRAPH_REUSE_DISABLE=1` costs 9.1%: 148.6 -> 135.1 tok/s). **There is
+nothing to win on the host side of this track.** Do not profile the CPU again.
+
+**2. The ~1.0 ms/token that is not kernel time is GPU-side graph replay, and
+it has a floor.** A standalone HIP-graph probe (`gprobe.hip` on the box, 400
+nodes, trivial kernel, 20 replays):
+
+| graph shape | per node |
+|---|---|
+| serial chain | **2.25-2.54 us** |
+| two parallel chains (fork/join capture on a 2nd stream) | **12.8 us** |
+| one fat kernel doing all the work | 0.016 us |
+
+Fifteen ROCm knobs were swept against the serial number and **not one helps**:
+`HIP_FORCE_DEV_KERNARG=0/1` and `AMD_DIRECT_DISPATCH=0` are ~25% WORSE (3.1
+us), and `GPU_MAX_HW_QUEUES`, `HSA_ENABLE_SDMA`, `AMD_SERIALIZE_KERNEL`,
+`HSA_ENABLE_INTERRUPT`, `DEBUG_CLR_GRAPH_PACKET_CAPTURE`, `AMD_OPT_FLUSH`,
+`HSA_DISABLE_CACHE_INV` are all inside noise of 2.25-2.30. **The
+multi-stream / concurrent-branch idea is dead**: expressing the graph's real
+parallelism costs 5x more than the serialization it removes. Do not spend a
+slot on it.
+
+**3. Expert weight LAYOUT is dead** — this was the previous round's top open
+lever. `bwprobe.hip` reads the exact access pattern of each matvec (one block
+per row, 8-byte lane loads, the real row length and pitch) and compares the
+8-of-256 expert gather against a contiguous 8-slab read and against a fully
+interleaved layout:
+
+| pattern (5.77 MB, Q5_K expert down: 16384 rows x 352 B) | GB/s |
+|---|---|
+| 8 slabs scattered over 256 | 803.8 |
+| 8 slabs contiguous | 830.6 |
+| rows interleaved across the 8 | 861.4 |
+
+and for the Q4_K gate/up gather (4096 rows x 1152 B): 306.5 / 307.4 / 309.9.
+The three layouts are the same number. **Scattering 8 of 256 expert slabs
+costs nothing**, because each slab is 590-720 KB of contiguous rows and that
+is already far above any DRAM page or channel-interleave granularity. There
+is no repack of the pinned GGUF that buys decode bandwidth, and 0021's
+load-time hook should not be spent trying.
+
+**4. Every dense matvec is exactly at its access pattern's ceiling.** Same
+probe, same geometry as the shipped kernels:
+
+| matvec | probe ceiling | shipped kernel |
+|---|---|---|
+| lm head Q6_K (417 MB) | 627 GB/s | 626 GB/s |
+| qkv+z grouped Q6_K (20.6 MB) | 580 | 587 |
+| attn_q Q6_K (13.8 MB) | 556 | 560 |
+| ssm_out Q6_K (6.88 MB) | 493 | 479 (serialized) |
+
+The ceiling falls with transfer size, not with anything the kernel does: only
+the 417 MB lm head reaches DRAM peak. Fit `T = c + bytes/627 GB/s` and every
+one of these lands at **c = 2.7-3.0 us of ramp per launch**. So a matvec
+dispatch costs ~2.8 us of ramp plus ~1.3 us of exposed replay gap before it
+moves a byte, and there are 773 dispatches in a token.
+
+### The arithmetic that bounds this track
+
+Per-token weight traffic from the GGUF, with 0021's requant applied:
+Q6_K projections 1050 MB + Q8_0 shexp 133 MB + MoE experts (8 of 256) 610 MB
++ Q6_K lm head 417 MB + F32 routers/alpha/beta 104 MB = **~2.31 GB/token**.
+
+- At the R9700's 640 GB/s that is **3.6 ms = 276 tok/s**, and the lm head
+  proves 627 GB/s is actually reachable, so ~2.7 ms of the 6.7 ms token is
+  irreducible streaming.
+- Measured now: 6.72 ms/token = **344 GB/s end-to-end**, 54% of peak.
+- The remaining 3.0 ms decomposes as ~773 dispatches x ~3.9 us of combined
+  ramp + replay gap. **That is the whole story of this track's decode.**
+
+A decode target of 210 tok/s is 4.76 ms/token, which requires 486 GB/s
+sustained across every microsecond including all 773 launches - i.e. the
+dispatch+ramp budget would have to fall from 3.0 ms to ~1.1 ms, a **3x cut in
+launch count**, from 773 to ~270. The series has removed roughly 40 launches
+per successful round for eleven rounds. Nothing in the measured structure of
+this graph supports that, and the two mechanisms that could have (host-side
+work, concurrent streams) are both measured dead above. A realistic ceiling
+for pure kernel work on this box is **185-200 tok/s**; 210+ needs fewer BYTES,
+and the only lever that reduces bytes is requantization, which the 0.1%
+perplexity gate makes a coin flip (see the 0021 table).
+
+## 0045: the GDN F32 matvec group co-launched with the qkv+z grouped mmvq (+1.3% decode, BYTE-EXACT)
+
+Given round 30, the only lever left is merging launches. Every GDN layer emits
+the alpha/beta F32 matvec group immediately **before** the 35 us qkv+z grouped
+mmvq (node order: `node_3`, `node_4` are the two F32 matvecs, then their folded
+epilogue chain, then `node_11`/`z-0`), and the two are independent - same
+activation, disjoint destinations, nothing but views and the F32 group's own
+epilogue between them. 0045 appends the F32 rows as extra blocks of the
+quantized launch: the grouped mmvq kernel runs the `mul_mat_vec_f_grouped` body
+verbatim for those blocks (same one-warp-per-row shape, same lane->column
+mapping, same warp reduction, same sigmoid/softplus epilogue), so it is
+byte-identical.
+
+**The block ORDER is the entire patch.** Two arrangements, same 30 dispatches
+removed per token:
+
+| F32 blocks placed | decode |
+|---|---|
+| at the END of the grid | **-1.50%** (5/5 rounds separated) |
+| at the FRONT of the grid | **+1.30%** (5/5 rounds separated) |
+
+At the end they are scheduled last, each occupies 1 of the block's 8 warps, and
+they extend the kernel's tail by their full latency - which costs more than the
+dispatch they saved. At the front they retire inside the quantized group's
+memory time. **When merging two kernels of very different sizes on this part,
+put the small one first**; this is probably the most transferable thing in the
+round.
+
+Measured, 5 interleaved rounds against a binary built from this patch's own
+parent commit (RUNPATH verified with `ldd`: the control resolves
+`libggml-hip.so.0` into its own snapshot):
+
+```
+candidate tg128 149.99 149.92 149.71 149.66 149.55  mean 149.77
+control   tg128 147.91 147.90 147.89 147.79 147.73  mean 147.84   -> +1.30%
+```
+
+Same-binary toggle agrees (+1.33%, 149.42 vs 147.46, 5/5 separated). Prefill is
+flat and untouched by construction - the grouped mmvq path is decode-only. Five
+interleaved pp512 rounds with the arm order alternated each round:
+
+```
+candidate pp512 4956.6 4982.7 4920.0 4933.4 4980.6  mean 4954.6
+control   pp512 4975.1 4920.4 4955.6 4961.1 4954.7  mean 4953.4   -> +0.02%
+```
+
+(A single non-interleaved pair earlier in the session read 4910 vs 4977 and
+looked like a 1.3% prefill regression. It was drift. **Never call a prefill
+delta from one unpaired pair on this box** - the pp512 spread across a session
+is ~1.5%, wider than most effects worth measuring.)
+
+Firing proven by census diff, not a debug print: **25238 vs 26288 dispatches
+over 35 tokens = exactly -30.0/token**, and `mul_mat_vec_f_grouped` drops from
+70 to 40 launches per token.
+
+Correctness: **decode-path perplexity is bit-identical**, 8.8713 candidate vs
+8.8713 control (`-b 512 -ub 1 --chunks 8` on `gainz-corpus.txt`; that corpus
+gives a different absolute number than the wikitext readings elsewhere in this
+file - what matters is that the two arms agree to four decimals), and server
+greedy is 6/6 byte-identical against the toggle-off control.
+
+`GGML_CUDA_MMVQ_F32_COLAUNCH=0` restores the separate grouped mmvf launch.
+
+### The bug this round nearly shipped: co-launched groups need a disjointness check of their own
+
+The first working version read **5/6** on server greedy - only the 1000-token
+prompt differed - while `-c 512` perplexity, decode-path perplexity and the
+five short prompts were all bit-identical. The tempting reading is "server
+run-to-run noise". It was not: running the SAME arm twice back to back is
+**6/6 identical**, so the harness is deterministic and a 5/6 is a real
+difference.
+
+The cause is structural and worth internalising for any future co-launch.
+Hoist legality is checked by walking the nodes BETWEEN the two sites, and this
+detector deliberately **excludes the nodes the co-launch itself computes** -
+otherwise the F32 group's own folded epilogue would block every hoist. That
+exclusion means the two merged groups are never checked against **each other**.
+As separate launches they were strictly ordered by the stream; inside one
+kernel they run with no ordering at all, so any aliasing between the quantized
+group's writes and the F32 group's writes or inputs becomes a race. ggml-alloc's
+layout is shape-dependent, which is exactly why it appeared only at long
+context.
+
+The fix is an explicit cross-product check: every quantized member's write
+against every F32 member's write, folded destination, bias/scale, skip nodes
+and both sources, and each F32 write against the quantized sources. It declines
+the co-launch instead of racing. After it: **6/6 byte-identical**, the census
+still shows -30.0 dispatches/token, and the speed is unchanged - candidate
+149.40/149.30/149.37/149.20 against control 147.42/147.49/147.45/147.35,
+**+1.28%, 4/4 rounds separated**.
+
+**Rule for the next co-launch:** hoist legality is about the nodes in between;
+it says nothing about the two things you are merging. Check those separately,
+always.
+
+### Debugging note that cost a build
+
+The first version scanned FORWARD from the grouped-mmvq site for an F32 group
+and never fired (census diff: exactly 0 dispatches changed). The F32 group is
+**before** the quantized group in node order; the kernel trace looked the other
+way round only because I mis-aligned the per-token window. Detection has to run
+at the mmvf site and pull the quantized group down into it. **Dump the node
+list (`name`, `op`) around the site before writing a directional detector** -
+the kernel order in a rocprofv3 trace is not the node order.
+
 ## Recommended firing order
 
 The runner applies the whole patch directory, so the series is a ladder rather
@@ -2228,7 +2426,9 @@ speed has a disable toggle. Two do not carry speed: **0038** is 0037's kernel
 made bit-identical and must not be applied without 0037; **0039** is 0031's
 kernel made sign-of-zero-exact and must not be applied without 0031
 (`GGML_SSM_CONV_FOLD_STOCK_SHAPE=0` falls back to the 0031 kernel in place).
-If a ranked run has to be pared back, drop from the end: 0044 (prefill only,
+If a ranked run has to be pared back, drop from the end: **0045** (decode only,
+independent of everything except the grouped mmvq/mmvf launches it merges -
+`GGML_CUDA_MMVQ_F32_COLAUNCH=0` restores the separate launches), then 0044 (prefill only,
 a new kernel plus one dispatch branch, independent of everything —
 `GGML_F32_SKINNY_MAX_ROWS=0` disables it), then 0043 (prefill only,
 independent of everything — `GGML_GDN_COLS_PER_WAVE=1` restores the stock

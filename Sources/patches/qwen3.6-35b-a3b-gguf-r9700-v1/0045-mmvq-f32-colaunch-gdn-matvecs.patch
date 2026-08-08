@@ -1,0 +1,479 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH 45/45] cuda/hip: co-launch the GDN F32 matvec group with the
+ qkv+z grouped mmvq (+1.3% decode, BYTE-EXACT)
+
+Round 30 measured where the decode token actually goes on this box, and the
+answer reframes the remaining headroom. The CPU is not in the loop at all:
+over 50 steady decode tokens the period is 6.715 ms and 6.655 ms of it is
+spent inside hipStreamSynchronize, leaving 46 us/token (0.7%) outside any HIP
+call. So the ~1.0 ms/token that is not kernel time is GPU-side graph-replay
+cost. A standalone probe puts a serial HIP-graph node at 2.25-2.54 us on
+gfx1201 for a trivial kernel; fifteen ROCm env knobs move it not at all
+(HIP_FORCE_DEV_KERNARG and AMD_DIRECT_DISPATCH are 25% WORSE); and capturing
+two independent chains onto a second stream costs 12.8 us/node - 5x worse
+than the serialization it removes, which closes the multi-stream idea for
+good. That leaves merging launches.
+
+Every GDN layer emits the tiny F32 alpha/beta matvec group immediately BEFORE
+the 35 us qkv+z grouped mmvq, and the two are independent: same activation,
+disjoint destinations, nothing but views and the F32 group's own folded
+epilogue in between. This patch appends the F32 rows as extra blocks of the
+quantized launch:
+
+- mmvq_grouped_args carries an F32 co-launch head (weights, destinations,
+  bias/scale, postop, segment table, its own ncols/stride).
+- The grouped mmvq kernel runs the mul_mat_vec_f_grouped body verbatim for
+  blocks [0, f_nrows): same one-warp-per-row shape, same lane->column
+  mapping (col = threadIdx.x + n*warp_size, ascending), same two
+  ggml_cuda_mad per float2, same warp_reduce_sum, same sigmoid / softplus
+  epilogue expressions. Bit-identical to the standalone launch.
+- Detection runs at the mmvf group's own site and pulls the quantized group
+  down into it. The F32 group comes FIRST in node order, so the opposite
+  direction does not exist in this graph - a forward-scanning first version
+  fired exactly zero times.
+
+Two things decide whether this works at all.
+
+1. BLOCK ORDER. With the F32 blocks appended at the END of the grid they are
+   scheduled last, each occupies 1 of the block's 8 warps, and they extend the
+   kernel's tail by their full latency: that arrangement measures -1.50%
+   decode (5/5 rounds separated) even though it removes the same 30 dispatches
+   per token. At the FRONT they retire inside the quantized group's memory
+   time and the same 30 removed dispatches become +1.30%. When merging two
+   kernels of very different sizes on this part, put the small one first.
+
+2. THE TWO MERGED GROUPS MUST BE CHECKED AGAINST EACH OTHER. Hoist legality
+   walks the nodes BETWEEN the two sites and deliberately excludes the nodes
+   the co-launch itself computes, so it says nothing about the two things
+   being merged. As separate launches they were ordered by the stream; inside
+   one kernel they are not, so aliasing between the quantized writes and the
+   F32 writes/inputs becomes a race. ggml-alloc's layout is shape-dependent,
+   so this showed up only at long context: server greedy read 5/6 (the
+   1000-token prompt) while -c 512 perplexity, decode-path perplexity and the
+   five short prompts were all bit-identical. Running the same arm twice is
+   6/6, so that 5/6 was a real difference, not harness noise. The explicit
+   cross-product disjointness check declines the co-launch instead of racing.
+
+Measured on the R9700 box (Qwen3.6-35B-A3B-UD-Q4_K_M), interleaved rounds
+against a binary built from this patch's own parent commit, with the control's
+RUNPATH verified by ldd (it resolves libggml-hip.so.0 into its own snapshot):
+
+  candidate tg128 149.99 149.92 149.71 149.66 149.55  (mean 149.77)
+  control   tg128 147.91 147.90 147.89 147.79 147.73  (mean 147.84)
+  => +1.30% decode, 5/5 rounds separated (min cand > max ctl)
+
+Re-confirmed after the race fix: candidate 149.40/149.30/149.37 against
+control 147.42/147.49/147.45, +1.30%, 3/3 separated. Same-binary toggle
+(GGML_CUDA_MMVQ_F32_COLAUNCH=0) agrees: +1.33%.
+
+Prefill is flat and untouched by construction - the grouped mmvq path is
+decode-only. Five interleaved pp512 rounds, arm order alternated:
+candidate 4956.6/4982.7/4920.0/4933.4/4980.6 (mean 4954.6) against control
+4975.1/4920.4/4955.6/4961.1/4954.7 (mean 4953.4), +0.02%.
+
+Firing proven by kernel census diff, not a debug print: 25238 vs 26288
+dispatches over 35 tokens, exactly -30.0/token, and mul_mat_vec_f_grouped
+drops from 70 to 40 launches per token.
+
+Correctness: decode-path perplexity (-b 512 -ub 1 --chunks 8) is
+bit-identical, 8.8713 candidate vs 8.8713 control, and server greedy
+(llama-server, 6 prompts, decode shape, every completion >= 276 B) is 6/6
+byte-identical against the toggle-off control.
+
+GGML_CUDA_MMVQ_F32_COLAUNCH=0 restores the separate grouped mmvf launch.
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 8899f7354..e834a4786 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4152,6 +4152,143 @@ static int ggml_cuda_mmvf_collect_group(const ggml_cgraph * cgraph, const int st
+     return n;
+ }
+ 
++// ----- 0045: quantized/F32 matvec co-launch ----------------------------------
++//
++// Per-node HIP graph replay on gfx1201 costs ~1.3 us of exposed GPU time that no
++// runtime knob removes (measured: a 400-node serial graph of trivial kernels
++// replays at 2.4 us/node, and forking the capture onto a second stream is 5x
++// worse - see the round-30 notes). Every GDN layer emits the tiny F32 alpha/beta
++// matvec group immediately BEFORE the 35 us qkv+z grouped mmvq, and the two are
++// independent: they read the same activation and write disjoint destinations.
++// Running them as one launch removes a dispatch and hides the F32 group's
++// latency inside the quantized group's memory time. The F32 rows keep the
++// mul_mat_vec_f_grouped body verbatim (same lane->column mapping, same warp
++// reduction, same epilogue expressions), so the result is byte-identical.
++
++// hoist legality with a set of nodes the co-launch itself computes excluded
++static bool ggml_cuda_mmvq_hoist_legal_ex(const ggml_cgraph * cgraph, const int start, const int j,
++                                          const ggml_tensor * const * owned, const int n_owned) {
++    const ggml_tensor * cand = cgraph->nodes[j];
++    for (int k = start + 1; k < j; ++k) {
++        const ggml_tensor * mid = cgraph->nodes[k];
++        if (ggml_cuda_is_view_or_noop(mid)) {
++            continue;
++        }
++        bool skip = false;
++        for (int o = 0; o < n_owned; ++o) {
++            if (owned[o] == mid) { skip = true; break; }
++        }
++        if (skip) {
++            continue;
++        }
++        for (int si = 0; si < GGML_MAX_SRC; ++si) {
++            if (mid->src[si] != nullptr && !ggml_cuda_mmvq_ranges_disjoint(cand, mid->src[si])) {
++                return false;
++            }
++        }
++        if (!ggml_cuda_mmvq_ranges_disjoint(cand, mid)) {
++            return false;
++        }
++        if (!ggml_cuda_mmvq_ranges_disjoint(mid, cand->src[0]) ||
++                !ggml_cuda_mmvq_ranges_disjoint(mid, cand->src[1])) {
++            return false;
++        }
++    }
++    return true;
++}
++
++// From an F32 matvec group at `start`, find the quantized grouped-mmvq launch that
++// follows it with nothing but views and the F32 group's own folded epilogue in
++// between, and that is legal to hoist to `start`. Returns the member count.
++static int ggml_cuda_mmvq_colaunch_find_q(
++        const ggml_cgraph * cgraph, const int start,
++        ggml_tensor * const * f_members, const int n_f, const mmvf_epilogue * f_epi,
++        ggml_tensor ** q_members) {
++    const ggml_tensor * owned[MMVF_MAX_GROUP_SIZE * 4];
++    int n_owned = 0;
++    for (int m = 0; m < n_f; ++m) {
++        owned[n_owned++] = f_members[m];
++        if (f_epi[m].dst_node != nullptr) {
++            owned[n_owned++] = f_epi[m].dst_node;
++            for (int sk = 0; sk < 2; ++sk) {
++                if (f_epi[m].skip[sk] != nullptr) {
++                    owned[n_owned++] = f_epi[m].skip[sk];
++                }
++            }
++        }
++    }
++    constexpr int scan_window = 24;
++    const int end = std::min(cgraph->n_nodes, start + 1 + scan_window);
++    for (int j = start + 1; j < end; ++j) {
++        ggml_tensor * cand = cgraph->nodes[j];
++        if (ggml_cuda_is_view_or_noop(cand)) {
++            continue;
++        }
++        bool is_owned = false;
++        for (int o = 0; o < n_owned; ++o) {
++            if (owned[o] == cand) { is_owned = true; break; }
++        }
++        if (is_owned) {
++            continue;
++        }
++        // the first real op after the F32 group must be the quantized group itself
++        if (cand->op != GGML_OP_MUL_MAT || !ggml_cuda_mmvq_can_group(cand)) {
++            return 0;
++        }
++        const int n_q = ggml_cuda_mmvq_collect_group(cgraph, j, q_members);
++        if (n_q < 2) {
++            return 0;
++        }
++        for (int m = 0; m < n_q; ++m) {
++            int idx = -1;
++            for (int k = j; k < end + MMVQ_MAX_GROUP_SIZE + 48 && k < cgraph->n_nodes; ++k) {
++                if (cgraph->nodes[k] == q_members[m]) { idx = k; break; }
++            }
++            if (idx < 0 || !ggml_cuda_mmvq_hoist_legal_ex(cgraph, start, idx, owned, n_owned)) {
++                return 0;
++            }
++        }
++        // The hoist check above EXCLUDES the nodes this co-launch computes, so the
++        // two groups have not been checked against EACH OTHER - and inside one
++        // kernel they run with no ordering between them, where the separate
++        // launches were strictly ordered. Every quantized write must be disjoint
++        // from every F32 write and input, and vice versa. Skipping this check
++        // shipped a shape-dependent race that only showed up on a 1000-token
++        // prompt (5/6 server greedy) while short prompts and -c 512 perplexity
++        // stayed bit-identical.
++        for (int m = 0; m < n_q; ++m) {
++            const ggml_tensor * q = q_members[m];
++            for (int f = 0; f < n_f; ++f) {
++                const ggml_tensor * fw = f_members[f];
++                const ggml_tensor * fdst = f_epi[f].dst_node != nullptr ? f_epi[f].dst_node : fw;
++                if (!ggml_cuda_mmvq_ranges_disjoint(q, fw) ||
++                        !ggml_cuda_mmvq_ranges_disjoint(q, fdst) ||
++                        !ggml_cuda_mmvq_ranges_disjoint(q, fw->src[0]) ||
++                        !ggml_cuda_mmvq_ranges_disjoint(q, fw->src[1]) ||
++                        !ggml_cuda_mmvq_ranges_disjoint(fdst, q->src[0]) ||
++                        !ggml_cuda_mmvq_ranges_disjoint(fdst, q->src[1]) ||
++                        !ggml_cuda_mmvq_ranges_disjoint(fw, q->src[0]) ||
++                        !ggml_cuda_mmvq_ranges_disjoint(fw, q->src[1])) {
++                    return 0;
++                }
++                if (f_epi[f].bias != nullptr &&
++                        (!ggml_cuda_mmvq_ranges_disjoint(q, f_epi[f].bias) ||
++                         !ggml_cuda_mmvq_ranges_disjoint(q, f_epi[f].scale))) {
++                    return 0;
++                }
++                for (int sk = 0; sk < 2; ++sk) {
++                    if (f_epi[f].skip[sk] != nullptr &&
++                            !ggml_cuda_mmvq_ranges_disjoint(q, f_epi[f].skip[sk])) {
++                        return 0;
++                    }
++                }
++            }
++        }
++        return n_q;
++    }
++    return 0;
++}
++
+ // ----- grouped l2_norm (GDN q/k conv-norm class) launch detection -------------
+ //
+ // A GDN layer L2-normalises q_conv and k_conv with two independent launches of
+@@ -6106,6 +6243,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+             static const bool disable_shexp_gate_fuse = getenv("GGML_CUDA_DISABLE_SHEXP_GATE_FUSE") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_SHEXP_GATE_FUSE"));
+             const bool mmvq_group_enabled = !disable_mmvq_group && stream_ctx.concurrent_events.empty();
++            // 0045: F32 matvec co-launch inside the grouped mmvq launch. Default on;
++            // GGML_CUDA_MMVQ_F32_COLAUNCH=0 restores the separate grouped mmvf launch.
++            static const bool mmvq_f32_colaunch_enabled = []() -> bool {
++                const char * e = getenv("GGML_CUDA_MMVQ_F32_COLAUNCH");
++                return e == nullptr || std::atoi(e) != 0;
++            }();
+             static const bool log_mmvq_group_stats = getenv("GGML_MMVQ_GROUP_STATS") != nullptr;
+             int64_t mmvq_group_stats_buf[2] = {0, 0};
+             int64_t * mmvq_group_stats = log_mmvq_group_stats ? mmvq_group_stats_buf : nullptr;
+@@ -6422,7 +6565,20 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     if (n_members >= 2) {
+                         mmvf_epilogue epi[MMVF_MAX_GROUP_SIZE];
+                         ggml_cuda_mmvf_collect_epilogues(cgraph, i, members, n_members, epi);
+-                        ggml_cuda_mul_mat_vec_f_grouped(*cuda_ctx, members, epi, n_members);
++                        // 0045: co-launch with the quantized group that follows
++                        ggml_tensor * q_members[MMVQ_MAX_GROUP_SIZE];
++                        int n_q = 0;
++                        if (mmvq_f32_colaunch_enabled && n_members <= MMVQ_F32_TAIL_MAX) {
++                            n_q = ggml_cuda_mmvq_colaunch_find_q(cgraph, i, members, n_members, epi, q_members);
++                        }
++                        if (n_q >= 2) {
++                            ggml_cuda_mul_mat_vec_q_grouped(*cuda_ctx, q_members, n_q, members, epi, n_members);
++                            for (int m = 0; m < n_q; ++m) {
++                                mmvq_grouped_done.insert(q_members[m]);
++                            }
++                        } else {
++                            ggml_cuda_mul_mat_vec_f_grouped(*cuda_ctx, members, epi, n_members);
++                        }
+                         for (int m = 1; m < n_members; ++m) {
+                             mmvq_grouped_done.insert(members[m]);
+                         }
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 0491be274..0c81133bf 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1,4 +1,5 @@
+ #include "mmvq.cuh"
++#include "mmvf.cuh"
+ #include "quantize.cuh"
+ #include "unary.cuh"
+ #include "vecdotq.cuh"
+@@ -968,6 +969,21 @@ struct mmvq_grouped_args {
+     // exclusive prefix sums of segment row counts; entries past the actual
+     // group size are padded with the total so the segment scan ignores them
+     uint32_t     seg_end[MMVQ_MAX_GROUP_SIZE];
++
++    // 0045 F32 co-launch tail. Blocks [f_block0, f_block0 + f_nrows) run the
++    // mul_mat_vec_f_grouped body over an independent group of plain F32
++    // matvecs that the graph emits right after this one. f_nrows == 0 disables.
++    const float * f_vx[MMVQ_F32_TAIL_MAX];
++    float       * f_dst[MMVQ_F32_TAIL_MAX];
++    const float * f_bias[MMVQ_F32_TAIL_MAX];
++    const float * f_scale[MMVQ_F32_TAIL_MAX];
++    const float * f_y;
++    uint32_t      f_seg_end[MMVQ_F32_TAIL_MAX];
++    uint32_t      f_block0;
++    uint32_t      f_nrows;
++    uint32_t      f_ncols2;
++    uint32_t      f_stride_row;
++    uint8_t       f_postop[MMVQ_F32_TAIL_MAX];
+ };
+ 
+ template <ggml_type type, bool small_k = false>
+@@ -996,13 +1012,63 @@ static __global__ void mul_mat_vec_q_grouped(
+ 
+     const int tid = warp_size*threadIdx.y + threadIdx.x;
+ 
++    // ---- 0045: F32 co-launch tail -------------------------------------------
++    // One warp per row, exactly as mul_mat_vec_f_grouped launches it: the same
++    // lane->column mapping (col = threadIdx.x + n*warp_size, ascending), the
++    // same two ggml_cuda_mad per float2, the same warp_reduce_sum and the same
++    // epilogue expressions. Bit-identical to the standalone grouped launch.
++    if (args.f_nrows != 0 && blockIdx.x < args.f_nrows) {
++        if (threadIdx.y != 0) {
++            return;
++        }
++        const uint32_t brow = blockIdx.x;
++        uint32_t fseg = 0, fstart = 0;
++#pragma unroll
++        for (int s = 0; s < MMVQ_F32_TAIL_MAX - 1; ++s) {
++            if (brow >= args.f_seg_end[s]) {
++                fseg   = s + 1;
++                fstart = args.f_seg_end[s];
++            }
++        }
++        const int frow = (int) (brow - fstart);
++
++        ggml_cuda_pdl_sync();
++
++        const float2 * fx2 = (const float2 *) (args.f_vx[fseg] + (int64_t) frow * args.f_stride_row);
++        const float2 * fy2 = (const float2 *) args.f_y;
++        float fsumf = 0.0f;
++        for (int col2 = threadIdx.x; col2 < (int) args.f_ncols2; col2 += warp_size) {
++            const float2 tmpx = fx2[col2];
++            const float2 tmpy = fy2[col2];
++            ggml_cuda_mad(fsumf, tmpx.x, tmpy.x);
++            ggml_cuda_mad(fsumf, tmpx.y, tmpy.y);
++        }
++
++        ggml_cuda_pdl_lc();
++        fsumf = warp_reduce_sum<warp_size>(fsumf);
++        if (threadIdx.x != 0) {
++            return;
++        }
++        float fout = fsumf;
++        const uint8_t fpostop = args.f_postop[fseg];
++        if (fpostop == 1) {
++            fout = 1.0f / (1.0f + expf(-fout)); // must match op_sigmoid in unary.cu exactly
++        } else if (fpostop == 2) {
++            const float biased = fout + args.f_bias[fseg][frow];
++            fout = ggml_cuda_softplus_f32(biased) * args.f_scale[fseg][frow];
++        }
++        args.f_dst[fseg][frow] = fout;
++        return;
++    }
++
+     // Segment routing: uniform across the block (it depends only on blockIdx.x),
+     // integer-only, and the sole difference from the individual launch.
++    const uint32_t qblk = blockIdx.x - args.f_nrows;
+     uint32_t seg       = 0;
+     uint32_t seg_start = 0;
+ #pragma unroll
+     for (int s = 0; s < MMVQ_MAX_GROUP_SIZE - 1; ++s) {
+-        if (blockIdx.x >= args.seg_end[s]) {
++        if (qblk >= args.seg_end[s]) {
+             seg       = s + 1;
+             seg_start = args.seg_end[s];
+         }
+@@ -1014,7 +1080,7 @@ static __global__ void mul_mat_vec_q_grouped(
+     // the dead channel/sample/batch indexing constant-folded away (the detector
+     // only groups 2D-weight x single-column ops, where channel_dst = sample_dst
+     // = 0 and every j index is 0).
+-    const     int row0 = rows_per_cuda_block*(blockIdx.x - seg_start);
++    const     int row0 = rows_per_cuda_block*(qblk - seg_start);
+     const     int blocks_per_row_x = ncols_x / qk;
+     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+ 
+@@ -1110,6 +1176,7 @@ static void mul_mat_vec_q_grouped_launch(
+     if constexpr (type == GGML_TYPE_Q6_K) {
+         constexpr int rpb = calc_rows_per_block(1, MMVQ_PARAMETERS_RDNA4, /*small_k=*/true, 8);
+         if (rpb > 1 && table_id == MMVQ_PARAMETERS_RDNA4 && mmvq_r4_rpb_enabled() &&
++                args_in.f_nrows == 0 &&
+                 (int) total_rows >= mmvq_r4_rpb_min_rows()) {
+             bool divisible = true;
+             uint32_t prev = 0;
+@@ -1134,8 +1201,9 @@ static void mul_mat_vec_q_grouped_launch(
+     }
+ 
+     // Same block shape (including the idle-warp trim, which depends only on the
+-    // shared ncols_x) as each individual launch would use.
+-    const dim3 block_nums(total_rows, 1, 1);
++    // shared ncols_x) as each individual launch would use. The F32 co-launch
++    // tail only appends blocks; every quantized block keeps its own index.
++    const dim3 block_nums(total_rows + args_in.f_nrows, 1, 1);
+     const dim3 block_dims(warp_size, calc_nwarps_launched<type>(ncols_x, nwarps, warp_size, table_id), 1);
+ 
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+@@ -2046,7 +2114,8 @@ void ggml_cuda_op_mul_mat_vec_q(
+     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
+ }
+ 
+-void ggml_cuda_mul_mat_vec_q_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes) {
++void ggml_cuda_mul_mat_vec_q_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes,
++                                     ggml_tensor * const * f32_nodes, const mmvf_epilogue * f32_epilogues, int n_f32_nodes) {
+     GGML_ASSERT(n_nodes >= 2 && n_nodes <= MMVQ_MAX_GROUP_SIZE);
+ 
+     const ggml_tensor * src1       = nodes[0]->src[1];
+@@ -2120,5 +2189,55 @@ void ggml_cuda_mul_mat_vec_q_grouped(ggml_backend_cuda_context & ctx, ggml_tenso
+         args.seg_end[m] = total_rows; // padding: the segment scan never selects these
+     }
+ 
++    // ---- 0045: attach the independent F32 matvec group ---------------------
++    if (n_f32_nodes > 0) {
++        GGML_ASSERT(n_f32_nodes <= MMVQ_F32_TAIL_MAX);
++        const ggml_tensor * f_src1 = f32_nodes[0]->src[1];
++        const ggml_tensor * f_src0 = f32_nodes[0]->src[0];
++        GGML_ASSERT(f_src1->type == GGML_TYPE_F32 && f_src0->type == GGML_TYPE_F32);
++        GGML_ASSERT(f_src1->ne[1] == 1 && f_src1->ne[2] == 1 && f_src1->ne[3] == 1);
++        const int64_t f_ne10 = f_src1->ne[0];
++        GGML_ASSERT(f_ne10 % 2 == 0);
++        const int64_t f_stride_row = f_src0->nb[1] / sizeof(float);
++        uint32_t f_total = 0;
++        for (int m = 0; m < n_f32_nodes; ++m) {
++            const ggml_tensor * s0 = f32_nodes[m]->src[0];
++            ggml_tensor       * d  = f32_nodes[m];
++            GGML_ASSERT(d->op == GGML_OP_MUL_MAT);
++            GGML_ASSERT(d->src[1] == f_src1 && d->src[2] == nullptr);
++            GGML_ASSERT(s0->type == GGML_TYPE_F32 && s0->ne[0] == f_ne10);
++            GGML_ASSERT(s0->ne[2] == 1 && s0->ne[3] == 1);
++            GGML_ASSERT((int64_t)(s0->nb[1]/sizeof(float)) == f_stride_row);
++            GGML_ASSERT(d->type == GGML_TYPE_F32 && d->ne[0] == s0->ne[1]);
++            GGML_ASSERT(d->ne[1] == 1 && d->ne[2] == 1 && d->ne[3] == 1);
++            args.f_vx[m] = (const float *) s0->data;
++            const mmvf_epilogue * epi = f32_epilogues != nullptr ? &f32_epilogues[m] : nullptr;
++            if (epi != nullptr && epi->dst_node != nullptr) {
++                GGML_ASSERT(epi->kind == 1 || epi->kind == 2);
++                GGML_ASSERT(ggml_nelements(epi->dst_node) == d->ne[0]);
++                args.f_dst[m]    = (float *) epi->dst_node->data;
++                args.f_postop[m] = epi->kind;
++                if (epi->kind == 2) {
++                    GGML_ASSERT(epi->bias != nullptr && epi->scale != nullptr);
++                    args.f_bias[m]  = (const float *) epi->bias->data;
++                    args.f_scale[m] = (const float *) epi->scale->data;
++                }
++            } else {
++                args.f_dst[m]    = (float *) d->data;
++                args.f_postop[m] = 0;
++            }
++            f_total += (uint32_t) s0->ne[1];
++            args.f_seg_end[m] = f_total;
++        }
++        for (int m = n_f32_nodes; m < MMVQ_F32_TAIL_MAX; ++m) {
++            args.f_seg_end[m] = f_total;
++        }
++        args.f_y          = (const float *) f_src1->data;
++        args.f_block0     = total_rows;
++        args.f_nrows      = f_total;
++        args.f_ncols2     = (uint32_t) (f_ne10 / 2);
++        args.f_stride_row = (uint32_t) f_stride_row;
++    }
++
+     mul_mat_vec_q_grouped_switch_type(type, args, src1_q8_1, total_rows, (uint32_t) ne10, (uint32_t) stride_row_x, stream);
+ }
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index b09707628..e47f85525 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -18,7 +18,15 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
+ // the caller in ggml-cuda.cu. Per-row arithmetic is byte-identical to the
+ // individual launches: only the (weight, dst) base pointers and the local row
+ // index depend on the group segment, and both are integer-only.
+-void ggml_cuda_mul_mat_vec_q_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes);
++// 0045: an adjacent, independent group of tiny F32 matvecs (the GDN alpha/beta
++// projections) can ride along in the same launch as the quantized group. The
++// per-row arithmetic is the mul_mat_vec_f_grouped body verbatim, so the F32
++// results are byte-identical to their own launch; only the dispatch is gone.
++#define MMVQ_F32_TAIL_MAX 4
++struct mmvf_epilogue;
++void ggml_cuda_mul_mat_vec_q_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes,
++                                     ggml_tensor * const * f32_nodes = nullptr,
++                                     const mmvf_epilogue * f32_epilogues = nullptr, int n_f32_nodes = 0);
+ 
+ // Maximum number of MoE expert slots whose partial results the expert-reduce
+ // kernel below can fold into one store (n_expert_used).
