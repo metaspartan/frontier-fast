@@ -2194,6 +2194,32 @@ The batch threshold itself is flat between 32 and 128; forcing MMQ costs 12.5%.
 overhead it carries (4.2 ms/pass of `dequantize_block_q6_K` plus ~1.4 ms of
 `convert_unary`) is already priced into that comparison.
 
+### Measured dead: lifting the AMD WMMA head-size cap on flash attention
+
+`flash_attn_tile<256,256,4,8>` is 3.6% of a prefill pass (10 launches, 359 us)
+and 1% of decode, and the reason it is the tile kernel is not a heuristic that
+happened to lose — it is structural, and worth one paragraph so nobody re-buys
+it. `ggml_cuda_get_best_fattn_kernel` has exactly one AMD WMMA rule:
+
+```c
+// AMD WMMA is always faster than the tile kernel if the full tile width of 16 can be utilized.
+if ((amd_wmma_available(cc) && gqa_opt_applies && Q->ne[0] <= 128) && ... )
+    return BEST_FATTN_KERNEL_MMA_F16;
+```
+
+Instrumenting the selector settles what is failing in one run:
+`Qne=256,... gqa=8 mask=1 maxbias=0.0 kvpad=1 strides16=1 gqa_opt=1 wmma=1` —
+**everything passes except the head size. qwen35moe's full-attention layers are
+DKQ = DV = 256**, so the `<= 128` cap keeps them on the tile kernel
+unconditionally, at any batch size.
+
+Lifting the cap to 256 does select the MMA kernel — the instance exists and
+launches (`flash_attn_ext_f16<256, 256, 8, 8, false, false>`, 10 per pass) — and
+then **`ggml_abort`s inside the backend synchronize**. The cap is loading an
+actual constraint of the AMD MMA instances at that head size, not a tuning
+guess. Reverted; no patch. If anyone revisits this, the abort is the thing to
+read first, not the timings.
+
 ## Recommended firing order
 
 The runner applies the whole patch directory, so the series is a ladder rather
@@ -2205,8 +2231,9 @@ kernel made sign-of-zero-exact and must not be applied without 0031
 If a ranked run has to be pared back, drop from the end: 0044 (prefill only,
 a new kernel plus one dispatch branch, independent of everything —
 `GGML_F32_SKINNY_MAX_ROWS=0` disables it), then 0043 (prefill only,
-independent of everything, and the one patch that spends real perplexity
-budget — `GGML_GDN_COLS_PER_WAVE=2` is the half-measure), then 0042 (a
+independent of everything — `GGML_GDN_COLS_PER_WAVE=1` restores the stock
+kernel; note CPW=2 is *not* a safer half-measure, it is just a different
+perplexity draw and a slower one), then 0042 (a
 one-constant change, independent of everything), then 0041 (needs 0031+0039,
 which own the decode conv fold it extends), then 0040 (prefill only, independent
 of everything), then 0039, then 0038+0037, then 0036, 0035, 0034 (independent
@@ -2235,9 +2262,12 @@ anything else.
 Rounds 21 and 22 bought correctness; 23, 24 and 25 are the first speed since
 0037 — one on the prefill side, two on the decode side.
 
-Correctness state of the stack is unchanged: **-0.180%** against stock on the
-decode path, **-0.11 to -0.17%** at the gate shape, and every banked fold now
-has a perplexity number taken at the shape where it actually runs.
+Correctness state of the stack after 0044: **+0.010% against stock at the gate
+shape** (3.9318 on both loads against stock's perfectly reproducible 3.9314),
+and **3.9338 on the decode path**, identical to the pre-0043 stack — both 0043
+and 0044 are gated off the decode shape by construction, so the entire decode
+ladder is numerically untouched by this session. Every banked fold still has a
+perplexity number taken at the shape where it actually runs.
 
 ### Gate the next decode fold like this
 
