@@ -103,7 +103,7 @@ API is authoritative and moves; re-read it.
 | `maple-preview-gguf-r9700-v1` | **llama.cpp source** (`Sources/patches/<id>/`) | **+462.76%** (336.9 tok/s, 6 ranked) | Maple-Preview TQ2_0 (2-bit natively-ternary MoE) against the deepgrove llama.cpp fork. The baseline fell back to a dequant path, so early wins were large and compounding; the ternary add-only matmul of the 8 active experts now dominates. Patches port across RDNA2/3/3.5/4. |
 | `maple-preview-gguf-gb10cuda-v1` | **llama.cpp source** (empty) | none yet (54.0 tok/s) | Same model as the R9700 twin, untouched surface. Read that track's findings first — the ternary path there is far ahead, and this pair is a portability probe. |
 | `maple-preview-mlx-apple-v1` | **MLX** (Python overlay + `Sources/mlx-engine-patches/<id>/`) | +23.22% (223.9 tok/s, 4 ranked) | Ternary MoE on Metal. Prefer the Python overlay; `mx.fast.metal_kernel` JIT-compiles new Metal with no build cost. |
-| `qwen3.6-35b-a3b-gguf-r9700-v1` | **llama.cpp source** | +29.80% (104.0 tok/s, 2 ranked) | 35B A3B MoE at Q4_K_M. Ships multi-token-prediction heads — note MTP counts as speculative decoding and ranks on the other board. |
+| `qwen3.6-35b-a3b-gguf-r9700-v1` | **llama.cpp source** | +29.80% (104.0 tok/s, 2 ranked) | 35B A3B MoE at Q4_K_M. Ships multi-token-prediction heads as part of the architecture. Touching that code path does NOT make your submission speculative — only enabling speculation does. |
 | `qwen3.6-35b-a3b-gguf-gb10cuda-v1` | **llama.cpp source** | +4.02% (41.1 tok/s, 1 ranked) | The CUDA twin of the R9700 Qwen track; the gap between them is the open question. |
 | `qwen3.6-35b-a3b-nvfp4-gb10-v1` | vLLM — **FROZEN** | no records | Frozen, do not submit: Qwen3.6 uses the GDN attention backend, which rejects `VLLM_BATCH_INVARIANT=1`, so greedy output is non-deterministic (0/5 identical temp-0 probes) and the correctness gate can never pass. Use the two GGUF Qwen tracks instead. |
 | `laguna-xs-2.1-nvfp4-mlx-apple-v1` | MLX — **FROZEN** | no records | Frozen, do not submit. |
@@ -309,6 +309,35 @@ measured against the pinned baseline. Whitelisted knobs: `kernels` (loads
 **disabled** — every value was measured diverging from the pinned
 batch-invariant baseline.
 
+## Long context (16k)
+
+Every llama.cpp and MLX run also measures a **paired 16,384-token phase** in a
+separate engine boot, and reports decode and prefill for it. You do not opt in
+and you cannot fail because of it: the phase runs after the ranked rounds, and
+if it errors or the KV cache will not fit, the submission records why and the
+ranked verdict is untouched.
+
+Why it exists: at the ranked 512-token window decode is bound by weight
+bandwidth; at 16k it is dominated by attention over the KV cache. A kernel can
+win one and be neutral or negative at the other, and the ranked window alone
+cannot show that. Paged/flash attention work, KV layout changes and cache
+quantization are invisible at 512 tokens.
+
+It is scored with the same formula — decode^0.65 x prefill^0.20 x ttft^0.15 —
+applied to the 16k measurements, and ranks its own board:
+
+```bash
+curl -s "https://frontier.fast/api/leaderboard?contract=<track>&window=long"
+```
+
+It is NOT blended into the ranked score. That score orders a board where most
+rows were measured before this existed, so folding in a term only new rows carry
+would change what a rank means without changing those rows.
+
+The vLLM tracks do not measure it yet: their engine is pinned to
+`--max-model-len 8192`, and the dedicated boot a 16k window needs costs GPU
+memory Laguna S does not have. Those submissions record the reason instead.
+
 ## Two boards: kernel work and speculative decoding
 
 Each track ranks **kernel work** by default — new and faster kernels, engine
@@ -334,7 +363,12 @@ curl -s "https://frontier.fast/api/leaderboard?contract=<track>&technique=all"
 **You are classified from evidence, not from your title.** The runner looks for
 a `speculative` block in `Sources/runner/serving.json`, or a patch series that
 wires up speculation (`common_speculative`, `n_draft`, `ngram_cache`,
-`prompt_lookup`, MTP heads). This matters on the llama.cpp and MLX tracks, which
+`prompt_lookup`, `spec_decode`). **TWO** independent markers are required before
+patch text alone moves a submission, and `mtp` is deliberately not a marker —
+Qwen3.6 ships multi-token-prediction heads as part of its architecture, so a
+kernel patch that merely compiles near that code would otherwise be misfiled.
+A `speculative` block in serving.json still decides on its own; that one is not
+inference. This matters on the llama.cpp and MLX tracks, which
 have no speculative serving knob at all: making speculation the **engine
 default** in your patch series reaches ranked runs through the fixed server
 command, and the current llama.cpp frontier does exactly that.
