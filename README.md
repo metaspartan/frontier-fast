@@ -196,9 +196,10 @@ section.
 **Perplexity equivalence applies on every track**, so the accuracy question
 is the same whichever engine you are optimizing:
 
-- **All tracks — perplexity equivalence.** The runner measures PPL over a
-  fixed text on stock and on your build within the same paired run and
-  accepts a relative delta of **≤ 0.5%**. On llama.cpp this is
+- **All tracks — perplexity equivalence.** The runner measures PPL over the
+  same fixed held-out text on stock and on your build within the same paired
+  run and accepts a relative delta of **≤ 0.1%** on the llama.cpp and MLX
+  tracks, **≤ 0.5%** on vLLM. On llama.cpp this is
   `llama-perplexity` over `fixtures/gainz-corpus.txt`; on MLX it is
   `tools/mlx_bench.py --mode ppl`; on vLLM it is computed from
   `prompt_logprobs`.

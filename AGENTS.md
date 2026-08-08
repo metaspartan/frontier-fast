@@ -1,6 +1,6 @@
 # frontier.fast — Agent Instructions
 
-You are participating in the frontier.fast inference optimization challenge. Your goal is to make model inference faster while keeping the model behaviourally intact, as measured by your track's correctness gate — perplexity equivalence (<= 0.5% relative delta) on every track, plus teacher-forced argmax agreement (>= 90%) on the vLLM tracks.
+You are participating in the frontier.fast inference optimization challenge. Your goal is to make model inference faster while keeping the model behaviourally intact, as measured by your track's correctness gate — perplexity equivalence (<= 0.1% relative delta on the llama.cpp and MLX tracks, <= 0.5% on the vLLM tracks), plus teacher-forced argmax agreement (>= 90%) on the vLLM tracks.
 
 ## The gainzfast CLI
 
@@ -171,8 +171,13 @@ correctness. Takes ~6 minutes.
 ```bash
 llama-perplexity -m <model> -f fixtures/gainz-corpus.txt -ngl 99 -c 512 --chunks 8
 ```
-Run it on stock and on your build; the gate is a relative delta ≤ 0.5%. Build
+Run it on stock and on your build; the gate is a relative delta ≤ 0.1%. Build
 the `llama-perplexity` target as well as `llama-server`.
+
+That bound was 0.5% until deltas across every verified run were seen to fall
+between 0.000% and 0.041% — 0.5% allowed roughly a whole quantisation step of
+damage. The comparison is paired and deterministic, so there is no sampling
+noise the bound has to leave room for.
 
 **MLX track:**
 ```bash
@@ -180,7 +185,7 @@ python3 tools/mlx_bench.py --model LiquidAI/LFM2.5-2.6B-MLX \
   --corpus fixtures/gainz-corpus.txt --mode ppl
 PYTHONPATH=$PWD/cand python3 tools/mlx_bench.py ... --mode ppl   # your overlay
 ```
-Same 0.5% gate, same corpus, same script the runner uses.
+Same 0.1% gate, same corpus, same script the runner uses.
 
 ## Measurement discipline
 
@@ -295,9 +300,17 @@ one will not apply to the other, so a flag would only add a way to get it
 wrong. Generate `csrc/` patches against a clone of vllm-project/vllm at
 `752a3a5`, not against the package copied out of the image.
 
-The correctness gate is the same everywhere (perplexity equivalence ≤ 0.5%),
-so a kernel that preserves the model's distribution is acceptable on any
-track regardless of how it reorders arithmetic.
+The correctness gate is the same everywhere in kind (perplexity equivalence:
+≤ 0.1% on llama.cpp and MLX, ≤ 0.5% on vLLM while its corpus change beds in),
+so a kernel that preserves the model's distribution is acceptable on any track
+regardless of how it reorders arithmetic.
+
+Both arms of the long-context phase are also compared at 16k and 32k, and the
+result is published on the record. That is reported, not gated: one flipped
+knife-edge token makes every later token differ, so divergence there marks a run
+worth reading rather than a submission to reject. It exists because correctness
+was otherwise checked only at 512 tokens of context while speed is scored to
+32k — which is exactly where a KV-indexing or RoPE-scaling bug would hide.
 
 ## The serving surface (vLLM tracks)
 
