@@ -1455,28 +1455,161 @@ one build and it is now wired in — `ggml_cuda_op_ssm_conv_fold` gained the
 a whole against stock. It is inside the band, it is measured, and it is now
 documented at the shape where it actually runs.
 
+## Round-23 map (post-0039 re-profile, read before picking a lever)
+
+Fresh rocprofv3 census of the banked build, `llama-bench -p 0 -n 34 -r 1`,
+normalised by 35 tokens (27338 dispatches; 781.1/token, so the window is whole).
+**781 dispatches, 5.70 ms of kernel in a 6.96 ms wall token** — unchanged from
+the round-20 projection, and only 33 distinct kernels remain.
+
+| us/token | n/token | each | kernel | note |
+|---|---|---|---|---|
+| 1064 | 30 | 35.5us | mmvq_grouped Q6_K qkv+z | 583 GB/s, 91% of peak |
+| 735 | 40 | 18.4us | mmvq Q6_K ssm_out + attn wo | at its isolated ceiling (round 11) |
+| 719 | 40 | 18.0us | mmvq Q4_K MoE gate+up | 527 GB/s |
+| 666 | 1 | 666us | mmvq Q6_K output head | 96% of peak, done |
+| 499+42 | 37+3 | 13.5us | mmvq expert-reduce Q5_K/Q6_K | 0037/0038; geometry swept dead |
+| 330 | 70 | 4.7us | mmvf_grouped | 216us of it is the F32 router, 388 GB/s |
+| 246 | 10 | 24.6us | mmvq Q6_K attn wq | 560 GB/s |
+| 228 | 80 | 2.9us | rms_norm_pre_add | closed as a kernel (round 19) |
+| 167 | 31 | 5.4us | mmvq_grouped Q8_0 shexp | |
+| 153 | 40 | 3.8us | mmvq Q8_0 shexp down | |
+| 151 | 30 | 5.0us | gated_delta_net | |
+| 115 | 19 | 6.0us | mmvq Q8_0 (ids) | |
+| 109 | 40 | 2.7us | topk_moe | ONE workgroup; ~1.3us above the launch floor |
+| 101 | 71 | 1.4us | unary_gated_op_quant | after 0036 |
+| 82 | 60 | 1.4us | quantize_q8_1 | 40 are structurally dead (round 17) |
+| 82 | 50 | 1.6us | rms_norm_f32 | 30 of them are the GDN gated norm |
+| 61 | 30 | 2.0us | l2_norm_f32_grouped | the GDN q/k conv norms — **best open fold** |
+| 58+22 | 10+10 | | flash_attn_tile + combine | |
+| 52 | 12.6 | 4.1us | `__amd_rocclr_copyBuffer` | still unattributed; worth one probe |
+| 47 | 30 | 1.6us | ssm_conv_fold_stock | 0031/0039 |
+
+Long context on the same build: **tg128 @ d16384 = 134.5 tok/s, @ d32768 =
+124.8 tok/s** (decode-only, r=2). The 32k long board entry stands.
+
+Prefill census (pp512, per pass, 2276 dispatches / 114.9 ms of kernel before
+0040): `mul_mat_q` Q4_K experts 21.5%, Q5_K expert-down 14.7%, `gated_delta_net`
+11.5%, the deliberate Q6_K dequant+GEMM route ~14%, **`k_bin_bcast` op_mul 3.0%
+(40 x 87us) — taken by 0040**, `k_bin_bcast` op_add 0.9%.
+
+Ranked open levers after 0040: (1) fold the two GDN `l2_norm`s into the decode
+conv-fold epilogue — 30 launches x (2.0us + ~1.6us of bubble) is ~1.6% of the
+wall token, and a 256-thread conv block covers exactly two 128-wide norm rows,
+so warps 0 and 1 can each replay the stock one-warp reduction out of LDS and
+stay byte-exact; (2) the F32 router at 388 GB/s against the 583 the grouped
+Q6_K matvec reaches — 257 one-warp blocks is too little memory parallelism for
+2 MB, but k-splitting it reroutes experts, so it is not free; (3) attribute the
+12.6 `copyBuffer` launches; (4) prefill `gated_delta_net` (11.5%).
+
+## 0040: the MoE routing weight folded into the MMQ prefill epilogue (+2.3% prefill, BYTE-EXACT)
+
+0034 folded the routing-weight multiply into the `mul_mat_id` epilogue at the
+decode shape, where MUL_MAT_ID takes mmvq. At prefill batches the same node
+takes MMQ instead, so the multiply survives as a full elementwise pass over
+`[n_embd, n_expert_used, n_tokens]`: 40 launches of 87 us, **3.48 ms of a
+114.9 ms pass**, moving 33 MB of read-modify-write per layer to apply one scalar
+per column.
+
+The index needed no new bookkeeping, which is why this was worth doing at all.
+MMQ stores through `dst[ids_dst[j]*stride_col_dst + i]`, and for MUL_MAT_ID
+`ids_dst[j]` is the flat destination row `token*n_expert_used + slot` — exactly
+the flat index into the `[1, n_expert_used, n_tokens]` routing-weight vector. So
+the epilogue multiplies by `dst_scale[ids_dst[j]]` and stores once. Bit-exact by
+0034's argument: the multiplicand is the same rounded f32 the stock kernel would
+have written and the MUL would have read back.
+
+### The whole round is in one structural detail: a null-pointer branch is not free
+
+The first version put the obvious conditional inside MMQ's unrolled store loop:
+
+```c
+if (dst_scale_used) { val *= dst_scale[ids_dst[j]]; }
+```
+
+Toggle-isolated that measured +1.55% on pp512, 5/5 disjoint — and it was a lie.
+Against a control binary built from the parent commit the **fold-off arm was
+1.3% slower than the control** (the Q5_K expert-down went 456.6 -> 478.5 us with
+the fold disabled), so the patch as a whole scored **1.0013** — a wash. A
+conditional global load inside a fully unrolled store loop costs on every MMQ
+launch in the build, whether or not the fold ever fires.
+
+Splitting it into a **separate scaled store loop**, with the stock loop left
+verbatim behind `if (dst_scale != nullptr) { ...; return; }`, fixes it
+completely: the fold-off arm returns to 0.9992 against the control and the
+fold-on arm is 1.0228. Same arithmetic, same number of instructions executed —
+only the codegen of the path that does not execute changed.
+
+**This is the prefill OFF-control trap from 0021 in a new costume, and the
+toggle A/B cannot see it.** Both toggle arms live in the same binary, so any
+cost the patch imposes on the untoggled path is subtracted from both and
+cancels. Any patch that edits a hot kernel shared with untouched call sites
+needs a third arm built from the parent commit.
+
+Measured (runner box, `HIP_VISIBLE_DEVICES=0`, whole-process interleaved 3-arm
+A/B, rotated order, 5 rounds):
+
+| arm | pp512 | median | vs control |
+|---|---|---|---|
+| control (parent commit binary) | 4277.2-4343.8 | 4305.7 | — |
+| 0040, fold OFF | 4268.2-4342.4 | 4302.3 | **0.9992** |
+| 0040, fold ON | 4368.8-4442.8 | 4424.9 | **1.0277** (per-round median 1.0228) |
+
+Arms disjoint 5/5 — `min(ON) = 4368.8 > max(control) = 4343.8`. tg128 neutral in
+all three arms (145.4-145.9).
+
+- pp512 census: **2276 -> 2236 dispatches/pass, 117.4 -> 112.0 ms of kernel**;
+  the 40 `k_bin_bcast` op_mul launches at grid 1024x8x512 are gone
+- gate ppl `-c 512 --chunks 8`: ON **3.9249 / 3.9269** (two loads), OFF 3.9271,
+  stock 3.9314 — **-0.11 to -0.17%**, in band. This fold DOES fire at the gate
+  shape (it is gated on the prefill shape), so for once the official gate covers
+  the patch that needs it.
+- decode-path ppl `-b 512 -ub 1 --chunks 8`: **3.9338**, identical to the banked
+  stack — the fold is gated off the decode shape by construction (mmvq claims
+  those batches, and that is 0034)
+- `llama-server` greedy **6/6 BYTE-EXACT** vs the fold-off control, completions
+  276-1194 B, all non-empty
+- `test-backend-ops` MUL_MAT_ID / MUL_MAT / MUL OK
+- stream-k stays correct: the partial written to the fixup buffer is left
+  unscaled and `mul_mat_q_stream_k_fixup` applies the weight as it accumulates
+  (the shapes this model uses are all non-stream-k, but the plumbing is there)
+- `GGML_CUDA_DISABLE_MOE_WEIGHT_FUSE_MMQ=1` restores the stock pair
+
+Detection mirrors 0034 with the decode guard inverted: a (MUL_MAT_ID, MUL)
+subgraph via `ggml_can_fuse_subgraph`, an f32 factor of shape
+`[1, n_expert_used, n_tokens]` contiguous, an identically laid out MUL
+destination, and the exact dispatch conditions under which
+`ggml_cuda_mul_mat_id` would have taken the MMQ route (quantized src0, batch
+above the mmvq mmid cutoff, `ggml_cuda_should_use_mmq`).
+
 ## Recommended firing order
 
 The runner applies the whole patch directory, so the series is a ladder rather
-than a choice; **0001-0039** is the verified set and every patch that carries
+than a choice; **0001-0040** is the verified set and every patch that carries
 speed has a disable toggle. Two do not carry speed: **0038** is 0037's kernel
 made bit-identical and must not be applied without 0037; **0039** is 0031's
 kernel made sign-of-zero-exact and must not be applied without 0031
 (`GGML_SSM_CONV_FOLD_STOCK_SHAPE=0` falls back to the 0031 kernel in place).
-If a ranked run has to be pared back, drop from the end: 0039, then 0038+0037,
-then 0036, 0035, 0034 (independent +1.5% decode folds); 0033 is the prefill
-fold; 0032 and 0030 are the two largest decode wins and should be the last to
-go. 0037 has two halves in different files — dropping it means dropping both,
-since the graph half alone leaves the decode combine as n_expert_used-1
-separate adds.
+If a ranked run has to be pared back, drop from the end: 0040 (prefill only),
+then 0039, then 0038+0037, then 0036, 0035, 0034 (independent +1.5% decode
+folds); 0033 is the prefill fold; 0032 and 0030 are the two largest decode wins
+and should be the last to go. 0037 has two halves in different files — dropping
+it means dropping both, since the graph half alone leaves the decode combine as
+n_expert_used-1 separate adds. 0040 is independent of everything else in the
+series and touches only the MMQ write-back and the MUL_MAT_ID dispatch.
 
-**Projection is unchanged at ~1.563 vs the 1.4525 bank** (decode 1.7536,
-prefill 1.2911, ttft 1.2258): rounds 21 and 22 both bought correctness, not
-speed. What changed this round is the confidence behind it — every banked fold
-now has a perplexity number taken at the shape where it actually runs, the
-stack reads **-0.180%** against stock on the decode path and **-0.13 to -0.14%**
-at the gate shape, and the two folds that were numerically uncharacterised
-(0032, and 0037's two halves separately) came back byte-exact.
+**Projection after 0040: ~1.570-1.575 vs the 1.4525 bank.** Decode is unchanged
+at 1.7536; prefill 1.2911 -> **1.3205** (x1.0228, measured against a
+parent-commit control, not a toggle); ttft moves with prefill for prompt
+processing, so the band spans ttft flat (1.570) to ttft carrying the full
+prefill ratio (1.575). Rounds 21 and 22 bought correctness; round 23 is the
+first speed since 0037, and it is entirely on the prefill/ttft side of the
+exponent — worth ~+0.5-0.8% of score, which is what a 0.20/0.15 exponent pays
+for 2.3%.
+
+Correctness state of the stack is unchanged: **-0.180%** against stock on the
+decode path, **-0.11 to -0.17%** at the gate shape, and every banked fold now
+has a perplexity number taken at the shape where it actually runs.
 
 ### Gate the next decode fold like this
 
@@ -1497,3 +1630,8 @@ at the gate shape, and the two folds that were numerically uncharacterised
    difference** before calling it reassociation: value-equal with different
    bits is a dropped identity operation and is fixable (0039); ULP moves are
    contraction and mirroring the source will not save it (0031, 0033).
+5. **If the patch edits a kernel that untouched call sites also run, add a
+   third arm built from the parent commit** (0040). A toggle A/B puts both arms
+   in the same binary, so any cost the edit imposes on the un-toggled path is
+   subtracted from both and cancels; 0040's first version read +1.55% on the
+   toggle and 1.0013 against a real control.

@@ -1,0 +1,468 @@
+From c539b5ca123eaf3bb1ef654df569047a28dfba51 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sat, 8 Aug 2026 16:17:41 +0000
+Subject: [PATCH] cuda/hip: fold the MoE routing weight into the MMQ prefill
+ epilogue (+2.3% prefill, byte-exact)
+
+0034 folded the MoE routing-weight multiply into the mul_mat_id epilogue at the
+decode shape, where MUL_MAT_ID takes mmvq. At prefill batches the same node
+takes MMQ instead, so the multiply survives as a full elementwise pass over
+[n_embd, n_expert_used, n_tokens]: on the pp512 census it is 40 launches of
+87 us, 3.48 ms of a 114.9 ms pass, moving 33 MB of read-modify-write per layer
+to apply one scalar per column - while the matmul that produced those bytes had
+every one of them in a register.
+
+The index needs no new bookkeeping. MMQ writes through
+dst[ids_dst[j]*stride_col_dst + i], and for MUL_MAT_ID ids_dst[j] is the flat
+destination row token*n_expert_used + slot - which is exactly the flat index
+into the [1, n_expert_used, n_tokens] routing-weight vector. So the epilogue
+multiplies by dst_scale[ids_dst[j]] and stores once.
+
+Bit-exact by the same argument as 0034: the multiplicand is the same rounded f32
+the stock kernel would have written and the MUL would have read back. Server
+greedy is byte-identical to the fold-off control on 6/6 prompts.
+
+The scaled store loop is a SEPARATE loop in both write_backs rather than a
+conditional inside the stock one, and that is the whole performance story. The
+first version put "if (dst_scale) val *= dst_scale[ids_dst[j]]" inside the
+unrolled store loop, which reads as free when the pointer is null. Measured
+against a same-source control built from the parent commit, it cost 1.3% of
+pp512 on every MMQ launch in the build whether or not the fold fired (the Q5_K
+expert-down went 456.6 -> 478.5 us with the fold off), and the patch as a whole
+was a wash: 1.0013 against the control. With the two loops split the fold-off
+arm is 0.9992 against the control - neutral - and the fold-on arm is 1.0228.
+A conditional global load inside a fully unrolled store loop is not free.
+
+Detection mirrors 0034 with the decode guard inverted: a (MUL_MAT_ID, MUL)
+subgraph, an f32 factor of shape [1, n_expert_used, n_tokens] contiguous, an
+identically laid out MUL destination, and the exact dispatch conditions under
+which ggml_cuda_mul_mat_id would have taken the MMQ route (quantized src0, batch
+above the mmvq mmid cutoff, ggml_cuda_should_use_mmq). Stream-k stays correct:
+the partial written to the fixup buffer is left unscaled and the fixup kernel
+applies the weight as it accumulates. GGML_CUDA_DISABLE_MOE_WEIGHT_FUSE_MMQ=1
+restores the stock pair.
+
+Measured (runner box, HIP_VISIBLE_DEVICES=0, whole-process interleaved 3-arm
+A/B against a control binary built from the parent commit):
+
+- pp512  control 4277-4344 (median 4305.7), fold OFF 4268-4342 (median 4302.3,
+  ratio 0.9992), fold ON 4368-4443 (median 4424.9, ratio 1.0277 vs control,
+  per-round median 1.0228); arms disjoint 5/5, min(ON) > max(control)
+- tg128 neutral in all three arms (145.4-145.9)
+- pp512 kernel census: 2276 -> 2236 dispatches per pass, 117.4 -> 112.0 ms of
+  kernel; the 40 k_bin_bcast op_mul launches at grid 1024x8x512 are gone
+- gate ppl -c 512 --chunks 8: ON 3.9249 / 3.9269 (two loads), OFF 3.9271,
+  stock 3.9314 -> -0.11 to -0.17%, in band
+- decode-path ppl -b 512 -ub 1 --chunks 8: 3.9338, identical to the banked
+  stack (the fold is gated off the decode shape by construction)
+- llama-server greedy 6/6 BYTE-EXACT vs the fold-off control, 276-1194 B
+- test-backend-ops MUL_MAT_ID / MUL_MAT / MUL OK
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  75 +++++++++++++++++++++
+ ggml/src/ggml-cuda/mmq.cu       |  19 +++++-
+ ggml/src/ggml-cuda/mmq.cuh      | 114 +++++++++++++++++++++++++++-----
+ 3 files changed, 191 insertions(+), 17 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index cd7d61cc6..7fec340eb 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1883,6 +1883,67 @@ static bool ggml_cuda_moe_weight_fuse_detect(const ggml_cgraph * cgraph, const i
+     return true;
+ }
+ 
++// Prefill analogue of the fold above. At batch shapes MUL_MAT_ID leaves the
++// mmvq route and takes MMQ, so the routing-weight MUL survives as a full
++// elementwise pass over [n_embd, n_expert_used, n_tokens]: 87 us and 33 MB of
++// read-modify-write per layer at pp512, to apply one scalar per column. The MMQ
++// write_back holds the finished value in a register and already knows
++// ids_dst[j], the flat (token, slot) destination row - which is exactly the
++// flat index of the routing weight, so the fold needs no extra bookkeeping.
++static bool ggml_cuda_mul_mat_id_takes_mmq(const ggml_tensor * mm) {
++    const ggml_tensor * src0 = mm->src[0];
++    const ggml_tensor * src1 = mm->src[1];
++    const ggml_tensor * ids  = mm->src[2];
++    if (src0 == nullptr || src1 == nullptr || ids == nullptr) {
++        return false;
++    }
++    if (src1->type != GGML_TYPE_F32 || mm->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (!ggml_is_quantized(src0->type)) {
++        return false;
++    }
++    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++    if (mm->ne[2] <= MMVQ_MAX_BATCH_SIZE && mm->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc)) {
++        return false; // the mmvq route claims this shape first; that is the decode fold above
++    }
++    return ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[2], src0->ne[2]);
++}
++
++static bool ggml_cuda_moe_weight_fuse_detect_q(const ggml_cgraph * cgraph, const int i,
++        const ggml_tensor ** out_mul, const ggml_tensor ** out_weights) {
++    const ggml_tensor * mm = cgraph->nodes[i];
++    if (mm->op != GGML_OP_MUL_MAT_ID || i + 1 >= cgraph->n_nodes) {
++        return false;
++    }
++    if (!ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL }, { i + 1 })) {
++        return false;
++    }
++    const ggml_tensor * mul = cgraph->nodes[i + 1];
++    if (mul->src[0] != mm && mul->src[1] != mm) {
++        return false;
++    }
++    const ggml_tensor * w = mul->src[0] == mm ? mul->src[1] : mul->src[0];
++    // one factor per (token, expert slot), broadcast over the embedding dimension
++    if (mm->ne[3] != 1 || mm->ne[1] < 1 || !ggml_is_contiguous(mm)) {
++        return false;
++    }
++    if (w == nullptr || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) ||
++            w->ne[0] != 1 || w->ne[1] != mm->ne[1] || w->ne[2] != mm->ne[2] || w->ne[3] != 1) {
++        return false;
++    }
++    if (mul->type != GGML_TYPE_F32 || !ggml_are_same_shape(mul, mm) || !ggml_is_contiguous(mul) ||
++            mul->nb[0] != sizeof(float) || mul->nb[1] != mm->nb[1] || mul->nb[2] != mm->nb[2]) {
++        return false;
++    }
++    if (!ggml_cuda_mul_mat_id_takes_mmq(mm)) {
++        return false;
++    }
++    *out_mul     = mul;
++    *out_weights = w;
++    return true;
++}
++
+ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+@@ -5847,6 +5908,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_SSM_CONV_FOLD_SEQ"));
+             static const bool disable_moe_weight_fuse = getenv("GGML_CUDA_DISABLE_MOE_WEIGHT_FUSE") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_MOE_WEIGHT_FUSE"));
++            static const bool disable_moe_weight_fuse_q = getenv("GGML_CUDA_DISABLE_MOE_WEIGHT_FUSE_MMQ") != nullptr &&
++                                                   std::atoi(getenv("GGML_CUDA_DISABLE_MOE_WEIGHT_FUSE_MMQ"));
+             static const bool disable_moe_expert_reduce = getenv("GGML_CUDA_DISABLE_MOE_EXPERT_REDUCE") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_MOE_EXPERT_REDUCE"));
+             static const bool disable_shexp_gate_fuse = getenv("GGML_CUDA_DISABLE_SHEXP_GATE_FUSE") != nullptr &&
+@@ -5948,6 +6011,18 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     }
+                 }
+ 
++                if (!disable_moe_weight_fuse_q && stream_ctx.concurrent_events.empty() &&
++                        node->op == GGML_OP_MUL_MAT_ID) {
++                    const ggml_tensor * f_mul = nullptr;
++                    const ggml_tensor * f_w   = nullptr;
++                    if (ggml_cuda_moe_weight_fuse_detect_q(cgraph, i, &f_mul, &f_w)) {
++                        ggml_cuda_mul_mat_q(*cuda_ctx, node->src[0], node->src[1], node->src[2],
++                                            (ggml_tensor *) f_mul, f_w);
++                        grouped_done.insert(f_mul);
++                        continue;
++                    }
++                }
++
+                 if (!disable_ssm_conv_fold && stream_ctx.concurrent_events.empty() && node->op == GGML_OP_CONCAT) {
+                     const ggml_tensor * f_conv = nullptr;
+                     const ggml_tensor * f_silu = nullptr;
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 707437ea3..99bfaa24c 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -83,7 +83,8 @@ static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, con
+ }
+ 
+ void ggml_cuda_mul_mat_q(
+-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst) {
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
++        const ggml_tensor * dst_scale) {
+     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+@@ -132,6 +133,7 @@ void ggml_cuda_mul_mat_q(
+     const size_t y_block_size       = use_native_fp4 ? sizeof(block_fp4_mmq) : sizeof(block_q8_1_mmq);
+     const size_t y_values_per_block = use_native_fp4 ? QK_FP4_MMQ            : QK8_1_MMQ;
+ 
++    GGML_ASSERT(!dst_scale || ids);
+     if (!ids) {
+         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
+             ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
+@@ -168,6 +170,7 @@ void ggml_cuda_mul_mat_q(
+         const mmq_args args = {
+             src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
+             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
++            nullptr,
+             ne00, ne01, ne1, s01, ne11, s1,
+             ne02, ne12, s02, s12, s2,
+             ne03, ne13, s03, s13, s3,
+@@ -182,6 +185,19 @@ void ggml_cuda_mul_mat_q(
+ 
+     const int64_t n_expert_used = ids->ne[0];
+     const int64_t ne_get_rows = ne12 * n_expert_used;
++
++    // MoE routing-weight fold: dst_scale holds one f32 per (token, expert slot),
++    // flat-indexed exactly like ids_dst, so write_back can apply it in place of
++    // a separate elementwise MUL pass over the whole [n_embd, slots, tokens] block.
++    const float * dst_scale_d = nullptr;
++    if (dst_scale) {
++        GGML_ASSERT(dst_scale->type == GGML_TYPE_F32);
++        GGML_ASSERT(ggml_is_contiguous(dst_scale));
++        GGML_ASSERT(ggml_nelements(dst_scale) == ne1*ne2);
++        GGML_ASSERT(ggml_is_contiguous(dst));
++        GGML_ASSERT(ne1 == n_expert_used);
++        dst_scale_d = (const float *) dst_scale->data;
++    }
+     GGML_ASSERT(ne1 == n_expert_used);
+ 
+     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
+@@ -248,6 +264,7 @@ void ggml_cuda_mul_mat_q(
+     const mmq_args args = {
+         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
+         src1_scale.ptr,
++        dst_scale_d,
+         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
+         ne02, ne02, s02, s12, s2,
+         ne03, ne13, s03, s13, s3,
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index 360eff138..a706db869 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -13,7 +13,8 @@
+ typedef void (*ggml_cuda_mmq_load_tiles_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
+ typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
+ typedef void (*ggml_cuda_mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
+-    float * __restrict__ dst, const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max);
++    float * __restrict__ dst, const float * __restrict__ y_scale, const float * __restrict__ dst_scale,
++    const int stride, const int i_max, const int j_max);
+ 
+ enum mmq_q8_1_ds_layout {
+     MMQ_Q8_1_DS_LAYOUT_D4,
+@@ -427,13 +428,51 @@ static __host__ int ggml_cuda_mmq_get_nbytes_shared_x(const ggml_cuda_mmq_config
+ 
+ template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_write_back_dp4a(
+         const float * __restrict__ sum, const int32_t * __restrict__ ids_dst, float * __restrict__ dst,
+-        const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max) {
++        const float * __restrict__ y_scale, const float * __restrict__ dst_scale,
++        const int stride, const int i_max, const int j_max) {
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+ 
+     const bool y_scale_used = y_scale != nullptr;
+ 
++    // MoE routing-weight fold: one f32 per (token, expert slot), and ids_dst[j]
++    // is exactly that flat index into the weight vector. It is a separate loop
++    // rather than a conditional inside the stock one because a conditional
++    // global load in the unrolled store loop costs ~1.3% on EVERY MMQ launch in
++    // the build, fold firing or not (measured against a same-source control).
++    if (dst_scale != nullptr) {
++#pragma unroll
++        for (int j0 = 0; j0 < J; j0 += nwarps) {
++            const int j = j0 + threadIdx.y;
++
++            if (j > j_max) {
++                return;
++            }
++
++            const int   row_dst = ids_dst[j];
++            const float w_dst   = dst_scale[row_dst];
++
++#pragma unroll
++            for (int i0 = 0; i0 < I; i0 += warp_size) {
++                const int i = i0 + threadIdx.x;
++
++                if (fallback && i > i_max) {
++                    continue;
++                }
++
++                float val = sum[(j0/nwarps) * (I/warp_size) + i0/warp_size];
++                if constexpr (type == GGML_TYPE_NVFP4) {
++                    if (y_scale_used) {
++                        val = y_scale[j] * val;
++                    }
++                }
++                dst[row_dst*stride + i] = w_dst * val;
++            }
++        }
++        return;
++    }
++
+ #pragma unroll
+     for (int j0 = 0; j0 < J; j0 += nwarps) {
+         const int j = j0 + threadIdx.y;
+@@ -467,7 +506,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
+ template<ggml_type type, int J, bool fallback>
+ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
+             const float * __restrict__ sum, const int * __restrict__ ids_dst, float * __restrict__ dst,
+-            const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max) {
++            const float * __restrict__ y_scale, const float * __restrict__ dst_scale,
++            const int stride, const int i_max, const int j_max) {
+ 
+ #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+     typedef tile<16, 16, int, DATA_LAYOUT_J_MAJOR> tile_C;
+@@ -485,6 +525,42 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
+ 
+     const bool y_scale_used = y_scale != nullptr;
+ 
++    // see the note on the dp4a write_back: the scaled store loop is separate so
++    // that the stock one keeps its stock codegen
++    if (dst_scale != nullptr) {
++#pragma unroll
++        for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
++#pragma unroll
++            for (int n = 0; n < ntx; ++n) {
++#pragma unroll
++                for (int l = 0; l < tile_C::ne; ++l) {
++                    const int j = j0 + (threadIdx.y % ntx) * tile_C::J + tile_C::get_j(l);
++
++                    if (j > j_max) {
++                        continue;
++                    }
++
++                    const int i = i0 + n*tile_C::I + tile_C::get_i(l);
++
++                    if (fallback && i > i_max) {
++                        continue;
++                    }
++
++                    const int row_dst = ids_dst[j];
++
++                    float val = sum[(j0/tile_C::J + n)*tile_C::ne + l];
++                    if constexpr (type == GGML_TYPE_NVFP4) {
++                        if (y_scale_used) {
++                            val = y_scale[j] * val;
++                        }
++                    }
++                    dst[row_dst*stride + i] = dst_scale[row_dst] * val;
++                }
++            }
++        }
++        return;
++    }
++
+ #pragma unroll
+     for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+ #pragma unroll
+@@ -868,7 +944,7 @@ template <ggml_type type, int J, bool fallback, bool fixup>
+ static __device__ __forceinline__ void mul_mat_q_process_tile(
+         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
+         const int * __restrict__ ids_dst, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+-        const float * __restrict__ y_scale,
++        const float * __restrict__ y_scale, const float * __restrict__ dst_scale,
+         const int stride_row_x, const int ncols_y, const int stride_col_dst,
+         const int tile_x_max_i, const int tile_y_max_j, const int kb0_start, const int kb0_stop) {
+ 
+@@ -934,9 +1010,11 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+     }
+ 
+     if (fixup) {
+-        write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J);
++        // the partial sum lands unscaled in the fixup buffer; the fixup kernel
++        // applies the routing weight when it adds the partials into dst
++        write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, nullptr, I, I, J);
+     } else {
+-        write_back(sum, ids_dst, dst, y_scale, stride_col_dst, tile_x_max_i, tile_y_max_j);
++        write_back(sum, ids_dst, dst, y_scale, dst_scale, stride_col_dst, tile_x_max_i, tile_y_max_j);
+     }
+ }
+ 
+@@ -948,7 +1026,7 @@ __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_g
+ static __global__ void mul_mat_q(
+         const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
+         const int32_t * __restrict__ expert_bounds, float * __restrict__ dst, float * __restrict__ tmp_fixup,
+-        const float * __restrict__ y_scale,
++        const float * __restrict__ y_scale, const float * __restrict__ dst_scale,
+         const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst, const int stride_row_x, const int ncols_y, const int stride_col_dst,
+         const uint3 channel_ratio, const uint3 nchannels_y, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+         const uint3 sample_ratio, const uint3 nsamples_y, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+@@ -1047,7 +1125,7 @@ static __global__ void mul_mat_q(
+ 
+         constexpr bool fixup = false;
+         mul_mat_q_process_tile<type, J, fallback, fixup>
+-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
++            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile, dst_scale,
+              stride_row_x, ncols_y, stride_col_dst,
+              tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+         return;
+@@ -1141,7 +1219,7 @@ static __global__ void mul_mat_q(
+ 
+         constexpr bool fixup = false; // All but (potentially) the last iterations write their data to dst rather than the fixup buffer.
+         mul_mat_q_process_tile<type, J, fallback, fixup>
+-            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
++            (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile, dst_scale,
+              stride_row_x, ncols_y, stride_col_dst,
+              tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+ 
+@@ -1225,7 +1303,7 @@ static __global__ void mul_mat_q(
+ 
+     constexpr bool fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
+     mul_mat_q_process_tile<type, J, fallback, fixup>
+-        (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile,
++        (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, tmp_fixup, y_scale_tile, dst_scale,
+          stride_row_x, ncols_y, stride_col_dst,
+          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
+ }
+@@ -1234,7 +1312,8 @@ template <ggml_type type, int J, bool fallback>
+ __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback)/2, 1)
+ static __global__ void mul_mat_q_stream_k_fixup(
+         const int32_t * __restrict__ ids_dst, const int32_t * __restrict__ expert_bounds, float * __restrict__ dst,
+-        float * __restrict__ tmp_last_tile, const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
++        float * __restrict__ tmp_last_tile, const float * __restrict__ dst_scale,
++        const uint3 blocks_per_ne00, const int nrows_x, const int ncols_dst,
+         const int stride_col_dst, const uint3 nchannels_y, const int stride_channel_dst, const uint3 nsamples_y,
+         const int stride_sample_dst, const uint3 ntx) {
+     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
+@@ -1364,13 +1443,15 @@ static __global__ void mul_mat_q_stream_k_fixup(
+             return;
+         }
+ 
+-        dst[ids_dst_shared[j]*stride_col_dst + i] += sum[j0/nwarps];
++        const int row_dst = ids_dst_shared[j];
++        dst[row_dst*stride_col_dst + i] += dst_scale ? dst_scale[row_dst]*sum[j0/nwarps] : sum[j0/nwarps];
+     }
+ }
+ 
+ struct mmq_args {
+     const char * x; ggml_type type_x; const int * y; const int32_t * ids_dst; const int32_t * expert_bounds; float * dst;
+     const float * y_scale;
++    const float * dst_scale; // MoE routing weight, one f32 per (token, expert slot)
+     int64_t ncols_x; int64_t nrows_x; int64_t ncols_dst; int64_t stride_row_x; int64_t ncols_y; int64_t nrows_dst;
+     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
+     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
+@@ -1420,7 +1501,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+ 
+     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
+         mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
+-            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
++            (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale, args.dst_scale,
+              blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+              channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+              sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+@@ -1449,7 +1530,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+     const dim3 block_dims_fixup(block_dims.x, block_dims.y/2, block_dims.z);
+ 
+     mul_mat_q<type, J, fallback><<<block_nums_stream_k, block_dims, nbytes_shared, stream>>>
+-        (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale,
++        (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.y_scale, args.dst_scale,
+          blocks_per_ne00_fd, args.nrows_x, args.ncols_dst, args.stride_row_x, args.ncols_y, args.nrows_dst,
+          channel_ratio_fd, nchannels_y_fd, args.stride_channel_x, args.stride_channel_y, args.stride_channel_dst,
+          sample_ratio_fd, nsamples_y_fd, args.stride_sample_x, args.stride_sample_y, args.stride_sample_dst,
+@@ -1461,7 +1542,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
+ 
+     CUDA_CHECK(cudaGetLastError());
+     mul_mat_q_stream_k_fixup<type, J, fallback><<<block_nums_fixup, block_dims_fixup, 0, stream>>>
+-        (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
++        (args.ids_dst, args.expert_bounds, args.dst, tmp_fixup.ptr, args.dst_scale, blocks_per_ne00_fd, args.nrows_x, args.ncols_dst,
+          args.nrows_dst, nchannels_y_fd, args.stride_channel_dst, nsamples_y_fd, args.stride_sample_dst,
+          ntx_fd);
+ }
+@@ -1621,6 +1702,7 @@ extern DECL_MMQ_CASE(GGML_TYPE_NVFP4);
+ // -------------------------------------------------------------------------------------------------------------------------
+ 
+ void ggml_cuda_mul_mat_q(
+-        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst);
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
++        const ggml_tensor * dst_scale = nullptr);
+ 
+ bool ggml_cuda_should_use_mmq(enum ggml_type type, int cc, int64_t ne11, int64_t n_experts);
+-- 
+2.53.0
+
