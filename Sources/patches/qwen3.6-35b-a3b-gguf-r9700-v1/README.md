@@ -1498,8 +1498,8 @@ conv-fold epilogue~~ — **taken by 0041, +1.3% decode**; (2) the F32 router at
 388 GB/s against the 583 the grouped Q6_K matvec reaches — 257 one-warp blocks
 is too little memory parallelism for 2 MB, but k-splitting it reroutes experts,
 so it is not free — **0042 took the byte-exact half of this (unroll), leaving
-only the parts that reroute experts**; (3) attribute the 12.6 `copyBuffer`
-launches; (4) prefill
+only the parts that reroute experts**; ~~(3) attribute the 12.6 `copyBuffer`
+launches~~ — **closed in round 26: 6/token in steady state, 0.36%**; (4) prefill
 `gated_delta_net` (11.5%); (5) the 30 GDN gated `rms_norm_f32` launches are the
 same shape of opportunity 0041 just took, one kernel further down the chain —
 they normalise `[128, 32 heads]` straight out of `gated_delta_net`, whose grid
@@ -1718,6 +1718,92 @@ per block or wider per-lane loads, and both change the per-lane column
 assignment — which for the router means different logits, which means a
 different top-8. That is inside the gate but no longer byte-exact, so it is a
 separate decision, not a continuation of this one.
+
+## Round 26: three levers measured dead — do not re-buy any of them
+
+No patch. Three of the round-23 open items were taken to a measurement and all
+three closed. Each cost one build and one sweep; the point of writing them down
+is that they each *look* like the obvious next thing.
+
+### 1. The mmvq k-loop unroll does NOT inherit 0042's win
+
+0042 raised the grouped **F32** matvec's unroll from 4 to 16 for +0.7%. The
+obvious follow-up is the quantized matvecs, where the Q5_K expert-down sits at
+444 GB/s and the Q4_K expert gate+up at 527 GB/s against 583 for the dense Q6_K
+qkv matvec. `#pragma unroll N` was added to all four mmvq k-loops (bit-identical
+by the same argument — the accumulation into `tmp[j][i]` stays in ascending
+`kbx` order at any unroll) and swept, interleaved, 3 rounds against a
+parent-commit control:
+
+| arm | tg128 median |
+|---|---|
+| control | 148.86 |
+| unroll disabled | 148.73 |
+| unroll 2 | 148.60 |
+| unroll 4 | **147.72 (-0.77%)** |
+
+Monotonically worse. **The premise does not transfer, and the diagnostic that
+separates the two cases is free: divide the launch grid by the warp size.** The
+router launches 257 waves and is latency-limited, so loads-in-flight is the
+lever. The expert matvecs launch 8192-16384 waves — already saturated — so their
+bandwidth gap is locality (reads scattered across 256 expert slabs, 8 used), and
+unrolling only costs registers. Together with the three geometry sweeps
+(rows-per-block, nwarps, MMQ J), **every kernel-tuning axis on the quantized
+matvecs is now closed**; the Q5_K expert-down at 444 GB/s is an access-pattern
+problem, not a tuning problem.
+
+### 2. 0023's MoE J-tile multiplier is already the optimum
+
+0023 caps the MMQ J tile at `2 * cols_per_expert` for MoE. At pp512 that is
+`2 * ceil(4096/256) = 32`, and each expert's ~16-column segment fills half a
+tile — which reads like obvious waste. It is not. Swept (bit-identical: J
+changes the tile decomposition, never the per-element k-loop order), 3
+interleaved rounds, pp512 medians:
+
+| multiplier | floor | pp512 | vs shipped |
+|---|---|---|---|
+| **2** | 16 | **4421** | **shipped** |
+| 1 | 16 | 4086 | -7.6% |
+| 1 | 8 | 4084 | -7.6% |
+| 3 | 16 | 4258 | -3.7% |
+| 4 | 16 | 4184 | -5.4% |
+
+pp2048 agrees (4194 at mult=2 vs 3909 at mult=1). A sharp local optimum in both
+directions — halving J costs more in tiles and re-loaded x-tiles than the padding
+it saves. `GGML_CUDA_MMQ_MOE_J_MULT` / `_MIN` were not kept; the sweep is the
+result.
+
+### 3. `__amd_rocclr_copyBuffer` is a profiling artefact of the first token
+
+Round-19 and round-23 both listed "attribute the 12.6 `copyBuffer` launches per
+token (52 us)" as an open item. The dispatch-stream analysis (sort the kernel
+trace by timestamp, split on the output-head launch, count per window) says the
+number is wrong: **237 of the 441 copies in a 35-token trace happen in the first
+window**, and the steady-state rate is ~6 per token — 25 us, 0.36% of the wall
+token, arriving in bursts of 0 to 26 that do not correlate with graph position.
+In a typical token there are exactly **two**, one just after the token-embedding
+`get_rows` and one mid-graph. Not a lever. **Per-token averages taken over a
+whole trace hide setup work; split on a token boundary before believing one.**
+
+### Still open, in order
+
+1. **Prefill `gated_delta_net`** — 11.5% of a pp512 pass (439 us x 30). The
+   source carries a `//TODO: Add chunked kernel for even faster pre-fill`; a
+   chunkwise scan is the standard fix and the largest single prefill item left,
+   but it is an algorithmic change with real numeric risk, not a tuning round.
+2. **The MoE expert matvecs' locality at decode** (Q5_K down 444 GB/s, 499
+   us/token) — every tuning axis is closed, so this needs a layout idea
+   (interleaving the 8 routed slabs, or a different expert-major ordering),
+   which on a pinned GGUF means the 0021 load-time hook.
+3. `unary_gated_op_quant` (71/token, 101 us + ~114 us of bubble) cannot fold into
+   the gate/up matvec epilogue: the q8_1 block max spans 32 output rows and each
+   matvec block owns one row, so it would need a cross-block reduction.
+4. The GDN gated `rms_norm` (30/token) cannot fold into `gated_delta_net`
+   either: its grid is `(H, n_seqs, S_v/num_warps)`, so **32 blocks** cooperate
+   on each head's 128-wide output row and the norm needs all of them. 0041's
+   trick does not generalise — check the producer's block-to-row mapping first.
+5. `topk_moe` (40/token, 2.73 us) is already fixed-depth after 0014; what is
+   left is close to the single-workgroup launch floor.
 
 ## Recommended firing order
 
