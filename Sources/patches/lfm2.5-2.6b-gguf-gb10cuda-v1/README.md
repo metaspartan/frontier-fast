@@ -6,6 +6,7 @@ Applied in order against pinned llama.cpp **b10237**.
 | --- | --- | --- |
 | 0001–0011 | laguna-xs gb10cuda engine family, unchanged | **+0.9% decode, +0.8% prefill** (see "the 11-patch family" below) |
 | 0012 | `cuda-sm121-wide-q4k-mmvq-vecdot` | **+7.76% decode** (5/5 interleaved rounds disjoint; prefill neutral) |
+| 0013 | `cuda-rms-norm-register-cached-row` | **+0.65% prefill** (5/5 disjoint), decode +0.19% (overlapping); **bit-exact** |
 
 ## 0012: the sm_121 wide Q4_K mmvq vec_dot (+7.76% decode)
 
@@ -91,6 +92,28 @@ other `ncols_dst` mirrors GENERIC exactly.
 Projection: decode `1.0091 × 1.0776 = 1.0874`, prefill `1.0083`, ttft
 unchanged → score **~1.056–1.064** against the **1.0135** bank.
 
+## 0013: the folded rms_norm keeps its row in registers (+0.65% prefill, bit-exact)
+
+`rms_norm_pre_add_f32` walks its row twice — once to build the sum of squares
+after the folded residual add, once to scale/multiply/quantize — and the second
+walk re-reads exactly the floats the first one computed. When `ncols` is an
+exact multiple of `block_size` and the per-thread column count is <= 8, both
+loops become `#pragma unroll` loops over that count and the values stay in
+registers. The exact-multiple requirement is what keeps every lane of every
+warp live on every step, so the warp reductions in the quantize epilogue see
+the participation they see today; any other shape takes the stock loops.
+
+Bit-exact by construction, and measured so: gate **22.7466** and decode-path
+**22.6048**, matching the 12-patch control digit for digit.
+
+- **pp512: control max 8046.86 vs patch min 8054.78 — 5/5 arms disjoint,
+  median ratio 1.0065.** At prefill the kernel is 4.4% of the pass and the
+  re-read is of a genuinely large tensor, so this is where it pays.
+- tg128 120.76 vs 120.99 median, **+0.19% with arms overlapping by 0.02** —
+  neutral-to-slightly-positive, not a decode win. The decode-shape grid is one
+  block for one row, so the saved read was already an L2 hit; what is left is
+  one dependent round trip out of a ~3.6 us kernel, 61 times a token.
+
 ## The decode profile that produced 0012 — read this first
 
 `nsys --cuda-graph-trace=node`, `llama-bench -p 0 -n 34 -r 1`, on the
@@ -147,11 +170,24 @@ are admin-restricted, so use the standalone probe plus census diffs instead.
 | `GGML_CUDA_GRAPH_OPT=1` (multi-stream graph optimizer) | neutral |
 | `GGML_CUDA_ENABLE_MMVQ_GROUP=1` (grouped mmvq on) | **-2.5%**, keep 0010's default |
 | `GGML_CUDA_PDL=0` | -3%, i.e. PDL is already on and already paying |
+| Q6_K wide vec_dot (`vdr` 1 → 2, same sharing as 0012) | +0.24%, arms overlapping = neutral |
+| Q4_K `vdr = 8` (16-byte int4 loads, single-warp block) | 0.9987 |
 | ssm-conv + c-gate mul fold (R9700 port) | 0.996 |
 | ngram self-speculation | neutral, and off-board anyway |
 
 Notes that cost real runner time to learn:
 
+- **The two negative wide-vec_dot results pin the mechanism, and they matter
+  more than the win does.** The Q6_K pair form does the *same* index/scale/q8/d8
+  sharing as 0012 and halves the call count, and it buys nothing — because
+  `block_q6_K` is 210 bytes, so `ql`/`qh` are 2-byte aligned and must go through
+  `get_int_b2`, i.e. pairs of 16-bit loads, and the load cannot widen. And
+  `vdr = 8` widens Q4_K further to 16-byte `int4` loads *and* collapses the block
+  to a single warp with no LDS reduction at all — and gives back 0.13%. So on
+  GB10 the payoff is **load width and nothing else**, and it **saturates at 8
+  bytes per lane**. Target only quant types whose block size permits an `int2`
+  cast; do not chase call-count sharing, redundant-work removal, or the
+  reduction tail.
 - **The qwen3.6 gb10 sm_121 mmvq table does not transfer to a dense model.**
   There it pays through `rows_per_block` under `small_k`; LFM2.5 is dense with
   `n_embd` 2048, so Q4_K has `blocks_per_row_x = 8`, `small_k` never fires,
@@ -179,12 +215,17 @@ memory-contended conditions noted above.
 
 ## Open, in the order I would try them
 
-1. **Q6_K wide vec_dot** (`vdr` 1 → 2, `nwarps` stays 4 because
-   `blocks_per_iter = 2*nwarps` already lands on 8). Q6_K is the output head
-   plus 14 ffn_down projections = **28% of the token** and it reads its
-   weights through `get_int_b2`, i.e. **pairs of 16-bit loads**, because
-   `block_q6_K` is 210 bytes. The pair form cannot widen the load, but it
-   shares the scale/qh/q8/d8 fetches and halves the call count.
+1. **Cross-port 0012 to the other three gb10cuda tracks.** laguna-xs, laguna-s
+   and qwen3.6 are all `Q4_K_M` on this box, so the wide vec_dot applies to
+   their (ids-path) expert matvecs too, and those tracks are far more
+   matvec-dominated than this one. Note the coverage arithmetic changes with
+   `n_embd`: `blocks_per_iter = vdr*nwarps*warp_size/qi`, so a 4096-column row
+   has 16 k-blocks and takes `vdr = 4` with `nwarps` **unchanged** at 4, while a
+   2048-column row needs `nwarps = 2` as here. Those tracks already carry an
+   `MMVQ_PARAMETERS_SM121` table, so only the `get_vdr_mmvq(type, table_id)`
+   overload and the wide `vec_dot_q4_K_q8_1` need adding — and pin their
+   `should_use_small_k` predicate to the *stock* vdr so the `rows_per_block`
+   decision does not move at the same time.
 2. **Prefill**: `unary_gated_op_kernel` (silu) is **12.9% of pp512** and
    `quantize_mmq_q8_1` another **6.9%** — the glu writes f32 and a separate
    pass reads it back to build the MMQ-layout q8_1. 0008 already folds the

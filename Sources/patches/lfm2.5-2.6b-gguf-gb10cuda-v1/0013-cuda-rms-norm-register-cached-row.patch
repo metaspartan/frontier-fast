@@ -1,0 +1,164 @@
+From 9bd602c001e78dedf4574203c1d9284645843354 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sat, 8 Aug 2026 10:54:57 -0600
+Subject: [PATCH 13/13] CUDA: hold the folded rms_norm row in registers
+
+`rms_norm_pre_add_f32` walks its row twice: once to build the sum of squares
+(after the folded residual add) and once to scale, multiply and quantize. The
+second walk re-reads exactly the floats the first one computed. At the decode
+shape that is a second dependent memory round trip on a kernel whose grid is a
+single block for a single row - 61 of them per token on this model, 3.6 us
+each, one SM busy and 47 idle.
+
+When ncols is an exact multiple of block_size and the per-thread column count
+fits a small fixed cache (<= 8), both loops become `#pragma unroll` loops over
+that count and the values live in registers between them. The exact-multiple
+requirement is what keeps every lane of every warp live on every step, so the
+warp reductions in the quantize epilogue see exactly the participation they
+see today. Any other shape takes the stock loops unchanged.
+
+Bit-exact by construction: the value used in the second pass is the same float
+that would have been stored and loaded back. Measured perplexity is identical
+in both readings - gate 22.7466 and decode-path 22.6048, matching the control
+digit for digit.
+
+Measured on the runner box, 5 interleaved whole-process rounds against the
+12-patch build:
+
+- pp512 8046.86 max on the control vs 8054.78 min with the patch, i.e. **5/5
+  arms disjoint, median ratio 1.0065** (+0.65% prefill). This is where it
+  pays: at prefill the kernel is 4.4% of the pass and the re-read is of a
+  genuinely large tensor.
+- tg128 120.76 median vs 120.99 median, **+0.19%**, arms overlapping by 0.02 -
+  report this as neutral-to-slightly-positive, not as a decode win.
+
+---
+ ggml/src/ggml-cuda/norm.cu | 93 ++++++++++++++++++++++++++++++++++----
+ 1 file changed, 84 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index fc0c65b..eafde41 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -683,20 +683,55 @@ static __global__ void rms_norm_pre_add_f32(const rms_norm_pre_add_args args,
+ 
+     ggml_cuda_pdl_sync();
+ 
++    // Register cache for the normalize pass. The second loop below re-reads
++    // exactly the values this loop computes; at the decode shape the grid is a
++    // single block for a single row, so that re-read is a second dependent
++    // memory round trip on a kernel whose whole cost is latency. Holding the
++    // values in registers instead is bit-exact by construction: the value used
++    // is the same float that would have been stored and loaded back.
++    // Taken only when ncols is an exact multiple of block_size, so every lane
++    // of every warp is live on every unrolled step and nothing about the warp
++    // reductions in the quantize epilogue changes.
++    constexpr int max_cached = 8;
++    float xcache[max_cached];
++    const int  nper      = ncols / block_size;
++    const bool use_cache = nper >= 1 && nper <= max_cached && nper*block_size == ncols;
++
+     // add chain: identical operand order and identical per-element rounding to
+     // the k_bin_bcast fold it replaces
+-    for (int col = tid; col < ncols; col += block_size) {
+-        float acc = args.src[0][(int64_t) row * args.stride_row[0] + col];
++    if (use_cache) {
+ #pragma unroll
+-        for (int k = 1; k < n_add; ++k) {
+-            acc = acc + args.src[k][(int64_t) row * args.stride_row[k] + col];
+-        }
+-        if constexpr (n_add > 1) {
+-            add_dst[col] = acc;
++        for (int v = 0; v < max_cached; ++v) {
++            if (v >= nper) {
++                break;
++            }
++            const int col = tid + v*block_size;
++            float acc = args.src[0][(int64_t) row * args.stride_row[0] + col];
++#pragma unroll
++            for (int k = 1; k < n_add; ++k) {
++                acc = acc + args.src[k][(int64_t) row * args.stride_row[k] + col];
++            }
++            if constexpr (n_add > 1) {
++                add_dst[col] = acc;
++            }
++
++            xcache[v] = acc;
++            tmp += acc * acc;
+         }
++    } else {
++        for (int col = tid; col < ncols; col += block_size) {
++            float acc = args.src[0][(int64_t) row * args.stride_row[0] + col];
++#pragma unroll
++            for (int k = 1; k < n_add; ++k) {
++                acc = acc + args.src[k][(int64_t) row * args.stride_row[k] + col];
++            }
++            if constexpr (n_add > 1) {
++                add_dst[col] = acc;
++            }
+ 
+-        const float xi = acc;
+-        tmp += xi * xi;
++            const float xi = acc;
++            tmp += xi * xi;
++        }
+     }
+ 
+     // sum up partial sums
+@@ -706,6 +741,45 @@ static __global__ void rms_norm_pre_add_f32(const rms_norm_pre_add_args args,
+     const float mean  = tmp / ncols;
+     const float scale = rsqrtf(mean + eps);
+ 
++    if (use_cache) {
++#pragma unroll
++        for (int v = 0; v < max_cached; ++v) {
++            if (v >= nper) {
++                break;
++            }
++            const int col = tid + v*block_size;
++            const int mul_col = fastmodulo(col, mul_ncols_packed);
++            const float x_col = xcache[v];
++            const float val   = scale * x_col * mul[mul_col];
++            dst[col]          = val;
++
++            if constexpr (do_quant) {
++                // stock quantize_q8_1 body, on the value just written
++                block_q8_1 * y = (block_q8_1 *) q8_1_dst;
++
++                const int64_t i_cont = (int64_t) row * ncols + col;
++                const int64_t ib     = i_cont / QK8_1;
++                const int64_t iqs    = i_cont % QK8_1;
++
++                const float xq = val;
++                float amax = fabsf(xq);
++                float sum  = xq;
++
++                amax = warp_reduce_max<QK8_1>(amax);
++                sum  = warp_reduce_sum<QK8_1>(sum);
++
++                const float  d = amax / 127.0f;
++                const int8_t q = amax == 0.0f ? 0 : roundf(xq / d);
++
++                y[ib].qs[iqs] = q;
++
++                if (iqs == 0) {
++                    y[ib].ds = make_half2(d, sum);
++                }
++            }
++
++        }
++    } else {
+     for (int col = tid; col < ncols; col += block_size) {
+         const int mul_col = fastmodulo(col, mul_ncols_packed);
+         const float x_col = (n_add > 1) ? add_dst[col]
+@@ -738,6 +812,7 @@ static __global__ void rms_norm_pre_add_f32(const rms_norm_pre_add_args args,
+             }
+         }
+     }
++    }
+ }
+ 
+ template <int n_add>
+-- 
+2.43.0
+
