@@ -1493,14 +1493,15 @@ Prefill census (pp512, per pass, 2276 dispatches / 114.9 ms of kernel before
 11.5%, the deliberate Q6_K dequant+GEMM route ~14%, **`k_bin_bcast` op_mul 3.0%
 (40 x 87us) — taken by 0040**, `k_bin_bcast` op_add 0.9%.
 
-Ranked open levers after 0040: (1) fold the two GDN `l2_norm`s into the decode
-conv-fold epilogue — 30 launches x (2.0us + ~1.6us of bubble) is ~1.6% of the
-wall token, and a 256-thread conv block covers exactly two 128-wide norm rows,
-so warps 0 and 1 can each replay the stock one-warp reduction out of LDS and
-stay byte-exact; (2) the F32 router at 388 GB/s against the 583 the grouped
-Q6_K matvec reaches — 257 one-warp blocks is too little memory parallelism for
-2 MB, but k-splitting it reroutes experts, so it is not free; (3) attribute the
-12.6 `copyBuffer` launches; (4) prefill `gated_delta_net` (11.5%).
+Ranked open levers after 0040: ~~(1) fold the two GDN `l2_norm`s into the decode
+conv-fold epilogue~~ — **taken by 0041, +1.3% decode**; (2) the F32 router at
+388 GB/s against the 583 the grouped Q6_K matvec reaches — 257 one-warp blocks
+is too little memory parallelism for 2 MB, but k-splitting it reroutes experts,
+so it is not free; (3) attribute the 12.6 `copyBuffer` launches; (4) prefill
+`gated_delta_net` (11.5%); (5) the 30 GDN gated `rms_norm_f32` launches are the
+same shape of opportunity 0041 just took, one kernel further down the chain —
+they normalise `[128, 32 heads]` straight out of `gated_delta_net`, whose grid
+is already 32 blocks in z.
 
 ## 0040: the MoE routing weight folded into the MMQ prefill epilogue (+2.3% prefill, BYTE-EXACT)
 
@@ -1582,30 +1583,116 @@ destination, and the exact dispatch conditions under which
 `ggml_cuda_mul_mat_id` would have taken the MMQ route (quantized src0, batch
 above the mmvq mmid cutoff, `ggml_cuda_should_use_mmq`).
 
+## 0041: the GDN q/k l2 norms folded into the decode conv-fold epilogue (+1.3% decode, BYTE-EXACT)
+
+Round-23's top-ranked open lever, and it paid. qwen35moe convolves `[q | k | v]`
+as one 8192-channel block and then l2-normalises the q and k halves per 128-wide
+head. Grouped since 0019 that is still **30 launches per token at 2.0 us**, each
+re-reading 16 KB the conv fold had in registers a moment earlier.
+
+The kernel half is a shape coincidence worth remembering: a 256-thread conv
+block owns exactly 256 channels, which is exactly **two 128-wide norm rows**. So
+warps 0 and 1 replay the stock one-warp `l2_norm` body out of shared memory —
+same `col = lane; col += 32` accumulation order, the same `warp_reduce_sum`
+(for `block_size == WARP_SIZE`, `block_reduce<SUM,32>` *is* `warp_reduce_sum`),
+the same `rsqrtf(fmaxf(tmp, eps*eps))`, the same store order. Byte-identical to
+`l2_norm_f32_grouped` by construction.
+
+### Where the result is allowed to land was the whole round (again)
+
+This is the third time in this series (0032, 0037, now 0041) that the fold was
+easy and the allocation was not. Two successive declines, each fixed by a
+different move:
+
+1. **With separate destinations, ggml-alloc hands the two norms buffers that a
+   node between the conv and the norms is still using.** Declined on every layer
+   of every token. Fixed by making the norms **in-place on the conv output at
+   the decode shape** (`qwen35moe.cpp`, `GGML_L2_NORM_INPLACE=0` restores).
+   Semantically free — the q and k halves of the conv output have no consumer
+   other than these two norms — and it puts the result inside the buffer the
+   fold already owns. Gated to `n_t == 1`: at prefill the q/k views are strided
+   over tokens, and an in-place destination would make the norm kernel store
+   contiguously into a strided view.
+2. **In place, the destination then overlaps the ACTIVATION.** At the decode
+   shape ggml-alloc routinely co-locates them, because the CONCAT is the
+   activation's last consumer. That is not a new hazard: the fold already
+   depends on the co-location being *exact*, since thread `ch` reads `x[ch]` and
+   then writes `y[ch]`, the same address. The norm write lands on the same 256
+   channels the block has already read, after a `__syncthreads`, so it is safe
+   under exactly that condition — `x->data == silu->data` and a unit channel
+   stride — and the detector declines on anything weaker.
+
+And one guard that had to be **removed**: the CONCAT output must not be in the
+operand list. When this fold fires the concat is never materialised, and the
+0031 detector has already rejected any consumer of it other than the SSM_CONV
+and the writeback CPY, both folded away. Its buffer is dead — and ggml-alloc
+hands exactly that buffer to the norm destinations on every layer, so guarding
+on it declined the whole fold for nothing. **When a fold declines, print which
+operand it declined against** (`GGML_CUDA_SSM_CONV_L2_DBG=1`); three of this
+round's builds were spent narrowing that down one bit at a time.
+
+The epilogue is a separate kernel (`ssm_conv_fold_l2_f32`) rather than a runtime
+branch inside `ssm_conv_fold_stock_f32` — see 0040 for what a not-taken branch
+in a hot kernel costs.
+
+Measured (runner box, `HIP_VISIBLE_DEVICES=0`, whole-process interleaved 3-arm
+A/B against a control binary built from the parent commit, rotated order):
+
+| arm | tg128 | median | vs control |
+|---|---|---|---|
+| control (0040 binary) | 145.36-145.79 | 145.65 | — |
+| fold + in-place OFF | 145.57-145.80 | 145.63 | **0.9999** |
+| ON | 147.50-147.80 | 147.58 | **1.0133** |
+
+Arms disjoint 5/5 — `min(ON) = 147.50 > max(control) = 145.79`.
+
+- pp512 neutral: 6 further rounds at `-r 3`, per-round ratios 0.9988-1.0039,
+  median 0.9997
+- long context: tg128 @ d16384 **134.01 -> 135.84** (+1.37%), @ d32768
+  **124.53 -> 126.07** (+1.24%) — the 32k long board moves with it
+- decode census: **781.1 -> 751.1 dispatches/token**, 5680 -> 5627 us of kernel;
+  `l2_norm_f32_grouped` is gone and the conv fold goes 1.57 -> 2.24 us, so the
+  ~1.6 us of per-dispatch bubble is again most of the win
+- decode-path ppl `-b 512 -ub 1 --chunks 8`: **3.9338** all on, **3.9338** with
+  both halves off, **3.9338** with in-place on and the fold off — identical to
+  four decimals in all three arms, and identical to the banked stack
+- gate-shape ppl `-c 512 --chunks 8`: 3.9271, unchanged (neither half fires
+  there — this is a decode-shape fold, so the official gate does not cover it;
+  the decode-shape reading above is the one that counts)
+- `llama-server` greedy **6/6 BYTE-EXACT** vs the fold-off control
+- `test-backend-ops` L2_NORM / SSM_CONV / GATED_DELTA_NET OK
+
+One toggle interaction to know: `ssm_conv_fold_l2_f32` is derived from 0039's
+stock-shaped loop nest, so when the l2 fold accepts,
+`GGML_SSM_CONV_FOLD_STOCK_SHAPE=0` no longer reaches the 0031 kernel. Disable
+`GGML_CUDA_DISABLE_SSM_CONV_L2_FOLD=1` first if you want that comparison back.
+
 ## Recommended firing order
 
 The runner applies the whole patch directory, so the series is a ladder rather
-than a choice; **0001-0040** is the verified set and every patch that carries
+than a choice; **0001-0041** is the verified set and every patch that carries
 speed has a disable toggle. Two do not carry speed: **0038** is 0037's kernel
 made bit-identical and must not be applied without 0037; **0039** is 0031's
 kernel made sign-of-zero-exact and must not be applied without 0031
 (`GGML_SSM_CONV_FOLD_STOCK_SHAPE=0` falls back to the 0031 kernel in place).
-If a ranked run has to be pared back, drop from the end: 0040 (prefill only),
-then 0039, then 0038+0037, then 0036, 0035, 0034 (independent +1.5% decode
-folds); 0033 is the prefill fold; 0032 and 0030 are the two largest decode wins
-and should be the last to go. 0037 has two halves in different files — dropping
-it means dropping both, since the graph half alone leaves the decode combine as
-n_expert_used-1 separate adds. 0040 is independent of everything else in the
-series and touches only the MMQ write-back and the MUL_MAT_ID dispatch.
+If a ranked run has to be pared back, drop from the end: 0041 (needs 0031+0039,
+which own the decode conv fold it extends), then 0040 (prefill only, independent
+of everything), then 0039, then 0038+0037, then 0036, 0035, 0034 (independent
++1.5% decode folds); 0033 is the prefill fold; 0032 and 0030 are the two largest
+decode wins and should be the last to go. 0037 has two halves in different files
+— dropping it means dropping both, since the graph half alone leaves the decode
+combine as n_expert_used-1 separate adds. 0041 likewise has two halves (the
+in-place norm in `qwen35moe.cpp` and the CUDA epilogue) and the CUDA half
+declines without the graph half.
 
-**Projection after 0040: ~1.570-1.575 vs the 1.4525 bank.** Decode is unchanged
-at 1.7536; prefill 1.2911 -> **1.3205** (x1.0228, measured against a
-parent-commit control, not a toggle); ttft moves with prefill for prompt
-processing, so the band spans ttft flat (1.570) to ttft carrying the full
-prefill ratio (1.575). Rounds 21 and 22 bought correctness; round 23 is the
-first speed since 0037, and it is entirely on the prefill/ttft side of the
-exponent — worth ~+0.5-0.8% of score, which is what a 0.20/0.15 exponent pays
-for 2.3%.
+**Projection after 0041: ~1.584-1.589 vs the 1.4525 bank.** Decode 1.7536 ->
+**1.7769** (x1.0133); prefill 1.2911 -> **1.3205** (x1.0228); ttft moves with
+prefill for prompt processing, so the band spans ttft flat (1.584) to ttft
+carrying the full prefill ratio (1.589). Every ratio here is measured against a
+binary built from the patch's own parent commit, not against a toggle.
+
+Rounds 21 and 22 bought correctness; 23 and 24 are the first speed since 0037,
+one on each side of the exponent.
 
 Correctness state of the stack is unchanged: **-0.180%** against stock on the
 decode path, **-0.11 to -0.17%** at the gate shape, and every banked fold now

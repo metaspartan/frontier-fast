@@ -1,0 +1,511 @@
+From 795582435b5a8f02a96984c33dc1ef712e30c752 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sat, 8 Aug 2026 16:39:43 +0000
+Subject: [PATCH] cuda/hip: fold the GDN q/k l2 norms into the decode conv-fold
+ epilogue (+1.3% decode, byte-exact)
+
+qwen35moe convolves [q | k | v] as one 8192-channel block and then l2-normalises
+the q and k halves per 128-wide head. Grouped since 0019 that is still 30
+launches per token at 2.0 us, and every one of them re-reads 16 KB the conv fold
+had in registers a moment earlier. A 256-thread conv block owns exactly 256
+channels, which is exactly two 128-wide norm rows, so warps 0 and 1 can replay
+the stock one-warp l2_norm body out of shared memory: same
+"col = lane; col += 32" accumulation order, the same warp_reduce_sum (for
+block_size == WARP_SIZE, block_reduce<SUM,32> IS warp_reduce_sum), the same
+rsqrtf(fmaxf(tmp, eps*eps)) and the same store order. Byte-identical to
+l2_norm_f32_grouped, 30 fewer launches per token.
+
+Getting the kernel right was the easy half. Where the result is allowed to land
+was the round, exactly as in 0032 and 0037:
+
+1. With separate destinations ggml-alloc hands the two norms buffers that a node
+   between the conv and the norms is still using, and the fold declines on every
+   layer. So the norms are made IN-PLACE on the conv output at the decode shape
+   (qwen35moe.cpp, GGML_L2_NORM_INPLACE=0 restores). That is semantically free -
+   the q and k halves of the conv output have no consumer other than these two
+   norms - and it puts the result inside the buffer the fold already owns. Only
+   at n_t == 1: at prefill the q/k views are strided over tokens and an in-place
+   destination would make the norm kernel store contiguously into a strided view.
+2. In place, the norm destination then overlaps the ACTIVATION, because at the
+   decode shape ggml-alloc routinely co-locates the two (the CONCAT is the
+   activation last consumer). That is not a new hazard: the fold already depends
+   on the co-location being exact, since thread ch reads x[ch] and then writes
+   y[ch], the same address. The norm write lands on the same 256 channels the
+   block has already read, after a __syncthreads, so it is safe under exactly
+   that condition - x->data == silu->data and a unit channel stride - and the
+   detector declines on anything weaker.
+
+The CONCAT output is deliberately NOT in the operand guard: when this fold fires
+the concat is never materialised, and the 0031 detector has already rejected any
+consumer of it other than the SSM_CONV and the writeback CPY, both folded away.
+Its buffer is dead, and ggml-alloc hands it to the norm destinations on every
+layer - guarding on it declines the whole fold for nothing.
+
+The epilogue lives in a separate kernel (ssm_conv_fold_l2_f32) rather than a
+runtime branch inside ssm_conv_fold_stock_f32; see 0040 for what a not-taken
+branch in a hot kernel costs. GGML_CUDA_DISABLE_SSM_CONV_L2_FOLD=1 restores the
+separate grouped launch; GGML_CUDA_SSM_CONV_L2_DBG=1 prints accept/decline.
+
+Measured (runner box, HIP_VISIBLE_DEVICES=0, whole-process interleaved 3-arm
+A/B against a control binary built from the parent commit, rotated order):
+
+- tg128: control 145.36-145.79 (median 145.65), fold+inplace OFF 145.57-145.80
+  (median 145.63, ratio 0.9999), ON 147.50-147.80 (median 147.58, ratio 1.0133);
+  arms disjoint 5/5, min(ON) 147.50 > max(control) 145.79
+- pp512 neutral: 6 further rounds at r=3, per-round ratios 0.9988-1.0039,
+  median 0.9997
+- tg128 @ d16384 134.01 -> 135.84 (+1.37%), @ d32768 124.53 -> 126.07 (+1.24%)
+- decode census: 781.1 -> 751.1 dispatches/token, 5680 -> 5627 us of kernel;
+  l2_norm_f32_grouped gone, the conv fold 1.57 -> 2.24 us
+- decode-path ppl -b 512 -ub 1 --chunks 8: 3.9338 all on, 3.9338 with fold and
+  inplace off, 3.9338 with inplace on and fold off - identical to four decimals
+  in all three arms, and identical to the banked stack
+- gate-shape ppl -c 512 --chunks 8: 3.9271, unchanged (neither half fires there)
+- llama-server greedy 6/6 BYTE-EXACT vs the fold-off control
+- test-backend-ops L2_NORM / SSM_CONV / GATED_DELTA_NET OK
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 191 +++++++++++++++++++++++++++++++-
+ ggml/src/ggml-cuda/ssm-conv.cu  | 139 ++++++++++++++++++++++-
+ ggml/src/ggml-cuda/ssm-conv.cuh |  17 ++-
+ src/models/qwen35moe.cpp        |  21 +++-
+ 4 files changed, 363 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7fec340eb..77cdede98 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1944,6 +1944,189 @@ static bool ggml_cuda_moe_weight_fuse_detect_q(const ggml_cgraph * cgraph, const
+     return true;
+ }
+ 
++
++// ---------------------------------------------------------------------------
++// The two GDN conv norms, collected for the decode conv-fold epilogue.
++//
++// qwen35moe convolves [q | k | v] as one 8192-channel block and then l2-normalises
++// the q and k halves per 128-wide head. Grouped (0019) that is still 30 launches
++// per token of 2.0 us each, and each one re-reads 16 KB the conv fold had in
++// registers a moment earlier. A 256-thread conv block owns exactly two norm rows,
++// so the fold can do them - but only if writing the norm destinations early is
++// safe, which is an allocation question, not a kernel question (0032 rule 1).
++static void ggml_cuda_tensor_byte_span(const ggml_tensor * t, const char ** lo, const char ** hi) {
++    const char * base = (const char *) t->data;
++    size_t span = ggml_type_size(t->type);
++    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
++        if (t->ne[d] > 1) {
++            span += (size_t) (t->ne[d] - 1) * t->nb[d];
++        }
++    }
++    *lo = base;
++    *hi = base + span;
++}
++
++static bool ggml_cuda_spans_overlap(const ggml_tensor * a, const ggml_tensor * b) {
++    if (a == nullptr || b == nullptr || a->data == nullptr || b->data == nullptr) {
++        return false;
++    }
++    if (a->buffer != b->buffer) {
++        return false;
++    }
++    const char *alo, *ahi, *blo, *bhi;
++    ggml_cuda_tensor_byte_span(a, &alo, &ahi);
++    ggml_cuda_tensor_byte_span(b, &blo, &bhi);
++    return alo < bhi && blo < ahi;
++}
++
++static bool ggml_cuda_ssm_conv_l2_dbg() {
++    static const bool v = getenv("GGML_CUDA_SSM_CONV_L2_DBG") != nullptr;
++    return v;
++}
++
++// Collects the L2_NORM nodes that ride along in the fold. Returns the count, or
++// 0 to decline. `silu` is the conv output the fold writes.
++static int ggml_cuda_ssm_conv_l2_collect(const ggml_cgraph * cgraph, const int i,
++        const ggml_tensor * concat, const ggml_tensor * ssm_conv,
++        const ggml_tensor * silu, const ggml_tensor * wb_cpy,
++        ggml_tensor ** out_nodes) {
++    static const bool disable = getenv("GGML_CUDA_DISABLE_SSM_CONV_L2_FOLD") != nullptr &&
++                                std::atoi(getenv("GGML_CUDA_DISABLE_SSM_CONV_L2_FOLD"));
++    if (disable) {
++        return 0;
++    }
++    constexpr int block_size = 256;
++
++    int n = 0;
++    int last_idx = i;
++    int64_t ncols = 0;
++    float   eps   = 0.0f;
++
++    const int window = std::min(i + 48, cgraph->n_nodes);
++    for (int j = i + 1; j < window; ++j) {
++        ggml_tensor * cand = cgraph->nodes[j];
++        if (cand->op != GGML_OP_L2_NORM) {
++            continue;
++        }
++        const ggml_tensor * src = cand->src[0];
++        if (src == nullptr || src->view_src != silu) {
++            continue;
++        }
++        if (n >= SSM_CONV_L2_MAX_SEG) {
++            return 0; // more norms than the epilogue can carry: take none
++        }
++        if (src->type != GGML_TYPE_F32 || cand->type != GGML_TYPE_F32) {
++            return 0;
++        }
++        if (src->ne[2] != 1 || src->ne[3] != 1 || src->nb[0] != sizeof(float) ||
++                src->nb[1] != (size_t) src->ne[0] * sizeof(float)) {
++            return 0;
++        }
++        if (!ggml_is_contiguous(cand) || !ggml_are_same_shape(cand, src)) {
++            return 0;
++        }
++        float e;
++        memcpy(&e, cand->op_params, sizeof(float));
++        if (n == 0) {
++            ncols = src->ne[0];
++            eps   = e;
++            // rows must tile the conv block exactly, and each row must fit one warp pass
++            if (ncols <= 0 || ncols % WARP_SIZE != 0 || block_size % ncols != 0) {
++                return 0;
++            }
++        } else if (src->ne[0] != ncols || e != eps) {
++            return 0;
++        }
++        const size_t off = (const char *) src->data - (const char *) silu->data;
++        if ((const char *) src->data < (const char *) silu->data ||
++                off % (block_size * sizeof(float)) != 0 ||
++                (src->ne[1] * ncols) % block_size != 0 ||
++                off / sizeof(float) + src->ne[1] * ncols > (size_t) ggml_nelements(silu)) {
++            return 0;
++        }
++        // the fold writes this destination while it is still reading the
++        // activation and the conv state, and blocks are not synchronised with
++        // each other, so any overlap with an input is a genuine race
++        // NOT including the CONCAT output: when this fold fires the concat is
++        // never materialised (the fold reads the state window and the activation
++        // directly and builds the writeback from registers), and the 0031
++        // detector has already rejected any consumer of it other than the
++        // SSM_CONV and the writeback CPY, both of which are folded away. Its
++        // buffer is dead, and ggml-alloc hands it to the norm destinations on
++        // every layer - guarding on it declines the whole fold for nothing.
++        // An in-place norm writes back exactly the bytes it read, inside the
++        // buffer this fold already owns and has in registers - that is not an
++        // alias, it is the point (see qwen35moe.cpp). Every other overlap is.
++        const bool in_place = cand->data == src->data;
++        // The activation and the conv output are routinely co-located at the
++        // decode shape - the CONCAT is the activation last consumer, so
++        // ggml-alloc reuses its buffer - and the fold already depends on that
++        // being EXACT: thread ch reads x[ch] and then writes y[ch], the same
++        // address. An in-place norm write lands on the same 256 channels the
++        // block has already read, after a __syncthreads, so it is safe under
++        // the same condition and nothing weaker.
++        const ggml_tensor * x_in = concat->src[1];
++        const bool x_exact = in_place && x_in->data == silu->data &&
++                             x_in->nb[1] == sizeof(float) && silu->nb[0] == sizeof(float);
++        const ggml_tensor * ins[] = { concat->src[0], x_exact ? nullptr : x_in, ssm_conv->src[1],
++                                      in_place ? nullptr : silu, wb_cpy->src[1] };
++        static const char * innames[] = { "state", "x", "w", "silu", "wb" };
++        for (int q = 0; q < 5; ++q) {
++            if (ggml_cuda_spans_overlap(cand, ins[q])) {
++                if (ggml_cuda_ssm_conv_l2_dbg()) {
++                    fprintf(stderr, "ssm-conv-l2: decline, dst overlaps %s\n", innames[q]);
++                }
++                return 0;
++            }
++        }
++        out_nodes[n++] = cand;
++        last_idx = j;
++    }
++
++    if (n == 0) {
++        return 0;
++    }
++
++    // nothing executed between the fold and the norms may read or write the
++    // memory the fold is about to write early
++    for (int j = i + 1; j <= last_idx; ++j) {
++        ggml_tensor * mid = cgraph->nodes[j];
++        bool is_member = mid == ssm_conv || mid == silu || mid == wb_cpy || mid == concat;
++        for (int m = 0; m < n; ++m) {
++            is_member = is_member || mid == out_nodes[m];
++        }
++        if (is_member || mid->op == GGML_OP_NONE || mid->op == GGML_OP_VIEW ||
++                mid->op == GGML_OP_RESHAPE || mid->op == GGML_OP_PERMUTE ||
++                mid->op == GGML_OP_TRANSPOSE) {
++            continue;
++        }
++        for (int m = 0; m < n; ++m) {
++            if (out_nodes[m]->data == out_nodes[m]->src[0]->data) {
++                continue; // in place inside the fold's own output
++            }
++            if (ggml_cuda_spans_overlap(mid, out_nodes[m])) {
++                if (ggml_cuda_ssm_conv_l2_dbg()) {
++                    fprintf(stderr, "ssm-conv-l2: decline, node %d dst overlaps a norm dst\n", j);
++                }
++                return 0;
++            }
++            for (int k = 0; k < GGML_MAX_SRC; ++k) {
++                if (ggml_cuda_spans_overlap(mid->src[k], out_nodes[m])) {
++                    if (ggml_cuda_ssm_conv_l2_dbg()) {
++                        fprintf(stderr, "ssm-conv-l2: decline, node %d src overlaps a norm dst\n", j);
++                    }
++                    return 0;
++                }
++            }
++        }
++    }
++
++    if (ggml_cuda_ssm_conv_l2_dbg()) {
++        fprintf(stderr, "ssm-conv-l2: accept %d norms, ncols=%d\n", n, (int) ncols);
++    }
++    return n;
++}
++
+ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+     GGML_TENSOR_BINARY_OP_LOCALS
+ 
+@@ -6038,7 +6221,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                             }
+                             ggml_cuda_op_ssm_conv_fold_seq(*cuda_ctx, node, f_conv, f_silu, f_cpy);
+                         } else {
+-                            ggml_cuda_op_ssm_conv_fold(*cuda_ctx, node, f_conv, f_silu, f_cpy);
++                            ggml_tensor * l2_nodes[SSM_CONV_L2_MAX_SEG];
++                            const int n_l2 = ggml_cuda_ssm_conv_l2_collect(cgraph, i, node, f_conv, f_silu, f_cpy, l2_nodes);
++                            ggml_cuda_op_ssm_conv_fold(*cuda_ctx, node, f_conv, f_silu, f_cpy, l2_nodes, n_l2);
++                            for (int m = 0; m < n_l2; ++m) {
++                                grouped_done.insert(l2_nodes[m]);
++                                mmvq_grouped_done.insert(l2_nodes[m]);
++                            }
+                         }
+                         grouped_done.insert(f_conv);
+                         grouped_done.insert(f_silu);
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index 19bb827d1..656803cd8 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -292,6 +292,123 @@ static __global__ void ssm_conv_fold_stock_f32(const float * __restrict__ state,
+     wbc[2] = xv;
+ }
+ 
++
++// ---------------------------------------------------------------------------
++// The decode fold with the GDN q/k l2 norms in its epilogue.
++//
++// The conv output is 8192 channels; a 256-thread block owns 256 of them, which
++// is exactly two 128-wide norm rows, and the value each thread needs is already
++// in its register. So warps 0 and 1 replay the stock one-warp l2_norm body out
++// of shared memory - same `col = lane; col += 32` accumulation order, the same
++// warp_reduce_sum (block_reduce<SUM,32> IS warp_reduce_sum), the same
++// rsqrtf(fmaxf(tmp, eps*eps)) and the same store order - so the result is
++// byte-identical to l2_norm_f32_grouped and 30 launches per token disappear.
++//
++// This is a separate kernel from ssm_conv_fold_stock_f32 rather than a runtime
++// branch inside it: see 0040 for what a not-taken branch in a hot kernel costs.
++struct ssm_conv_l2_args {
++    float * dst     [SSM_CONV_L2_MAX_SEG];
++    int     ch_begin[SSM_CONV_L2_MAX_SEG];
++    int     ch_end  [SSM_CONV_L2_MAX_SEG];
++    int     nseg;
++    int     ncols;
++    float   eps;
++};
++
++template <int block_size>
++static __global__ void ssm_conv_fold_l2_f32(const float * __restrict__ state, const float * __restrict__ x,
++                                            const float * __restrict__ w_all, const float * __restrict__ bias,
++                                            float * __restrict__ y, float * __restrict__ wb, const int nr,
++                                            const int state_nb1, const int x_nb1, const int w_nb1,
++                                            const int64_t n_t, const ssm_conv_l2_args l2) {
++    const int ch = blockIdx.x * block_size + threadIdx.x;
++
++    __shared__ float sy[block_size];
++
++    float yv = 0.0f;
++
++    if (ch < nr) {
++        const float * st = (const float *) ((const char *) state + ch * state_nb1);
++        const float * wc = (const float *) ((const char *) w_all + ch * w_nb1);
++        const float   xv = *(const float *) ((const char *) x + ch * x_nb1);
++
++        float x_r[4] = { 0.0f };
++        float w[4]   = { 0.0f };
++
++#pragma unroll
++        for (size_t j = 0; j < 4; j++) {
++            w[j] = wc[j];
++        }
++
++        float b = bias != nullptr ? bias[ch] : 0.0f;
++
++        for (int64_t i = 0; i < n_t; i++) {
++            float sumf = 0.0f;
++
++            if (i == 0) {
++                for (size_t j = 0; j < 3; j++) {
++                    x_r[j] = st[j];
++                }
++                x_r[3] = xv;
++            }
++
++#pragma unroll
++            for (size_t j = 0; j < 4; j++) {
++                sumf += x_r[(i + j) % 4] * w[j];
++            }
++            sumf += b;
++            yv = ggml_cuda_op_silu_single(sumf);
++            y[i * nr + ch] = yv;
++        }
++
++        float * wbc = wb + ch * 3;
++        wbc[0] = x_r[1];
++        wbc[1] = x_r[2];
++        wbc[2] = xv;
++    }
++
++    sy[threadIdx.x] = yv;
++    __syncthreads();
++
++    constexpr int warp_size = 32;
++    const int lane = threadIdx.x % warp_size;
++    const int warp = threadIdx.x / warp_size;
++    const int ncols = l2.ncols;
++    const int rows_per_block = block_size / ncols;
++
++    if (warp < rows_per_block) {
++        const int ch0 = blockIdx.x * block_size + warp * ncols;
++
++        int     seg_row = -1;
++        float * seg_dst = nullptr;
++#pragma unroll
++        for (int s = 0; s < SSM_CONV_L2_MAX_SEG; ++s) {
++            if (s < l2.nseg && ch0 >= l2.ch_begin[s] && ch0 < l2.ch_end[s]) {
++                seg_row = (ch0 - l2.ch_begin[s]) / ncols;
++                seg_dst = l2.dst[s];
++            }
++        }
++
++        if (seg_dst != nullptr) {
++            const float * row = sy + warp * ncols;
++
++            float tmp = 0.0f;
++            for (int col = lane; col < ncols; col += warp_size) {
++                const float xi = row[col];
++                tmp += xi * xi;
++            }
++            tmp = warp_reduce_sum(tmp);
++
++            const float scale = rsqrtf(fmaxf(tmp, l2.eps * l2.eps));
++
++            float * d = seg_dst + (int64_t) seg_row * ncols;
++            for (int col = lane; col < ncols; col += warp_size) {
++                d[col] = scale * row[col];
++            }
++        }
++    }
++}
++
+ static bool ssm_conv_fold_stock_shape() {
+     static const bool v = getenv("GGML_SSM_CONV_FOLD_STOCK_SHAPE") == nullptr ||
+                           std::atoi(getenv("GGML_SSM_CONV_FOLD_STOCK_SHAPE")) != 0;
+@@ -323,7 +440,8 @@ static void ssm_conv_fold_dump(const ggml_tensor * out, cudaStream_t stream);
+ 
+ void ggml_cuda_op_ssm_conv_fold(ggml_backend_cuda_context & ctx,
+         const ggml_tensor * concat, const ggml_tensor * ssm_conv,
+-        const ggml_tensor * silu, const ggml_tensor * wb_cpy) {
++        const ggml_tensor * silu, const ggml_tensor * wb_cpy,
++        ggml_tensor * const * l2_nodes, int n_l2) {
+     const ggml_tensor * state = concat->src[0];   // [d_conv-1, nr] (view of the cache or the get_rows copy)
+     const ggml_tensor * x     = concat->src[1];   // [1, nr] transposed view of the qkv projection
+     const ggml_tensor * w     = ssm_conv->src[1]; // [d_conv, nr]
+@@ -341,6 +459,25 @@ void ggml_cuda_op_ssm_conv_fold(ggml_backend_cuda_context & ctx,
+     const int grid  = (int) ((nr + block - 1) / block);
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dim3(grid, 1, 1), dim3(block, 1, 1), 0, ctx.stream());
+     ssm_conv_state_dump(state, ctx.stream());
++    if (n_l2 > 0) {
++        GGML_ASSERT(n_l2 <= SSM_CONV_L2_MAX_SEG);
++        ssm_conv_l2_args l2 = {};
++        l2.nseg  = n_l2;
++        l2.ncols = (int) l2_nodes[0]->ne[0];
++        memcpy(&l2.eps, l2_nodes[0]->op_params, sizeof(float));
++        for (int m = 0; m < n_l2; ++m) {
++            const ggml_tensor * src = l2_nodes[m]->src[0];
++            const size_t off = (const char *) src->data - (const char *) silu->data;
++            l2.dst[m]      = (float *) l2_nodes[m]->data;
++            l2.ch_begin[m] = (int) (off / sizeof(float));
++            l2.ch_end[m]   = l2.ch_begin[m] + (int) (src->ne[1] * l2.ncols);
++        }
++        ggml_cuda_kernel_launch((ssm_conv_fold_l2_f32<256>), launch_params,
++            state_d, x_d, w_d, (const float *) nullptr, y_d, wb_d, (int) nr,
++            (int) state->nb[1], (int) x->nb[1], (int) w->nb[1], (int64_t) 1, l2);
++        ssm_conv_fold_dump(silu, ctx.stream());
++        return;
++    }
+     if (ssm_conv_fold_stock_shape()) {
+         ggml_cuda_kernel_launch(ssm_conv_fold_stock_f32, launch_params,
+             state_d, x_d, w_d, (const float *) nullptr, y_d, wb_d, (int) nr,
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cuh b/ggml/src/ggml-cuda/ssm-conv.cuh
+index 7826ab317..a8b07e862 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cuh
++++ b/ggml/src/ggml-cuda/ssm-conv.cuh
+@@ -2,10 +2,25 @@
+ 
+ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node = nullptr, ggml_tensor * silu_dst = nullptr);
+ 
++// Up to this many L2_NORM nodes may ride along in the decode conv fold epilogue
++// (qwen35moe emits exactly two: the q and k conv norms).
++#define SSM_CONV_L2_MAX_SEG 2
++
++// A contiguous run of conv-output channels that becomes `nrows` rows of `ncols`,
++// each l2-normalised into its own destination tensor.
++struct ssm_conv_l2_seg {
++    float * dst;
++    int     ch_begin;
++    int     nrows;
++};
++
+ // GDN conv-chain fold (concat + conv + silu + state writeback in one kernel).
++// `l2_nodes` (may be null) are L2_NORM nodes over channel-aligned views of the
++// silu output; they are computed in the same launch out of shared memory.
+ void ggml_cuda_op_ssm_conv_fold(ggml_backend_cuda_context & ctx,
+         const ggml_tensor * concat, const ggml_tensor * ssm_conv,
+-        const ggml_tensor * silu, const ggml_tensor * wb_cpy);
++        const ggml_tensor * silu, const ggml_tensor * wb_cpy,
++        ggml_tensor * const * l2_nodes = nullptr, int n_l2 = 0);
+ 
+ // Multi-token (prefill) form of the same fold: also deletes the concat_non_cont
+ // transpose that builds the time-major conv input.
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 05923b274..5824fe827 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -487,8 +487,25 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+ 
+     const float eps_norm = hparams.f_norm_rms_eps;
+ 
+-    q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
+-    k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
++    // At the decode shape the two conv norms are made IN-PLACE on the conv
++    // output. Semantically free - the q and k halves of the conv output have no
++    // consumer other than these two norms - and it is what makes the CUDA
++    // conv-fold epilogue able to compute them: with separate destinations
++    // ggml-alloc hands the norms buffers that a node between the conv and the
++    // norms is still using, and the fold declines on every layer (measured).
++    // In place, the norm result lands inside the buffer the fold already owns.
++    // Only at n_t == 1: at prefill the q/k views are strided over tokens, and
++    // an in-place destination would make the norm kernel store contiguously
++    // into a strided view.
++    static const bool l2_inplace = getenv("GGML_L2_NORM_INPLACE") == nullptr ||
++                                   std::atoi(getenv("GGML_L2_NORM_INPLACE")) != 0;
++    if (l2_inplace && n_seq_tokens == 1 && n_seqs == 1) {
++        q_conv = ggml_l2_norm_inplace(ctx0, q_conv, eps_norm);
++        k_conv = ggml_l2_norm_inplace(ctx0, k_conv, eps_norm);
++    } else {
++        q_conv = ggml_l2_norm(ctx0, q_conv, eps_norm);
++        k_conv = ggml_l2_norm(ctx0, k_conv, eps_norm);
++    }
+ 
+     //q_conv = ggml_cont_4d(ctx0, q_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+     //k_conv = ggml_cont_4d(ctx0, k_conv, head_k_dim, num_k_heads, n_seq_tokens, n_seqs);
+-- 
+2.53.0
+
