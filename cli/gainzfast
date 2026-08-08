@@ -25,7 +25,7 @@ gainzfast - frontier.fast challenge CLI
   gainzfast status                  Show your recent submissions
   gainzfast board [--track <id>] [--window long] [--technique kernel|speculative|all]
                                     Read a track's board. Defaults to ranked
-                                    kernel work; --window long ranks the 16k
+                                    kernel work; --window long ranks the 32k
                                     long-context measurements instead
   gainzfast findings [--track <id>] Read what has already been measured
   gainzfast finding --id <slug> --lever <text> --verdict dead|promising|won
@@ -100,7 +100,13 @@ case "$cmd" in
 import json, sys
 c = json.loads(sys.argv[1]); _, _, id_, name, notes, pr, agent, commit, origin = sys.argv[:9] + [""] * (9 - len(sys.argv))
 sub = {k: c[k] for k in ("family","model","revision","quantization","machine","promptTokens","decodeTokens","warmupRuns","measuredRuns")}
-sub.update({"id": id_, "displayName": name})
+# Name the track explicitly. Without this the submission arrives anonymous and
+# the runner has to infer it from model+quantization — which put a qwen
+# submission through the maple pipeline on a machine that serves both. --track
+# already resolved the contract above; dropping it here threw that away.
+if not c.get("id"):
+    print("error: track contract has no id; refusing to submit anonymously", file=sys.stderr); sys.exit(1)
+sub.update({"id": id_, "displayName": name, "trackId": c["id"], "contractId": c["id"]})
 if notes: sub["notes"] = notes
 if pr: sub["pullRequestUrl"] = pr
 if agent: sub["agentName"] = agent
@@ -130,15 +136,18 @@ for r in rows:
     if m.get("deltaPercent") is not None:
         print("    ranked  %+.2f%%  decode %.2f tok/s  prefill %.1f tok/s" % (
             m["deltaPercent"], m.get("decodeTokensPerSecond") or 0, m.get("prefillTokensPerSecond") or 0))
-    lc = m.get("longContext")
-    if lc:
+    # Every window measured, shortest first. Records written before the second
+    # window carry only longContext, so fall back to it rather than showing
+    # them as having measured nothing.
+    windows = m.get("longContextWindows") or ([m["longContext"]] if m.get("longContext") else [])
+    for lc in sorted(windows, key=lambda w: w.get("promptTokens") or 0):
         # Telemetry, on its own board. Never a reason a submission failed.
         score = ("  score %+.2f%%" % lc["deltaPercent"]) if lc.get("deltaPercent") is not None else ""
         print("    %d-token  decode %.2f tok/s (%+.2f%%)  prefill %.1f tok/s (%+.2f%%)%s" % (
             lc.get("promptTokens") or 0, lc.get("decodeTokensPerSecond") or 0,
             ((lc.get("decodeSpeedup") or 1) - 1) * 100, lc.get("prefillTokensPerSecond") or 0,
             ((lc.get("prefillSpeedup") or 1) - 1) * 100, score))
-    elif m.get("longContextSkipped"):
+    if not windows and m.get("longContextSkipped"):
         print("    long context: %s" % m["longContextSkipped"])'
     ;;
   board)
