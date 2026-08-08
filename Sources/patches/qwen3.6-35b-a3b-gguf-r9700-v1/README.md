@@ -1815,10 +1815,12 @@ first-touch weight bandwidth, and never from re-read elimination.
 
 ### Still open, in order
 
-1. **Prefill `gated_delta_net`** — 11.5% of a pp512 pass (439 us x 30). The
-   source carries a `//TODO: Add chunked kernel for even faster pre-fill`; a
-   chunkwise scan is the standard fix and the largest single prefill item left,
-   but it is an algorithmic change with real numeric risk, not a tuning round.
+1. ~~**Prefill `gated_delta_net`**~~ — **taken by 0043, +5.7% prefill, and the
+   chunkwise scan the `//TODO` asks for was not needed**: the kernel was
+   issue-bound on its own reduction, not on the serial recurrence. After 0043 it
+   is 283 us x 30 = 7.6% of a pass; a chunkwise scan is still the only way to
+   attack what is left, and it is still an algorithmic change with real numeric
+   risk.
 2. **The MoE expert matvecs' locality at decode** (Q5_K down 444 GB/s, 499
    us/token) — every tuning axis is closed, so this needs a layout idea
    (interleaving the 8 routed slabs, or a different expert-major ordering),
@@ -1833,16 +1835,185 @@ first-touch weight bandwidth, and never from re-read elimination.
 5. `topk_moe` (40/token, 2.73 us) is already fixed-depth after 0014; what is
    left is close to the single-workgroup launch floor.
 
+## 0043: the prefill gated_delta_net is issue-bound, and half the issue is the butterfly (+5.7% prefill)
+
+Round-26's open lever (1), and it did **not** need the chunkwise scan the source
+`//TODO` suggests. The premise in that TODO — that the serial recurrence is the
+problem — is wrong on this part at this shape, and the free diagnostic said so:
+
+```
+grid (H=32, n_seqs=1, S_v/num_warps=32) x 4 warps = 4096 waves / 128 SIMDs = 32 waves/SIMD
+442 us x 2.4 GHz = 1.06 M cycles / 32 wave-slots / 512 tokens = 65 cycles per token per wave
+```
+
+65 cycles against **~39 VALU ops** of actual per-token work. Not 257 waves and
+latency-starved (0042's router), not saturated-and-scattered (the expert
+matvecs, round 26) — **issue-bound with a wave count that is already right**. And
+of those 39 ops, 20 are the two 5-step DPP butterflies and only 12 are
+arithmetic. The reduction costs more than the recurrence.
+
+### The reformulation
+
+Stock gives one column of the recurrent state to a whole wave: 32 lanes hold 4
+rows each, and each token turns two row-sharded dot products (`S^T k`, `S^T q`)
+into scalars, so two full butterflies pay for 12 FMAs.
+
+`gated_delta_net_mc_cuda` gives **CPW columns to one wave**. The wave splits into
+CPW groups of `32/CPW` lanes; each group owns one column and a proportionally
+taller *contiguous* row shard. Per column the arithmetic is untouched — the same
+four-row FMA chains over the same rows — but the butterfly shrinks to
+`log2(32/CPW)` steps. The dropped levels are not lost: they become in-register
+adds over the lane's own chunk accumulators, which is where the stock lane was
+already spending adds. Cost per column at CPW=4 is ~19 ops against 39.
+
+Measured per kernel: **442 -> 283 us, 1.56x** (CPW=2 291, CPW=8 300).
+
+The stock kernel is left **verbatim** and still serves decode. The multi-column
+kernel is gated on `n_tokens > 1` and on the vec4 layout, so the decode path
+keeps the same kernel, the same geometry, the same registers, and — 0040's rule
+— no new branch in a kernel untouched call sites run.
+
+### The measurement that decided the shape of the patch
+
+The first version templated CPW onto the *existing* kernel rather than adding a
+second one. Against a real control that read **0.994 on tg128, 5/5 rounds** — a
+0.6% decode loss for a prefill patch, purely from the CPW=1 instantiation's
+codegen. Splitting it into two kernels put decode back to 0.999 (arms
+overlapping) and cost prefill nothing. Same lesson as 0040 in a third costume:
+**if the decode path can keep running literally the code it ran before, make it
+do that.**
+
+| arm | pp512 med | vs control | tg128 med | vs control |
+|---|---|---|---|---|
+| control (0042 binary) | 4376.98 | — | 148.54 | — |
+| CPW=1 (stock kernel) | 4367.91 | 1.0005 | 148.34 | 0.9984 |
+| CPW=2 | 4574.74 | 1.0489 | 148.43 | 0.9987 |
+| **CPW=4 (shipped)** | **4615.17** | **1.0571** | 148.41 | 0.9991 |
+| CPW=8 | 4605.63 | 1.0522 | 148.36 | 0.9988 |
+
+pp arms disjoint 5/5 (`min(CPW=4) = 4601.28 > max(control) = 4447.88`); tg arms
+overlap the control in all four cases. CPW=1 at 1.0005 is the proof that the
+added kernels cost the untouched path nothing.
+
+- long context neutral: tg128 @ d16384 136.95 -> 136.66, @ d32768 126.90 -> 126.72
+- firing proven by census diff: 60 launches of
+  `gated_delta_net_mc_cuda<128,false,false,4>` replace 60 of
+  `gated_delta_net_cuda<128,false,false,true>` at the prefill shape
+- `test-backend-ops` GATED_DELTA_NET / SSM_CONV OK
+- `GGML_GDN_COLS_PER_WAVE=1|2|4|8` re-sweeps it; `1` restores the stock kernel
+
+### A control snapshot is not a control — check the RUNPATH
+
+The first A/B of this round read the control at 4664 and CPW=1 at 4399 and said
+the refactor cost 5.7%. All of it was an artefact. `cp -a cand/build/bin ctl43bin`
+is what the round-19 note says to do, and it is **not sufficient**: these thin
+executables carry an *absolute* `DT_RUNPATH` of
+`/home/ghost/fable-qwen/cand/build/bin`, so `ctl43bin/llama-bench` loaded the
+**new** `libggml-hip.so` and the "control" arm was the candidate at its default
+setting. `ldd` on the snapshot says so in one line. `DT_RUNPATH` is searched
+*after* `LD_LIBRARY_PATH` (unlike `DT_RPATH`), so the fix is one variable:
+
+```sh
+LD_LIBRARY_PATH=~/fable-qwen/ctl43bin ~/fable-qwen/ctl43bin/llama-bench ...
+# verify: ldd <bin> | grep ggml-hip   ->   must point INTO the snapshot
+```
+
+Every future control arm in this series must be verified with `ldd` before the
+numbers are believed.
+
+### Not bit-exact — and the reason closes the door on ever making it so
+
+The claim this patch was designed around was that the reduction tree is
+*identical*: chunk `j` of multi-column lane `m` holds exactly what stock lane
+`m*nchunk + j` held, so pairing adjacent chunks in registers reproduces the low
+lane-index bits of the stock butterfly and the shortened DPP sequence supplies
+the high bits, step for step (`^1`, `^2`, `row_half_mirror`, `row_mirror`,
+`permlanex16` is a bit-order-0..4 balanced tree, and each step only ever
+exchanges inside a group of NL lanes). The argument is correct at source level
+and it does not survive the compiler: this tree builds with
+**`-funsafe-math-optimizations`**, so LLVM carries `reassoc` on every FP op and
+re-associates each kernel's accumulation into whatever chain it prefers. Two
+differently shaped sources will not agree no matter how carefully the
+source-level order is matched, and matching them would mean disabling reassoc in
+the *stock* kernel too — which changes decode.
+
+**Carry this forward: on this tree, "I wrote the same reduction order" is not an
+argument for bit-exactness.** The byte-exact folds in this series (0034, 0035,
+0036, 0040, 0041, 0042) are byte-exact because they *move* an unchanged
+computation, not because they rebuild one.
+
+Classified by dumping the op's `dst` and state for the first prefill launch of
+every layer, CPW=1 vs CPW=4 (CPW=1 reproduces itself byte-for-byte across two
+loads, so the op is deterministic and this is purely reassociation):
+
+| | ndiff | max ULP | max rel |
+|---|---|---|---|
+| attn out, CPW=2 | 28.2% | 9 | 7.9e-7 |
+| attn out, CPW=4 | 40.7% | 9 | 6.7e-7 |
+| attn out, CPW=8 | 53.2% | 15 | 1.0e-6 |
+| state, CPW=4 | 0.85% | 512 | 3.5e-5 (on values ~1e-9) |
+| state, CPW=8 | 23.4% | 9430 | 6.2e-4 |
+
+CPW=8 is visibly looser as well as slower — a second reason to ship 4.
+
+### What that costs at the gate: a coin flip of fixed size, not a cost that scales
+
+`llama-perplexity -c 512 --chunks 8`, 4 loads per arm. Two facts first, both
+worth knowing independently of this patch: **stock is perfectly reproducible
+(3.9314 four times), and the banked stack is not** — CPW=1, which runs the stock
+kernel, spreads 3.9230-3.9276 across loads. Something already in 0001-0042 makes
+the gate shape load-dependent at the +-0.05% level. So read medians only.
+
+| arm | loads | median | vs stock |
+|---|---|---|---|
+| stock | 3.9314 x4 | 3.9314 | — |
+| 0042 control binary | 3.9265 / 3.9271 / 3.9271 / 3.9331 | 3.9271 | -0.109% |
+| CPW=1 (same, new binary) | 3.9271 / 3.9230 / 3.9276 / 3.9271 | 3.9271 | -0.109% |
+| **CPW=4 (shipped)** | 3.9182 / 3.9199 / 3.9201 / 3.9211 | **3.9200** | **-0.290%** |
+| CPW=2 | 3.9379 / 3.9339 / 3.9375 / 3.9307 | 3.9357 | +0.109% |
+| CPW=8 | 3.9322 / 3.9308 / 3.9292 / 3.9383 | 3.9315 | +0.003% |
+
+The two control rows landing on the same median to four digits is the
+cross-check that the method is sound. And then **the three multi-column arms go
+-0.29%, +0.11%, +0.00% with no monotone relation to CPW at all** — which is the
+whole story: a ULP perturbation in front of a top-8-of-256 router reroutes
+experts and perplexity lands wherever it lands. There is no "more aggressive
+CPW costs more accuracy" axis to trade along, so **CPW=2 is not a safer
+pare-back** — it is just a different draw, and a slower one.
+
+What that means operationally: the draw is a property of the *configuration*,
+not of the run. Within CPW=4 the four loads span 0.074%; across configurations
+the span is 0.40%. So the shipped -0.290% is stable and reproducible, sits 0.21
+points inside the +-0.5% gate, and does not need re-drawing. But it is the first
+patch in the series to spend real gate budget, and the budget is shared: **any
+future non-byte-exact fold has to be measured on top of this stack, not against
+stock, and it draws its own +-0.3%.** If a round ever needs the headroom back,
+`GGML_GDN_COLS_PER_WAVE=1` is the only reliable way to get it — that restores the
+stock kernel and gives up the whole +5.7%.
+
+decode-path ppl `-b 512 -ub 1 --chunks 8`: **3.9338**, identical to the banked
+stack, in both arms — the multi-column kernel is gated off the decode shape by
+construction, so the decode ladder is untouched.
+
+`llama-server` greedy vs the CPW=1 control: **2/6 byte-identical**, the other
+four diverging after 101-408 B, all six completions non-empty and >= 276 B.
+That is the expected and permitted consequence of a float32 regrouping in front
+of a top-8 router (0031 and 0033 are the precedents in this series), but it does
+mean **byte-exact greedy is no longer available as this round's safety net** —
+the decode-path perplexity reading and the census diff are.
+
 ## Recommended firing order
 
 The runner applies the whole patch directory, so the series is a ladder rather
-than a choice; **0001-0042** is the verified set and every patch that carries
+than a choice; **0001-0043** is the verified set and every patch that carries
 speed has a disable toggle. Two do not carry speed: **0038** is 0037's kernel
 made bit-identical and must not be applied without 0037; **0039** is 0031's
 kernel made sign-of-zero-exact and must not be applied without 0031
 (`GGML_SSM_CONV_FOLD_STOCK_SHAPE=0` falls back to the 0031 kernel in place).
-If a ranked run has to be pared back, drop from the end: 0042 (a one-constant
-change, independent of everything), then 0041 (needs 0031+0039,
+If a ranked run has to be pared back, drop from the end: 0043 (prefill only,
+independent of everything, and the one patch that spends real perplexity
+budget — `GGML_GDN_COLS_PER_WAVE=2` is the half-measure), then 0042 (a
+one-constant change, independent of everything), then 0041 (needs 0031+0039,
 which own the decode conv fold it extends), then 0040 (prefill only, independent
 of everything), then 0039, then 0038+0037, then 0036, 0035, 0034 (independent
 +1.5% decode folds); 0033 is the prefill fold; 0032 and 0030 are the two largest
@@ -1852,12 +2023,13 @@ combine as n_expert_used-1 separate adds. 0041 likewise has two halves (the
 in-place norm in `qwen35moe.cpp` and the CUDA epilogue) and the CUDA half
 declines without the graph half.
 
-**Projection after 0042: ~1.591-1.596 vs the 1.4525 bank.** Decode 1.7536 ->
-**1.7893** (x1.0133 from 0041, x1.0070 from 0042); prefill 1.2911 -> **1.3205**
-(x1.0228 from 0040); ttft moves with
-prefill for prompt processing, so the band spans ttft flat (1.584) to ttft
-carrying the full prefill ratio (1.589). Every ratio here is measured against a
-binary built from the patch's own parent commit, not against a toggle.
+**Projection after 0043: ~1.609-1.628 vs the 1.4525 bank.** Decode 1.7536 ->
+**1.7893** (x1.0133 from 0041, x1.0070 from 0042); prefill 1.2911 -> 1.3205
+(x1.0228 from 0040) -> **1.3959** (x1.0571 from 0043); ttft moves with
+prefill for prompt processing, so the band spans ttft flat (1.609) to ttft
+carrying the full prefill ratio (1.628). Every ratio here is measured against a
+binary built from the patch's own parent commit, not against a toggle — and
+from 0043 on, against one whose `ldd` was checked.
 
 Rounds 21 and 22 bought correctness; 23, 24 and 25 are the first speed since
 0037 — one on the prefill side, two on the decode side.
