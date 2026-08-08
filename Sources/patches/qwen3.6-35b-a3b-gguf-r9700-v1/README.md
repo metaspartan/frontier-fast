@@ -1233,18 +1233,73 @@ the gate that declined), `GGML_CUDA_MOE_REDUCE_PER_SLOT=1` (bisect mode).
 Projection with 0033+0034+0035+0036+0037: decode 1.7265 x 1.0157 = **1.7536**,
 prefill **1.2911**, ttft **1.2258** -> score **~1.563** vs the 1.4525 bank.
 
+## 0038: the accumulator's declared shape was the contraction — 0037 is byte-exact
+
+0037 shipped as reassociation-class on the strength of its own bisect mode:
+`GGML_CUDA_MOE_REDUCE_PER_SLOT=1` reproduced the folded result exactly, so the
+slot-order reduction was exact and the rewritten matvec body was to blame.
+The body was not to blame. The **declaration** was.
+
+Stock `mul_mat_vec_q` accumulates into
+`float tmp[ncols_dst][rows_per_cuda_block]` and indexes it inside `#pragma
+unroll` loops. 0037 collapsed that to a scalar `float tmp` — the same
+arithmetic, and the compiler contracts it differently. Restoring the array
+shape (`float tmp[rpb]`, written by an unrolled row loop exactly as stock's `i`
+loop does) restores stock codegen:
+
+- **decode-path perplexity** (`-b 512 -ub 1 --chunks 8`, so the fold fires on
+  every layer at every position): fold ON **3.9338**, fold-off control
+  **3.9338** — identical, where 0037 read 3.9404 against the same control
+- **server greedy vs the fold-off control: 6/6 BYTE-EXACT** (0037: 2/6). Against
+  the full pre-patch build it is 5/6, the sixth being p5, the near-tie prompt
+  that drifts A/A in the control too
+- no cost: toggle A/B 5 rounds, tg128 143.01-143.23 -> 145.16-145.41, median
+  ratio **1.0152**, 5/5 disjoint — 0037 measured 1.0157, i.e. the same gain
+- official gate ppl 3.9320/3.9284/3.9267 vs stock 3.9314; prefill still
+  structurally untouched; `test-backend-ops` MUL_MAT_ID / ADD / MUL OK
+
+**This contradicts 0031's note that mirroring the source structure does not
+help.** It does — but the thing that has to match is the accumulator's declared
+shape and the loop nest that writes it, not the surrounding statements. Try it
+before accepting a reassociation-class result on any future matvec rewrite; it
+took one build here and turned a ppl-gated argument into bit-identity. It is
+also worth re-trying on 0031 and 0033, whose folds are still drifting.
+
+### Measured-dead this round: rows per block in the expert-reduce launch
+
+The array shape arrives with the knob it was written for,
+`GGML_MMVQ_EXPERT_REDUCE_RPB` (default 1 = shipped). Round-20 item 1 was the
+expert-down at 444 GB/s against the 527 the Q4_K gate/up reaches; giving each
+warp more than one row is the obvious fix, and it is not one. Swept on gfx1201,
+paired and interleaved:
+
+| rpb | tg128 | note |
+|---|---|---|
+| **1** | 145.45-145.76 | **shipped**; byte-exact |
+| 2 | 145.74-146.03 | +0.20%, 5/5 disjoint — but re-contracts, so not byte-exact |
+| 4 | 138.27 | **-4.8%** |
+| 8 | 144.42 | -0.6% |
+
+rpb=2 is real but tiny and costs the bit-identity argument, so it is not the
+default; rpb=4 collapses. This is the third independent confirmation (after
+round 11's dense-Q6_K corrections and 0029's per-shape retreat) that **matvec
+launch geometry on this part is exhausted** — the small quantized matvecs are
+latency/ramp-bound, and neither wider loads nor more rows per block moves them.
+Per-row, per-thread k-block assignment is unchanged at every rpb, so the knob is
+safe to re-sweep on other hardware.
+
+Projection is unchanged from 0037 (~1.563 vs the 1.4525 bank): 0038 buys
+bit-identity, not speed.
+
 ## Round-20 map (post-0037: 781 dispatches/token)
 
 `k_bin_bcast` is now 1/token and the quantize census is closed, so the cheap
 dispatch-removal seam this series has mined since round 12 is essentially spent
 at decode. What is left, in order:
 
-1. **The Q5_K/Q6_K expert down at 444 GB/s** against the 527 GB/s the Q4_K
-   gate/up reaches. It now runs inside `mul_mat_vec_q_expert_reduce` at
-   13.7us x 40, so the per-shape rows-per-block experiment (never blanket —
-   0024/0028 recorded blanket rpb on the ids path as a regression) has a new
-   and much more convenient home: the fold kernel is small, self-contained and
-   already gated to one shape.
+1. ~~**The Q5_K/Q6_K expert down at 444 GB/s**~~ — **swept dead, see 0038.**
+   Rows per block inside the fold kernel gives +0.20% at rpb=2 and -4.8% at
+   rpb=4. Geometry on this matvec is finished.
 2. **`rms_norm_pre_add` 80 x 2.8us** is closed as a kernel (round 19) but its
    *input* is not: after 0037 it reads the 8 KB reduced row instead of nothing
    new, so the traffic argument that motivated the fold is spent — what remains
@@ -1260,8 +1315,10 @@ at decode. What is left, in order:
 ## Recommended firing order
 
 The runner applies the whole patch directory, so the series is a ladder rather
-than a choice; 0001-0037 is the verified set and every patch has a disable
-toggle. If a ranked run has to be pared back, drop from the end: 0037, 0036,
+than a choice; 0001-0038 is the verified set and every patch has a disable
+toggle. 0038 has no toggle and no speed of its own — it is 0037's kernel made
+bit-identical, and must not be applied without 0037. If a ranked run has to be
+pared back, drop from the end: 0038+0037, 0036,
 0035, 0034 are independent +1.5% decode folds; 0033 is the prefill fold; 0032
 and 0030 are the two largest decode wins and should be the last to go. 0037 has
 two halves in different files — dropping it means dropping both, since the
