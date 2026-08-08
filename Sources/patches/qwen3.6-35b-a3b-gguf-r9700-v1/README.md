@@ -932,3 +932,76 @@ warp), so the lever is rows-per-block rather than warps (note 0024/0028
 recorded blanket rpb on the ids path as a regression, so it needs to be
 per-shape); (3) folding the 8-way expert reduction into the down matvec so
 `rms_norm_pre_add` reads 16 KB instead of 72 KB.
+
+
+## 0036: the q8_1 quantize folded into the fused unary+mul (+1.5% decode, BYTE-EXACT)
+
+Round-17 map item (1), and it closes the quantize census. Of the 81
+`quantize_q8_1` launches per decode token, round 17 measured the largest
+population (40, the MoE swiglu) structurally unfoldable. The other two are the
+same shape of problem and fold together:
+
+| n/token | activation | producer | consumer |
+|---|---|---|---|
+| 30 | GDN gated norm | `ggml_mul(rms_norm(o), silu(z))` | `ssm_out` Q6_K |
+| 10 | attention gate product | `ggml_mul(attn, sigmoid(g))` | `attn_output` Q6_K |
+
+Both producers are SAME-SHAPE multiplies whose second operand is a unary of
+another tensor, so **upstream already fuses each pair** into one
+`unary_gated_op_kernel` launch. The value the consumer's `quantize_q8_1` then
+loads back out of memory is the float that kernel held in a register one
+instruction earlier.
+
+The kernel that does both already existed: 0010 added
+`unary_gated_op_quant_kernel` for the GLU path, and its body is the plain gated
+kernel plus the stock `quantize_q8_1` statements over the value just stored.
+This patch only makes it *reachable* from the unary+mul fusion site - three
+small edits, no new kernel:
+
+1. `ggml_cuda_op_unary_mul` takes an optional `q8_1_dst` and routes to
+   `unary_gated_quant_cuda` when non-null (F32 only).
+2. `ggml_cuda_try_fuse` asks `ggml_cuda_quant_register_for_consumer` whether
+   the product feeds a mul_mat_vec_q in the lookahead window.
+3. `GGML_CUDA_DISABLE_UNARY_MUL_QUANT=1` restores the stock pair.
+
+**Why `quant_register_for_consumer` and not the plain register** - the same
+reason 0012 needed it. Neither consumer reads the product tensor: `ssm_out`
+reads `final_output`, a RESHAPE to `[head_v_dim*num_v_heads, n_t, n_s]`, and
+the o-projection reads the flat `[n_embd]` row. The cache entry has to be keyed
+on the consumer's view or the consumer looks it up and misses.
+
+- dispatches 861 -> **821/token**; `quantize_q8_1` 81 -> **41/token**
+- toggle A/B, 5 rounds: tg128 141.49-141.73 -> **143.63-143.87**, median ratio
+  **1.0147**, 5/5 disjoint; pp512 neutral (4347.1 vs 4344.5 median)
+- whole-process vs stock, 5 rounds: tg128 median ratio **1.7825**
+  (0035: 1.7542), pp512 **1.3504**
+- ppl 3.9273/3.9296/3.9277 vs stock 3.9314 (**-0.09%**); fold-off control same
+  session 3.9237/3.9271/3.9260
+- test-backend-ops UNARY / MUL / GLU / MUL_MAT / MUL_MAT_ID / RMS_NORM OK
+- **server greedy 6/6 BYTE-EXACT** vs the fold-off control (and 6/6 A/A), all
+  six completions non-empty and >= 276 bytes
+- full 36-patch series applies clean to pristine b10237 and the resulting tree
+  is `diff -r` identical to the measured tree
+
+**Trap (1) checked rather than assumed this time, and it passed.** A kernel
+trace of the *gate command itself* (`llama-perplexity -c 512 --chunks 8`) shows
+`quantize_q8_1` 121 -> 81 with exactly 30 silu and 10 sigmoid pairs moving from
+`unary_gated_op_kernel` to `unary_gated_op_quant_kernel`. The fold fires under
+the tool it is gated with, so the ppl reading covers it. Worth noting the
+opposite failure mode is easy here: at large `n_t` the consumer takes the MMQ
+path, `ggml_cuda_should_use_mmvq` declines, the register returns null and the
+fold correctly does nothing - a `-b`/`-ub` choice that keeps every ubatch large
+would have produced a meaningless green ppl.
+
+Byte-exactness argument: the folded kernel evaluates `op(x)*g` with the same
+operands in the same order as the kernel it replaces, and quantizes that float
+from a register instead of from the store that just wrote it (an f32 store/load
+round trip, exact). `quant_register_for_consumer` declines anything needing a
+padded row (`ne10_padded != ne10`), so the flat thread index maps to the q8_1
+block and lane that `quantize_q8_1`'s row-major mapping gives, and the amax /
+sum warp reductions see the same values in the same lanes. The 6/6 byte-exact
+server greedy is the measurement that confirms it.
+
+Projection with 0033+0034+0035+0036: decode 1.5959 x 1.0335 x 1.0152 x 1.0161
+x 1.0147 = **1.7265**, prefill 1.2468 x 1.0355 = **1.2911**, ttft following
+prefill (1.1838 x 1.0355 = 1.2258) -> score **~1.547** vs the 1.4525 bank.
