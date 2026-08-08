@@ -1,0 +1,723 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH 33/33] cuda/hip: extend the GDN conv-chain fold to the prefill shape, deleting concat_non_cont (+3.6% prefill)
+
+Round-13's prefill profile put `concat_non_cont` at 4.7% of pp512 (30 x 188 us),
+and a fresh profile of the r13+0032 build reproduces it (30 x 165 us per pass,
+4.1% of 240 ms). It is pure layout churn. Every GDN layer builds its conv input
+as
+
+    conv_input = CONCAT(state_window[3, C], TRANSPOSE(qkv_mixed)[n_t, C])
+
+- a [3+n_t, C] TIME-major buffer assembled by a scalar-indexed kernel from a
+CHANNEL-major activation - only for `ggml_ssm_conv` to read it back out
+channel by channel and write a channel-major result. At pp512 that is 16.8 MB
+read non-contiguously plus 16.8 MB written, per layer, at ~170 GB/s, five
+times the cost of the convolution it feeds.
+
+0031 already collapses CONCAT + SSM_CONV + SILU + the conv-state writeback CPY
+into one kernel, but only at n_t == 1. This patch generalises that fold to
+n_t > 1 (and to n_s > 1, see below): one thread owns a channel, walks
+`qkv_mixed` in its natural channel-major layout with the d_conv-wide window in
+registers, and writes the silu of the convolution straight to its destination.
+The concat never happens; per pass 30 concat_non_cont (165 us), 30
+ssm_conv_long_token_f32 (39 us) and 30 writeback cpys become 30 fold kernels
+(38 us) plus a staging kernel below the noise floor. Kernel time per pp512 pass
+drops 240.3 -> 224.3 ms and the fold kernel runs at an effective 876 GB/s
+(the activation is still MALL-resident from the projection that produced it).
+
+Two hazards, both real and both load-bearing:
+
+1. ALIASING. `ggml-alloc` places the conv/silu output exactly on top of
+   `qkv_mixed` - the CONCAT is that activation's last consumer, so it is dead
+   the moment the fold starts - which means the kernel writes its input.
+   Per channel that is safe: output token i is emitted only after column
+   i+d_conv-1 is already in registers, and every later output of that channel
+   reads it from the register window, never from memory. It is NOT safe across
+   token chunks (a chunk's d_conv-1 prologue columns are the previous chunk's
+   outputs) nor for the conv-state writeback (which reads the last d_conv-1
+   input columns). So the chunked path stages both, from the still-pristine
+   input, in a separate kernel before any output is written; and the detector
+   declines outright unless the two tensors are EXACTLY co-located or fully
+   disjoint, since any other overlap would cross channels.
+   When one chunk covers the whole ubatch - every server prompt shorter than
+   GGML_SSM_CONV_FOLD_SPLIT (default 64) - a second kernel takes over that
+   needs no staging at all: the window it must write back is still in the
+   thread's registers after the last output. No scratch, no pool allocation,
+   one launch.
+
+2. THE GATE CORPUS RUNS n_s = 4. `llama-perplexity` packs n_batch/n_ctx
+   sequences into one ubatch, so the gate corpus at `-c 512` evaluates
+   n_t = 128, n_s = 4 - and the 0031 detector required n_s == 1. The first
+   version of this patch was therefore never exercised by the perplexity gate
+   at all while looking perfectly healthy. The detector and both kernels now
+   carry the sequence dimension. Anything that measures this fold must first
+   confirm it FIRES there: GGML_CUDA_SSM_CONV_FOLD_DEBUG=1 prints one
+   accept/decline line per layer, with the numbered gate that declined.
+
+Signed zero: the stock kernels accumulate from a literal 0.0f that their
+codegen keeps, while the fold's is folded away, so an all-zero window landed on
+-0.0 where stock produces +0.0 - value-equal, but the sign survives silu into
+the rest of the graph. An arithmetic `+ 0.0f` is legal to optimise away and
+duly was; the fold normalises the bit pattern instead, at one VALU op per
+output.
+
+GGML_CUDA_DISABLE_SSM_CONV_FOLD_SEQ=1 restores the stock prefill chain (the
+n_t == 1 decode fold from 0031 is untouched by that toggle);
+GGML_SSM_CONV_FOLD_SPLIT and GGML_SSM_CONV_FOLD_BLOCK tune the chunked path.
+GGML_SSM_CONV_DUMP / GGML_SSM_WB_DUMP / GGML_SSM_STATE_DUMP write the conv
+output, the writeback triple and the decode-entry state to disk in a layout
+that is directly comparable between the two arms; they are how the numbers
+below were obtained and they skip themselves while a graph is capturing.
+
+Measured (runner box, HIP_VISIBLE_DEVICES=0):
+
+- same-binary toggle A/B, 5 interleaved rounds: pp512 4155.2-4195.1 off ->
+  4302.3-4359.2 on, median per-round ratio 1.0355 (arms fully disjoint,
+  5/5); tg128 neutral (137.3-137.7 both arms)
+- whole-process stock vs cand, 5 rounds: see README
+- split sweep (pp512): 16 -> 4285, 32 -> 4294, 64 -> 4268, 128 -> 4288,
+  256 -> 4250, 512 (single chunk) -> 4176. Flat over 16-128; 64 shipped.
+- gate ppl: 3.9288 / 3.9261 / 3.9271 / 3.9271 / 3.9267 vs stock 3.9314
+  (-0.07% to -0.13%, band 0.5%); the fold-off control in the same session
+  reads 3.9262-3.9390
+- test-backend-ops SSM_CONV / CONCAT / CPY / UNARY / GATED_DELTA_NET /
+  MUL_MAT all OK
+- numerics, measured directly rather than argued: over a full 512-token
+  prefill (n_t=512, n_s=1) all 30 GDN conv outputs are BYTE-IDENTICAL to
+  stock, as is the conv-state writeback; likewise at n_t = 2, 4, 5, 8, 11,
+  12, 16, 64, 128 and at n_s = 2 and 4. From the SECOND ubatch of a sequence
+  - i.e. once the conv state is no longer zero - the 4-term dot product
+  contracts differently than the stock kernel's and ~10% of outputs move by
+  1 ULP (2 ULP was never observed). That is the same ppl-gated class as
+  0024/0026/0028/0031 and the mildest instance of it in the series.
+- server greedy: the candidate is deterministic (6/6 byte-exact A/A); vs the
+  fold-off control 2/6 byte-exact and 4/6 drift at 9-58% prefixes, which is
+  the 1-ULP class above, not a state error - the writeback was verified
+  directly against the stock arm's materialised conv_input.
+
+---
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index b8c0f08fa..ce07859ca 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4178,31 +4178,52 @@ static int ggml_cuda_set_rows_collect_group(const ggml_cgraph * cgraph, const in
+ // window; the fused kernel then computes conv+silu straight from the two
+ // concat sources and performs the (register-buffered, alias-safe) state
+ // writeback, eliminating the concat and cpy launches and their bytes.
++// GGML_SSM_CONV_FOLD_DEBUG=1 names the gate that declined a layer. These
++// declines are allocation-dependent (see 0032) and cannot be reasoned about
++// from source alone - use it before guessing.
++static bool ggml_cuda_ssm_conv_fold_dbg() {
++    static const bool v = getenv("GGML_CUDA_SSM_CONV_FOLD_DEBUG") != nullptr &&
++                          std::atoi(getenv("GGML_CUDA_SSM_CONV_FOLD_DEBUG"));
++    return v;
++}
++#define SSM_FOLD_NO(tag) do { if (ggml_cuda_ssm_conv_fold_dbg()) { \
++        fprintf(stderr, "ssm-conv-fold: decline %s (node %d)\n", tag, i); } return false; } while (0)
++
+ static bool ggml_cuda_ssm_conv_fold_detect(const ggml_cgraph * cgraph, const int i,
+         const ggml_tensor ** out_ssm_conv, const ggml_tensor ** out_silu, const ggml_tensor ** out_wb_cpy) {
+     const ggml_tensor * concat = cgraph->nodes[i];
+     if (concat->op != GGML_OP_CONCAT || concat->type != GGML_TYPE_F32) {
+-        return false;
++        SSM_FOLD_NO("g1");
+     }
+     const ggml_tensor * state = concat->src[0];
+     const ggml_tensor * x     = concat->src[1];
+     if (state == nullptr || x == nullptr) {
+-        return false;
++        SSM_FOLD_NO("g2");
+     }
+-    // dim-0 concat of a [3, nr] window with a [1, nr] token column
++    // dim-0 concat of a [3, nr] window with an [n_t, nr] transposed token block
+     if (ggml_get_op_params_i32(concat, 0) != 0) {
+-        return false;
++        SSM_FOLD_NO("g3");
+     }
+     if (state->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32) {
+-        return false;
++        SSM_FOLD_NO("g4");
+     }
+-    if (state->ne[0] != 3 || x->ne[0] != 1 || concat->ne[0] != 4 ||
++    const int64_t n_t = x->ne[0];
++    const int64_t n_s = concat->ne[2];
++    if (state->ne[0] != 3 || n_t < 1 || concat->ne[0] != 3 + n_t ||
+             state->ne[1] != concat->ne[1] || x->ne[1] != concat->ne[1] ||
+-            concat->ne[2] != 1 || concat->ne[3] != 1) {
+-        return false;
++            state->ne[2] != n_s || x->ne[2] != n_s ||
++            (n_t == 1 && n_s != 1) || concat->ne[3] != 1) {
++        SSM_FOLD_NO("g5");
+     }
+     if (!ggml_is_contiguous(state) || state->nb[0] != sizeof(float) || x->nb[0] == 0) {
+-        return false;
++        SSM_FOLD_NO("g6");
++    }
++    if (n_t > 1) {
++        // the multi-token kernel walks the activation in its natural
++        // channel-major layout: the transposed view must be channel-contiguous
++        if (x->nb[1] != sizeof(float)) {
++            SSM_FOLD_NO("g7");
++        }
+     }
+ 
+     const ggml_tensor * ssm_conv = nullptr;
+@@ -4234,17 +4255,18 @@ static bool ggml_cuda_ssm_conv_fold_detect(const ggml_cgraph * cgraph, const int
+                 } else if (cand->op == GGML_OP_CPY && k == 0 && src->view_src == concat) {
+                     if (wb_cpy != nullptr) { return false; }
+                     // the tail view: positions [1, 3] of every channel
+-                    if (src->ne[0] != 3 || src->ne[1] != concat->ne[1] ||
+-                            (const char *) src->data != (const char *) concat->data + sizeof(float) ||
+-                            src->nb[1] != concat->nb[1]) {
+-                        return false;
++                    if (src->ne[0] != 3 || src->ne[1] != concat->ne[1] || src->ne[2] != n_s ||
++                            (const char *) src->data != (const char *) concat->data + n_t * sizeof(float) ||
++                            src->nb[1] != concat->nb[1] || src->nb[2] != concat->nb[2]) {
++                        SSM_FOLD_NO("g8");
+                     }
+                     // writeback target must be a contiguous f32 view
+                     const ggml_tensor * dst_v = cand->src[1];
+                     if (dst_v == nullptr || dst_v->type != GGML_TYPE_F32 ||
+                             dst_v->nb[0] != sizeof(float) || !ggml_is_contiguous(dst_v) ||
+-                            ggml_nelements(dst_v) != 3 * concat->ne[1]) {
+-                        return false;
++                            ggml_nelements(dst_v) != 3 * concat->ne[1] * n_s ||
++                            (n_s > 1 && dst_v->ne[0] != 3 * concat->ne[1])) {
++                        SSM_FOLD_NO("g9");
+                     }
+                     wb_cpy = cand;
+                 } else {
+@@ -4255,27 +4277,59 @@ static bool ggml_cuda_ssm_conv_fold_detect(const ggml_cgraph * cgraph, const int
+         GGML_UNUSED(consumes);
+     }
+     if (ssm_conv == nullptr || wb_cpy == nullptr) {
+-        return false;
++        SSM_FOLD_NO("g10");
+     }
+     // conv weights: [4, nr] f32, no bias fusion (decline if an ADD consumes the conv)
+     const ggml_tensor * w = ssm_conv->src[1];
+     if (w == nullptr || w->type != GGML_TYPE_F32 || w->ne[0] != 4 || w->ne[1] != concat->ne[1] ||
+             w->nb[0] != sizeof(float)) {
+-        return false;
++        SSM_FOLD_NO("g11");
+     }
+     // the conv output must be consumed by exactly one SILU (the stock fused shape here)
+     const int idx_conv = [&]() { for (int j = i + 1; j < window; ++j) { if (cgraph->nodes[j] == ssm_conv) return j; } return -1; }();
+     if (idx_conv < 0 || idx_conv + 1 >= cgraph->n_nodes) {
+-        return false;
++        SSM_FOLD_NO("g12");
+     }
+     const ggml_tensor * cand_silu = cgraph->nodes[idx_conv + 1];
+     if (cand_silu->op != GGML_OP_UNARY || ggml_get_unary_op(cand_silu) != GGML_UNARY_OP_SILU ||
+             cand_silu->src[0] != ssm_conv || cand_silu->type != GGML_TYPE_F32 ||
+-            !ggml_is_contiguous(cand_silu) || ggml_nelements(cand_silu) != concat->ne[1]) {
+-        return false;
++            !ggml_is_contiguous(cand_silu) || ggml_nelements(cand_silu) != concat->ne[1] * n_t * n_s ||
++            cand_silu->ne[0] != concat->ne[1] || cand_silu->ne[1] != n_t || cand_silu->ne[2] != n_s) {
++        SSM_FOLD_NO("g13");
++    }
++    if (n_t > 1) {
++        // The fold writes the conv output while still reading the activation.
++        // ggml-alloc is free to place them on top of each other (the CONCAT is
++        // the activation's last consumer). Per channel that is safe - output
++        // token i is written only after input column i+3 is in registers, and
++        // the chunk prologues and the state writeback are pre-staged - but only
++        // when the two tensors are EXACTLY co-located. Any other overlap would
++        // cross channels, so decline it.
++        const char * xb = (const char *) x->data;
++        const char * yb = (const char *) cand_silu->data;
++        const char * xe = xb + (size_t) (n_s - 1) * x->nb[2] + (size_t) (n_t - 1) * x->nb[0] +
++                          (size_t) concat->ne[1] * sizeof(float);
++        const char * ye = yb + (size_t) ggml_nbytes(cand_silu);
++        const bool exact  = (xb == yb) && ((size_t) x->nb[0] == (size_t) cand_silu->nb[1]) &&
++                            ((size_t) x->nb[2] == (size_t) cand_silu->nb[2]);
++        const bool disjnt = (ye <= xb) || (xe <= yb);
++        if (ggml_cuda_ssm_conv_fold_dbg()) {
++            fprintf(stderr, "ssm-conv-fold: alias n_t=%d exact=%d disjoint=%d\n", (int) n_t, (int) exact, (int) disjnt);
++        }
++        static const bool no_alias = getenv("GGML_CUDA_SSM_CONV_FOLD_NOALIAS") != nullptr &&
++                                     std::atoi(getenv("GGML_CUDA_SSM_CONV_FOLD_NOALIAS"));
++        if (no_alias && !disjnt) {
++            SSM_FOLD_NO("alias");
++        }
++        if (!exact && !disjnt) {
++            SSM_FOLD_NO("g14");
++        }
+     }
+     silu = cand_silu;
+ 
++    if (ggml_cuda_ssm_conv_fold_dbg()) {
++        fprintf(stderr, "ssm-conv-fold: accept node %d n_t=%d n_s=%d nr=%d\n", i, (int) n_t, (int) n_s, (int) concat->ne[1]);
++    }
+     *out_ssm_conv = ssm_conv;
+     *out_silu     = silu;
+     *out_wb_cpy   = wb_cpy;
+@@ -5574,6 +5628,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_SOFTPLUS_MUL"));
+             static const bool disable_ssm_conv_fold = getenv("GGML_CUDA_DISABLE_SSM_CONV_FOLD") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_SSM_CONV_FOLD"));
++            static const bool disable_ssm_conv_fold_seq = getenv("GGML_CUDA_DISABLE_SSM_CONV_FOLD_SEQ") != nullptr &&
++                                                   std::atoi(getenv("GGML_CUDA_DISABLE_SSM_CONV_FOLD_SEQ"));
+             const bool mmvq_group_enabled = !disable_mmvq_group && stream_ctx.concurrent_events.empty();
+             static const bool log_mmvq_group_stats = getenv("GGML_MMVQ_GROUP_STATS") != nullptr;
+             int64_t mmvq_group_stats_buf[2] = {0, 0};
+@@ -5640,8 +5696,19 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     const ggml_tensor * f_conv = nullptr;
+                     const ggml_tensor * f_silu = nullptr;
+                     const ggml_tensor * f_cpy  = nullptr;
+-                    if (ggml_cuda_ssm_conv_fold_detect(cgraph, i, &f_conv, &f_silu, &f_cpy)) {
+-                        ggml_cuda_op_ssm_conv_fold(*cuda_ctx, node, f_conv, f_silu, f_cpy);
++                    const bool multi_tok = node->src[1] != nullptr && node->src[1]->ne[0] > 1;
++                    if ((!multi_tok || !disable_ssm_conv_fold_seq) &&
++                            ggml_cuda_ssm_conv_fold_detect(cgraph, i, &f_conv, &f_silu, &f_cpy)) {
++                        if (multi_tok) {
++                            static const bool keep_concat = getenv("GGML_CUDA_SSM_CONV_FOLD_KEEPCONCAT") != nullptr &&
++                                                            std::atoi(getenv("GGML_CUDA_SSM_CONV_FOLD_KEEPCONCAT"));
++                            if (keep_concat) {
++                                ggml_cuda_op_concat(*cuda_ctx, node);
++                            }
++                            ggml_cuda_op_ssm_conv_fold_seq(*cuda_ctx, node, f_conv, f_silu, f_cpy);
++                        } else {
++                            ggml_cuda_op_ssm_conv_fold(*cuda_ctx, node, f_conv, f_silu, f_cpy);
++                        }
+                         grouped_done.insert(f_conv);
+                         grouped_done.insert(f_silu);
+                         grouped_done.insert(f_cpy);
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index 515b8d8da..9f89febaf 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -2,6 +2,26 @@
+ #include "ssm-conv.cuh"
+ #include "unary.cuh"
+ 
++#include <vector>
++
++static bool ssm_dump_capturing(cudaStream_t stream) {
++#ifdef GGML_USE_HIP
++    hipStreamCaptureStatus st = hipStreamCaptureStatusNone;
++    if (hipStreamIsCapturing(stream, &st) != hipSuccess) { return true; }
++    return st != hipStreamCaptureStatusNone;
++#else
++    cudaStreamCaptureStatus st = cudaStreamCaptureStatusNone;
++    if (cudaStreamIsCapturing(stream, &st) != cudaSuccess) { return true; }
++    return st != cudaStreamCaptureStatusNone;
++#endif
++}
++
++static int ssm_dump_max() {
++    static const int v = getenv("GGML_SSM_DUMP_MAX") ? atoi(getenv("GGML_SSM_DUMP_MAX")) : 60;
++    return v;
++}
++
++
+ template <bool apply_silu, size_t split_d_inner, size_t d_conv>
+ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_ptr,
+                                     const float * bias_ptr,
+@@ -207,6 +227,27 @@ static __global__ void ssm_conv_fold_f32(const float * __restrict__ state, const
+     wbc[2] = xv;
+ }
+ 
++// Diagnostic: GGML_SSM_STATE_DUMP=<prefix> writes the conv state as the decode
++// fold sees it on entry, i.e. exactly what the previous step wrote back.
++static void ssm_conv_state_dump(const ggml_tensor * state, cudaStream_t stream) {
++    static const char * pfx = getenv("GGML_SSM_STATE_DUMP");
++    if (pfx == nullptr || ssm_dump_capturing(stream)) {
++        return;
++    }
++    static int n = 0;
++    if (n >= ssm_dump_max()) {
++        return;
++    }
++    const size_t nb = ggml_nbytes(state);
++    std::vector<char> host(nb);
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    CUDA_CHECK(cudaMemcpy(host.data(), state->data, nb, cudaMemcpyDeviceToHost));
++    char path[512];
++    snprintf(path, sizeof(path), "%s.%03d.bin", pfx, n++);
++    FILE * f = fopen(path, "wb");
++    if (f) { fwrite(host.data(), 1, nb, f); fclose(f); }
++}
++
+ void ggml_cuda_op_ssm_conv_fold(ggml_backend_cuda_context & ctx,
+         const ggml_tensor * concat, const ggml_tensor * ssm_conv,
+         const ggml_tensor * silu, const ggml_tensor * wb_cpy) {
+@@ -226,10 +267,346 @@ void ggml_cuda_op_ssm_conv_fold(ggml_backend_cuda_context & ctx,
+     const int block = 256;
+     const int grid  = (int) ((nr + block - 1) / block);
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dim3(grid, 1, 1), dim3(block, 1, 1), 0, ctx.stream());
++    ssm_conv_state_dump(state, ctx.stream());
+     ggml_cuda_kernel_launch(ssm_conv_fold_f32, launch_params,
+         state_d, x_d, w_d, y_d, wb_d, (int) nr, (int) state->nb[1], (int) x->nb[1], (int) w->nb[1]);
+ }
+ 
++// ---------------------------------------------------------------------------
++// Multi-token (prefill) generalisation of the GDN conv-chain fold.
++//
++// The stock prefill chain materialises conv_input = CONCAT(state_window,
++// TRANSPOSE(qkv_mixed)) - a [d_conv-1+n_t, C] time-major buffer built by
++// concat_non_cont from a channel-major activation, ~32 MB of scalar-indexed
++// traffic per layer - only for ggml_ssm_conv to transpose it straight back.
++// This fold reads qkv_mixed in its natural channel-major layout, keeps the
++// d_conv-wide window in registers, and writes the (silu of the) convolution
++// directly, in exactly the stock accumulation order.
++//
++// Hazard note: ggml-alloc is free to place the conv/silu output ON TOP of
++// qkv_mixed (the CONCAT is that tensor only consumer, so it is dead right
++// after it). Writing y therefore clobbers x. Within one thread that is safe -
++// output token i is written only after column i+d_conv-1 has been loaded, and
++// no later output of that channel needs it - but the d_conv-1 prologue columns
++// of a token chunk belong to the PREVIOUS chunk outputs, and the conv-state
++// writeback reads the last d_conv-1 input columns. Both are therefore
++// pre-staged by ssm_conv_fold_seq_pre_f32 before any output is written.
++// ---------------------------------------------------------------------------
++
++// Stage, from the still-pristine inputs, into a scratch buffer: the d_conv-1
++// prologue columns of every token chunk (slots 0..n_chunks-1) plus the
++// conv-state writeback triple (slot n_chunks). Nothing outside the scratch is
++// written here, so this kernel cannot race the conv state it reads - the
++// writeback lands later, from the fold kernel, once state is dead.
++template <int d_conv>
++static __global__ void ssm_conv_fold_seq_pre_f32(const float * __restrict__ state, const float * __restrict__ x,
++                                                 float * __restrict__ pro,
++                                                 const int nr, const int n_t, const int n_chunks, const int split_n_t,
++                                                 const int state_nb1, const int state_nb2,
++                                                 const int x_nb0, const int x_nb1, const int x_nb2) {
++    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
++    if (ch >= nr) {
++        return;
++    }
++    const int seq = blockIdx.z;
++    const float * st = (const float *) ((const char *) state + (size_t) seq * state_nb2 + (size_t) ch * state_nb1);
++    const char  * xb = (const char *) x + (size_t) seq * x_nb2 + (size_t) ch * x_nb1;
++    pro += (size_t) seq * (n_chunks + 1) * (d_conv - 1) * nr;
++
++    const int k  = blockIdx.y;  // chunk index, or n_chunks for the writeback triple
++    const int c0 = k < n_chunks ? k * split_n_t : n_t;
++
++    float v[d_conv - 1];
++#pragma unroll
++    for (int j = 0; j < d_conv - 1; ++j) {
++        const int c = c0 + j;
++        v[j] = c < d_conv - 1 ? st[c] : *(const float *) (xb + (size_t) (c - (d_conv - 1)) * x_nb0);
++    }
++
++    float * out = pro + (size_t) k * (d_conv - 1) * nr;
++#pragma unroll
++    for (int j = 0; j < d_conv - 1; ++j) {
++        out[(size_t) j * nr + ch] = v[j];  // channel-major: coalesced
++    }
++}
++
++// One thread per channel per token chunk. Register window, stock accumulation.
++template <int d_conv>
++static __global__ void ssm_conv_fold_seq_f32(const float * __restrict__ x, const float * __restrict__ w_all,
++                                             const float * __restrict__ pro, float * __restrict__ y,
++                                             float * __restrict__ wb, const int n_chunks,
++                                             const int nr, const int n_t, const int split_n_t,
++                                             const int x_nb0, const int x_nb1, const int x_nb2,
++                                             const int y_nb1, const int y_nb2, const int w_nb1, const int wb_nb1) {
++    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
++    if (ch >= nr) {
++        return;
++    }
++    const int t0 = blockIdx.y * split_n_t;
++    if (t0 >= n_t) {
++        return;
++    }
++    const int t1 = min(t0 + split_n_t, n_t);
++
++    const int seq = blockIdx.z;
++    x   = (const float *) ((const char *) x + (size_t) seq * x_nb2);
++    y   = (float *) ((char *) y + (size_t) seq * y_nb2);
++    wb  = (float *) ((char *) wb + (size_t) seq * wb_nb1);
++    pro += (size_t) seq * (n_chunks + 1) * (d_conv - 1) * nr;
++
++    // conv-state writeback, from the staged triple. Safe here: the fold reads
++    // its prologues from the scratch, so nothing reads the conv state any more.
++    if (blockIdx.y == 0) {
++        const float * wbs = pro + (size_t) n_chunks * (d_conv - 1) * nr;
++#pragma unroll
++        for (int j = 0; j < d_conv - 1; ++j) {
++            wb[(size_t) ch * (d_conv - 1) + j] = wbs[(size_t) j * nr + ch];
++        }
++    }
++
++    const float * wc = (const float *) ((const char *) w_all + (size_t) ch * w_nb1);
++    const char  * xb = (const char *) x + (size_t) ch * x_nb1;
++    const float * pb = pro + (size_t) blockIdx.y * (d_conv - 1) * nr;
++
++    // mirror the stock register structure (preloaded w[], rolling x window) so
++    // the compiler contracts the accumulation the same way
++    float w[d_conv];
++#pragma unroll
++    for (int j = 0; j < d_conv; ++j) {
++        w[j] = wc[j];
++    }
++
++    float b[d_conv];
++#pragma unroll
++    for (int j = 0; j < d_conv - 1; ++j) {
++        b[j] = pb[(size_t) j * nr + ch];
++    }
++    b[d_conv - 1] = *(const float *) (xb + (size_t) t0 * x_nb0);  // column t0+d_conv-1
++
++    for (int i = t0; i < t1; ++i) {
++        if (i > t0) {
++#pragma unroll
++            for (int j = 0; j < d_conv - 1; ++j) {
++                b[j] = b[j + 1];
++            }
++            // column i+d_conv-1 == x index i (always >= 0 here)
++            b[d_conv - 1] = *(const float *) (xb + (size_t) i * x_nb0);
++        }
++
++        float sumf = 0.0f;
++#pragma unroll
++        for (int j = 0; j < d_conv; ++j) {
++            sumf += b[j] * w[j];
++        }
++        // The stock kernels accumulate from a literal 0.0f that the compiler
++        // keeps; here it folds that add away, so a window of all zeros lands
++        // on -0.0 where stock produces +0.0. Value-equal, but not byte-equal,
++        // and the sign does survive silu into the rest of the graph. Normalise
++        // it back on the bit pattern - an arithmetic (sumf + 0.0f) is legal to
++        // optimise away here and duly was. One VALU op per output.
++        if (__float_as_int(sumf) == (int) 0x80000000) {
++            sumf = 0.0f;
++        }
++        *(float *) ((char *) y + (size_t) i * y_nb1 + (size_t) ch * sizeof(float)) = ggml_cuda_op_silu_single(sumf);
++    }
++}
++
++// Diagnostic: GGML_SSM_CONV_DUMP=<prefix> writes the first 60 conv outputs
++// (stock or folded, whichever ran) to <prefix>.<n>.bin. Two runs of the same
++// prompt with the fold toggled therefore give a direct max-abs-diff on the
++// convolution result, which is the only thing this fold is allowed to change.
++static void ssm_conv_fold_dump(const ggml_tensor * out, cudaStream_t stream) {
++    static const char * pfx = getenv("GGML_SSM_CONV_DUMP");
++    if (pfx == nullptr || ssm_dump_capturing(stream)) {
++        return;
++    }
++    static const int64_t min_t = getenv("GGML_SSM_CONV_DUMP_MINT") ? atoi(getenv("GGML_SSM_CONV_DUMP_MINT")) : 0;
++    if (out->ne[1] < min_t) {
++        return;
++    }
++    static int n = 0;
++    if (n >= ssm_dump_max()) {
++        return;
++    }
++    const size_t nb = ggml_nbytes(out);
++    std::vector<char> host(nb);
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    CUDA_CHECK(cudaMemcpy(host.data(), out->data, nb, cudaMemcpyDeviceToHost));
++    char path[512];
++    snprintf(path, sizeof(path), "%s.%03d.bin", pfx, n++);
++    FILE * f = fopen(path, "wb");
++    if (f) {
++        fwrite(host.data(), 1, nb, f);
++        fclose(f);
++    }
++}
++
++// Diagnostic: GGML_SSM_WB_DUMP=<prefix> writes the conv-state writeback triple
++// as each arm computes it - the stock arm from the tail columns of the
++// materialised conv_input, the folded arm from the cache row it just wrote -
++// in the same compact [d_conv-1, nr] channel-major layout, so the two are
++// directly comparable.
++static void ssm_conv_wb_dump_raw(const void * src, size_t dpitch, size_t spitch,
++                                 size_t width, size_t height, cudaStream_t stream) {
++    static const char * pfx = getenv("GGML_SSM_WB_DUMP");
++    if (pfx == nullptr || ssm_dump_capturing(stream)) {
++        return;
++    }
++    static int n = 0;
++    if (n >= ssm_dump_max()) {
++        return;
++    }
++    std::vector<char> host(dpitch * height);
++    CUDA_CHECK(cudaStreamSynchronize(stream));
++    #ifdef GGML_USE_HIP
++    CUDA_CHECK(hipMemcpy2D(host.data(), dpitch, src, spitch, width, height, hipMemcpyDeviceToHost));
++#else
++    CUDA_CHECK(cudaMemcpy2D(host.data(), dpitch, src, spitch, width, height, cudaMemcpyDeviceToHost));
++#endif
++    char path[512];
++    snprintf(path, sizeof(path), "%s.%03d.bin", pfx, n++);
++    FILE * f = fopen(path, "wb");
++    if (f) { fwrite(host.data(), 1, host.size(), f); fclose(f); }
++}
++
++// Single-chunk form: one thread owns a channel for the whole ubatch, so the
++// d_conv-1 window that the state writeback needs is still in its registers at
++// the end and no staging buffer (and no pool allocation, and no second kernel)
++// is required. Used whenever one chunk covers all the tokens.
++template <int d_conv>
++static __global__ void ssm_conv_fold_seq1_f32(const float * __restrict__ state, const float * __restrict__ x,
++                                              const float * __restrict__ w_all, float * __restrict__ y,
++                                              float * __restrict__ wb,
++                                              const int nr, const int n_t,
++                                              const int state_nb1, const int state_nb2,
++                                              const int x_nb0, const int x_nb1, const int x_nb2,
++                                              const int y_nb1, const int y_nb2, const int w_nb1, const int wb_nb1) {
++    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
++    if (ch >= nr) {
++        return;
++    }
++    const int seq = blockIdx.y;
++
++    const float * st = (const float *) ((const char *) state + (size_t) seq * state_nb2 + (size_t) ch * state_nb1);
++    const float * wc = (const float *) ((const char *) w_all + (size_t) ch * w_nb1);
++    const char  * xb = (const char *) x + (size_t) seq * x_nb2 + (size_t) ch * x_nb1;
++    char        * yb = (char *) y + (size_t) seq * y_nb2 + (size_t) ch * sizeof(float);
++    float       * wbc = (float *) ((char *) wb + (size_t) seq * wb_nb1) + (size_t) ch * (d_conv - 1);
++
++    float w[d_conv];
++#pragma unroll
++    for (int j = 0; j < d_conv; ++j) {
++        w[j] = wc[j];
++    }
++
++    float b[d_conv];
++#pragma unroll
++    for (int j = 0; j < d_conv; ++j) {
++        const int c = j;  // window for output token 0: columns 0..d_conv-1
++        b[j] = c < d_conv - 1 ? st[c] : *(const float *) (xb + (size_t) (c - (d_conv - 1)) * x_nb0);
++    }
++
++    for (int i = 0; i < n_t; ++i) {
++        if (i > 0) {
++#pragma unroll
++            for (int j = 0; j < d_conv - 1; ++j) {
++                b[j] = b[j + 1];
++            }
++            const int c = i + d_conv - 1;
++            b[d_conv - 1] = c < d_conv - 1 ? st[c] : *(const float *) (xb + (size_t) (c - (d_conv - 1)) * x_nb0);
++        }
++
++        float sumf = 0.0f;
++#pragma unroll
++        for (int j = 0; j < d_conv; ++j) {
++            sumf += b[j] * w[j];
++        }
++        // see the note in ssm_conv_fold_seq_f32
++        if (__float_as_int(sumf) == (int) 0x80000000) {
++            sumf = 0.0f;
++        }
++        *(float *) (yb + (size_t) i * y_nb1) = ggml_cuda_op_silu_single(sumf);
++    }
++
++    // after the last output the window holds columns n_t-1 .. n_t+d_conv-2,
++    // and the conv state is exactly columns n_t .. n_t+d_conv-2
++#pragma unroll
++    for (int j = 0; j < d_conv - 1; ++j) {
++        wbc[j] = b[j + 1];
++    }
++}
++
++void ggml_cuda_op_ssm_conv_fold_seq(ggml_backend_cuda_context & ctx,
++        const ggml_tensor * concat, const ggml_tensor * ssm_conv,
++        const ggml_tensor * silu, const ggml_tensor * wb_cpy) {
++    constexpr int d_conv = 4;
++
++    const ggml_tensor * state = concat->src[0];
++    const ggml_tensor * x     = concat->src[1];
++    const ggml_tensor * w     = ssm_conv->src[1];
++    const ggml_tensor * wb    = wb_cpy->src[1];
++
++    const int nr  = (int) concat->ne[1];
++    const int n_t = (int) x->ne[0];
++    const int n_s = (int) concat->ne[2];
++
++    static const int split_n_t = [] {
++        const char * e = getenv("GGML_SSM_CONV_FOLD_SPLIT");
++        const int    v = e ? atoi(e) : 64;
++        return v > 0 ? v : 64;
++    }();
++
++    const int n_chunks = (n_t + split_n_t - 1) / split_n_t;
++
++    static const int block = [] {
++        const char * e = getenv("GGML_SSM_CONV_FOLD_BLOCK");
++        const int    v = e ? atoi(e) : 256;
++        return v > 0 ? v : 256;
++    }();
++    const int    gx     = (nr + block - 1) / block;
++    cudaStream_t stream = ctx.stream();
++
++    if (n_chunks == 1) {
++        // no staging buffer, no pool allocation, one kernel
++        const ggml_cuda_kernel_launch_params lp =
++            ggml_cuda_kernel_launch_params(dim3(gx, n_s, 1), dim3(block, 1, 1), 0, stream);
++        ggml_cuda_kernel_launch(ssm_conv_fold_seq1_f32<d_conv>, lp,
++            (const float *) state->data, (const float *) x->data, (const float *) w->data,
++            (float *) silu->data, (float *) wb->data,
++            nr, n_t, (int) state->nb[1], (int) state->nb[2],
++            (int) x->nb[0], (int) x->nb[1], (int) x->nb[2],
++            (int) silu->nb[1], (int) silu->nb[2], (int) w->nb[1], (int) wb->nb[1]);
++        ssm_conv_fold_dump(silu, stream);
++        ssm_conv_wb_dump_raw(wb->data, (d_conv - 1) * sizeof(float), (d_conv - 1) * sizeof(float),
++                             (d_conv - 1) * sizeof(float), (size_t) nr * n_s, stream);
++        return;
++    }
++
++    ggml_cuda_pool_alloc<float> pro(ctx.pool(), (size_t) n_s * (n_chunks + 1) * (d_conv - 1) * nr);
++
++    {
++        const ggml_cuda_kernel_launch_params lp =
++            ggml_cuda_kernel_launch_params(dim3(gx, n_chunks + 1, n_s), dim3(block, 1, 1), 0, stream);
++        ggml_cuda_kernel_launch(ssm_conv_fold_seq_pre_f32<d_conv>, lp,
++            (const float *) state->data, (const float *) x->data, pro.get(),
++            nr, n_t, n_chunks, split_n_t, (int) state->nb[1], (int) state->nb[2],
++            (int) x->nb[0], (int) x->nb[1], (int) x->nb[2]);
++    }
++    {
++        const ggml_cuda_kernel_launch_params lp =
++            ggml_cuda_kernel_launch_params(dim3(gx, n_chunks, n_s), dim3(block, 1, 1), 0, stream);
++        ggml_cuda_kernel_launch(ssm_conv_fold_seq_f32<d_conv>, lp,
++            (const float *) x->data, (const float *) w->data, (const float *) pro.get(), (float *) silu->data,
++            (float *) wb->data, n_chunks,
++            nr, n_t, split_n_t, (int) x->nb[0], (int) x->nb[1], (int) x->nb[2],
++            (int) silu->nb[1], (int) silu->nb[2], (int) w->nb[1], (int) wb->nb[1]);
++    }
++
++    ssm_conv_fold_dump(silu, stream);
++    ssm_conv_wb_dump_raw(wb->data, (d_conv - 1) * sizeof(float), (d_conv - 1) * sizeof(float),
++                         (d_conv - 1) * sizeof(float), (size_t) nr * n_s, stream);
++}
++
+ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node, ggml_tensor * silu_dst) {
+     const struct ggml_tensor * src0 = dst->src[0];  // conv_x
+     const struct ggml_tensor * src1 = dst->src[1];  // conv1d.weight
+@@ -269,9 +646,16 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
+         GGML_ASSERT(ggml_nelements(bias) == nr);
+     }
+ 
++    if (n_t >= 1 && nc == 4 && n_s >= 1) {
++        ssm_conv_wb_dump_raw((const char *) src0_d + (size_t) n_t * src0->nb[0],
++                             3 * sizeof(float), src0->nb[1], 3 * sizeof(float),
++                             (size_t) nr * n_s, stream);
++    }
++
+     if (fuse_silu) {
+         ssm_conv_f32_cuda<true>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
+                           out->nb[2], nc, nr, n_t, n_s, stream);
++        ssm_conv_fold_dump(out, stream);
+     } else {
+         ssm_conv_f32_cuda<false>(src0_d, src1_d, bias_d, src0->nb[0], src0->nb[1], src0->nb[2], src1->nb[1], dst_d, out->nb[0], out->nb[1],
+                           out->nb[2], nc, nr, n_t, n_s, stream);
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cuh b/ggml/src/ggml-cuda/ssm-conv.cuh
+index b32a58ba7..7826ab317 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cuh
++++ b/ggml/src/ggml-cuda/ssm-conv.cuh
+@@ -6,3 +6,9 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
+ void ggml_cuda_op_ssm_conv_fold(ggml_backend_cuda_context & ctx,
+         const ggml_tensor * concat, const ggml_tensor * ssm_conv,
+         const ggml_tensor * silu, const ggml_tensor * wb_cpy);
++
++// Multi-token (prefill) form of the same fold: also deletes the concat_non_cont
++// transpose that builds the time-major conv input.
++void ggml_cuda_op_ssm_conv_fold_seq(ggml_backend_cuda_context & ctx,
++        const ggml_tensor * concat, const ggml_tensor * ssm_conv,
++        const ggml_tensor * silu, const ggml_tensor * wb_cpy);

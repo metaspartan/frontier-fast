@@ -702,14 +702,7 @@ ranked run once the runner boots again.
 
 ## Round-14 map
 
-1. **Prefill: `concat_non_cont` is 4.7% of pp512** (30 x 188us). The GDN conv
-   input is built by transposing a [512, 8192] f32 activation into time-major
-   layout so `ggml_ssm_conv` can transpose it straight back - 32 MB of
-   scalar-indexed traffic at ~170 GB/s per layer, five times the cost of the
-   convolution itself. Extending the 0031 fold to `n_t > 1` (read `qkv_mixed`
-   in its natural channel-major layout plus the conv state, write the conv
-   output directly) deletes it. ~+4.5% prefill = ~+0.9% score, and it helps
-   ttft too. Highest-value untouched item.
+1. ~~**Prefill: `concat_non_cont` is 4.7% of pp512**~~ — **DONE, see 0033.**
 2. **`rms_norm_pre_add`: 80 launches/token at 2.8us** for a 2048-column norm
    in a single 1024-thread workgroup (32 waves in the block reduction on
    wave32). Try block 256 on RDNA4 - reassociation-class, ppl-gated. ~0.7%.
@@ -725,3 +718,73 @@ ranked run once the runner boots again.
    on a grouped-mmvf segment is a candidate. Remember rule (1) of 0032 -
    pin the chain adjacent to its matvec in the model graph FIRST, or the
    allocator will make every fold illegal.
+
+
+## 0033: the conv-chain fold at prefill shape - concat_non_cont deleted (+3.6% prefill)
+
+Round-14 item 1, confirmed on a fresh profile of the r13+0032 build: per pp512
+pass `concat_non_cont` is 30 x 165us (4.1% of 240ms kernel). The GDN conv input
+is a [3+n_t, C] TIME-major buffer assembled from a CHANNEL-major activation
+purely so `ggml_ssm_conv` can transpose it back - 33 MB of scalar-indexed
+traffic per layer at ~170 GB/s, five times the convolution it feeds.
+
+0033 generalises the 0031 fold from `n_t == 1` to any `n_t` (and any `n_s`):
+one thread per channel walks `qkv_mixed` in its natural layout with the
+d_conv window in registers and writes silu(conv) straight out. Per pass
+30 concats + 30 `ssm_conv_long_token_f32` + 30 writeback cpys become 30 fold
+kernels at 38.3us (an effective 876 GB/s - the activation is still MALL-warm
+from the projection that produced it). Kernel time 240.3 -> 224.3 ms/pass.
+
+- toggle A/B (`GGML_CUDA_DISABLE_SSM_CONV_FOLD_SEQ=1`), 5 rounds: pp512
+  4155.2-4195.1 -> **4302.3-4359.2**, median per-round ratio **1.0355**,
+  5/5 disjoint; tg128 neutral (137.3-137.7 both arms)
+- whole-process stock vs cand, 5 rounds: pp512 3214-3265 -> 4309-4357
+  (median ratio **1.3392**, was 1.301 at 0032), tg128 80.9-81.5 -> 137.1-137.6
+  (median **1.6934**, held)
+- ppl 3.9288/3.9261/3.9271/3.9271/3.9267 vs stock 3.9314 (**-0.07 to -0.13%**);
+  fold-off control same session 3.9262-3.9390
+- test-backend-ops SSM_CONV / CONCAT / CPY / UNARY / GATED_DELTA_NET / MUL_MAT OK
+- split sweep flat 16-128 (4250-4294), 64 shipped; single-chunk (split>=n_t)
+  costs ~2% at pp512 but is what short server prompts use anyway
+
+Three traps burned here, all worth the next agent's time:
+
+- **A fold can be invisible to the gate.** `llama-perplexity` packs
+  `n_batch/n_ctx` sequences into one ubatch, so the gate corpus at `-c 512`
+  runs **n_t=128, n_s=4** - and 0031's detector required `n_s == 1`. The first
+  version of this patch never fired during ANY perplexity run while reading a
+  perfectly healthy 3.9271. Always confirm the fold FIRES in the tool you are
+  gating with: `GGML_CUDA_SSM_CONV_FOLD_DEBUG=1` prints one accept/decline line
+  per layer with the numbered gate that declined.
+- **`llama-bench`'s prompt is not reproducible across processes.** It fills the
+  prompt with `std::rand()`; two runs of the same binary produce different
+  tokens, so tensor dumps from two llama-bench processes are incomparable
+  (an A/A check caught this - it read 0.18% agreement). Use `llama-perplexity`
+  for any cross-process numeric comparison.
+- **A chained-ubatch test is not chained unless you look past the cap.** Dumping
+  "the first 60 conv outputs" at 30 layers/ubatch only ever covers the warmup
+  plus ONE real ubatch, so it never exercises the state writeback -> next
+  ubatch path at all. `GGML_SSM_DUMP_MAX` now controls the cap; the writeback
+  itself is directly comparable between arms via `GGML_SSM_WB_DUMP` (the stock
+  arm dumps the tail columns of its materialised conv_input, the folded arm
+  the cache row it just wrote).
+
+Numerics, measured rather than argued (that is what the dump envs are for):
+over a full 512-token prefill all 30 conv outputs and all 30 writebacks are
+**byte-identical** to stock, likewise at n_t = 2, 4, 5, 8, 11, 12, 16, 64, 128
+and n_s = 2, 4. From the **second ubatch of a sequence** - i.e. once the conv
+state is no longer zero - the 4-term dot product contracts differently than the
+stock kernel's and ~10% of outputs move by exactly **1 ULP**. Server greedy:
+candidate deterministic (6/6 A/A byte-exact), 2/6 byte-exact vs the fold-off
+control and 4/6 drifting at 9-58% prefixes. Same ppl-gated class as
+0024/0026/0028/0031 and the mildest instance of it in the series. Ruled out
+along the way, each with an experiment: the concat buffer being left unwritten
+(re-running the concat anyway changes nothing), the pool allocation for the
+staging buffer (the no-scratch single-chunk path behaves identically), HIP
+graphs (`GGML_CUDA_DISABLE_GRAPHS=1` changes nothing), chunk size
+(split=1 and split=64 give bit-identical state), and `#pragma clang fp
+contract(off)` (no effect).
+
+Projection with 0032: decode 1.6494 (r12 1.5959 x 1.0335), prefill
+1.2468 x 1.0355 = 1.2911, ttft following prefill -> score **~1.494-1.499**
+vs the 1.4525 bank (0032 alone projects ~1.484).
