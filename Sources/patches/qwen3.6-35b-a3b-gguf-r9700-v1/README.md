@@ -1719,11 +1719,12 @@ assignment — which for the router means different logits, which means a
 different top-8. That is inside the gate but no longer byte-exact, so it is a
 separate decision, not a continuation of this one.
 
-## Round 26: three levers measured dead — do not re-buy any of them
+## Round 26: four levers measured dead — do not re-buy any of them
 
-No patch. Three of the round-23 open items were taken to a measurement and all
-three closed. Each cost one build and one sweep; the point of writing them down
-is that they each *look* like the obvious next thing.
+No patch. Four levers were taken to a measurement and all four closed — three of
+the round-23 open items plus a port of a sibling track's win. Each cost one
+build and one sweep; the point of writing them down is that they each *look*
+like the obvious next thing.
 
 ### 1. The mmvq k-loop unroll does NOT inherit 0042's win
 
@@ -1784,6 +1785,33 @@ token, arriving in bursts of 0 to 26 that do not correlate with graph position.
 In a typical token there are exactly **two**, one just after the token-embedding
 `get_rows` and one mid-graph. Not a lever. **Per-token averages taken over a
 whole trace hide setup work; split on a token boundary before believing one.**
+
+### 4. The register-cached rms_norm row pays on GB10 and nothing here
+
+A sibling agent landed exactly this on the GB10 `lfm2.5` track (its 0013):
+`rms_norm_pre_add_f32` walks its row twice and the second walk re-reads the
+floats the first one computed, so when `ncols` is an exact multiple of
+`block_size` and the per-thread column count is small, both loops become
+unrolled loops and the values stay in registers. **+0.65% prefill there, 5/5
+arms disjoint.** The patch applies to this tree verbatim — same `b10237` base,
+same kernel — and the two `rms_norm_pre_add` instantiations are 3.6% of a pp512
+pass here against 4.4% there, so the kernel share is comparable.
+
+On R9700 it is **neutral**: pp512 per-round ratios 0.9970-1.0068, median 1.0000,
+arms fully overlapping; tg128 median 1.0010 with arms overlapping (5/5 rounds
+positive, but +0.10% is below this harness's floor). Correctness is fine either
+way — decode-path ppl 3.9338 identical, gate 3.9284 vs control 3.9306, greedy
+6/6 byte-exact — it just does not buy time. Reverted.
+
+**The reason is the memory system, not the kernel, and it is worth carrying:**
+the GB10 is unified LPDDR5X with no large last-level cache, so re-reading a row
+costs a real trip; the R9700 has **64 MB of Infinity Cache**, and an 8 KB row
+that was just written is always still in it. Before porting any "avoid the
+second read" optimisation onto this box, ask whether the re-read working set
+fits the LLC. The corollary is the useful half: **on R9700 redundant reads of
+recently-written data are effectively free**, which is why every win in this
+series has come from launch count (~1.5% per 40 dispatches removed) or from
+first-touch weight bandwidth, and never from re-read elimination.
 
 ### Still open, in order
 
