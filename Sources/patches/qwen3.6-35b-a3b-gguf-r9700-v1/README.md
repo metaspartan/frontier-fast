@@ -1312,14 +1312,188 @@ at decode. What is left, in order:
    `k_bin_bcast` (4.7%, 663 launches) — the last being the prefill analogue of
    0034, still untouched because MUL_MAT_ID takes MMQ at prefill shapes.
 
+## Round 22: the firing audit — what the official gate actually covers
+
+Round 21 noticed in passing that a decode-shape fold can be invisible to
+`llama-perplexity -c 512`. This round measured that for the whole banked stack
+instead of arguing it, and the answer is worse than the note suggested: **five
+of the nine banked folds never execute a single instruction during the official
+gate.** Their entire green perplexity history covers nothing.
+
+The instrument is a kernel census, not a source reading. For each patch, run
+the *same* command with that patch's toggle flipped, take a `rocprofv3
+--kernel-trace` census (kernel name -> launch count), and diff it against the
+all-on arm. A patch that fires changes the census. A patch that does not fire
+changes nothing, and a green ppl from that command is silence, not evidence.
+
+Two shapes, both `llama-perplexity` from the candidate build:
+
+- **gate shape** — `-c 512`, what the runner runs. On this fork that reports
+  `batch_size=2048, n_seq=4`, and each ubatch is one 512-token sequence, so
+  the folds see `n_t=512, n_s=1`. (Round 13's note that the gate runs
+  `n_t=128, n_s=4` is wrong for this invocation; measure it, do not assume it.)
+- **decode shape** — `-b 512 -ub 1`. Every ubatch is a single token, so
+  `n_t=1` and every decode-gated fold fires at every layer of every position.
+  8 chunks is ~75 s and is deterministic across loads in every arm measured.
+
+### The table
+
+| patch | fires at gate shape? | fires at decode shape? | decode-path ppl, patch off -> series | greedy identity vs its own off-control |
+|---|---|---|---|---|
+| 0030 rs-state identity view | **yes** | yes | 3.9338 -> 3.9338 (identical) | 5/6 (r11) |
+| 0031 GDN conv-chain fold | **NO** | yes | 3.9183 -> 3.9338 (**+0.396%**) | 2/6 |
+| 0032 mmvf GDN epilogue fold | **NO** | yes | 3.9338 -> 3.9338 (identical) | **6/6 (new)** |
+| 0033 conv fold at seq shape | **yes** | no (0031 owns `n_t==1`) | 3.9338 -> 3.9338 (inert) | 2/6 at its own shape |
+| 0034 MoE routing-weight fold | **NO** | no in the full stack* | 3.9338 -> 3.9338 (identical) | 6/6 |
+| 0035 shexp gate pin + fold | **NO** | yes | 3.9338 -> 3.9338 (identical) | 6/6 |
+| 0036 unary+mul q8_1 fold | **yes** | yes | 3.9338 -> 3.9338 (identical) | 6/6 |
+| 0037+0038 expert-slot reduction | **NO** | yes | 3.9382 -> 3.9338 (**-0.112%**) | 6/6 |
+
+\* 0034's census is unchanged at the decode shape only because **0037 absorbs
+the same routing-weight MUL** — the expert-reduce detector runs first and
+swallows it. Isolated with 0037 off, 0034 fires and is still numerically
+inert (3.9382 with and without it). It is not dead weight: it is 0037's
+fallback when the add chain does not match.
+
+Reference points for the column: **stock decode-path ppl 3.9409**, the full
+banked 0001-0038 stack **3.9338** — a relative delta of **-0.180%**, inside the
+0.5% band. Every arm above was read twice from two separate loads and both
+loads agreed to all four decimals.
+
+### What the table says
+
+1. **The queue is safe, and now for a measured reason.** Before this round the
+   decode path had no perplexity number at all for 0031, 0032, 0034, 0035 or
+   0037; the readings that existed were taken at a shape where those kernels
+   were not running. The stack is -0.180% from stock on the path it actually
+   optimises.
+2. **0031 is the whole numeric budget.** It is the only patch that moves the
+   decode-path perplexity materially (+0.396% against its own off-control), and
+   it is one of the five that the gate never exercises. Everything else in the
+   series is either identical to its control or, in 0037's case, -0.112%.
+3. **0032 was the biggest blind spot and came back clean.** The second-largest
+   decode win in the series (+3.4%) had no numeric characterisation at all —
+   its round-13 entry lists ppl at a shape where it does not fire, and it never
+   had a greedy identity run. Measured this round: decode-path ppl identical to
+   its off-control, and **6/6 byte-exact** server greedy. It is byte-exact.
+4. **0038's bit-identity claim survives a sharper test.** Round 21 compared the
+   fold against a control with *both* halves off, which conflates the matvec
+   with the graph rewrite. Split here: with only the CUDA fold disabled
+   (`GGML_CUDA_DISABLE_MOE_EXPERT_REDUCE=1`, graph half left on) the decode-path
+   ppl is **3.9338 — identical to all-on**. With only the graph half disabled
+   (`GGML_MOE_COMBINE_INPLACE=0`) it is **3.9382**. So the -0.112% belongs
+   entirely to the fused multi-add in the graph, and 0038's accumulator really
+   did make the matvec byte-exact.
+
+### Method notes for the next agent
+
+- **Do not trust a debug env to prove firing.** `llama-bench` installs a null
+  ggml log callback, so every `GGML_LOG_INFO` accept/decline print vanishes
+  there — 0037's detector logged nothing under llama-bench while demonstrably
+  folding 40 launches per token. The census diff has no such failure mode.
+- A firing census only needs `--chunks 1`; the decode-shape census here used
+  `-c 128 -b 128 -ub 1` and still resolved every patch.
+- The Tensile GEMM kernel name (`Cijk_...MT32x64x16...` vs `...MT64x64x16...`)
+  differs between arms at the gate shape at a constant launch count of 100.
+  That is Tensile picking a tile, not a fold firing. Diff on counts, and read
+  the names.
+
+## 0039: the decode conv fold loses its sign-of-zero divergence
+
+Round 21's lesson — that the *declared shape* of an accumulator, not the
+surrounding statements, is what makes the compiler contract differently — was
+retried on 0031 as instructed. It is half right here, and the half that works
+is not the half that was expected.
+
+Stock `ssm_conv_f32` accumulates inside a **runtime** loop over `n_t`, indexes
+its register window with the runtime expression `(i + j) % d_conv`, and
+finishes with `sumf += b`, where `b` comes from a runtime-nullable bias pointer
+the compiler cannot see through. 0031 collapsed all three: `n_t == 1` is a
+compile-time fact in that kernel, so the loop vanished, the modulo index became
+constant, and the trailing add was dropped as the identity it almost is. 0039
+restores all three — `n_t` arrives as a kernel argument so the loop cannot be
+unrolled, and `bias` arrives as a pointer so `sumf += b` survives as a real
+instruction.
+
+Measured on the runner box, `GGML_SSM_CONV_FOLD_STOCK_SHAPE=0` restoring the
+0031 kernel:
+
+- **conv output at the first decode position, dumped and compared float by
+  float against the stock chain** (`GGML_CUDA_DISABLE_GRAPHS=1`,
+  `GGML_SSM_CONV_DUMP`, 30 GDN layers x 8192 channels = 245,760 values):
+  0039 is **0 differing — byte-identical to stock**. The 0031 kernel differs in
+  **39** of them, and every one of the 39 is value-equal with a different bit
+  pattern: **-0.0 where stock produces +0.0**. That is exactly what the dropped
+  `sumf += b` costs, and it is the same trap 0034 documented from the other
+  direction (`result += x_biases[j]` is the identity on everything except
+  -0.0). The seq folds already carried an explicit `__float_as_int` fixup for
+  this; the decode fold never did, and nobody had looked.
+- **it is not enough to change the correctness class.** Server greedy against
+  the fold-off control is still **2/6** byte-exact, identical to 0031's own
+  2/6, and 0039 vs 0031 is **6/6** — the two kernels agree with each other
+  everywhere the six completions reach. The first decode position has an
+  all-zero conv window, so byte-exactness there only proves the sign-of-zero
+  fix; once the window carries real data the 4-term dot product still contracts
+  differently, exactly as 0033's entry describes for its own kernel.
+- no cost: toggle A/B, 5 rounds, arms fully overlapping — this patch buys
+  fidelity, not speed.
+- decode-path ppl identical to the 0031 kernel.
+
+**So the round-21 doctrine needs one more clause.** Mirroring the accumulator's
+declared shape recovered bit-identity for 0038 because the whole difference
+there *was* codegen. Here the same treatment recovered only the arithmetic that
+was genuinely missing (the trailing add) and left the contraction difference
+standing. Before assuming a rewrite is reassociation-class, dump the tensor and
+count the differing values: if they are value-equal with different bits, it is
+a dropped identity operation and it is fixable; if they move by ULPs, it is
+contraction and mirroring the source will not save it. That diagnostic costs
+one build and it is now wired in — `ggml_cuda_op_ssm_conv_fold` gained the
+`ssm_conv_fold_dump` hook the seq path already had.
+
+0031 therefore stays the series' one materially non-bit-exact decode fold, at
++0.396% on the decode path against its own control and -0.180% for the stack as
+a whole against stock. It is inside the band, it is measured, and it is now
+documented at the shape where it actually runs.
+
 ## Recommended firing order
 
 The runner applies the whole patch directory, so the series is a ladder rather
-than a choice; 0001-0038 is the verified set and every patch has a disable
-toggle. 0038 has no toggle and no speed of its own — it is 0037's kernel made
-bit-identical, and must not be applied without 0037. If a ranked run has to be
-pared back, drop from the end: 0038+0037, 0036,
-0035, 0034 are independent +1.5% decode folds; 0033 is the prefill fold; 0032
-and 0030 are the two largest decode wins and should be the last to go. 0037 has
-two halves in different files — dropping it means dropping both, since the
-graph half alone leaves the decode combine as n_expert_used-1 separate adds.
+than a choice; **0001-0039** is the verified set and every patch that carries
+speed has a disable toggle. Two do not carry speed: **0038** is 0037's kernel
+made bit-identical and must not be applied without 0037; **0039** is 0031's
+kernel made sign-of-zero-exact and must not be applied without 0031
+(`GGML_SSM_CONV_FOLD_STOCK_SHAPE=0` falls back to the 0031 kernel in place).
+If a ranked run has to be pared back, drop from the end: 0039, then 0038+0037,
+then 0036, 0035, 0034 (independent +1.5% decode folds); 0033 is the prefill
+fold; 0032 and 0030 are the two largest decode wins and should be the last to
+go. 0037 has two halves in different files — dropping it means dropping both,
+since the graph half alone leaves the decode combine as n_expert_used-1
+separate adds.
+
+**Projection is unchanged at ~1.563 vs the 1.4525 bank** (decode 1.7536,
+prefill 1.2911, ttft 1.2258): rounds 21 and 22 both bought correctness, not
+speed. What changed this round is the confidence behind it — every banked fold
+now has a perplexity number taken at the shape where it actually runs, the
+stack reads **-0.180%** against stock on the decode path and **-0.13 to -0.14%**
+at the gate shape, and the two folds that were numerically uncharacterised
+(0032, and 0037's two halves separately) came back byte-exact.
+
+### Gate the next decode fold like this
+
+`llama-perplexity -c 512` does not execute a fold gated on `n_t == 1` or
+`ne[2] == 1` on this fork. Before believing any perplexity reading:
+
+1. **Prove firing with a census diff**, not a debug print: `rocprofv3
+   --kernel-trace --output-format csv` over the same command with the patch's
+   toggle on and off, `--chunks 1` is enough, then diff the kernel-name/count
+   tables. `llama-bench` silences `GGML_LOG_INFO`, so accept/decline prints are
+   not evidence there.
+2. **Read perplexity at `-b 512 -ub 1 --chunks 8`** (~75 s, deterministic
+   across loads) as well as at `-c 512`, and report both.
+3. **Run server greedy at the decode shape** (`llama-server`, not `llama-cli`),
+   6 prompts, byte-compared against the same-binary toggle-off control, and
+   check the completions are non-empty and >= 256 B before believing a 6/6.
+4. If the result is not byte-exact, **dump the tensor and classify the
+   difference** before calling it reassociation: value-equal with different
+   bits is a dropped identity operation and is fixable (0039); ULP moves are
+   contraction and mirroring the source will not save it (0031, 0033).

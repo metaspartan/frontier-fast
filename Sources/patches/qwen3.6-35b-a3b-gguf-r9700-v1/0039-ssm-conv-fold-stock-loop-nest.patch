@@ -1,0 +1,165 @@
+From 5392d1ceaac214e5446e5698ae093ecf3fc298ce Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sat, 8 Aug 2026 15:42:10 +0000
+Subject: [PATCH] cuda/hip: restore the stock loop nest in the decode conv fold
+ - the sign of zero comes back
+
+0031's fold reproduces stock ssm_conv_f32's arithmetic but not its shape.
+Stock accumulates inside a RUNTIME loop over n_t, indexes its register window
+with the runtime expression (i + j) % d_conv, and finishes with `sumf += b`,
+where b comes from a runtime-nullable bias pointer the compiler cannot see
+through. In 0031 n_t == 1 is a compile-time fact, so the loop vanished, the
+modulo index became constant, and the trailing add was dropped as the identity
+it almost is.
+
+It is not the identity. Dumping the conv output at the first decode position
+and comparing it float by float against the stock chain (30 GDN layers x 8192
+channels = 245,760 values, GGML_CUDA_DISABLE_GRAPHS=1 so the dump hook is
+reachable):
+
+- this kernel: 0 differing - byte-identical to stock
+- the 0031 kernel: 39 differing, and all 39 are value-equal with a different
+  bit pattern - -0.0 where stock produces +0.0
+
+which is the same trap 0034 documented from the other side (`result +=
+x_biases[j]` is the identity on everything except -0.0). The seq folds already
+carried an explicit __float_as_int fixup for it; the decode fold never did.
+
+This does not change the correctness class. Server greedy against the fold-off
+control is still 2/6 byte-exact, identical to 0031's own 2/6, because the first
+decode position has an all-zero conv window - once the window carries real data
+the 4-term dot product still contracts differently. It removes a real
+divergence from stock at zero cost, and it makes the two kernels'
+outputs agree: this kernel vs the 0031 kernel is 6/6 byte-exact.
+
+Measured (runner box, HIP_VISIBLE_DEVICES=0), GGML_SSM_CONV_FOLD_STOCK_SHAPE=0
+restoring the 0031 kernel:
+
+- toggle A/B, 5 rounds: tg128 on 145.62-145.81 vs off 145.61-145.88, arms fully
+  overlapping; pp512 neutral (4284-4310 vs 4278-4309) - fidelity, not speed
+- decode-path ppl (-b 512 -ub 1 --chunks 8): 3.9338 both arms, 2 loads each
+- gate-shape ppl (-c 512 --chunks 8): 3.9265/3.9263/3.9258 vs stock 3.9314
+- server greedy: A/A 6/6 byte-exact, vs the 0031 kernel 6/6 byte-exact, all six
+  completions non-empty and >= 276 B
+
+Also adds the ssm_conv_fold_dump hook the seq path already had to
+ggml_cuda_op_ssm_conv_fold, which is the diagnostic that found this: if the
+differing values are value-equal with different bits it is a dropped identity
+operation and it is fixable; if they move by ULPs it is contraction and
+mirroring the source will not save it.
+---
+ ggml/src/ggml-cuda/ssm-conv.cu | 84 +++++++++++++++++++++++++++++++++-
+ 1 file changed, 82 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index 9f89febaf..19bb827d1 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -227,6 +227,77 @@ static __global__ void ssm_conv_fold_f32(const float * __restrict__ state, const
+     wbc[2] = xv;
+ }
+ 
++// 0039: the 0038 lesson applied to the decode-shape conv fold.
++//
++// Stock ssm_conv_f32 accumulates inside a RUNTIME loop over n_t, indexes its
++// register window with the runtime expression (i + j) % d_conv, and finishes
++// with `sumf += b`, where b comes from a runtime-nullable bias pointer the
++// compiler cannot see through. 0031 collapsed all three away - n_t == 1 is a
++// compile-time fact in that kernel, so the index became constant, the outer
++// loop vanished and the trailing add was dropped as the identity it almost is.
++// That is the same class of contraction change 0038 found in the expert-reduce
++// accumulator: the arithmetic is equal, the declared shape is not.
++//
++// This kernel restores the stock loop nest. n_t arrives as a kernel argument
++// so the outer loop cannot be unrolled and (i + j) % d_conv stays dynamic;
++// bias arrives as a pointer so `sumf += b` survives as a real instruction (it
++// is also what keeps a window of all zeros on +0.0 rather than -0.0, which is
++// why the seq folds needed an explicit bit-pattern fixup and this one does
++// not). GGML_SSM_CONV_FOLD_STOCK_SHAPE=0 restores the 0031 kernel.
++static __global__ void ssm_conv_fold_stock_f32(const float * __restrict__ state, const float * __restrict__ x,
++                                               const float * __restrict__ w_all, const float * __restrict__ bias,
++                                               float * __restrict__ y, float * __restrict__ wb, const int nr,
++                                               const int state_nb1, const int x_nb1, const int w_nb1,
++                                               const int64_t n_t) {
++    const int ch = blockIdx.x * blockDim.x + threadIdx.x;
++    if (ch >= nr) {
++        return;
++    }
++
++    const float * st = (const float *) ((const char *) state + ch * state_nb1);
++    const float * wc = (const float *) ((const char *) w_all + ch * w_nb1);
++    const float   xv = *(const float *) ((const char *) x + ch * x_nb1);
++
++    float x_r[4] = { 0.0f };
++    float w[4]   = { 0.0f };
++
++#pragma unroll
++    for (size_t j = 0; j < 4; j++) {
++        w[j] = wc[j];
++    }
++
++    float b = bias != nullptr ? bias[ch] : 0.0f;
++
++    for (int64_t i = 0; i < n_t; i++) {
++        float sumf = 0.0f;
++
++        if (i == 0) {
++            for (size_t j = 0; j < 3; j++) {
++                x_r[j] = st[j];
++            }
++            x_r[3] = xv;
++        }
++
++#pragma unroll
++        for (size_t j = 0; j < 4; j++) {
++            sumf += x_r[(i + j) % 4] * w[j];
++        }
++        sumf += b;
++        y[i * nr + ch] = ggml_cuda_op_silu_single(sumf);
++    }
++
++    float * wbc = wb + ch * 3;
++    wbc[0] = x_r[1];
++    wbc[1] = x_r[2];
++    wbc[2] = xv;
++}
++
++static bool ssm_conv_fold_stock_shape() {
++    static const bool v = getenv("GGML_SSM_CONV_FOLD_STOCK_SHAPE") == nullptr ||
++                          std::atoi(getenv("GGML_SSM_CONV_FOLD_STOCK_SHAPE")) != 0;
++    return v;
++}
++
+ // Diagnostic: GGML_SSM_STATE_DUMP=<prefix> writes the conv state as the decode
+ // fold sees it on entry, i.e. exactly what the previous step wrote back.
+ static void ssm_conv_state_dump(const ggml_tensor * state, cudaStream_t stream) {
+@@ -248,6 +319,8 @@ static void ssm_conv_state_dump(const ggml_tensor * state, cudaStream_t stream)
+     if (f) { fwrite(host.data(), 1, nb, f); fclose(f); }
+ }
+ 
++static void ssm_conv_fold_dump(const ggml_tensor * out, cudaStream_t stream);
++
+ void ggml_cuda_op_ssm_conv_fold(ggml_backend_cuda_context & ctx,
+         const ggml_tensor * concat, const ggml_tensor * ssm_conv,
+         const ggml_tensor * silu, const ggml_tensor * wb_cpy) {
+@@ -268,8 +341,15 @@ void ggml_cuda_op_ssm_conv_fold(ggml_backend_cuda_context & ctx,
+     const int grid  = (int) ((nr + block - 1) / block);
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(dim3(grid, 1, 1), dim3(block, 1, 1), 0, ctx.stream());
+     ssm_conv_state_dump(state, ctx.stream());
+-    ggml_cuda_kernel_launch(ssm_conv_fold_f32, launch_params,
+-        state_d, x_d, w_d, y_d, wb_d, (int) nr, (int) state->nb[1], (int) x->nb[1], (int) w->nb[1]);
++    if (ssm_conv_fold_stock_shape()) {
++        ggml_cuda_kernel_launch(ssm_conv_fold_stock_f32, launch_params,
++            state_d, x_d, w_d, (const float *) nullptr, y_d, wb_d, (int) nr,
++            (int) state->nb[1], (int) x->nb[1], (int) w->nb[1], (int64_t) 1);
++    } else {
++        ggml_cuda_kernel_launch(ssm_conv_fold_f32, launch_params,
++            state_d, x_d, w_d, y_d, wb_d, (int) nr, (int) state->nb[1], (int) x->nb[1], (int) w->nb[1]);
++    }
++    ssm_conv_fold_dump(silu, ctx.stream());
+ }
+ 
+ // ---------------------------------------------------------------------------
+-- 
+2.53.0
+
