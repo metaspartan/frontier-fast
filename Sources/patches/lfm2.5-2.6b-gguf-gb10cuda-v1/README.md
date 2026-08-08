@@ -215,7 +215,11 @@ memory-contended conditions noted above.
 
 ## Open, in the order I would try them
 
-1. **Cross-port 0012 to the other three gb10cuda tracks.** laguna-xs, laguna-s
+1. ~~Cross-port 0012 to qwen3.6 gb10cuda~~ — **done, +1.77% decode, shipped as
+   that track's 0017.** Smaller than here for a counted reason: a decode census
+   there is 104 Q6_K / 100 Q8_0 / 40 Q4_K / 37 Q5_K launches per token, so Q4_K
+   is its *smallest* pool. **Still open: laguna-xs and laguna-s gb10cuda**, both
+   `Q4_K_M` on this box.**Cross-port 0012 to the other gb10cuda tracks.** laguna-xs, laguna-s
    and qwen3.6 are all `Q4_K_M` on this box, so the wide vec_dot applies to
    their (ids-path) expert matvecs too, and those tracks are far more
    matvec-dominated than this one. Note the coverage arithmetic changes with

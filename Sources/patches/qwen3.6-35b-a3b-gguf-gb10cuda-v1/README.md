@@ -100,6 +100,74 @@ arch-guarded to sm_121, `GGML_CUDA_DISABLE_MMQ_MOE_J` restores stock.
 - gate ppl 3.9306 on and off, byte-identical (-0.04% vs stock)
 - server greedy identity byte-exact; server uncached prefill 941 -> 987 tok/s
 
+## 0017: the sm_121 wide Q4_K mmvq vec_dot (+1.77% decode)
+
+Cross-port of the lfm2.5 gb10cuda 0012 lever, and **the correction to this
+README's "Q6_K mmvq load-path engineering is FLAT" entry below**. That entry
+is right about Q6_K and right about why — `block_q6_K` is 210 bytes, so
+`ql`/`qh` are 2-byte aligned and the load *cannot* widen — but its conclusion
+("issue-side MLP is NOT the limiter") generalised one quant type too far.
+Q4_K's block is 144 bytes with `qs` at offset 16, and a row is a whole number
+of blocks, so `qs` is 16-byte aligned and the weight fetch *can* become an
+8-byte `int2`. When it does, it pays.
+
+`get_vdr_mmvq(type, table_id)` returns 4 for Q4_K under the sm_121 table
+0014/0015 already established, and the sm_121 `vec_dot_q4_K_q8_1` covers the
+column pair `(iqs, iqs+2)`: the pair shares `bq8_offset`, the unpacked
+scale/min pair and `d8`, so that work happens once instead of twice. Only the
+**device** kernels route through the table-aware overload — the host
+`should_use_small_k` / `mmvq_may_use_small_k` predicates keep the stock vdr on
+purpose, so 0015's `rows_per_block` tuning for the expert shapes does not move
+at the same time and this stays a single-variable change. nwarps is untouched
+(this table already sets 2 for K-quants), so `blocks_per_iter` simply doubles
+from 4 to 8 and the k-loop makes half as many passes.
+
+Measured on the runner box (vllm container parked), 5 interleaved
+whole-process rounds against the 16-patch build:
+
+| round | 0016 tg128 | 0017 tg128 | 0016 pp512 | 0017 pp512 |
+| --- | --- | --- | --- | --- |
+| 1 | 71.21 | **72.43** | 2340.99 | 2340.83 |
+| 2 | 71.06 | **72.50** | 2349.25 | 2335.82 |
+| 3 | 71.27 | **72.47** | 2342.99 | 2339.35 |
+| 4 | 71.05 | **72.63** | 2320.56 | 2352.00 |
+| 5 | 71.26 | **72.39** | 2337.57 | 2346.99 |
+
+decode median ratio **1.0177**, 5/5 arms disjoint; pp512 overlapping in both
+directions, i.e. neutral (prefill takes MMQ and never enters this kernel).
+
+- **firing proof.** nwarps does not change here, so block dims do not move and
+  a name/shape census cannot see the patch. The register census can: the Q4_K
+  `mul_mat_vec_q` goes **48 → 56 registers/thread** at identical grid, block
+  and launch count, and every Q5_K / Q6_K / Q8_0 row is untouched.
+- gate ppl `-c 512 --chunks 8` **bit-identical 3.9306** both arms — the gate's
+  shapes never enter mmvq, so that reading covers nothing. Decode-path ppl
+  (`-b 512 -ub 1 --chunks 8`) **3.9143 → 3.9237, +0.240%**, inside the band.
+  Quote both.
+- **server greedy** (`llama-server`, 6 prompts, `temperature 0`, non-emptiness
+  asserted — 6/6 completions, 3789 and 3774 bytes): **2/6 byte-exact, 4/6
+  diverge mid-completion** (first divergence at bytes 471, 127, 135, 262).
+  Reassociation class, the same as every wide/multi-row matvec rewrite in this
+  family: the wide call moves an addition out of the warp reduction tree and
+  into a lane. Perplexity is the arbiter and it is in band.
+- the full 17-patch series applies clean to pristine `b10237` and the tree is
+  `diff -r` identical to the measured tree.
+
+Projection: decode `1.0177` on top of the bank → score **~1.055** against the
+**1.0435** bank.
+
+### What this says about the remaining pool
+
+A decode census (7 tokens, nsys) counts per token: **104 Q6_K**, **100 Q8_0**,
+**40 Q4_K**, **37 Q5_K** mmvq launches. Q4_K is the *smallest* of the four
+pools, which is exactly why this lever is worth 1.8% here and 7.8% on the
+LFM track where Q4_K is 71% of decode. The next candidate is **Q5_K**:
+`block_q5_K` is 176 bytes with `qs` at offset 48, both multiples of 16, so the
+same `int2` cast is legal. Check the expert `ncols_x` before building it — the
+R9700 twin measured Q5_K `vdr = 4` dead at k=512, where a row is only 2
+k-blocks and most lanes go idle. Q6_K is structurally closed (see below), and
+Q8_0 already uses wide accessors.
+
 ## Measured dead ends (healthy box, 2026-08-08, do not re-buy)
 
 - **Dense Q6_K multi-row mmvq (R9700 0024 port) is NEGATIVE on sm_121**:
@@ -130,6 +198,10 @@ arch-guarded to sm_121, `GGML_CUDA_DISABLE_MMQ_MOE_J` restores stock.
   ldcs median +0.07%). block_q6_K is 210 B = 2-byte aligned, so wide
   vectorized or cp.async loads are structurally impossible; issue-side MLP
   is NOT the limiter - the kernel rate is DRAM-side-determined.
+  **Amended by 0017**: the first two clauses hold, the last does not
+  generalise. It is Q6_K's 210-byte block that closes the lever, not the
+  hardware. Q4_K's 144-byte block admits the same widening and it is worth
+  +1.77% decode; Q5_K's 176-byte block should admit it too.
 - **Output-head requant is decode-NEUTRAL**: head Q6_K->Q5_K (68 MB/token
   cut, ppl +0.40% - inside band but thin margin) and Q6_K->Q5_1 (36
   MB/token, ppl -0.33%) both measured +0.0-0.2% tg32. The byte cut is
