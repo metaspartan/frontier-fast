@@ -1,0 +1,118 @@
+From 878393bf37e9f4be1cad01b3e4f3ff6c9628bd51 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sat, 8 Aug 2026 16:51:40 +0000
+Subject: [PATCH] cuda/hip: raise the grouped mmvf unroll to 16 - the F32
+ router is latency-starved (+0.7% decode, byte-exact)
+
+The grouped mmvf launch is 70 dispatches per token and 330 us, and the bulk of
+it is the 256-row F32 MoE router: 2 MB of weights per layer read by 257
+one-warp blocks in 5.39 us, which is 388 GB/s against the 583 GB/s the grouped
+Q6_K matvec reaches on the same part. Nothing is wrong with the loop. There is
+simply not enough memory parallelism in 257 waves to cover DRAM latency, and the
+only knob that changes that without changing the arithmetic is how many loads a
+wave keeps in flight.
+
+nunroll only groups the loads. Every lane still accumulates columns
+tid, tid+32, tid+64, ... in that order at any nunroll - the unrolled block
+issues its loads together and then mads them in ascending column order, and the
+tail loop continues the same sequence - so the result is bit-identical at every
+setting. That makes this a free sweep.
+
+Swept on gfx1201, interleaved, 3 rounds (tg128 medians):
+
+| nunroll | tg128 | note |
+|---|---|---|
+| 4 (stock) | 146.85 | 8 loads in flight per wave |
+| 8 | 147.66 | |
+| 16 | 148.01 | best, shipped |
+| 32 | 147.79 | register pressure starts to bite |
+
+Per-kernel, nunroll 4 -> 16: the router group 5.39 -> 4.89 us (388 -> 429 GB/s),
+the beta/alpha group 3.71 -> 2.64 us (-29%), total decode kernel time
+5650 -> 5584 us per token.
+
+Measured (runner box, HIP_VISIBLE_DEVICES=0, whole-process interleaved 3-arm
+A/B against a control binary built from the parent commit, rotated order):
+
+- tg128: control 147.29-147.76 (median 147.56), this build forced back to
+  nunroll=4 147.31-147.68 (median 147.40, ratio 0.9989 - templating the kernel
+  costs nothing), default nunroll=16 148.38-148.73 (median 148.59, ratio
+  1.0070); arms disjoint 5/5, min(ON) 148.38 > max(control) 147.76
+- pp512 neutral (median 4401.97 vs 4403.98, ratio 0.9995)
+- tg128 @ d16384 135.84 -> 136.73, @ d32768 126.07 -> 126.82
+- decode-path ppl -b 512 -ub 1 --chunks 8: 3.9338 at nunroll 16 and at
+  nunroll 4 - identical, and identical to the banked stack
+- gate-shape ppl -c 512 --chunks 8: 3.9293 vs stock 3.9314
+- llama-server greedy 6/6 BYTE-EXACT vs the nunroll=4 control
+- test-backend-ops MUL_MAT OK
+
+GGML_MMVF_GROUP_NUNROLL=4|8|16|32 re-sweeps it; the knob is safe to re-sweep on
+other hardware because the per-lane column assignment is unchanged at every
+setting.
+---
+ ggml/src/ggml-cuda/mmvf.cu | 35 ++++++++++++++++++++++++++++++++---
+ 1 file changed, 32 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index d78cd41a4..ac850fc22 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -764,6 +764,14 @@ struct mmvf_grouped_args {
+ // integer-only segment routing on blockIdx.x. One warp per row, identical
+ // unroll-batched k-loop, identical warp reduction: results are byte-identical
+ // to the individual launches.
++// The grouped launch is dominated by the 256-row F32 MoE router: 2 MB of weights
++// read by 257 one-warp blocks, which is 388 GB/s against the 583 the grouped
++// Q6_K matvec reaches on the same part. Nothing is wrong with the loop - there
++// is simply not enough memory parallelism in 257 waves to cover the latency, so
++// the knob is how many loads a wave keeps in flight. nunroll only groups the
++// loads: every lane still accumulates columns tid, tid+32, tid+64, ... in that
++// order at any nunroll, so the result is bit-identical.
++template <int nunroll>
+ static __global__ void mul_mat_vec_f_grouped(
+         const mmvf_grouped_args args, const float * __restrict__ y_ptr,
+         const int ncols2, const int stride_row) {
+@@ -790,7 +798,6 @@ static __global__ void mul_mat_vec_f_grouped(
+ 
+     float sumf = 0.0f;
+ 
+-    constexpr int nunroll = mmvf_nunroll<1, false>();
+     int col2 = tid;
+     for (; col2 + (nunroll - 1)*block_size < ncols2; col2 += nunroll*block_size) {
+         float2 tmpx[nunroll];
+@@ -899,8 +906,30 @@ void ggml_cuda_mul_mat_vec_f_grouped(ggml_backend_cuda_context & ctx, ggml_tenso
+     const dim3 block_dims(warp_size, 1, 1);
+ 
+     const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, ctx.stream()};
+-    ggml_cuda_kernel_launch(mul_mat_vec_f_grouped, launch_params,
+-        args, (const float *) src1->data, (int)(ne10/2), (int) stride_row);
++    static const int nunroll = getenv("GGML_MMVF_GROUP_NUNROLL") ?
++                               std::atoi(getenv("GGML_MMVF_GROUP_NUNROLL")) : 16;
++    switch (nunroll) {
++        case 4:
++            ggml_cuda_kernel_launch((mul_mat_vec_f_grouped<4>), launch_params,
++                args, (const float *) src1->data, (int)(ne10/2), (int) stride_row);
++            break;
++        case 8:
++            ggml_cuda_kernel_launch((mul_mat_vec_f_grouped<8>), launch_params,
++                args, (const float *) src1->data, (int)(ne10/2), (int) stride_row);
++            break;
++        case 16:
++            ggml_cuda_kernel_launch((mul_mat_vec_f_grouped<16>), launch_params,
++                args, (const float *) src1->data, (int)(ne10/2), (int) stride_row);
++            break;
++        case 32:
++            ggml_cuda_kernel_launch((mul_mat_vec_f_grouped<32>), launch_params,
++                args, (const float *) src1->data, (int)(ne10/2), (int) stride_row);
++            break;
++        default:
++            ggml_cuda_kernel_launch((mul_mat_vec_f_grouped<16>), launch_params,
++                args, (const float *) src1->data, (int)(ne10/2), (int) stride_row);
++            break;
++    }
+ }
+ 
+ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+-- 
+2.53.0
+

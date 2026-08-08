@@ -1497,7 +1497,9 @@ Ranked open levers after 0040: ~~(1) fold the two GDN `l2_norm`s into the decode
 conv-fold epilogue~~ — **taken by 0041, +1.3% decode**; (2) the F32 router at
 388 GB/s against the 583 the grouped Q6_K matvec reaches — 257 one-warp blocks
 is too little memory parallelism for 2 MB, but k-splitting it reroutes experts,
-so it is not free; (3) attribute the 12.6 `copyBuffer` launches; (4) prefill
+so it is not free — **0042 took the byte-exact half of this (unroll), leaving
+only the parts that reroute experts**; (3) attribute the 12.6 `copyBuffer`
+launches; (4) prefill
 `gated_delta_net` (11.5%); (5) the 30 GDN gated `rms_norm_f32` launches are the
 same shape of opportunity 0041 just took, one kernel further down the chain —
 they normalise `[128, 32 heads]` straight out of `gated_delta_net`, whose grid
@@ -1667,15 +1669,66 @@ stock-shaped loop nest, so when the l2 fold accepts,
 `GGML_SSM_CONV_FOLD_STOCK_SHAPE=0` no longer reaches the 0031 kernel. Disable
 `GGML_CUDA_DISABLE_SSM_CONV_L2_FOLD=1` first if you want that comparison back.
 
+## 0042: the grouped mmvf unroll — the F32 router is latency-starved, not slow (+0.7% decode, BYTE-EXACT)
+
+Round-23's open lever (2). The grouped mmvf launch is 70 dispatches and 330 us
+per token, most of it the 256-row F32 MoE router: 2 MB of weights per layer read
+by **257 one-warp blocks in 5.39 us = 388 GB/s**, against the 583 GB/s the
+grouped Q6_K matvec reaches on the same part. Nothing is wrong with the loop —
+257 waves cannot keep enough loads in flight to cover DRAM latency, and the only
+knob that changes that without changing the arithmetic is `nunroll`.
+
+**`nunroll` is a free knob, and that is the point worth carrying.** It only
+groups the loads: the unrolled block issues its loads together and then mads
+them in ascending column order, and the tail loop continues the same sequence,
+so every lane still accumulates columns `tid, tid+32, tid+64, ...` in that order
+at every setting. Bit-identical by construction — no correctness argument to
+make, just a sweep.
+
+| nunroll | tg128 | note |
+|---|---|---|
+| 4 (stock) | 146.85 | 8 loads in flight per wave |
+| 8 | 147.66 | |
+| **16** | **148.01** | **shipped** |
+| 32 | 147.79 | register pressure starts to bite |
+
+Per kernel, 4 -> 16: the router group **5.39 -> 4.89 us** (388 -> 429 GB/s), the
+beta/alpha group **3.71 -> 2.64 us** (-29%), decode kernel time 5650 -> 5584 us.
+
+3-arm A/B against a control built from the parent commit, rotated, 5 rounds:
+
+| arm | tg128 | median | vs control |
+|---|---|---|---|
+| control (0041 binary) | 147.29-147.76 | 147.56 | — |
+| this build forced to nunroll=4 | 147.31-147.68 | 147.40 | **0.9989** (templating is free) |
+| default nunroll=16 | 148.38-148.73 | 148.59 | **1.0070** |
+
+Arms disjoint 5/5. pp512 neutral (0.9995). tg128 @ d16384 135.84 -> 136.73,
+@ d32768 126.07 -> 126.82. Decode-path ppl **3.9338** at nunroll 16 and at
+nunroll 4 — identical, and identical to the banked stack; gate-shape ppl 3.9293
+vs stock 3.9314; `llama-server` greedy **6/6 BYTE-EXACT** vs the nunroll=4
+control; `test-backend-ops` MUL_MAT OK.
+
+`GGML_MMVF_GROUP_NUNROLL=4|8|16|32` re-sweeps it. Safe to re-sweep on other
+hardware: the per-lane column assignment is unchanged at every setting, so the
+answer can differ without the numerics differing.
+
+The router is still only at 429 GB/s. The remaining gap needs either more rows
+per block or wider per-lane loads, and both change the per-lane column
+assignment — which for the router means different logits, which means a
+different top-8. That is inside the gate but no longer byte-exact, so it is a
+separate decision, not a continuation of this one.
+
 ## Recommended firing order
 
 The runner applies the whole patch directory, so the series is a ladder rather
-than a choice; **0001-0041** is the verified set and every patch that carries
+than a choice; **0001-0042** is the verified set and every patch that carries
 speed has a disable toggle. Two do not carry speed: **0038** is 0037's kernel
 made bit-identical and must not be applied without 0037; **0039** is 0031's
 kernel made sign-of-zero-exact and must not be applied without 0031
 (`GGML_SSM_CONV_FOLD_STOCK_SHAPE=0` falls back to the 0031 kernel in place).
-If a ranked run has to be pared back, drop from the end: 0041 (needs 0031+0039,
+If a ranked run has to be pared back, drop from the end: 0042 (a one-constant
+change, independent of everything), then 0041 (needs 0031+0039,
 which own the decode conv fold it extends), then 0040 (prefill only, independent
 of everything), then 0039, then 0038+0037, then 0036, 0035, 0034 (independent
 +1.5% decode folds); 0033 is the prefill fold; 0032 and 0030 are the two largest
@@ -1685,14 +1738,15 @@ combine as n_expert_used-1 separate adds. 0041 likewise has two halves (the
 in-place norm in `qwen35moe.cpp` and the CUDA epilogue) and the CUDA half
 declines without the graph half.
 
-**Projection after 0041: ~1.584-1.589 vs the 1.4525 bank.** Decode 1.7536 ->
-**1.7769** (x1.0133); prefill 1.2911 -> **1.3205** (x1.0228); ttft moves with
+**Projection after 0042: ~1.591-1.596 vs the 1.4525 bank.** Decode 1.7536 ->
+**1.7893** (x1.0133 from 0041, x1.0070 from 0042); prefill 1.2911 -> **1.3205**
+(x1.0228 from 0040); ttft moves with
 prefill for prompt processing, so the band spans ttft flat (1.584) to ttft
 carrying the full prefill ratio (1.589). Every ratio here is measured against a
 binary built from the patch's own parent commit, not against a toggle.
 
-Rounds 21 and 22 bought correctness; 23 and 24 are the first speed since 0037,
-one on each side of the exponent.
+Rounds 21 and 22 bought correctness; 23, 24 and 25 are the first speed since
+0037 — one on the prefill side, two on the decode side.
 
 Correctness state of the stack is unchanged: **-0.180%** against stock on the
 decode path, **-0.11 to -0.17%** at the gate shape, and every banked fold now
