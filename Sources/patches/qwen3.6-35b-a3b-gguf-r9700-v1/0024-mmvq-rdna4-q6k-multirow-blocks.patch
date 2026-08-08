@@ -1,0 +1,163 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH 24/25] cuda: RDNA4 multi-row blocks for dense Q6_K mmvq (decode)
+
+Decode on this track is dominated by dense Q6_K matvecs (the 0021 requant
+target: qkv/gate/out projections plus the 248320-row output head - 42% of
+decode kernel time). Stock launch geometry on RDNA4 is one row per block
+(rows_per_cuda_block = 1), so each 256-thread block reads a single 1.7 KB
+row and exits: the memory system is latency-bound, measured 351-528 GB/s
+against the part's ~644 GB/s. The small_k multi-row mode that fixes exactly
+this is hard-disabled on all RDNA in should_use_small_k - apparently never
+tried on RDNA4.
+
+Opt dense Q6_K (ncols_dst == 1, no ids) into the small_k route on RDNA4 with
+rows_per_cuda_block = 2: per-block work doubles, block count halves, and
+per-row arithmetic is unchanged (each thread keeps its stock k-block
+assignment for every row, so per-row accumulation order - and the result -
+is byte-identical). The grouped mmvq kernel gets a small_k template variant
+(Q6_K only) so grouped members keep the same two-row geometry; seg_end
+switches to block units there, gated on every segment row count dividing
+evenly, else it falls back to the stock one-row grouped launch.
+
+Swept rpb 2/4/8 on the runner box: +3.1%/+1.9%/+0.8% decode. Q5_K was
+neutral; Q4_K/Q8_0 dense and the MUL_MAT_ID expert paths regressed - only
+dense Q6_K opts in. GGML_CUDA_DISABLE_MMVQ_RPB restores stock geometry.
+
+Same-binary toggle A/B (pinned device 0): tg128 112.9 -> 116.9 tok/s
+(+3.6% with 0025; +3.1% alone), tg64@d16384 107.1 -> 110.7 (+3.4%);
+pp512/pp16384 unchanged. Server level (isolated 0023-state control libs,
+interleaved): decode 112.9-113.5 -> 116.3-116.4 tok/s (+3.0%), prefill
+identical. Whole-process stock-vs-cand (5 rounds): tg128 ratio median
+1.4470 (vs 1.389 at 0023), pp512 1.2202. Gate ppl 3.9180/3.9180/3.9186
+(stock 3.9314, -0.33%, band +/-0.5%). Server greedy identity byte-exact vs
+the isolated 0023-state control on long and short prompts.
+---
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index e2f812c61..417d82235 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -478,6 +478,12 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
+                 return 1;
+         }
+     }
++#ifndef GGML_MMVQ_R4_SMALLK_RPB
++#define GGML_MMVQ_R4_SMALLK_RPB 2
++#endif
++    if (table_id == MMVQ_PARAMETERS_RDNA4 && ncols_dst == 1 && small_k) {
++        return GGML_MMVQ_R4_SMALLK_RPB;
++    }
+     return 1;
+ }
+ 
+@@ -861,6 +867,21 @@ static int mmvq_untrim_below_blocks() {
+     return v;
+ }
+ 
++// RDNA4 dense-Q6_K multi-row blocks (rows_per_cuda_block = 2): the stock
++// launch geometry gives every block a single 1.7 KB row read, which leaves the
++// memory system latency-bound (measured 351-528 GB/s on a 644 GB/s part).
++// Two rows per block doubles the per-block work at identical per-row
++// arithmetic (each thread keeps its stock k-block assignment for every row, so
++// per-row accumulation order is unchanged and results are byte-identical).
++// Measured on gfx1201/Qwen3.6: tg128 112.4 -> 115.6 tok/s dense-only.
++static bool mmvq_r4_rpb_enabled() {
++    static const bool v = []() {
++        const char * e = getenv("GGML_CUDA_DISABLE_MMVQ_RPB");
++        return e == nullptr || std::atoi(e) == 0;
++    }();
++    return v;
++}
++
+ template<ggml_type type>
+ static std::pair<dim3, dim3> calc_launch_params(
+         const int ncols_dst, const int ncols_x, const int nrows_x, const int nchannels_dst, const int nsamples_or_ntokens,
+@@ -903,7 +924,7 @@ struct mmvq_grouped_args {
+     uint32_t     seg_end[MMVQ_MAX_GROUP_SIZE];
+ };
+ 
+-template <ggml_type type>
++template <ggml_type type, bool small_k = false>
+ __launch_bounds__(calc_nwarps(type, 1, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q_grouped(
+         const mmvq_grouped_args args, const void * vy_ptr,
+@@ -914,8 +935,11 @@ static __global__ void mul_mat_vec_q_grouped(
+     constexpr int vdr = get_vdr_mmvq(type);
+     constexpr mmvq_parameter_table_id table_id = get_device_table_id();
+     constexpr int nwarps = calc_nwarps(type, ncols_dst, table_id);
+-    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, /*small_k=*/false, nwarps);
+-    static_assert(rows_per_cuda_block == 1, "grouped mmvq requires the block index to be the row index");
++    constexpr int rows_per_cuda_block = calc_rows_per_block(ncols_dst, table_id, small_k, nwarps);
++    // seg_end is given in block units, so the segment scan works for any
++    // rows_per_cuda_block as long as every segment row count divides evenly
++    // (the host guarantees that before choosing small_k = true).
++    static_assert(small_k || rows_per_cuda_block == 1, "grouped mmvq requires the block index to be the row index");
+     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+ 
+     constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
+@@ -1025,7 +1049,7 @@ static __global__ void mul_mat_vec_q_grouped(
+ 
+ template <ggml_type type>
+ static void mul_mat_vec_q_grouped_launch(
+-        const mmvq_grouped_args & args, const void * vy, const uint32_t total_rows,
++        const mmvq_grouped_args & args_in, const void * vy, const uint32_t total_rows,
+         const uint32_t ncols_x, const uint32_t stride_row_x, cudaStream_t stream) {
+     const int device    = ggml_cuda_get_device();
+     const int cc        = ggml_cuda_info().devices[device].cc;
+@@ -1035,13 +1059,40 @@ static void mul_mat_vec_q_grouped_launch(
+     const int nwarps = calc_nwarps(type, 1, table_id);
+     GGML_ASSERT(calc_rows_per_block(1, table_id, /*small_k=*/false, nwarps) == 1);
+ 
++    // Multi-row blocks (same geometry as the individual small_k launches) when
++    // the arch/type opts in and every segment row count divides evenly.
++    if constexpr (type == GGML_TYPE_Q6_K) {
++        constexpr int rpb = calc_rows_per_block(1, MMVQ_PARAMETERS_RDNA4, /*small_k=*/true, 8);
++        if (rpb > 1 && table_id == MMVQ_PARAMETERS_RDNA4 && mmvq_r4_rpb_enabled()) {
++            bool divisible = true;
++            uint32_t prev = 0;
++            mmvq_grouped_args args_blk = args_in;
++            for (int m = 0; m < MMVQ_MAX_GROUP_SIZE; ++m) {
++                const uint32_t rows = args_in.seg_end[m] - prev;
++                if (rows % rpb != 0) {
++                    divisible = false;
++                    break;
++                }
++                prev            = args_in.seg_end[m];
++                args_blk.seg_end[m] = args_in.seg_end[m] / rpb;
++            }
++            if (divisible) {
++                const dim3 block_nums(total_rows / rpb, 1, 1);
++                const dim3 block_dims(warp_size, calc_nwarps_launched<type>(ncols_x, nwarps, warp_size), 1);
++                const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
++                ggml_cuda_kernel_launch(mul_mat_vec_q_grouped<type, true>, launch_params, args_blk, vy, ncols_x, stride_row_x);
++                return;
++            }
++        }
++    }
++
+     // Same block shape (including the idle-warp trim, which depends only on the
+     // shared ncols_x) as each individual launch would use.
+     const dim3 block_nums(total_rows, 1, 1);
+     const dim3 block_dims(warp_size, calc_nwarps_launched<type>(ncols_x, nwarps, warp_size), 1);
+ 
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
+-    ggml_cuda_kernel_launch(mul_mat_vec_q_grouped<type>, launch_params, args, vy, ncols_x, stride_row_x);
++    ggml_cuda_kernel_launch(mul_mat_vec_q_grouped<type>, launch_params, args_in, vy, ncols_x, stride_row_x);
+ }
+ 
+ static void mul_mat_vec_q_grouped_switch_type(
+@@ -1196,6 +1247,15 @@ static void mul_mat_vec_q_switch_ncols_dst(
+             use = false;
+         }
+ 
++        // RDNA4: multi-row blocks for dense Q6_K matvecs (see
++        // mmvq_r4_rpb_enabled above). Swept on gfx1201: rpb 2/4/8 gave
++        // +3.1%/+1.9%/+0.8% decode for Q6_K; Q5_K was neutral and Q4_K/Q8_0
++        // and the MUL_MAT_ID expert paths regressed, so only dense Q6_K opts in.
++        if (GGML_CUDA_CC_IS_RDNA4(cc) && ncols_dst == 1 && !has_ids &&
++                type == GGML_TYPE_Q6_K && mmvq_r4_rpb_enabled()) {
++            use = true;
++        }
++
+         return use;
+     };
+ 

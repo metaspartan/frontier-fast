@@ -1,0 +1,40 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH 25/25] qwen35moe: pin qkv and z projections adjacent for the grouped mmvq launch
+
+The GDN qkv [2048->8192] and z gate [2048->4096] projections are independent
+matvecs over the same activation and (after the 0021 requant) the same
+quantization type, but z is consumed only at the very end of the GDN block,
+so the topological visit places its matvec far from the qkv one - outside
+the grouped-mmvq detector's reach. Pin the two adjacently with
+ggml_build_forward_expand (the exact trick the tree already uses for the
+beta/alpha pair) so the existing detector folds them into one grouped
+launch per GDN layer: 30 launches/token removed, ops/operands/shapes
+unchanged, outputs byte-identical by the grouped kernel's construction.
+
+Measured on the runner box: ~+1% decode on top of 0024 at llama-bench
+(stack 112.4 -> 116.9 tok/s tg128). At llama-server the grouped path is
+inert for these graphs (concurrent-events sections disable inline grouping),
+so this is bench-visible only: server decode and prefill measured identical
+to control (112.9-113.5 vs 112.9-113.5 with rpb disabled; prefill 843-852
+both arms). Covered by the same gates as 0024: ppl in band, server greedy
+identity byte-exact vs the isolated 0023-state control.
+---
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 8ebe321e5..1249d7088 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -265,6 +265,14 @@ std::pair<ggml_tensor *, ggml_tensor *> llama_model_qwen35moe::graph::build_qkvz
+     ggml_tensor * z = build_lora_mm(model.layers[il].wqkv_gate, input, model.layers[il].wqkv_gate_s);
+     cb(z, "z", il);
+ 
++    // The qkv and z projections are independent matvecs over the same
++    // activation; z is otherwise consumed only at the end of the GDN block, so
++    // the topological visit would place its matvec far from the qkv one. Pin
++    // them adjacently (same trick as beta/alpha below) so the CUDA backend can
++    // fold them into one grouped launch; ops, operands and shapes unchanged.
++    ggml_build_forward_expand(gf, qkv_mixed);
++    ggml_build_forward_expand(gf, z);
++
+     return { qkv_mixed, z };
+ }
+ 

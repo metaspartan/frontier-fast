@@ -310,3 +310,73 @@ Measured (runner box):
 Projection at submission: decode ~1.389 (draw-dependent), prefill ~1.22,
 ttft following prefill -> score ~1.33 vs the 1.2980 bank even on a fast
 stock decode draw.
+
+
+## Round 8 profile maps (post-0023 cand, rocprofv3)
+
+pp512 (256 ms kernel/pass): mul_mat_q Q4_K 18.8% + Q5_K 13.0% + small-J
+    2.8% (36% total, down from 43.6% pre-cap), gated_delta_net 13.1%,
+    rocBLAS fp16/f32 GEMMs ~18.6%, mm_ids_helper 4.5%, q6 dequant (0021
+    route) 3.4%.
+decode (6.9 ms kernel/token): mmvq ~64%, of which dense Q6_K = 42% (the
+    0021 requant targets: qkv/attn_q [2048->8192] 27.8us at 495 GB/s,
+    attn_gate [2048->4096] 19.6us at 351 GB/s, ssm_out 13.2us at 521 GB/s,
+    output head [2048->248320] 790us at 528 GB/s vs ~644 GB/s peak);
+    expert ids matvecs Q4_K 11.2% (489 GB/s) + Q5_K 6.8% (451 GB/s);
+    gated_delta_net 4.8%; grouped mmvf/mmvq 8.6%.
+pp16384: flash_attn_tile 31.9% dominates; mul_mat_q 24.5%; GDN 9.2%;
+    rocBLAS 13.1%. dec@16k: flash_attn_tile 30.3%.
+The long-context board surface is flash_attn_tile; the ranked decode
+surface is dense-Q6_K matvec efficiency; ranked prefill surface remains
+MMQ + GDN.
+
+## Measured-dead: MMQ RDNA4 tile geometry at J=32 (round 8)
+
+With the 0023 J-cap in place, swept the Q4_K/Q5_K J=32 CASE rows
+(nthreads, occupancy, I): stock (128,2,64) 3912 pp512; (64,2,32) 3774;
+(256,2,128) 3745; occupancy 1/3/4 within noise of stock. The J *selection*
+was the win; tile geometry is already optimal on RDNA4 for these expert
+shapes. Do not re-sweep.
+
+## 0024: round 8 - RDNA4 multi-row blocks for dense Q6_K mmvq (+3% decode)
+
+Stock mmvq on RDNA4 runs rows_per_cuda_block=1 everywhere: each 256-thread
+block reads one 1.7 KB Q6_K row and exits - latency-bound (351-528 GB/s on
+a 644 GB/s part). The small_k multi-row mode that fixes exactly this is
+hard-disabled on all RDNA in should_use_small_k (never tried on RDNA4).
+0024 opts dense Q6_K (ncols_dst==1, no ids) into the small_k route with
+rpb=2, and gives the grouped mmvq kernel a Q6_K small_k variant (seg_end in
+block units, divisibility-gated). Per-thread k-block assignment per row is
+unchanged -> byte-identical results. Swept rpb 2/4/8: +3.1/+1.9/+0.8%;
+Q5_K neutral; Q4_K/Q8_0 and the ids expert paths regress (excluded).
+GGML_CUDA_DISABLE_MMVQ_RPB restores stock.
+
+- toggle A/B: tg128 112.9 -> 116.9 (+3.6% with 0025), tg64@d16384
+  107.1 -> 110.7 (+3.4% - the long board gains too); pp512/pp16384 flat
+- server level (isolated 0023 control libs, interleaved): decode
+  112.9-113.5 -> 116.3-116.4 (+3.0%), prefill identical (843-852 both)
+- whole-process stock-vs-cand, 5 rounds: tg128 ratio median 1.4470
+  (0023: 1.389), pp512 1.2202 (held)
+- ppl: 3.9180/3.9180/3.9186/3.9263/3.9201 across 5 loads (stock 3.9314;
+  worst case -0.13%, band 0.5%)
+- server greedy identity byte-exact vs isolated 0023-state control
+  (long + short prompts). NOTE: the build makes thin executables over
+  shared libs - a copied llama-server binary still loads the CURRENT
+  build dir libs via RUNPATH. Control comparisons need a full bin-dir
+  snapshot + LD_LIBRARY_PATH, or the "control" silently runs cand code.
+
+## 0025: qkv/z grouped adjacency (bench-only, server-neutral)
+
+The GDN z gate matvec shares src1 and (post-0021) type with the qkv matvec
+but is consumed at the end of the GDN block, so topological order places it
+outside the grouped-mmvq detector window. Pinning the pair adjacent via
+ggml_build_forward_expand (the beta/alpha trick) folds them into one
+grouped launch per GDN layer: +1% decode at llama-bench. Under llama-server
+these graph sections carry concurrent events, which disable inline
+grouping, so it is SERVER-NEUTRAL (decode and prefill measured identical to
+control) - kept because it is free, byte-identity-verified, and pays on any
+non-concurrent-events dispatch.
+
+Projection at submission: decode ~1.447 local ratio (server +3.0% over the
+0023 state that ranked 1.3955), prefill ~1.186-1.22 unchanged, ttft
+following prefill -> score ~1.34-1.35 vs the 1.3103 frontier.
