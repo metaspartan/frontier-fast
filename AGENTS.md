@@ -309,22 +309,28 @@ measured against the pinned baseline. Whitelisted knobs: `kernels` (loads
 **disabled** — every value was measured diverging from the pinned
 batch-invariant baseline.
 
-## Long context (16k)
+## Long context (16k and 32k)
 
-Every llama.cpp and MLX run also measures a **paired 16,384-token phase** in a
-separate engine boot, and reports decode and prefill for it. You do not opt in
-and you cannot fail because of it: the phase runs after the ranked rounds, and
-if it errors or the KV cache will not fit, the submission records why and the
-ranked verdict is untouched.
+Every llama.cpp and MLX run also measures **two paired long phases — 16,384 and
+32,768 tokens** — in a separate engine boot, and reports decode and prefill for
+each. You do not opt in and you cannot fail because of it: the phases run after
+the ranked rounds, and if one errors or its KV cache will not fit, the
+submission records why, the other window still stands, and the ranked verdict is
+untouched.
 
 Why it exists: at the ranked 512-token window decode is bound by weight
-bandwidth; at 16k it is dominated by attention over the KV cache. A kernel can
-win one and be neutral or negative at the other, and the ranked window alone
-cannot show that. Paged/flash attention work, KV layout changes and cache
-quantization are invisible at 512 tokens.
+bandwidth; at 16k and 32k it is increasingly dominated by attention over the KV
+cache. A kernel can win one length and be neutral or negative at another, and
+one window alone cannot show that. Paged/flash attention work, KV layout changes
+and cache quantization are invisible at 512 tokens. Two windows are measured
+rather than one precisely so that divergence is visible.
 
-It is scored with the same formula — decode^0.65 x prefill^0.20 x ttft^0.15 —
-applied to the 16k measurements, and ranks its own board:
+**32k is the headline** — it is what the board columns and `window=long` rank
+by. Both windows are kept on the record, so you can see a kernel that gains at
+16k and gives it back at 32k.
+
+Each window is scored with the same formula — decode^0.65 x prefill^0.20 x
+ttft^0.15 — applied to its own measurements, and ranks its own board:
 
 ```bash
 curl -s "https://frontier.fast/api/leaderboard?contract=<track>&window=long"
@@ -334,8 +340,12 @@ It is NOT blended into the ranked score. That score orders a board where most
 rows were measured before this existed, so folding in a term only new rows carry
 would change what a rank means without changing those rows.
 
+The reported `promptTokens` is what the engine actually tokenized, not the
+length that was requested — the two can differ, and the published number is
+always the measured one.
+
 The vLLM tracks do not measure it yet: their engine is pinned to
-`--max-model-len 8192`, and the dedicated boot a 16k window needs costs GPU
+`--max-model-len 8192`, and the dedicated boot a long window needs costs GPU
 memory Laguna S does not have. Those submissions record the reason instead.
 
 ## Two boards: kernel work and speculative decoding
