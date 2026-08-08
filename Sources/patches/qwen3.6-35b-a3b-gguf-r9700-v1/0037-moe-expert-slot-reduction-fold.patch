@@ -1,0 +1,625 @@
+From 14cf4f95a92e5d5256dcf69fabef2b332af13489 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sat, 8 Aug 2026 14:41:36 +0000
+Subject: [PATCH] cuda/hip: fold the MoE expert-slot reduction into the down
+ matvec (+1.6% decode)
+
+After 0034 the expert-down `mul_mat_id` writes [n_embd, n_expert_used] with the
+routing weight already applied in its epilogue, and a fused multi-add sums the
+eight slices into [n_embd]: 40 launches/token at 1.7us, moving 64 KB of reads
+and 64 KB of writes per layer to produce 8 KB - when the matvec that wrote those
+bytes held every one of them in a register.
+
+The parallelism is the whole difficulty. In the launch this replaces
+`blockIdx.y` IS the expert slot, so nrows_x * n_expert_used warps are in flight;
+looping one warp over the eight experts would cut that 8x on a matvec that is
+latency-bound (444 GB/s measured), costing more than the fold saves. Instead
+`threadIdx.y` becomes the expert slot - it is free, because this shape trims to
+a single k-split warp (calc_nwarps_launched) - so the same number of warps run,
+the eight partials reduce through 32 bytes of LDS in slot order 0..7, and there
+is one store instead of eight.
+
+Two halves, only useful together:
+
+1. `mmvq.cu`: `mul_mat_vec_q_expert_reduce`, gated to the single-k-split-warp
+   shape it is derived from (one row per block, every k-block covered by one
+   warp in a single pass, host trimming active), plus a dedicated entry point
+   that reuses the shared q8_1 cache so falling through to
+   `ggml_cuda_mul_mat_vec_q` is free.
+2. `llama-graph.cpp`: the expert combine becomes in-place AT THE DECODE SHAPE,
+   so `moe_out` lands on the matvec's own output block (expert slot 0).
+
+Half 2 is not cosmetic, and it is the lesson of this round. The fold hoists the
+store back to matvec time, while the kernel's other blocks are still reading the
+routing weights and the ids - and out of place, ggml-alloc frees both at the
+routing multiply and puts `moe_out` exactly there: 156/160 decode sites landed
+on the weights, 4/160 on the ids, and the hazard scan correctly declined every
+one. Slot 0 is disjoint from both by construction, because `experts` is
+allocated while the ids are still live and the multiply reuses it in place while
+`weights` is still live.
+
+The first attempt at half 2 kept the weights and ids alive with dangling view
+nodes instead. It worked, and it made the whole engine nondeterministic: server
+greedy A/A went from 5/6 byte-exact to 0/6, with the CUDA fold disabled, and it
+was not the 0032 epilogue pass or the 0030 state view (both toggled off, still
+0/6). Do not pin tensors with consumerless view nodes on this fork.
+
+Measured (runner box, HIP_VISIBLE_DEVICES=0):
+
+- toggle A/B (both halves off = pre-patch), 5 rounds: tg128 143.63-143.91 ->
+  145.89-146.10, median per-round ratio 1.0157, 5/5 disjoint; pp512 neutral
+  (arms overlap: 4280-4362 off vs 4271-4338 on)
+- dispatches 821 -> 781/token; k_bin_bcast 41 -> 1/token; decode kernel time
+  5.734 -> 5.686 ms/token
+- whole-process vs stock, 5 rounds: tg128 median ratio 1.7979 (0036: 1.7825),
+  pp512 1.3410
+- gate ppl 3.9248/3.9259/3.9262 vs stock 3.9314 (-0.13 to -0.17%); prefill is
+  structurally untouched (the fold requires ne[2] == 1, the in-place combine
+  n_tokens == 1)
+- decode-path ppl - llama-perplexity -ub 1 so every ubatch is one token and the
+  fold actually fires - 3.9404 vs 3.9338 fold-off, i.e. +0.229% vs stock,
+  deterministic across loads and inside the 0.5% band
+- test-backend-ops MUL_MAT_ID / ADD / MUL / VIEW OK
+- server greedy: A/A deterministic (5/6 byte-exact, p5 is the near-tie prompt
+  that also drifts A/A in the control); vs control 2/6 byte-exact, 4/6 drift
+
+Not byte-exact, and measured rather than assumed: GGML_CUDA_MOE_REDUCE_PER_SLOT=1
+keeps the new launch geometry but stores per slot and leaves the add chain in
+the graph, and it reproduces the folded result exactly. So the reduction is
+exact in slot order - it is the rewritten matvec body that the compiler
+contracts differently, the same class as 0024/0026/0028/0031/0033 and gated the
+same way.
+
+GGML_CUDA_DISABLE_MOE_EXPERT_REDUCE=1 disables the fold,
+GGML_MOE_COMBINE_INPLACE=0 the graph half, GGML_CUDA_MOE_REDUCE_DEBUG=1 prints
+one accept/decline line per site with the gate that declined.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 158 +++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cu      | 270 ++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvq.cuh     |  19 +++
+ src/llama-graph.cpp             |  25 ++-
+ 4 files changed, 471 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7442e20a7..cd7d61cc6 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3321,6 +3321,141 @@ static bool ggml_cuda_mmvq_ranges_disjoint(const ggml_tensor * a, const ggml_ten
+     return a1 <= b0 || b1 <= a0;
+ }
+ 
++// ---- 0037: the MoE expert-slot reduction folded into the down matvec ----
++//
++// Matches the whole tail of build_moe_ffn's expert combine as it appears in the
++// cgraph at decode (one token):
++//
++//   i    MUL_MAT_ID   ffn_moe_down      [n_embd, n_expert_used, 1]
++//   i+1  MUL          ffn_moe_weighted  (routing weights; folded by 0034)
++//   ...  VIEW x n     one per expert slot, slot-ordered
++//   ...  ADD  x n-1   left-folded chain, fused into one k_bin_bcast upstream
++//
++// and reports the final ADD, whose destination the folded matvec writes
++// directly; every node in between is absorbed. The slot ORDER matters: the fold
++// sums slot 0..n-1 in that order, which is what launch_bin_bcast_pack's fused
++// multi-add does, so the result is bit-identical rather than merely equivalent.
++static bool ggml_cuda_moe_expert_reduce_detect(
++        const ggml_cgraph * cgraph, const int i,
++        const ggml_tensor ** out_w, ggml_tensor ** out_final, int * out_last_idx) {
++    static const bool debug = getenv("GGML_CUDA_MOE_REDUCE_DEBUG") != nullptr &&
++                              std::atoi(getenv("GGML_CUDA_MOE_REDUCE_DEBUG"));
++#define GGML_MOE_REDUCE_DECLINE(reason)                                              \
++    do {                                                                             \
++        if (debug) { GGML_LOG_INFO("moe-reduce: decline @%d: %s\n", i, (reason)); }   \
++        return false;                                                                \
++    } while (0)
++
++    const ggml_tensor * mm = cgraph->nodes[i];
++    if (mm->op != GGML_OP_MUL_MAT_ID) {
++        return false;
++    }
++
++    // reuse the 0034 pair check: it establishes the MUL at i+1, the per-slot
++    // routing-weight vector, mmvq routing, ne[2] == 1 and the layout match
++    const ggml_tensor * mul = nullptr;
++    const ggml_tensor * w   = nullptr;
++    if (!ggml_cuda_moe_weight_fuse_detect(cgraph, i, &mul, &w, GGML_OP_MUL_MAT_ID)) {
++        return false;
++    }
++
++    const int64_t n_slots = mm->ne[1];
++    if (n_slots < 2 || n_slots > MMVQ_EXPERT_REDUCE_MAX_SLOTS) {
++        GGML_MOE_REDUCE_DECLINE("expert slot count out of range");
++    }
++    if (mm->ne[2] != 1 || mm->ne[3] != 1) {
++        GGML_MOE_REDUCE_DECLINE("not a single-token matvec");
++    }
++    if (mul->flags & GGML_TENSOR_FLAG_OUTPUT) {
++        GGML_MOE_REDUCE_DECLINE("weighted experts is a graph output");
++    }
++    // the weighted experts must be consumed by the n slot views and nothing else
++    if (ggml_node_get_use_count(cgraph, i + 1) != (int32_t) n_slots) {
++        GGML_MOE_REDUCE_DECLINE("weighted experts has other consumers");
++    }
++
++    const ggml_tensor * views[MMVQ_EXPERT_REDUCE_MAX_SLOTS] = { nullptr };
++    int j = i + 2;
++    for (int64_t s = 0; s < n_slots; ++s, ++j) {
++        if (j >= cgraph->n_nodes) {
++            GGML_MOE_REDUCE_DECLINE("graph ends inside the slot views");
++        }
++        const ggml_tensor * v = cgraph->nodes[j];
++        if (v->op != GGML_OP_VIEW || v->view_src != mul) {
++            GGML_MOE_REDUCE_DECLINE("not a slot view of the weighted experts");
++        }
++        if (v->type != GGML_TYPE_F32 || v->ne[0] != mul->ne[0] || v->ne[1] != mul->ne[2] ||
++                v->ne[2] != 1 || v->ne[3] != 1 || v->nb[0] != sizeof(float)) {
++            GGML_MOE_REDUCE_DECLINE("slot view has an unexpected shape");
++        }
++        if ((const char *) v->data != (const char *) mul->data + s*mul->nb[1]) {
++            GGML_MOE_REDUCE_DECLINE("slot views are not in slot order");
++        }
++        if ((v->flags & GGML_TENSOR_FLAG_OUTPUT) || ggml_node_get_use_count(cgraph, j) != 1) {
++            GGML_MOE_REDUCE_DECLINE("slot view has other consumers");
++        }
++        views[s] = v;
++    }
++
++    const ggml_tensor * acc = views[0];
++    for (int64_t s = 1; s < n_slots; ++s, ++j) {
++        if (j >= cgraph->n_nodes) {
++            GGML_MOE_REDUCE_DECLINE("graph ends inside the add chain");
++        }
++        const ggml_tensor * a = cgraph->nodes[j];
++        if (a->op != GGML_OP_ADD || a->src[0] != acc || a->src[1] != views[s]) {
++            GGML_MOE_REDUCE_DECLINE("add chain is not the left-folded slot sum");
++        }
++        const bool is_last = (s == n_slots - 1);
++        if (!is_last && ((a->flags & GGML_TENSOR_FLAG_OUTPUT) ||
++                         ggml_node_get_use_count(cgraph, j) != 1)) {
++            GGML_MOE_REDUCE_DECLINE("intermediate add has other consumers");
++        }
++        acc = a;
++    }
++
++    ggml_tensor * final_add = cgraph->nodes[j - 1];
++    if (final_add->type != GGML_TYPE_F32 || !ggml_is_contiguous(final_add) ||
++            final_add->nb[0] != sizeof(float) || ggml_nelements(final_add) != mm->ne[0]) {
++        GGML_MOE_REDUCE_DECLINE("reduced output is not a plain contiguous row");
++    }
++    // An out-of-place chain gets a fresh allocation that ggml-alloc almost always
++    // takes from the just-freed routing weights, which this kernel reads while it
++    // writes - see the in-place combine in build_moe_ffn.
++    if (final_add->data != views[0]->data) {
++        GGML_MOE_REDUCE_DECLINE("reduced output is not the slot-0 block");
++    }
++
++    // The store moves back to matvec time, so the destination must not alias
++    // anything the matvec reads (0032's lesson: a hoisted epilogue write is an
++    // allocation problem). Nothing else executes in the window - the absorbed
++    // nodes are the only ones between - so these are the whole hazard set.
++    const ggml_tensor * ids = mm->src[2];
++    if (!ggml_cuda_mmvq_ranges_disjoint(final_add, w)) {
++        GGML_MOE_REDUCE_DECLINE("reduced output aliases the routing weights");
++    }
++    if (!ggml_cuda_mmvq_ranges_disjoint(final_add, mm->src[0])) {
++        GGML_MOE_REDUCE_DECLINE("reduced output aliases the weight slab");
++    }
++    // NOTE: src[1] deliberately not checked. The matvec never reads it - it
++    // reads the q8_1 copy in the pool - and any quantize this launch issues
++    // runs before it on the same stream.
++    if (ids != nullptr && !ggml_cuda_mmvq_ranges_disjoint(final_add, ids)) {
++        GGML_MOE_REDUCE_DECLINE("reduced output aliases the ids");
++    }
++
++    if (debug) {
++        GGML_LOG_INFO("moe-reduce: accept @%d slots=%d absorbing %d..%d\n",
++                      i, (int) n_slots, i + 1, j - 1);
++    }
++
++    *out_w        = w;
++    *out_final    = final_add;
++    *out_last_idx = j - 1;
++    return true;
++#undef GGML_MOE_REDUCE_DECLINE
++}
++
+ static bool ggml_cuda_mmvq_hoist_legal(const ggml_cgraph * cgraph, const int start, const int j) {
+     const ggml_tensor * cand = cgraph->nodes[j];
+     for (int k = start + 1; k < j; ++k) {
+@@ -5712,6 +5847,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_SSM_CONV_FOLD_SEQ"));
+             static const bool disable_moe_weight_fuse = getenv("GGML_CUDA_DISABLE_MOE_WEIGHT_FUSE") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_MOE_WEIGHT_FUSE"));
++            static const bool disable_moe_expert_reduce = getenv("GGML_CUDA_DISABLE_MOE_EXPERT_REDUCE") != nullptr &&
++                                                   std::atoi(getenv("GGML_CUDA_DISABLE_MOE_EXPERT_REDUCE"));
+             static const bool disable_shexp_gate_fuse = getenv("GGML_CUDA_DISABLE_SHEXP_GATE_FUSE") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_SHEXP_GATE_FUSE"));
+             const bool mmvq_group_enabled = !disable_mmvq_group && stream_ctx.concurrent_events.empty();
+@@ -5776,6 +5913,27 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue; // already computed as part of a grouped rms_norm / rope launch
+                 }
+ 
++                // 0037: fold the routing-weight multiply AND the n-way expert-slot
++                // reduction into the down matvec. Tried before the 0034 pair fold
++                // below, which is the fallback when the add chain does not match.
++                if (!disable_moe_expert_reduce && stream_ctx.concurrent_events.empty() &&
++                        node->op == GGML_OP_MUL_MAT_ID) {
++                    const ggml_tensor * f_w    = nullptr;
++                    ggml_tensor       * f_out  = nullptr;
++                    int                 f_last = -1;
++                    const bool per_slot = ggml_cuda_moe_reduce_per_slot_mode();
++                    if (ggml_cuda_moe_expert_reduce_detect(cgraph, i, &f_w, &f_out, &f_last) &&
++                            ggml_cuda_mul_mat_vec_q_expert_reduce(*cuda_ctx, node->src[0], node->src[1],
++                                                                  node->src[2], f_w,
++                                                                  per_slot ? cgraph->nodes[i + 1] : f_out)) {
++                        const int k_end = per_slot ? i + 1 : f_last;
++                        for (int k = i + 1; k <= k_end; ++k) {
++                            grouped_done.insert(cgraph->nodes[k]);
++                        }
++                        continue;
++                    }
++                }
++
+                 if (!disable_moe_weight_fuse && stream_ctx.concurrent_events.empty() &&
+                         node->op == GGML_OP_MUL_MAT_ID) {
+                     const ggml_tensor * f_mul = nullptr;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index e3e7ab423..0df713326 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1564,6 +1564,196 @@ static void mul_mat_vec_q_switch_type(
+     }
+ }
+ 
++
++// ----- 0037: the MoE expert-slot reduction folded into the down matvec -----
++//
++// After 0034 the expert-down MUL_MAT_ID writes [n_embd, n_expert_used] with the
++// routing weight already applied in its epilogue, and a fused multi-add then
++// sums the eight slices into [n_embd]: one launch per layer moving 64 KB of
++// reads and 64 KB of writes to produce 8 KB, when the matvec that wrote those
++// bytes held every one of them in a register.
++//
++// The parallelism is the whole difficulty. In the launch this replaces
++// blockIdx.y IS the expert slot, so nrows_x * n_expert_used warps are in
++// flight; looping one warp over the eight experts would cut that 8x on a
++// matvec that is latency-bound (444 GB/s measured), which costs more than the
++// fold saves. Instead threadIdx.y becomes the expert slot - it is free, because
++// this shape trims to a single k-split warp (see calc_nwarps_launched) - so the
++// same number of warps run and there is one store instead of eight.
++//
++// Byte-exactness: each expert warp keeps exactly the k-block assignment, the
++// vec_dot sequence and the warp reduction of the single-warp launch it
++// replaces, including the nwarps-1 identically-zero partials the host-trimmed
++// warps contribute; the slot results are then summed in slot order 0..n-1 in a
++// single lane, which is the left-to-right fold launch_bin_bcast_pack applies to
++// the fused ADD chain it replaces.
++template <ggml_type type>
++__launch_bounds__(MMVQ_EXPERT_REDUCE_MAX_SLOTS*ggml_cuda_get_physical_warp_size(), 1)
++static __global__ void mul_mat_vec_q_expert_reduce(
++        const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr,
++        const float * dst_scale_ptr, float * dst_ptr,
++        const uint32_t ncols_x, const uint3 nchannels_y,
++        const uint32_t stride_row_x, const uint32_t stride_channel_x, const uint32_t stride_channel_y,
++        const uint32_t stride_channel_dst) {
++    const void    * GGML_CUDA_RESTRICT vx        = vx_ptr;
++    const void    * GGML_CUDA_RESTRICT vy        = vy_ptr;
++    const int32_t * GGML_CUDA_RESTRICT ids       = ids_ptr;
++    const float   * GGML_CUDA_RESTRICT dst_scale = dst_scale_ptr;
++    float         * GGML_CUDA_RESTRICT dst       = dst_ptr;
++
++    constexpr int qk  = ggml_cuda_type_traits<type>::qk;
++    constexpr int qi  = ggml_cuda_type_traits<type>::qi;
++    constexpr mmvq_parameter_table_id table_id = get_device_table_id();
++    constexpr int vdr       = get_vdr_mmvq(type, table_id);
++    constexpr int nwarps    = calc_nwarps(type, 1, table_id);
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
++
++    // one k-split warp per expert slot; the host gate guarantees a single pass
++    constexpr int blocks_per_iter = vdr * warp_size / qi;
++
++    const uint32_t channel_dst      = threadIdx.y;
++    const int      row0             = blockIdx.x;
++    dst += row0;
++    const int      blocks_per_row_x = ncols_x / qk;
++
++    ggml_cuda_pdl_sync();
++    const uint32_t channel_x = ids[channel_dst];
++    const uint32_t channel_y = fastmodulo(channel_dst, nchannels_y);
++
++    const float dst_scale_v = dst_scale[channel_dst];
++
++    float tmp = 0.0f;
++
++    const block_q8_1 * y = ((const block_q8_1 *) vy) + channel_y*stride_channel_y;
++    const int kbx_offset = channel_x*stride_channel_x + row0*stride_row_x;
++
++    for (int kbx = threadIdx.x / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
++        const int kby = kbx * (qk/QK8_1); // y block index that aligns with kbx
++        const int kqs = vdr * (threadIdx.x % (qi/vdr));
++        tmp += vec_dot_q_cuda(vx, &y[kby], kbx_offset + kbx, kqs);
++    }
++
++    // The launch this replaces runs one warp and adds the nwarps-1 trimmed
++    // (identically +0.0f) partials before the warp reduction. Keep them: for a
++    // -0.0f accumulator that addition is not the identity, and dropping it
++    // would be the only place this kernel could differ from stock bit patterns.
++#pragma unroll
++    for (int l = 0; l < nwarps-1; ++l) {
++        tmp += 0.0f;
++    }
++    tmp = warp_reduce_sum<warp_size>(tmp);
++
++    // Bisect mode (GGML_CUDA_MOE_REDUCE_PER_SLOT=1): store each slot where the
++    // launch this replaces would, and leave the add chain in the graph. Isolates
++    // the matvec restructure from the reduction.
++    if (stride_channel_dst != 0) {
++        if (threadIdx.x == 0) {
++            dst[channel_dst*stride_channel_dst] = tmp * dst_scale_v;
++        }
++        return;
++    }
++
++    __shared__ float slot_sums[MMVQ_EXPERT_REDUCE_MAX_SLOTS];
++    if (threadIdx.x == 0) {
++        slot_sums[channel_dst] = tmp * dst_scale_v;
++    }
++    __syncthreads();
++
++    if (threadIdx.x == 0 && threadIdx.y == 0) {
++        float sum = slot_sums[0];
++        for (uint32_t s = 1; s < blockDim.y; ++s) {
++            sum += slot_sums[s];
++        }
++        dst[0] = sum;
++    }
++}
++
++// Returns false (having launched nothing) when this type/shape does not reduce
++// to the single-k-split-warp launch the kernel above is byte-exact against.
++template <ggml_type type>
++static bool mul_mat_vec_q_expert_reduce_launch(
++        const void * vx, const void * vy, const int32_t * ids, const float * dst_scale, float * dst,
++        const int ncols_x, const int nrows_x, const int n_slots, const int nchannels_y,
++        const int stride_row_x, const int stride_channel_x, const int stride_channel_y,
++        const int stride_channel_dst, cudaStream_t stream) {
++    constexpr int qk = ggml_cuda_type_traits<type>::qk;
++    constexpr int qi = ggml_cuda_type_traits<type>::qi;
++
++    const int device    = ggml_cuda_get_device();
++    const int cc        = ggml_cuda_info().devices[device].cc;
++    const int warp_size = ggml_cuda_info().devices[device].warp_size;
++    const mmvq_parameter_table_id table_id = get_device_table_id(cc);
++
++    if (n_slots < 2 || n_slots > MMVQ_EXPERT_REDUCE_MAX_SLOTS) {
++        return false;
++    }
++    const int vdr    = get_vdr_mmvq(type, table_id);
++    const int nwarps = calc_nwarps(type, 1, table_id);
++    if (vdr <= 0 || qi % vdr != 0) {
++        return false;
++    }
++    // the replaced launch must be one row per block, or blockIdx.x is not the row
++    if (calc_rows_per_block(1, table_id, /*small_k=*/false, nwarps) != 1) {
++        return false;
++    }
++    if (ncols_x % qk != 0) {
++        return false;
++    }
++    // ... and must cover every k-block with one warp in a single pass, or the
++    // per-thread k-block assignment (and so the FP op order) would move
++    const int blocks_per_row_x   = ncols_x / qk;
++    const int threads_per_kblock = qi / vdr;
++    if (blocks_per_row_x * threads_per_kblock > warp_size) {
++        return false;
++    }
++    if (calc_nwarps_launched<type>(ncols_x, nwarps, warp_size, table_id) != 1) {
++        return false;
++    }
++    // ... and the host must actually be trimming this launch (GGML_MMVQ_UNTRIM_BLOCKS)
++    if ((int64_t) nrows_x * (int64_t) n_slots < (int64_t) mmvq_untrim_below_blocks()) {
++        return false;
++    }
++
++    const dim3  block_nums(nrows_x, 1, 1);
++    const dim3  block_dims(warp_size, n_slots, 1);
++    const uint3 nchannels_y_fd = init_fastdiv_values(nchannels_y);
++
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
++    ggml_cuda_kernel_launch(mul_mat_vec_q_expert_reduce<type>, launch_params,
++        vx, vy, ids, dst_scale, dst, (uint32_t) ncols_x, nchannels_y_fd,
++        (uint32_t) stride_row_x, (uint32_t) stride_channel_x, (uint32_t) stride_channel_y,
++        (uint32_t) stride_channel_dst);
++    return true;
++}
++
++static bool mul_mat_vec_q_expert_reduce_switch_type(
++        const void * vx, const ggml_type type_x, const void * vy, const int32_t * ids,
++        const float * dst_scale, float * dst,
++        const int ncols_x, const int nrows_x, const int n_slots, const int nchannels_y,
++        const int stride_row_x, const int stride_channel_x, const int stride_channel_y,
++        const int stride_channel_dst, cudaStream_t stream) {
++#define MMVQ_EXPERT_REDUCE_CASE(t)                                                                  \
++    case t:                                                                                         \
++        return mul_mat_vec_q_expert_reduce_launch<t>(vx, vy, ids, dst_scale, dst, ncols_x, nrows_x, \
++            n_slots, nchannels_y, stride_row_x, stride_channel_x, stride_channel_y,          \
++            stride_channel_dst, stream);
++    switch (type_x) {
++        MMVQ_EXPERT_REDUCE_CASE(GGML_TYPE_Q4_0)
++        MMVQ_EXPERT_REDUCE_CASE(GGML_TYPE_Q4_1)
++        MMVQ_EXPERT_REDUCE_CASE(GGML_TYPE_Q5_0)
++        MMVQ_EXPERT_REDUCE_CASE(GGML_TYPE_Q5_1)
++        MMVQ_EXPERT_REDUCE_CASE(GGML_TYPE_Q8_0)
++        MMVQ_EXPERT_REDUCE_CASE(GGML_TYPE_Q2_K)
++        MMVQ_EXPERT_REDUCE_CASE(GGML_TYPE_Q4_K)
++        MMVQ_EXPERT_REDUCE_CASE(GGML_TYPE_Q5_K)
++        MMVQ_EXPERT_REDUCE_CASE(GGML_TYPE_Q6_K)
++        default:
++            return false;
++    }
++#undef MMVQ_EXPERT_REDUCE_CASE
++}
++
+ void ggml_cuda_mul_mat_vec_q(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+         const ggml_cuda_mm_fusion_args_host * fusion) {
+@@ -1703,6 +1893,86 @@ void ggml_cuda_mul_mat_vec_q(
+         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+ }
+ 
++bool ggml_cuda_moe_reduce_per_slot_mode() {
++    static const bool v = []() {
++        const char * e = getenv("GGML_CUDA_MOE_REDUCE_PER_SLOT");
++        return e != nullptr && std::atoi(e) != 0;
++    }();
++    return v;
++}
++
++bool ggml_cuda_mul_mat_vec_q_expert_reduce(
++        ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1,
++        const ggml_tensor * ids, const ggml_tensor * weights, ggml_tensor * dst) {
++    GGML_ASSERT(src1->type    == GGML_TYPE_F32);
++    GGML_ASSERT(dst->type     == GGML_TYPE_F32);
++    GGML_ASSERT(weights->type == GGML_TYPE_F32);
++    GGML_ASSERT(ids != nullptr && ids->type == GGML_TYPE_I32);
++
++    const int64_t ne00 = src0->ne[0];
++    const int64_t ne01 = src0->ne[1];
++    const int64_t ne10 = src1->ne[0];
++    const int64_t ne11 = src1->ne[1];
++    const int64_t ne12 = src1->ne[2];
++    const int64_t ne13 = src1->ne[3];
++
++    const size_t ts_src0 = ggml_type_size(src0->type);
++    const size_t ts_src1 = ggml_type_size(src1->type);
++
++    GGML_ASSERT(src0->nb[0] == ts_src0);
++    GGML_ASSERT(src1->nb[0] == ts_src1);
++    GGML_ASSERT(ids->nb[0]  == ggml_type_size(ids->type));
++
++    const int64_t n_slots = ggml_nelements(weights);
++    if (n_slots < 2 || n_slots > MMVQ_EXPERT_REDUCE_MAX_SLOTS) {
++        return false;
++    }
++
++    cudaStream_t stream = ctx.stream();
++
++    // If src0 is a temporary compute buffer it may have padding that mmvq reads.
++    if (ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
++        const size_t size_data  = ggml_nbytes(src0);
++        const size_t size_alloc = ggml_backend_buffer_get_alloc_size(src0->buffer, src0);
++        if (size_alloc > size_data) {
++            GGML_ASSERT(ggml_is_contiguously_allocated(src0));
++            GGML_ASSERT(!src0->view_src);
++            CUDA_CHECK(cudaMemsetAsync((char *) src0->data + size_data, 0, size_alloc - size_data, stream));
++        }
++    }
++
++    // Exactly the shared q8_1 quantization ggml_cuda_mul_mat_vec_q would use, so
++    // a fall-through to that path (this function returning false) is free.
++    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
++    const char * src1_q8_1 = nullptr;
++    {
++        const int64_t s11 = src1->nb[1] / ts_src1;
++        const int64_t s12 = src1->nb[2] / ts_src1;
++        const int64_t s13 = src1->nb[3] / ts_src1;
++        src1_q8_1 = ctx.quantized_src1_cache.find(src1, stream, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13);
++        if (src1_q8_1 == nullptr) {
++            const size_t size_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
++            char * dst_q8_1 = ctx.quantized_src1_cache.insert(
++                ctx.pool(), src1, stream, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, size_q8_1);
++            quantize_row_q8_1_cuda((const float *) src1->data, nullptr, dst_q8_1, src0->type,
++                                   ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++            src1_q8_1 = dst_q8_1;
++        }
++    }
++
++    const int64_t s01 = src0->nb[1] / ts_src0;
++    const int64_t s02 = src0->nb[2] / ts_src0;
++    const int64_t s11 = ne10_padded / QK8_1;
++
++    const int stride_channel_dst = ggml_cuda_moe_reduce_per_slot_mode()
++        ? (int) (dst->nb[1] / ggml_type_size(dst->type)) : 0;
++
++    return mul_mat_vec_q_expert_reduce_switch_type(
++        src0->data, src0->type, src1_q8_1, (const int32_t *) ids->data,
++        (const float *) weights->data, (float *) dst->data,
++        ne00, ne01, n_slots, ne11, s01, s02, s11, stride_channel_dst, stream);
++}
++
+ void ggml_cuda_op_mul_mat_vec_q(
+     ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index 44b13c51b..b09707628 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -20,6 +20,25 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc);
+ // index depend on the group segment, and both are integer-only.
+ void ggml_cuda_mul_mat_vec_q_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes);
+ 
++// Maximum number of MoE expert slots whose partial results the expert-reduce
++// kernel below can fold into one store (n_expert_used).
++#define MMVQ_EXPERT_REDUCE_MAX_SLOTS 8
++
++// Expert-down matvec with the routing-weight scale AND the n_expert_used-way
++// slot reduction folded in: writes the reduced [n_embd] row directly, so the
++// [n_embd, n_expert_used] intermediate and the fused multi-add that consumed it
++// never happen. Returns false without launching anything if the shape/type does
++// not reduce to the single-k-split-warp launch the fold is byte-exact against,
++// in which case the caller must fall back to ggml_cuda_mul_mat_vec_q.
++bool ggml_cuda_mul_mat_vec_q_expert_reduce(ggml_backend_cuda_context & ctx,
++    const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids,
++    const ggml_tensor * weights, ggml_tensor * dst);
++
++// Bisect only: GGML_CUDA_MOE_REDUCE_PER_SLOT=1 keeps the new launch geometry but
++// stores per expert slot into `dst` (the routing-weight MUL's destination),
++// leaving the add chain in the graph.
++bool ggml_cuda_moe_reduce_per_slot_mode();
++
+ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst, const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index dd50a0eb1..985336f4d 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2209,10 +2209,33 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     // note: here we explicitly use hparams.n_expert_used instead of n_expert_used
+     //       to avoid potentially a large number of add nodes during warmup
+     //       ref: https://github.com/ggml-org/llama.cpp/pull/14753
++    // In-place at the decode shape, so moe_out lands on the down matvec's own
++    // output block (expert slot 0) instead of wherever ggml-alloc next has room.
++    // A backend that folds the slot reduction into that matvec writes moe_out at
++    // MATVEC time, while the matvec's blocks are still reading the routing
++    // weights and the expert ids; out of place ggml-alloc puts moe_out exactly
++    // on those (measured on qwen35moe: 156/160 decode sites on the weights,
++    // 4/160 on the ids), which makes the fold illegal. Slot 0 is disjoint from
++    // both by construction: `experts` is allocated while the ids are still live,
++    // and the weight multiply's destination reuses it in place while `weights`
++    // is still live.
++    //
++    // Only at n_tokens == 1: an in-place chain is a chain of VIEW-backed nodes,
++    // which the upstream multi-add fusion declines (ggml_node_has_n_uses rejects
++    // views), so at prefill - where the fold never fires - it would trade one
++    // fused k_bin_bcast for n_expert_used-1 separate launches.
++    // GGML_MOE_COMBINE_INPLACE=0 restores the stock out-of-place chain.
++    static const bool moe_combine_inplace = []() {
++        const char * e = getenv("GGML_MOE_COMBINE_INPLACE");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    const bool combine_inplace = moe_combine_inplace && n_tokens == 1;
++
+     ggml_tensor * moe_out = cur_experts[0];
+ 
+     for (uint32_t i = 1; i < hparams.n_expert_used; ++i) {
+-        moe_out = ggml_add(ctx0, moe_out, cur_experts[i]);
++        moe_out = combine_inplace ? ggml_add_inplace(ctx0, moe_out, cur_experts[i])
++                                  : ggml_add        (ctx0, moe_out, cur_experts[i]);
+ 
+         ggml_build_forward_expand(gf, moe_out);
+     }
+-- 
+2.53.0
+

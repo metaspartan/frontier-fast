@@ -1110,10 +1110,159 @@ measured and ranked 0.9476. The genuinely open prefill items are `mul_mat_q`
 launches) — the last being the prefill analogue of 0034, since at prefill
 shapes MUL_MAT_ID takes MMQ and the routing-weight multiply is not folded.
 
+## 0037: the MoE expert-slot reduction folded into the down matvec (+1.6% decode)
+
+Round-19's "best remaining candidate", and the design in that section survived
+contact: `blockDim.y = n_expert_used` with an LDS reduction in slot order, NOT
+one warp looping over eight experts. What the design did **not** anticipate is
+that most of the round would go on where the result is allowed to land.
+
+After 0034 the expert-down `mul_mat_id` writes `[n_embd, n_expert_used]` with
+the routing weight already applied in its epilogue, and a fused multi-add sums
+the eight slices — 40 launches/token at 1.7us, moving 64 KB of reads and 64 KB
+of writes per layer to produce 8 KB, when the matvec that wrote those bytes had
+every one of them in a register. Two halves, only useful together:
+
+1. `mmvq.cu`: `mul_mat_vec_q_expert_reduce`. `threadIdx.y` becomes the expert
+   slot — free, because this shape trims to a single k-split warp
+   (`calc_nwarps_launched`) — so the same `nrows_x * n_expert_used` warps stay
+   in flight, the eight partials reduce through 32 bytes of LDS in slot order
+   0..7 (the order `launch_bin_bcast_pack`'s fused multi-add uses), and there is
+   one store instead of eight. Gated to exactly the launch it is derived from:
+   one row per block, every k-block covered by one warp in a single pass, host
+   trimming active. A dedicated entry point reuses the shared q8_1 cache, so
+   declining and falling through to `ggml_cuda_mul_mat_vec_q` costs nothing.
+2. `llama-graph.cpp`: the expert combine becomes **in-place at the decode
+   shape**, so `moe_out` lands on the matvec's own output block (expert slot 0).
+
+### Rule 1 of 0032 again, in a new costume: it is an allocation problem
+
+The fold hoists the store back to matvec time, while the kernel's other blocks
+are still reading the routing weights and the ids. Out of place, ggml-alloc
+frees both at the routing multiply and puts `moe_out` **exactly there**:
+`GGML_CUDA_MOE_REDUCE_DEBUG=1` reported 156/160 decode sites declining on the
+weights and 4/160 on the ids — the fold matched perfectly and fired zero times.
+
+Expert slot 0 is disjoint from both **by construction**, and that is the whole
+reason half 2 exists: `experts` is allocated at the `MUL_MAT_ID` while the ids
+are still live, and the routing multiply's destination reuses it in place while
+`weights` is still live, so neither can ever be recycled into it.
+
+### Measured-dead, and expensive: pinning tensors with dangling view nodes
+
+The first version of half 2 kept `weights` and `selected_experts` alive with
+consumerless `ggml_view_1d` nodes (a view keeps its source alive in ggml-alloc,
+and view nodes are skipped at execution — apparently free). It worked: 160/160
+sites folded. It also **made the engine nondeterministic**. Server greedy A/A
+on the *same build with the CUDA fold disabled* went from 5/6 byte-exact to
+**0/6**; it was not the 0032 epilogue pass and not the 0030 state view (both
+toggled off, still 0/6). The mechanism was never identified and the approach was
+abandoned rather than debugged. Two portable notes:
+
+- **Do not pin tensors with consumerless view nodes on this fork.** Their
+  `n_views` is never decremented, so the source is pinned for the whole graph
+  and every later allocation moves.
+- `ggml_view_tensor` is not the tool anyway: it builds an **op-NONE** tensor,
+  which `ggml_build_forward_expand` files as a LEAF, so it neither counts as a
+  view for ggml-alloc nor receives a backend assignment — the run aborts in
+  `ggml_gallocr_allocate_node` on `GGML_ASSERT(buffer_id >= 0)`. Use
+  `ggml_view_1d` if you must.
+
+The ungated version also moved the gate ppl from 3.9268 (+/-0.0015 across loads)
+to a flat 3.9359, because the extra use shifts allocations and the topk_moe
+fusion's memory-range hazard scan is allocation-dependent. Any graph-lifetime
+change on this model is a numerics change at prefill; keep them off the prefill
+shape.
+
+### Not byte-exact — and which half is responsible was measured, not assumed
+
+`GGML_CUDA_MOE_REDUCE_PER_SLOT=1` keeps the new launch geometry but stores per
+expert slot and leaves the add chain in the graph. It reproduces the folded
+result **exactly** (decode-path ppl 5.5086 both), so the slot-order reduction is
+exact and it is the rewritten matvec body the compiler contracts differently —
+the same class as 0024/0026/0028/0031/0033, and the same reason 0031's
+"mirrored the source structure" attempt failed. Keep that toggle: it is the only
+cheap way to split a matvec fold's arithmetic from its epilogue.
+
+### The gate this round needed, and does not have by default
+
+**A decode-shape fold is invisible to the official ppl gate.** `llama-perplexity
+-c 512` runs n_t=128 ubatches, the consumer takes MMQ, and this fold (which
+requires `ne[2] == 1`) never fires — the green reading covers nothing.
+`llama-perplexity -b 512 -ub 1` makes every ubatch a single token, so the fold
+fires on every layer of every position, and gives a real decode-path perplexity.
+Every decode-only patch in this series (0031, 0034, 0035, 0036) should be
+re-read with that in mind; this is the first round to actually measure it.
+
+Measured (runner box, `HIP_VISIBLE_DEVICES=0`):
+
+- toggle A/B (both halves off = pre-patch), 5 rounds: tg128 143.63-143.91 ->
+  **145.89-146.10**, median per-round ratio **1.0157**, 5/5 disjoint; pp512
+  neutral (arms overlap, 4280-4362 off vs 4271-4338 on)
+- dispatches **821 -> 781/token**; `k_bin_bcast` **41 -> 1/token**; decode
+  kernel time 5.734 -> 5.686 ms/token. The mmvq family stays at 251 launches
+  per token in both arms (40 individual+grouped expert-down launches become 40
+  expert-reduce launches), so the whole gain is the vanished bin_bcast plus its
+  ~1.5us of dispatch bubble — round 19's "1.5% per 40 launches removed" holds
+  for a fourth consecutive round
+- whole-process vs stock, 5 rounds: tg128 median ratio **1.7979** (0036:
+  1.7825), pp512 1.3410
+- **server level** (`llama-server -ngl 99 -c 8192 --parallel 1`, interleaved,
+  uncached 533-token prompt): decode 140.60-141.17 -> **142.60-143.16** (arms
+  disjoint, +1.4%); prefill 3466-3525 vs 3477-3517, neutral
+- **prefill OFF-control**: first-token logprobs (`n_probs=20`, 5 prompts) are
+  **byte-identical** between arms — prefill is provably untouched, as the two
+  shape gates (`ne[2] == 1`, `n_tokens == 1`) require
+- gate ppl 3.9248/3.9259/3.9262 vs stock 3.9314 (**-0.13 to -0.17%**);
+  fold-off control same session 3.9269/3.9275
+- **decode-path ppl** (`-b 512 -ub 1 --chunks 8`): **3.9404** vs 3.9338
+  fold-off, i.e. **+0.229% vs stock 3.9314** — inside the 0.5% band, and
+  deterministic across loads in both arms
+- `test-backend-ops` MUL_MAT_ID / ADD / MUL / VIEW OK
+- server greedy: A/A **deterministic** (5/6 byte-exact; p5 is the near-tie
+  prompt that also drifts A/A in the control), vs control 2/6 byte-exact and
+  4/6 drifting mid-completion — the reassociation class above
+- the full 37-patch series applies clean to pristine `b10237` and the resulting
+  tree is `diff -r` identical to the measured tree
+
+Toggles: `GGML_CUDA_DISABLE_MOE_EXPERT_REDUCE=1` (fold),
+`GGML_MOE_COMBINE_INPLACE=0` (graph half — set both for a true pre-patch
+control), `GGML_CUDA_MOE_REDUCE_DEBUG=1` (one accept/decline line per site with
+the gate that declined), `GGML_CUDA_MOE_REDUCE_PER_SLOT=1` (bisect mode).
+
+Projection with 0033+0034+0035+0036+0037: decode 1.7265 x 1.0157 = **1.7536**,
+prefill **1.2911**, ttft **1.2258** -> score **~1.563** vs the 1.4525 bank.
+
+## Round-20 map (post-0037: 781 dispatches/token)
+
+`k_bin_bcast` is now 1/token and the quantize census is closed, so the cheap
+dispatch-removal seam this series has mined since round 12 is essentially spent
+at decode. What is left, in order:
+
+1. **The Q5_K/Q6_K expert down at 444 GB/s** against the 527 GB/s the Q4_K
+   gate/up reaches. It now runs inside `mul_mat_vec_q_expert_reduce` at
+   13.7us x 40, so the per-shape rows-per-block experiment (never blanket —
+   0024/0028 recorded blanket rpb on the ids path as a regression) has a new
+   and much more convenient home: the fold kernel is small, self-contained and
+   already gated to one shape.
+2. **`rms_norm_pre_add` 80 x 2.8us** is closed as a kernel (round 19) but its
+   *input* is not: after 0037 it reads the 8 KB reduced row instead of nothing
+   new, so the traffic argument that motivated the fold is spent — what remains
+   is folding the residual add chain, which is the same hoisted-write
+   allocation problem this round solved, and slot 0 is again the safe landing
+   spot.
+3. `mmvf_grouped` (70/token, 327us) is dominated by the F32 router reading
+   2 MB/layer; a Q8_0 router would halve that but is a weight-format change.
+4. Prefill: `mul_mat_q` (41.3%), `gated_delta_net` (11.8%) and the prefill
+   `k_bin_bcast` (4.7%, 663 launches) — the last being the prefill analogue of
+   0034, still untouched because MUL_MAT_ID takes MMQ at prefill shapes.
+
 ## Recommended firing order
 
 The runner applies the whole patch directory, so the series is a ladder rather
-than a choice; 0001-0036 is the verified set and every patch has a disable
-toggle. If a ranked run has to be pared back, drop from the end: 0036, 0035,
-0034 are independent +1.5% decode folds; 0033 is the prefill fold; 0032 and
-0030 are the two largest decode wins and should be the last to go.
+than a choice; 0001-0037 is the verified set and every patch has a disable
+toggle. If a ranked run has to be pared back, drop from the end: 0037, 0036,
+0035, 0034 are independent +1.5% decode folds; 0033 is the prefill fold; 0032
+and 0030 are the two largest decode wins and should be the last to go. 0037 has
+two halves in different files — dropping it means dropping both, since the
+graph half alone leaves the decode combine as n_expert_used-1 separate adds.
