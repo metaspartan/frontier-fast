@@ -2932,3 +2932,160 @@ getting there means folding essentially every elementwise and norm launch into
 an adjacent matvec — roughly 180 more dispatches removed at ~2.5 us each, or
 about fifteen more rounds at this round's rate. 200 needs either a quantization
 that fails the gate or a part with more bandwidth.
+
+## Round 34: the per-dispatch cost measured at nine dispatch counts — 210 tok/s is arithmetically out of reach
+
+Round 33 projected 166–171 tok/s for the co-launch/fold program and ~185 for a
+recompute program on top, by applying the **3.2 us/dispatch** that 0046 actually
+bought to the 502 and 301 dispatch floors. A competing reading of the same
+numbers — "3610 us of streaming plus 502 x 3.2 = 192 tok/s, plus 301 x 3.2 =
+219" — reaches a very different answer from the same two inputs. This round
+settles it by **measuring** t(d) instead of extrapolating one point.
+
+### The ladder
+
+Every fold in this series carries a disable toggle, so the series is its own
+dispatch-count dial. Nine cumulative arms, each adding one more disabled fold,
+`llama-bench -p 0 -n 128 -r 3` for timing and a `rocprofv3 --kernel-trace`
+census for the exact dispatch count, **swept in both directions** (forward then
+reverse) to control for drift:
+
+| arm (cumulative) | dispatches/token | tg128 | us/token |
+|---|---|---|---|
+| base (0046 stack) | 681.1 | 153.03 | 6535 |
+| `+MMVQ_F32_COLAUNCH=0` | 751.1 | 147.88 | 6762 |
+| `+DISABLE_NORM_QUANT` | 871.1 | 142.06 | 7039 |
+| `+DISABLE_UNARY_MUL_QUANT` | 911.1 | 140.38 | 7124 |
+| `+DISABLE_PRE_ADD_NORM` | 980.1 | 136.83 | 7308 |
+| `+DISABLE_SSM_CONV_FOLD(+L2)` | 1070.1 | 131.52 | 7603 |
+| `+DISABLE_{MMVQ,MMVF,NORM,ROPE,SET_ROWS}_GROUP` | 1360.1 | 116.81 | 8561 |
+| `+DISABLE_MOE_EXPERT_REDUCE` | 1640.1 | 106.70 | 9372 |
+
+(`GGML_CUDA_MMVQ_TOPK_COLAUNCH=0` is excluded from the fit: it costs 2.0% of
+decode but leaves the dispatch count at 681.1, so it is not a dispatch-count
+point. Worth knowing on its own — 0046's win is not purely a dispatch removal.)
+
+### The fit, and the number that decides everything
+
+```
+t(d) = 4448.4 us + 2.991 us * d       R2 = 0.99705
+```
+
+Two facts come straight off it:
+
+1. **The marginal cost per dispatch does not decay as the graph shrinks.**
+   Local slopes, low d to high d: 3.25, 2.31, 2.11, 2.68, 3.28, 3.30, 2.90
+   us/dispatch. No trend. The one measured co-launch (0046, 3.2 us) sits inside
+   that band. So a linear model is the right model, and extrapolating the 3.2 us
+   downward was legitimate.
+2. **The intercept is 4448 us, not 3610.** Weight streaming is 3742 us (2.35 GB
+   at the 627 GB/s the lm head proves reachable). The remaining **~700 us is the
+   matvec bandwidth ramp** — 291 matvec launches that are the model's own
+   matmuls and cannot be removed, each spending ~2.4 us climbing to full
+   bandwidth. That time is *inside* kernel execution, so removing dispatches
+   never touches it.
+
+That second fact is the whole discrepancy. A budget of the form
+"streaming + d x per-dispatch" implicitly assumes every launch, matvec included,
+costs only the per-dispatch overhead. The measurement says there is a fixed
+~700 us on top of streaming that no amount of folding reaches.
+
+### What the model says about every target
+
+| d | t(d) | tok/s | status |
+|---|---|---|---|
+| 681.1 (today) | 6535 | 153.0 | measured |
+| 502 (conservative floor) | 5950 | **168** | round 33's 166–171 confirmed |
+| 301 (recompute floor) | 5349 | **187** | round 33's ~185 confirmed |
+| 291 (matvec launches alone) | 5318 | **188** | **hard ceiling of the dispatch program** |
+| 184 | 5000 | 200 | needs 107 fewer launches than the model has matmuls |
+| 105 | 4762 | 210 | ditto |
+| 0 (physically impossible) | 4448 | 225 | the asymptote |
+
+**Round 33's 166–171 and ~185 are the correct figures.** The 192/219 reading is
+wrong for one identifiable reason: it prices the 291 irreducible matvec launches
+at the elementwise per-dispatch rate and drops their ramp.
+
+**200 and 210 tok/s are not reachable by any dispatch program on this box**, and
+the specific blocking term is not the barrier cost and not the byte count: it is
+that 291 matvec launches cost `4448 + 291 x 2.99 = 5318 us` before a single
+elementwise kernel exists. Reaching 210 would require deleting 186 of the
+model's own matmuls.
+
+### The 301 floor is itself optimistic for this graph
+
+Even 187 assumes norms fold into their consumers by recompute. The largest norm
+class is `rms_norm_pre_add` — 80/token, 230 us — and its consumers are the
+4096-block routed gate+up mmvq and the 12352-block qkv+z grouped mmvq. Every
+host block already reads the *quantized* activation (2.3 KB of q8_1), not the
+f32 row; recomputing the reduction means each block reads the 8 KB f32 row
+instead, i.e. 12352 x 8 KB = **98 MB of extra L2 traffic per layer** (~39 us at
+L2 bandwidth) to save one 2.8 us launch. Recompute is only viable where the host
+grid is small. The reachable floor for this graph is nearer **510–540**, worth
+`(681 - 525) x 2.99 = 466 us` -> 6069 us -> **165 tok/s**.
+
+### The one correction that raises the ceiling: merge matvecs, not elementwise ops
+
+The fit also reprices the candidate list. Removing an **elementwise** dispatch is
+worth 2.99 us (the gap). Removing a **matvec** dispatch is worth 2.99 + ~2.85 =
+**5.8 us**, because it takes a bandwidth ramp with it. That nearly doubles the
+value of the round-31 hide-pool rows whose guest is itself a matvec, and it means
+the ranking should be:
+
+| move | class | x/token | us/token | est. |
+|---|---|---|---|---|
+| shexp down (Q8_0) merged into `expert_reduce` (Q5_K) | matvec | 40 | 232 | +3.7% |
+| shexp swiglu `unary_gated_op_quant` -> guest of routed gate+up mmvq | elementwise | 40 | 120 | +1.8% |
+| routed swiglu `quantize_q8_1` -> guest of shexp down mmvq | elementwise | 40 | 120 | +1.8% |
+| GDN `ssm_norm` + z-gate `unary_gated_op_quant` fused | elementwise | 30 | 90 | +1.4% |
+| attn k/v grouped mmvq merged into attn wq | matvec | 10 | 58 | +0.9% |
+
+The first and last need the **second vec_dot type in one launch** that round 31
+identified and 0046 did not build. The middle three need a *guest block* inside
+the stock `mul_mat_vec_q` (0046 built the equivalent only for the custom
+`mul_mat_vec_q_grouped`), plus the node reorder that makes `ggml-alloc` hand the
+guest a disjoint buffer.
+
+Taken together those five are `-160` dispatches of which 50 are matvecs:
+`466 + 50 x 2.85 = 609 us` -> 5926 us -> **169 tok/s**, ~166 ranked. That is the
+honest target band, and it is +10% on today.
+
+### The post-0046 census this round is derived from
+
+`rocprofv3 --kernel-trace`, `llama-bench -p 0 -n 34 -r 1`, 23838 dispatches / 35
+tokens = **681.1/token, 5494 us of kernel in a 6535 us token**. Dispatch-id order
+is the true stream order (start-timestamp order has 2449 inversions — sort by
+`Dispatch_Id`, not by `Start_Timestamp`, or the layer structure is unreadable).
+
+A **GDN layer is 7 dispatches** and the **MoE block 8**:
+
+```
+GDN   1 rms_norm_pre_add_f32<1024,N,true>   1 blk    2.8us   input norm + residual add + q8_1
+      2 mul_mat_vec_q_grouped           12352 blk   36.5us   qkv + z + the 0045 F32 beta/alpha tail
+      3 ssm_conv_fold_l2_f32               32 blk    2.1us
+      4 gated_delta_net_cuda               32 blk    4.7us
+      5 rms_norm_f32<256>                  32 blk    1.6us   ssm_norm
+      6 unary_gated_op_quant               16 blk    1.3us   norm * silu(z) + q8_1
+      7 mul_mat_vec_q                    2048 blk   16.2us   ssm_out
+MoE   1 rms_norm_pre_add_f32<1024,N,true>   1 blk    2.8us   post-attn norm + q8_1
+      2 mul_mat_vec_f_grouped<16>         257 blk    4.7us   shexp_gate F32 + router F32
+      3 mul_mat_vec_q_grouped            1025 blk    5.2us   shexp gate/up Q8_0 + 0046 topk guest
+      4 mul_mat_vec_q                    4096 blk   17.3us   routed gate+up, GLU fused
+      5 quantize_q8_1                      16 blk    1.3us   routed swiglu -> q8_1
+      6 mul_mat_vec_q_expert_reduce      2048 blk   13.4us   routed down + weighted reduce
+      7 unary_gated_op_quant                2 blk    1.4us   shexp swiglu + q8_1
+      8 mul_mat_vec_q                    2048 blk    3.8us   shexp down
+```
+
+MoE 7 depends only on MoE 3, and MoE 5 only on MoE 4, which is what makes the
+two elementwise co-launches above legal: 7 can ride inside 4, and 5 can ride
+inside 8, once the graph is reordered so `ggml-alloc` stops handing the guest a
+block the host is still reading (the same failure round 31 hit and round 32
+fixed with a `probs_in` reorder).
+
+Both `unary_gated_op_quant_kernel` and `quantize_q8_1` are **warp-local** — no
+`__shared__`, no `__syncthreads`, the q8_1 reduction is `warp_reduce_*<QK8_1=32>`
+over 32 consecutive elements. Because the element index is flat and contiguous,
+those 32-element groups stay warp-aligned under **any** host block size that is a
+multiple of 32, so relocating them into a foreign grid is bit-identical by
+construction, exactly as 0046's topk guest was.
