@@ -874,3 +874,61 @@ timestamp, not the console tail**, whenever a toggle unexpectedly reads zero.
 Projection with 0033+0034+0035: decode 1.5959 x 1.0335 x 1.0152 x 1.0161 =
 **1.7015**, prefill 1.2468 x 1.0355 = **1.2911**, ttft following prefill ->
 score **~1.529** vs the 1.4525 bank.
+
+
+## Measured-dead (round 17): the remaining 81 quantize_q8_1 launches
+
+Instrumented both `quantize_row_q8_1_cuda` call sites in `mmvq.cu`; the 81
+launches per decode token are exactly three populations:
+
+| n/token | activation | consumer |
+|---|---|---|
+| 40 | `ffn_moe_swiglu` [512,8] | expert down (Q5_K/Q6_K), MUL_MAT_ID |
+| 30 | `final_output` (RESHAPE of the GDN gated norm) [4096] | `ssm_out` Q6_K |
+| 10 | `attn_gated` (MUL) [4096] | `attn_output` Q6_K |
+
+The largest is **structurally unfoldable**. The MoE gate/up matvecs and their
+GLU are already fused into ONE mmvq launch, and in that kernel each CUDA block
+produces one output element per row - so a 32-element q8_1 block spans 32
+different blocks. Writing q8_1 from that epilogue needs cross-block
+communication. (Also probed and measured dead: the batch test in
+`ggml_cuda_norm_quant_has_mmvq_consumer` uses `s1->ne[1]`, which for a
+MUL_MAT_ID consumer is the EXPERT dimension rather than ncols_dst; correcting
+it to `ne[2]` changes nothing, because the MoE glu never reaches that hook -
+the fused gate/up+glu path consumes it first.)
+
+The other two populations (40/token combined, ~112us with graph-replay
+overhead, ~1.6% decode) remain **open**, and share one root cause: both
+producers are SAME-SHAPE multiplies, while the folded-quantize multiply kernel
+only handles the broadcast-scalar form (`ggml_cuda_mul_bcast0_quant_ok`
+requires `src1->ne[0] == 1`). A same-shape mul+q8_1 kernel registered through
+`ggml_cuda_quant_register_for_consumer` (the consumers read a RESHAPE of the
+producer, so the cache entry must be keyed on the consumer's view) folds both.
+
+
+## Round-17 map (decode census after 0035: 861 dispatches, 5.85 ms kernel in a
+## 7.06 ms wall token)
+
+| tot/token | kernel | note |
+|---|---|---|
+| 1064us | mmvq_grouped Q6_K qkv+z (30x35.4us) | 581 GB/s, at the practical ceiling |
+| 726us | mmvq Q4_K MoE gate+up (40x18.1us) | 527 GB/s |
+| 667us | mmvq Q6_K output head (1x666us) | 621 GB/s = 96% of peak, done |
+| 490us | mmvq Q6_K ssm_out (30x16.3us) | 419 GB/s in-graph (479 serialized) |
+| 485us | mmvq Q5_K/Q6_K expert down (37x13.1us) | **447 GB/s, one warp per block - the weakest big matvec** |
+| 325us | mmvf_grouped (70) | |
+| 267us | mmvq_grouped Q8_0 shexp (50) | |
+| 196us | rms_norm_pre_add (69x2.8us) | one 1024-thread workgroup; ~26 GB/s from a single CU, which is already above that CU's fair share of DRAM - little headroom |
+| 195us | gated_delta_net (30) | 0026 territory |
+| 150us | topk_moe (40x2.7us) | one block, 256 experts; launch-floor bound |
+| 106us | quantize_q8_1 (81) | see the dead end above; 40 of them still open |
+| 67us | k_bin_bcast (41) | what is left after 0034/0035 |
+
+Best remaining candidates, in order: (1) the same-shape mul+quantize fold
+above (~1.6% decode); (2) the Q5_K/Q6_K expert-down matvec at 447 GB/s against
+the 527 GB/s the Q4_K gate/up achieves - it launches ONE warp per block after
+idle-warp trimming (k=512 is 2 k-blocks, and Q5_K vdr=2 covers both in one
+warp), so the lever is rows-per-block rather than warps (note 0024/0028
+recorded blanket rpb on the ids path as a regression, so it needs to be
+per-shape); (3) folding the 8-way expert reduction into the down matvec so
+`rms_norm_pre_add` reads 16 KB instead of 72 KB.
