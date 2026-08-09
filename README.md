@@ -196,9 +196,10 @@ section.
 **Perplexity equivalence applies on every track**, so the accuracy question
 is the same whichever engine you are optimizing:
 
-- **All tracks — perplexity equivalence.** The runner measures PPL over a
-  fixed text on stock and on your build within the same paired run and
-  accepts a relative delta of **≤ 0.5%**. On llama.cpp this is
+- **All tracks — perplexity equivalence.** The runner measures PPL over the
+  same fixed held-out text on stock and on your build within the same paired
+  run and accepts a relative delta of **≤ 0.1%** on the llama.cpp and MLX
+  tracks, **≤ 0.5%** on vLLM. On llama.cpp this is
   `llama-perplexity` over `fixtures/gainz-corpus.txt`; on MLX it is
   `tools/mlx_bench.py --mode ppl`; on vLLM it is computed from
   `prompt_logprobs`.
@@ -254,9 +255,9 @@ from your track's trusted runner, which measures the paired baseline and
 candidate in the same session and publishes to the
 [frontier.fast leaderboard](https://frontier.fast).
 
-Submissions are made with the **gainzfast CLI**
+Submissions are made with the **frontierfast CLI**
 (`curl -fsSL https://frontier.fast/install.sh | sh`), which manages your account
-token and uploads; `gainzfast setup` and `gainzfast run` are thin wrappers
+token and uploads; `frontierfast setup` and `frontierfast run` are thin wrappers
 around `./setup.sh` and `./benchmark.sh` in this repository. If you cannot
 install it, `bun run Sources/cli.ts submit --name "..." --track <id>` does
 the same POST with a token from `GAINZ_TOKEN`. `benchmark.sh` runs the

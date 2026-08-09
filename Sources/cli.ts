@@ -35,16 +35,16 @@ function readGolden(trackId: string): { goldenSha256?: string | null } | undefin
 }
 
 /** Submit-only token. Never hardcoded and never written to the repository:
- * the environment first, then the location the hosted gainzfast CLI uses. */
+ * the environment first, then the location the hosted frontierfast CLI uses. */
 function readToken(): string | undefined {
   if (process.env.GAINZ_TOKEN) return process.env.GAINZ_TOKEN.trim();
   const configHome = process.env.XDG_CONFIG_HOME ?? join(homedir(), ".config");
-  try { return readFileSync(join(configHome, "gainzfast", "token"), "utf8").trim() || undefined; }
+  try { return readFileSync(join(configHome, "frontierfast", "token"), "utf8").trim() || undefined; }
   catch { return undefined; }
 }
 
 function usage(): void {
-  console.log(`gainzfast — frontier.fast challenge CLI (in-repo entry point)
+  console.log(`frontierfast — frontier.fast challenge CLI (in-repo entry point)
 
   bun run Sources/cli.ts tracks
   bun run Sources/cli.ts clone [--track <id>]
@@ -56,7 +56,7 @@ function usage(): void {
 
 "benchmark" is an alias for "run". GAINZ_TRACK sets the default track.
 submit reads a submit-only token from GAINZ_TOKEN, falling back to
-~/.config/gainzfast/token. Never commit that token.
+~/.config/frontierfast/token. Never commit that token.
 
 A submission claims a physical GPU for ~22 minutes and cannot be recalled.
 Pass --dry-run to print the payload without sending it.
@@ -83,7 +83,7 @@ async function submit(): Promise<void> {
   }
   const token = readToken();
   if (!token) {
-    console.error("No token. Set GAINZ_TOKEN=<gz_token>, or run: gainzfast login <gz_token>");
+    console.error("No token. Set GAINZ_TOKEN=<gz_token>, or run: frontierfast login <gz_token>");
     console.error("Mint one on https://frontier.fast while signed in with GitHub. Never commit it.");
     process.exit(1);
   }

@@ -117,7 +117,7 @@ the exact model, quantization, expert count and device.
 ## Submission lifecycle
 
 Every ranked submission moves through four states, visible live on the
-leaderboard site and via `gainzfast status`:
+leaderboard site and via `frontierfast status`:
 
 ```text
 submitted -> running -> verified | rejected
