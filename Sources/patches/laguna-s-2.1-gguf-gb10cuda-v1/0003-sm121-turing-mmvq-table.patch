@@ -1,0 +1,41 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH 3/5] cuda: route sm_121 to the Turing mmvq parameter table
+
+First of the three patches that together carry the sm_121 wide Q4_K mmvq
+vec_dot to this track (0003 table alias, 0004 dedicated SM121 table, 0005
+the wide vec_dot itself). They are measured as one unit here - see 0005's
+message and the README for this track's numbers - because 0005 cannot exist
+without the SM121 table id that 0003/0004 introduce.
+
+GB10 decode measures the MoE expert matvecs well below achievable bandwidth
+under the GENERIC mmvq config (4 warps/row): the LPDDR5 latency wants more
+ILP per warp, not more warps. The Turing table (2 warps for K-quants) is the
+right shape. Verified separately on the qwen3.6 and laguna-xs GB10 twins,
+which share Laguna S's 256-expert top-8 routing.
+---
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index c3f95f9..abea72f 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -83,6 +83,11 @@ static constexpr __device__ mmvq_parameter_table_id get_device_table_id() {
+     return MMVQ_PARAMETERS_GCN;
+ #elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_TURING && __CUDA_ARCH__ < GGML_CUDA_CC_AMPERE
+     return MMVQ_PARAMETERS_TURING;
++#elif defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 1210
++    // GB10 (sm_121): LPDDR5 latency-bound decode measures the MoE expert
++    // matvecs at 35-40% of achievable bandwidth under the GENERIC config;
++    // the Turing table (2 warps for K-quants) trades warp count for ILP.
++    return MMVQ_PARAMETERS_TURING;
+ #else
+     return MMVQ_PARAMETERS_GENERIC;
+ #endif
+@@ -104,6 +109,9 @@ static __host__ mmvq_parameter_table_id get_device_table_id(int cc) {
+     if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) >= GGML_CUDA_CC_TURING && ggml_cuda_highest_compiled_arch(cc) < GGML_CUDA_CC_AMPERE) {
+         return MMVQ_PARAMETERS_TURING;
+     }
++    if (GGML_CUDA_CC_IS_NVIDIA(cc) && ggml_cuda_highest_compiled_arch(cc) == 1210) {
++        return MMVQ_PARAMETERS_TURING;
++    }
+     return MMVQ_PARAMETERS_GENERIC;
+ }
+ 

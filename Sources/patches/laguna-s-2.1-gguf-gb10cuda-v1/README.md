@@ -7,6 +7,111 @@ Applied in order against pinned llama.cpp **b10237**
 | --- | --- | --- |
 | 0001 | `cuda-mmvq-group-same-activation-matvecs` | **+1.868% decode** (in-process paired A/B, 12 rotated cycles, no-op floor 0.99994) |
 | 0002 | `sm121-mmq-moe-j64-cap` | **+4.47% prefill** (median of same-mode interleaved toggle rounds; decode neutral — the cap is MMQ/prefill-only) |
+| 0003–0005 | sm_121 mmvq tables + **wide Q4_K mmvq vec_dot** | **+3.2% decode** (same-mode medians +3.09% / +3.31%, arms disjoint within mode); prefill neutral |
+
+## 0003–0005: the sm_121 wide Q4_K mmvq vec_dot (+3.2% decode)
+
+Port of the lever that is `0016` on laguna-xs gb10cuda (+9.51%), `0012` on
+lfm2.5 gb10cuda (+7.76%) and `0017` on qwen3.6 gb10cuda (+1.77%). Stock
+`vec_dot_q4_K_q8_1` runs at `vdr = 2`, so every lane fetches its weights as two
+separate 4-byte loads. `block_q4_K` is 144 bytes with `qs` at offset 16 and a
+row is a whole number of blocks, so `qs` is 16-byte aligned and the fetch can
+legally become an 8-byte `int2`. The three patches are one unit: 0005 keys off
+the `MMVQ_PARAMETERS_SM121` table id that 0003/0004 introduce.
+
+**Why S gets +3.2% where XS gets +9.5%, and why that was predictable.** The
+cross-track spread is set by how much of a model's decode is Q4_K. This
+README's own byte census says Laguna S reads 7.48 GB/token of which only
+2070 MB (27.7%) is Q4_K routed experts — the rest is BF16 experts, attention
+and the head, none of which this patch touches. Sizing the lever from that
+census predicts the Q4_K bucket moving 11.7 ms → ~9.0 ms of a 48.6 ms token,
+i.e. +5.6% as an upper bound; +3.2% measured is the same story with the
+shared-expert Q4_K share and the untouched dense path diluting it. **Do not
+size this family from the XS number.**
+
+### The measurement, and a correction to this track's protocol
+
+Six interleaved ABBA whole-process rounds, `llama-bench -p 512 -n 64 -r 3`,
+two binary snapshots (control = this series at 0001–0002, i.e. the patch's own
+parent commit; candidate = +0003–0005):
+
+| round | order | parent pp512 | parent tg64 | cand pp512 | cand tg64 | naive ratio |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | A,B | 629.13 | 24.278 | 664.35 | 26.460 | 1.0899 |
+| 2 | B,A | 634.85 | 24.402 | 649.49 | 26.664 | 1.0927 |
+| 3 | A,B | 613.67 | 24.184 | 654.27 | 26.648 | 1.1019 |
+| 4 | B,A | 661.55 | 25.714 | 630.69 | 25.007 | 0.9725 |
+| 5 | A,B | 648.89 | 25.875 | 636.35 | 25.134 | 0.9714 |
+| 6 | B,A | 634.39 | 24.332 | 594.16 | 25.055 | 1.0297 |
+
+The naive per-round ratios span **0.971 to 1.102** and are worthless. Sorting
+each arm's own `tg64` readings into that arm's two launch modes resolves it
+completely:
+
+| | parent | candidate | same-mode ratio |
+| --- | --- | --- | --- |
+| slow mode | 24.184, 24.278, 24.332, 24.402 | 25.007, 25.055, 25.134 | **1.0309** |
+| fast mode | 25.714, 25.875 | 26.460, 26.648, 26.664 | **1.0331** |
+
+Two independent estimates agreeing to 0.02 points, and **within each mode the
+two arms' readings are completely disjoint** (parent-slow tops out at 24.402
+below candidate-low's 25.007; parent-fast tops out at 25.875 below
+candidate-high's 26.460). Prefill is neutral: 633.5/629.1 = 1.007 in the slow
+mode, 654.3/655.2 = 0.999 in the fast mode.
+
+**The correction.** 0002's section proposed classifying launch mode by `pp512`.
+That works for a decode-only patch but **not for this one, and the trap is
+live**: `MMVQ_PARAMETERS_SM121` changes `calc_nwarps`/`calc_rows_per_block` for
+`ncols_dst` 2–8, which `mul_mat_id` uses during prefill, so the candidate has
+its own prefill behaviour and `pp512` is no longer an arm-independent mode
+indicator. Reading rounds 1–3 that way would have published **+9%** — three
+rounds, all six arms disjoint, every naive check passing. Rounds 4 and 5 are
+the only reason that did not happen. **Classify each arm against its own
+historical tg64 clusters, never against the other arm's, and never stop a
+whole-process A/B on this track at three agreeing rounds.**
+
+### Correctness
+
+- **gate-shape ppl** (`-c 512 --chunks 8`, runner corpus): **4.7508 ± 0.27989
+  on both arms**, identical to five significant figures including the error
+  bar, and equal to the stock gate value this README already records. This is
+  the shape the trusted runner scores. It is also partly blind — at batch 512
+  the ppl path is MMQ-shaped and mmvq barely runs — which is why the next line
+  exists.
+- **decode-path ppl** (`-c 512 -b 512 -ub 1`, all 15 chunks the corpus yields):
+  **5.7682 ± 0.26064 → 5.7669 ± 0.26030, −0.023%**, against a ±0.1% symmetric
+  band. This is the reading that actually exercises the patched kernel, and it
+  is an order of magnitude inside the band. Note the XS twin needed the deep
+  reading to clear (+0.327% at 15–16 chunks vs +0.912% at 8); on Laguna S the
+  8-chunk gate shape is bit-identical anyway, so both readings agree here.
+- **server greedy**: see the note below on how this check must be run on this
+  model — the naive form produces a false pass.
+- **`cuobjdump -res-usage`**: every touched `mul_mat_vec_q` instantiation is
+  `STACK:0`. The changed small_k instantiations move as intended (SHARED
+  2560→4096 and 4096→7168, registers up) with no spill. This track's 0001
+  section documents a kernel-parameter spill that *inverted* a result, so this
+  is checked before any timing is believed.
+- **provenance**: the five patch files in this directory apply clean to
+  pristine `b10237` and the resulting tree is `diff`-identical to the tree that
+  produced the measured binaries, across all five touched CUDA sources.
+
+### llama-server binds its port before the model is loaded
+
+The `empty-file-greedy-identity-false-pass` finding already warned about
+comparing two empty outputs. It recurred here in a new disguise, and the new
+form is worth recording: `llama-server` accepts connections on `--port` while
+the 90 GB model is still loading, so a readiness probe of the form
+
+```sh
+curl -s http://127.0.0.1:$PORT/health && break
+```
+
+succeeds **immediately** — curl does not fail on a 503 — and every completion
+that follows races a server that cannot answer. All six came back as errors,
+both transcripts were 0 bytes, and `cmp` would have reported them identical.
+Poll the response **body** for `"status":"ok"`, and keep a minimum-byte
+assertion on each transcript as the backstop. The byte assertion is what
+caught this; the `cmp` did not.
 
 ## 0002: cap the MMQ MoE J tile at 64 on sm_121 (prefill)
 
