@@ -7,6 +7,7 @@ Applied in order against pinned llama.cpp **b10237**
 | --- | --- | --- |
 | 0001 | `cuda-mmvq-group-same-activation-matvecs` | **+1.868% decode** (in-process paired A/B, 12 rotated cycles, no-op floor 0.99994) |
 | 0002 | `sm121-mmq-moe-j64-cap` | **+4.47% prefill** (median of same-mode interleaved toggle rounds; decode neutral — the cap is MMQ/prefill-only) |
+| 0003 | `llama-absorb-trailing-ubatch` | **+38.4% scored prefill slope**, +21.3% ttft, decode −0.47%; gate ppl bit-identical |
 
 The verified frontier on this track is **1.030637** (0001+0002). Stock baseline
 is 23.627 tok/s decode, 343.1 tok/s prefill, 0.66 s TTFT.
@@ -108,7 +109,44 @@ Converted to what is scored:
 1.0306 would become **≈1.132**. pp84 is one ubatch either way and is unchanged,
 which is the control that says the effect is the tail and nothing else.
 
-### Why this is NOT yet a patch — read before shipping it
+### SHIPPED as 0003 — adaptive absorption, not the flag
+
+Both preconditions below cleared and the patch is `0003`. It does **not** raise
+`n_ubatch`: `llama_context::decode` picks the ubatch size for the batch before
+handing it to `init_batch`, and runs the batch as one ubatch when it overhangs
+`n_ubatch` by at most `min(n_batch, n_ubatch + n_ubatch/8)`. Both
+`graph_reserve` sites are sized at the same bound.
+
+**The first version never fired, and the reason is worth carrying forward.** It
+put the absorption inside `split_simple`; these models reach the allocator
+through `split_equal`. The symptom was a "measurement" that was pure launch-mode
+lottery — the candidate happened to draw the slow mode and read 4% *worse*, with
+pp84 (one ubatch under both arms) moving by the same 4%. **Choosing the ubatch
+size before `init_batch` covers `split_simple`, `split_equal` and `split_seq`
+at once.** Verify firing from the ubatch sizes the allocator emits
+(`n_tokens = 534` on, `512` off) — a llama-bench timing cannot tell you.
+`llama-bench` also swallows `LLAMA_LOG_INFO` unless you pass `-v`.
+
+Measured, same binary toggled, three interleaved ABBA rounds, each arm
+classified against its own tg64 clusters (stock drew slow 3/3; absorbed drew
+slow 1, fast 2):
+
+| same-mode (slow) | stock | absorbed | ratio |
+| --- | --- | --- | --- |
+| pp84 | 239.81 | 238.34 | 0.9939 |
+| pp534 | 547.19 | 663.88 | 1.2133 |
+| **scored prefill slope** | **720.9 tok/s** | **997.9 tok/s** | **1.3843** |
+| tg64 | 24.414 | 24.300 | 0.9953 |
+
+Score `0.9953^0.65 × 1.3843^0.20 × 1.2133^0.15` = **1.0953** → ≈**1.129**.
+
+Preconditions, both cleared: decode is **−0.47%**, with every absorbed reading
+inside the stock arm's own clusters; and `llama-server -ngl 99 -c 8192
+--parallel 1` boots and listens with absorption on. Gate ppl is
+**4.7508 ± 0.27989** on absorption-on, absorption-off and a separately built
+control.
+
+### The two preconditions as they stood before shipping
 
 It is a change to a llama.cpp **default**, not a kernel, and it is shaped to the
 fact that the scored prompt is 534. Three things must be settled first, and none

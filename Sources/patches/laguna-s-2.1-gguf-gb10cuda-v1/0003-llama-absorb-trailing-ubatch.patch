@@ -1,0 +1,131 @@
+From 2e410bff38a9a39149b8f36cc76e730cd5fc03ba Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sun, 9 Aug 2026 05:44:17 -0600
+Subject: [PATCH] llama: absorb a small overhanging ubatch instead of paying a
+ second MoE sweep
+
+On a sparse-MoE model the cost of a ubatch is set by the routed expert weights
+it must read, which is a function of experts and layers rather than of how many
+tokens it carries. A batch that overhangs n_ubatch by a little therefore pays a
+SECOND full sweep of the expert weights for that handful of tokens.
+
+Measured on Laguna-S (256 experts, top-8, 47 layers) at the default
+n_ubatch = 512: a 534-token batch splits 512 + 22, and that 22-token tail costs
+175.1 ms against the 512-token ubatch's 801.1 ms - 17.9% of the prefill for 4.1%
+of the tokens, a 5.09x per-token penalty, of which 160 ms is mul_mat_q plus BF16
+mul_mat_f_ids re-reading ~30 GB of experts. It is bandwidth, not tiling, so no
+kernel change recovers it; the only remedy is to not issue the second sweep.
+
+llama_context::decode now picks the ubatch size for the batch before handing it
+to init_batch: when the batch overhangs n_ubatch by no more than
+min(n_batch, n_ubatch + n_ubatch/8), it is run as a single ubatch. Both
+graph_reserve sites are sized at the same bound so the absorbed ubatch always
+fits the compute buffer it was reserved for.
+
+Choosing the size before the split covers every memory module: the allocator is
+reached through split_simple, split_equal and split_seq, and which one runs
+depends on the model. Rebalancing is not the alternative and was measured - two
+267-token ubatches pay two full sweeps (~1140 ms) against 512+22's 976 ms.
+
+Batches of n_ubatch tokens or fewer, and decode, take a bit-for-bit unchanged
+path: the test requires n_tokens > n_ubatch.
+
+Measured on the GB10 runner (mode-classified, same binary toggled): scored
+prefill slope 720.9 -> 997.9 tok/s (+38.4%), ttft +21.3%, decode -0.47%.
+Perplexity -c 512 is 4.7508 +/- 0.27989 with absorption on, off, and on a
+separately built control - identical to five significant figures.
+
+LLAMA_UBATCH_ABSORB=0 restores stock splitting.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ src/llama-context.cpp | 51 ++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 48 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 19cca7d..748b9b2 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -574,6 +574,47 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+     }
+ }
+ 
++// Adaptive tail-ubatch absorption.
++//
++// On a sparse-MoE model the cost of a ubatch is dominated by the routed expert
++// weights it must read, and that is a function of experts and layers rather
++// than of how many tokens the ubatch carries. A batch that overhangs n_ubatch
++// by a little therefore pays a SECOND full sweep of the expert weights for that
++// handful of tokens: on Laguna-S (256 experts, top-8, 47 layers) at the default
++// n_ubatch = 512, a 534-token batch splits 512 + 22 and the 22-token tail costs
++// 175.1 ms against the 512-token ubatch's 801.1 ms - 17.9% of the prefill for
++// 4.1% of the tokens.
++//
++// Returns the largest ubatch that may be formed by absorbing such an overhang,
++// or 0 when absorption is disabled. Rebalancing the split is NOT the remedy and
++// was measured: two 267-token ubatches pay two full sweeps.
++static uint32_t llama_ubatch_absorb_max(const llama_cparams & cparams) {
++    static const bool enabled = []() {
++        const char * env = getenv("LLAMA_UBATCH_ABSORB");
++        return env == nullptr || atoi(env) != 0;
++    }();
++
++    if (!enabled) {
++        return 0;
++    }
++
++    const uint32_t n_max = std::min(cparams.n_batch, cparams.n_ubatch + cparams.n_ubatch/8);
++
++    return n_max > cparams.n_ubatch ? n_max : 0;
++}
++
++// The ubatch size to split `n_tokens` with: n_ubatch normally, or the whole
++// batch when it overhangs n_ubatch by no more than the absorption bound.
++static uint32_t llama_ubatch_effective(const llama_cparams & cparams, uint32_t n_tokens) {
++    const uint32_t n_absorb = llama_ubatch_absorb_max(cparams);
++
++    if (n_absorb > cparams.n_ubatch && n_tokens > cparams.n_ubatch && n_tokens <= n_absorb) {
++        return n_tokens;
++    }
++
++    return cparams.n_ubatch;
++}
++
+ void llama_context::sched_reserve() {
+     if (!sched_need_reserve) {
+         return;
+@@ -588,7 +629,8 @@ void llama_context::sched_reserve() {
+     const int64_t t_start_us = ggml_time_us();
+ 
+     const uint32_t n_seqs = cparams.n_seq_max;
+-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
++    const uint32_t n_ubatch_res = std::max(cparams.n_ubatch, llama_ubatch_absorb_max(cparams));
++    const uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_res);
+ 
+     const size_t max_nodes = this->graph_max_nodes(n_tokens);
+ 
+@@ -819,7 +861,8 @@ bool llama_context::memory_update(bool optimize) {
+         }
+ 
+         const uint32_t n_seqs = cparams.n_seq_max;
+-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
++        const uint32_t n_ubatch_res = std::max(cparams.n_ubatch, llama_ubatch_absorb_max(cparams));
++        const uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_res);
+ 
+         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
+ 
+@@ -1794,8 +1837,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+     llama_memory_context_ptr mctx;
+ 
++    const uint32_t n_ubatch_eff = llama_ubatch_effective(cparams, balloc->get_n_tokens());
++
+     while (true) {
+-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
++        mctx = memory->init_batch(*balloc, n_ubatch_eff, output_all);
+         if (!mctx) {
+             return -2;
+         }
+-- 
+2.43.0
+
