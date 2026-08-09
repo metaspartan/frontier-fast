@@ -4213,3 +4213,93 @@ unchanged 1.9558, score **1.7835 -> ~1.824 (+2.28%)** — of which prefill is
 
 `mul_mat_q` remains **46.2% of the slope** (42.05 ms) and is untouched by this
 round. That is the next lever and it is the largest one left.
+
+## Round 43: the STANDING GATE COMMAND, and why ~20% of submissions fail it regardless of merit
+
+0055 was **rejected**: `perplexity 3.9314 -> 3.9408 (0.239% delta, limit 0.1%)`.
+The speed was real (measured 1.8066, +80.66%, prefill 1.4718, ttft 1.6717) but the
+verdict is the verdict. Chasing why produced two results that matter far more
+than 0055 did.
+
+### 1. The exact gate command — use this and nothing else from now on
+
+From `~/gainz-runner-rocm/app/src/rocm-worker.ts` (read-only):
+
+```bash
+HIP_VISIBLE_DEVICES=0 <bin>/llama-perplexity \
+    -m $MODEL -f ~/gainz-ppl-corpus.txt -ngl 99 -c 512 --chunks 8
+```
+
+**No `-b`, no `-ub`** — llama.cpp defaults (n_batch 2048, n_ubatch 512).
+Gate: `|cand - stock| / stock <= 0.001`, symmetric.
+
+Three things this series had wrong:
+
+- **The baseline is STOCK b10237, not the previous frontier.** The runner builds
+  `~/llama.cpp` (tag `b10237`) and measures it in the same session. All 54
+  patches share **one 0.1% budget against stock**, they do not each get 0.1%
+  against their predecessor.
+- The campaign's habitual `-b 512 -ub 1 --chunks 8` decode-path ppl is a
+  *different shape* and reads 3.9382 where the gate reads 3.9314. It is a useful
+  signal but it is **not the gate**.
+- There is also a **KL-divergence comparison** (`-c 512 --chunks 4
+  --kl-divergence-base`) — currently reported, not gated, but it sees
+  distribution shifts perplexity cannot. Worth running locally.
+
+`~/fable-qwen/gate.sh` on the box now runs exactly this against
+`~/fable-qwen/stock/build/bin` (verified `b10237`, same commit `2b63e0610` as the
+runner's tree).
+
+### 2. Stock is bit-stable. Our build is not. That is a ~20% false-rejection rate.
+
+Running the gate command repeatedly, same box, same session:
+
+```
+stock (b10237)   3.9314 x 20    spread 0.000%   -- every position, hot and cold
+0054 frontier    25 draws, min 3.9269, max 3.9448, spread 0.455%, median 3.9318
+```
+
+Ordering was controlled explicitly, because the first run happened to be
+stock-then-candidate and that is a confound:
+
+| phase | order | result |
+|---|---|---|
+| A | **candidate x6 first, cold box** | 3.9318 3.9313 3.9318 3.9318 **3.9269** 3.9318 |
+| B | stock x6 second, hot box (65 C) | **3.9314 x6, identical** |
+| C | interleaved x6 | cand 3.9318 **3.9395** 3.9318 3.9306 **3.9367** 3.9318 / stock 3.9314 x6 |
+
+**Stock is deterministic in every position; the patched build jitters in every
+position.** It is not the box, not thermal, not run order — it is our series.
+
+Since stock is deterministic, the runner's delta is entirely the candidate's
+single draw. Of 25 draws, **5 fall outside ±0.1% — a 20% false-rejection rate on
+any submission, however clean.**
+
+And 0055 specifically: its own three draws at the gate shape were 3.9319,
+3.9311, 3.9311 — **-0.008% vs stock, comfortably passing.** The runner's 3.9408
+(+0.239%) sits squarely inside the excursion distribution above. 0055 was very
+probably a bad draw rather than real damage. It has still been **removed from the
+series** (rejected patches do not stay), and it should not be resubmitted until
+the nondeterminism is fixed — resubmitting on a coin flip is not evidence.
+
+### What has been ruled out
+
+- **Thermal / run order** — phase B above.
+- **0021's load-time requant threading** — `GGML_LOAD_REQUANT_NTHREAD=1` still
+  jitters (3.9318 3.9333 3.9326 3.9315 3.9302). Note `GGML_LOAD_REQUANT=0` is
+  **not a clean control**: it reads ~3.954, +0.58% vs stock, so that toggle does
+  not restore stock behaviour and cannot be used as an off-arm.
+- **Atomics** — the only atomics in the whole diff are 0053's arrival counter in
+  `mmvq.cu`, and 0053 is decode-only; the gate shape is pure prefill.
+
+The remaining suspects are the prefill-active patches with cross-kernel data
+dependencies — the co-launch family (0045-0048, 0052), the MMQ folds (0023,
+0040), the GDN prefill chain (0033, 0039, 0041, 0043) and the skinny f32 GEMM
+(0044). An uninitialised or stale read is the shape of defect that produces
+per-load variation with a deterministic stock.
+
+**Bisecting this is the highest-value work available on this track.** It is worth
+more than any single kernel round: at a 20% false-rejection rate the series is
+losing roughly one submission in five, and a nondeterministic engine is a
+correctness defect in its own right. Detecting a 20% rate needs ~10 loads per
+arm (~6 min), so a grouped binary search over the toggle list is ~30-40 minutes.
