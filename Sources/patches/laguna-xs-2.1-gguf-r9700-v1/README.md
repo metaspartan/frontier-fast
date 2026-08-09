@@ -250,3 +250,125 @@ The cost constant on this track is about **2.6 us per removed small dispatch**
    it consumes the router and feeds the routed matvec, and 0017/0018 already
    moved the shared expert inside the routed launch. Unlike qwen3.6 there is
    nothing left running beside it. Do not re-open without first un-folding 0018.
+
+
+## Round 2 (2026-08-09): the ranked TTFT/prefill terms were never censused — and
+## the server was doing ~120 MiB of per-request bookkeeping nobody had looked at
+
+Nineteen patches went into decode. `prefill 1.0125` and `ttft 1.0020` say the
+other 35% of the score exponent had never been touched. This round censuses
+both, and the first thing it finds is worth more than any kernel left here.
+
+### The sensitivity algebra — read this before pricing any prefill/ttft idea
+
+`Sources/runner/base.ts` measures `ttft = t(534)`, `prefill = (t(534)-t(84))/451`
+and `decode = (t_full(534,128) - t(534))/127`. Writing a candidate's savings as
+`a` on the ttft request, `b` on the short request and `c` on the full request
+(all in seconds), the score derivative on this track's local numbers
+(ttft 0.247 s, slope numerator 0.107 s, decode numerator 0.762 s) is
+
+```
+dScore/Score = 1.631*a + 0.853*c - 1.876*b
+```
+
+Three consequences that kill obvious plans:
+
+- **A ttft-ONLY saving is score-NEGATIVE.** `0.15/0.247 = 0.61` against
+  `0.65/0.762 = 0.85`: the decode subtraction charges you more than the ttft
+  term pays. Any host-side work you remove must come off the *full* request too.
+- Work present at 534 and absent at 84 (per-token or per-extra-ubatch) is the
+  best class at ~2.2-3.1 per second saved.
+- Decode work is worth 0.853 per second — the smallest coefficient per ms, even
+  though it carries the largest exponent, because its denominator is 3x bigger.
+
+### Census: 52,726 minor faults per ranked request, AnonHugePages 0 kB
+
+Replica of the harness, `minflt` read from `/proc/<srv>/stat` around each
+request: **ttft 52,726 / short 38,450 / full 21,097 faults**, ~206 MiB of
+4 KiB first-touch per ttft request, and `AnonHugePages: 0 kB` in
+`smaps_rollup` — the qwen 0057 regime exactly. (LFM2.5 on the same box is
+2,757 — the small-state regime, see that track's README.)
+
+### MEASURED DEAD: qwen 0057 (`MADV_HUGEPAGE` on per-request host state)
+
+Zero-rebuild confirmation, `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`, 4 arms
+off/on/on/off, 9 runs each:
+
+| arm | TTFT | prefill tok/s | decode tok/s | AnonHugePages |
+|---|---:|---:|---:|---|
+| off | 0.24437 | 4255.6 | 167.09 | 0 kB |
+| on | 0.20762 | 4238.2 | 160.71 | 3428352 kB |
+| on | 0.20867 | 4215.9 | 159.99 | 3459072 kB |
+| off | 0.24901 | 4129.8 | 166.16 | 0 kB |
+
+**ttft -15.6%, prefill +0.8%, decode -3.8% → score +0.2%.** The faults are real
+(52,154 removed for 38.5 ms, i.e. **0.74 us/fault** — carry that constant) but
+they land almost entirely on the ttft and short requests, which is exactly the
+`a` and `b` profile the algebra above punishes. Prefill cancels because both
+arms of the slope lose the same fixed cost. **Do not port 0057 here.**
+
+### 0021 — the server creates context checkpoints it always throws away (SHIPPED)
+
+`llama-server -v` on a 528-token request:
+
+```
+task 0 | cached n_tokens = 0 / 11 / 523          <- THREE llama_decode calls
+task 0 | created context checkpoint 1 (12 tok,   1.407 MiB)
+task 0 | created context checkpoint 2 (524 tok, 60.007 MiB)
+task 4 | erased invalidated context checkpoint (... pos_next = 0) x2
+```
+
+`tools/server/server-context.cpp` breaks the prompt at `{4 + n_ubatch, 4}`
+tokens from its end purely so a checkpoint can be captured (PR 20288), then the
+next cache-cold request erases both unused. Priced with `--ctx-checkpoints 0`,
+4 arms: ttft **x1.196**, prefill **x1.080**, decode **x0.983** → **+3.18%**.
+
+Shipped as adaptive credit rather than a flag or a default flip — a restore
+refills it, a task that discards its checkpoints spends it, one probe task
+every 64 — so multi-turn traffic keeps the feature. 8-arm A/B gives ttft
+**x1.1960**, prefill **x1.0822**, decode **x0.9858**, modelled **+3.39%**.
+Gate ppl **5.2611 = stock, 3/3**, and the served path is **bit-identical**:
+16/16 greedy prompts byte-identical with `max |dlogprob| = 0.000e+00`.
+
+### The prefill slope census (llama-bench, per pass — halve the raw trace)
+
+`rocprofv3 --kernel-trace`, `-p 84,300,534 -n 0 -r 1`. **llama-bench runs a
+warmup plus the rep, so every figure the trace reports is TWO passes.** Per
+pass: pp84 74.2 ms, pp534 183.8 ms → slope 243.6 us/tok = 4105 tok/s, which
+matches the server's 4256 tok/s. Kernel is 75% of the 244 ms ttft.
+
+| kernel | pp84 | pp300 | pp534 | %slope |
+|---|---:|---:|---:|---:|
+| `mul_mat_q` | 59.6 | 91.5 | 131.6 | 65.7% |
+| `flash_attn_ext_f16<128,128,8,8>` | 1.5 | 5.3 | 9.6 | 7.4% |
+| `k_bin_bcast` | 1.0 | 3.5 | 6.4 | 4.9% |
+| `mm_ids_helper<8>` | 1.2 | 3.3 | 6.1 | 4.5% |
+| **rocBLAS f32 `Cijk_..._MT64x64x16`** | **5.07** | **5.07** | **9.70** | **4.2%** |
+| `quantize_mmq_q8_1` | 1.4 | 2.7 | 5.2 | 3.5% |
+| `rms_norm_f32<256>` | 0.8 | 2.3 | 4.4 | 3.3% |
+
+Note `mul_mat_q` grows only 1.53x when tokens grow 3.6x (84 -> 300): on a
+256-expert MoE the expert weight stream is common to both arms of the slope and
+largely cancels. **The rocBLAS f32 row is INVARIANT in tokens** — 5.07 ms at
+both 84 and 300, doubling at 534 only because there are two ubatches. It is the
+MoE router `[2048 -> 256]`, one launch per layer per ubatch, 38 per ubatch:
+
+```
+grid 2048 wi / wg 64 = 32 workgroups   130.2 us each   (M = 512 ubatch)
+grid  256 wi / wg 64 =  4 workgroups   125.1 us each   (M = 22 tail ubatch)
+```
+
+**4 workgroups on a 64-CU part, and the 22-token tail costs the same as the
+512-token one.** This is qwen 0044/0056 verbatim — the port is open and priced
+at roughly +0.9% score (decode-neutral, since the full request saves the same
+absolute time as the ttft request). Divide the grid by the workgroup size
+before assuming a vendor kernel is doing something clever.
+
+### Open, in order
+
+1. Port qwen 0044+0056 (`mmf32-skinny`) for the router. ~+0.9%, decode-neutral,
+   the shapes are identical to qwen's so the kernel needs no changes.
+2. `mul_mat_q` at 65.7% of the slope — qwen round 47 has it at 94-99% of
+   achievable on loads but only 61-81% of a no-LDS/no-MMA probe. Never censused.
+3. The decode levers from round 1 are unchanged (F32 router matvec, Q6_K V into
+   the Q/K group).

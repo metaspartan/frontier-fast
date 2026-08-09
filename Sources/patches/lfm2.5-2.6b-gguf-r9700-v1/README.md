@@ -212,3 +212,83 @@ Post-round census is 347.5 dispatches/token, ~4160 us. The remaining non-matvec
 pool: `quantize_q8_1` 60, `rms_norm_pre_add` 61, and the 8 attention layers'
 rope/set_rows/flash-attn glue. The matvec side is closed on bandwidth grounds
 (above). The next largest coherent cut is the 60 `quantize_q8_1` launches.
+
+
+## Round 2 (2026-08-09): the ranked TTFT is 12% server bookkeeping
+
+### Census first — and it kills the obvious port
+
+`minflt` per request read from `/proc/<srv>/stat` around a faithful replica of
+`Sources/runner/base.ts`: **ttft 2,757 / short 2,316 / full 823**, with
+`AnonHugePages: 0 kB`. That is ~11 MiB of first-touch per request — the
+*small-state* regime. qwen's 0057 (`MADV_HUGEPAGE` on the per-request host
+state) is worth ~2 ms here against a 67 ms ttft and is **dead on this track**;
+the same patch was dead on the GB10 twin at the same size. Laguna-XS on this box
+is 52,726 faults and is the regime where it is worth censusing. Cost constant if
+you need it: **0.74 us per minor fault**, measured.
+
+### The sensitivity algebra for this track
+
+With ttft 0.0682 s, slope numerator 0.0407 s and decode numerator 0.530 s, a
+candidate saving `a` on the ttft request, `b` on the short one and `c` on the
+full one moves the score by
+
+```
+dScore/Score = 4.844*a + 1.226*c - 4.916*b     (per second)
+```
+
+Unlike the MoE track next door, a **ttft-only saving is score-POSITIVE here**
+(+0.10% per ms) because ttft is only 1/8 of the decode numerator rather than
+1/3. Fixed per-request host cost is worth attacking on LFM2.5 and is not worth
+attacking on Laguna-XS. Check the ratio before porting anything between them.
+
+### 0012 — the server creates context checkpoints it always throws away (SHIPPED)
+
+`llama-server -v` on a 529-token request:
+
+```
+task 0 | cached n_tokens = 0 / 12 / 524         <- THREE llama_decode calls
+task 0 | created context checkpoint 1 (13 tok,  0.344 MiB)
+task 0 | created context checkpoint 2 (525 tok, 0.344 MiB)
+task 4 | erased invalidated context checkpoint (... pos_next = 0) x2
+```
+
+`tools/server/server-context.cpp` breaks the prompt at `{4 + n_ubatch, 4}`
+tokens from its end purely so a checkpoint can be captured (PR 20288); the next
+cache-cold request erases both unused. **On this model the checkpoints are
+0.344 MiB each — the entire cost is the two extra `llama_decode` calls**, which
+is why the fault census said nothing about it and the wall clock said 8.4 ms.
+Priced with `--ctx-checkpoints 0`, 4 arms: ttft x1.139, prefill x1.015, decode
+x1.0015 → **+2.38%**.
+
+Shipped as an adaptive credit (a restore refills it, a task that discards its
+checkpoints spends it, one probe task every 64) so multi-turn traffic keeps the
+feature. 8-arm A/B, same binary, `LLAMA_ADAPTIVE_CKPT` toggle: ttft **x1.1247**
+(arms fully disjoint), prefill **x1.0252**, decode **x1.0038**, modelled
+**+2.54%**.
+
+### The numeric caveat, and why it is stock's rather than the patch's
+
+Gate ppl is **22.5182 = stock, 3/3** — `llama-perplexity` does not link the
+server. The *served* path does move: 13/16 greedy prompts byte-identical, three
+diverge, first-token logprob deltas 0.006-0.17 nats. LFM2.5's recurrent scan
+re-associates across a physical-batch boundary, so one 529-token batch is not
+bit-equal to 13 + 512 + 4. That is a property of the engine, not of this patch —
+with the **unmodified b10237 binary** the same corpus reads
+
+```
+-c 530 -b 530 -ub 512   (512 + 18)   14.9516  14.9516
+-c 530 -b 530 -ub 530   (one batch)  14.7064  14.7064
+```
+
+**1.64% apart from batch shape alone.** The candidate's served path is the
+single-batch regime — the one `llama-perplexity` itself uses, and the lower of
+the two. Carry the rule: on this model, never reason about a batching change
+from a `-c 512` reading, and quote which shape you measured.
+
+### Still open
+
+The round-1 census stands: 347.5 dispatches/token, matvecs closed on bandwidth,
+the attackable pool is `quantize_q8_1` (60/token) and `rms_norm_pre_add`
+(61/token). The co-launch / guest-relocation family from the qwen series has
+never been tried on this graph.
