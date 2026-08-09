@@ -7,7 +7,28 @@ Applied in order against pinned llama.cpp **b10237**
 | --- | --- | --- |
 | 0001 | `cuda-mmvq-group-same-activation-matvecs` | **+1.868% decode** (in-process paired A/B, 12 rotated cycles, no-op floor 0.99994) |
 | 0002 | `sm121-mmq-moe-j64-cap` | **+4.47% prefill** (median of same-mode interleaved toggle rounds; decode neutral — the cap is MMQ/prefill-only) |
-| 0003–0005 | sm_121 mmvq tables + **wide Q4_K mmvq vec_dot** | **+3.2% decode** (same-mode medians +3.09% / +3.31%, arms disjoint within mode); prefill neutral |
+| 0003–0005 | sm_121 mmvq tables + **wide Q4_K mmvq vec_dot** | **+3.2% decode** (same-mode medians +3.09% / +3.31%, arms disjoint within mode); prefill neutral. **Verified on the trusted runner: score 1.050258** |
+
+The verified frontier on this track is **1.050258** (was 1.030637). Stock
+baseline is 23.627 tok/s decode, 343.1 tok/s prefill, 0.66 s TTFT.
+
+### 0003–0005 as the trusted runner measured it
+
+Worth recording because it validates the local protocol below. Paired rounds
+against stock: **1.0544 / 1.0391 / 1.0482**, spread 0.0153, median **1.0482**.
+The local same-mode analysis predicted the runner would read
+`1.0187 (0001) × 1.032 (this patch) = 1.051`; it read 1.0482, and the score
+came in at 1.050258 against a projection of ~1.0497.
+
+Had the naive three-round reading been published instead, the same prediction
+would have been `1.0187 × 1.09 = 1.11` — off by five points. **The same-mode
+protocol is what made the local number predictive.**
+
+Long-context arms (published, not gated): 16350 tok 21.56 → 22.44 (+3.85%),
+32743 tok 19.80 → 20.52 (+3.93%). Both positive and consistent with the short
+window. Text diverges there, as expected for a non-bit-identical float
+regrouping on top-8-of-256 routing — this patch touches neither KV indexing nor
+RoPE, so the divergence carries no bug signal.
 
 ## 0003–0005: the sm_121 wide Q4_K mmvq vec_dot (+3.2% decode)
 
@@ -194,7 +215,7 @@ animation to `/tmp`. Use `llama-server` + `POST /completion`, assert
 non-empty, and wrap every invocation in `timeout`. Recorded as the
 `empty-file-greedy-identity-false-pass` finding.
 
-The frontier is **+1.459%** (score 1.014589, decode 24.01 tok/s) from
+The prior frontier was **+1.459%** (score 1.014589, decode 24.01 tok/s) from
 `0001-cuda-mmvq-group-same-activation-matvecs.patch`, verified on the trusted
 runner. Stock baseline is 23.627 tok/s decode, 343.1 tok/s prefill, 0.66 s TTFT.
 
