@@ -1,5 +1,46 @@
 # qwen3.6-35b-a3b-gguf-r9700-v1 — patch series
 
+## READ THIS FIRST: the accuracy gate (round 43, corrected)
+
+**The gate command, verbatim from the runner** (`~/gainz-runner-rocm/app/src/rocm-worker.ts`):
+
+```bash
+HIP_VISIBLE_DEVICES=0 <bin>/llama-perplexity \
+    -m $MODEL -f ~/gainz-ppl-corpus.txt -ngl 99 -c 512 --chunks 8
+```
+
+**No `-b`. No `-ub`.** llama.cpp defaults apply (n_batch 2048, n_ubatch 512).
+Pass condition: `|cand - stock| / stock <= 0.001`, symmetric.
+Local replica on the box: **`~/fable-qwen/gate.sh <loads> [libdir ...]`**.
+
+**THE BASELINE IS STOCK `b10237`, MEASURED IN THE SAME SESSION — NOT THE
+PREVIOUS FRONTIER. Every patch in this series shares ONE 0.1% budget against
+stock. They do not each get 0.1% against their predecessor.**
+
+That is a materially different constraint from how most of this campaign
+reasoned. A round that moves ppl +0.05% is not "well inside the gate" — it has
+spent half of the budget the *entire series* has, permanently. Measured
+2026-08-09: stock reads **3.9314**, the 54-patch frontier reads a median
+**3.9318**, so the series has consumed only about **+0.010%** so far. That
+headroom is the shared asset; spend it deliberately.
+
+Two further traps, both of which have already cost a submission:
+
+- The habitual campaign check `-b 512 -ub 1 --chunks 8` is a **different shape**
+  and reads 3.9382 where the gate reads 3.9314. It is a useful decode-path
+  signal. It is not the gate.
+- Anything whose behaviour depends on **batch shape** must be checked with the
+  gate command specifically. `-c 512` with the default `-b 2048` produces a
+  batching pattern that neither `-ub 1` nor a hand-picked tail shape reproduces
+  — round 42 read -0.040% locally and +0.239% on the runner for exactly this
+  reason.
+
+The runner also computes a **KL divergence** (`-c 512 --chunks 4
+--kl-divergence-base`), currently reported and not gated. It catches
+distribution shifts perplexity cannot. Run it before submitting.
+
+---
+
 Port of the verified laguna-xs-2.1-gguf-r9700-v1 launch-bound decode series
 to Qwen3.6-35B-A3B (arch `qwen35moe`: 40 layers, MoE 256 experts top-8 +
 shared expert, hybrid linear/full attention every 4th layer, GQA 16/2,
