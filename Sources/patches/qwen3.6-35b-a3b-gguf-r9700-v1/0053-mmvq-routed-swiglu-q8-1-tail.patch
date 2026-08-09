@@ -1,0 +1,566 @@
+From 690f1beb394fe690f466f552d9afd6ec0c6c4877 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sun, 9 Aug 2026 04:33:05 +0000
+Subject: [PATCH] cuda/hip: the routed SwiGLU q8_1 quantize as a cross-block
+ matvec epilogue (+0.6% decode)
+
+A q8_1 block needs 32 consecutive destination elements; mul_mat_vec_q gives each
+block rows_per_cuda_block of them, so the 32 live in QK8_1/rpb different blocks
+and no block can quantize on its own. That is why round 37 closed both the
+guest and the fold framings for this launch.
+
+An arrival counter reaches it without a grid barrier. Each block publishes its
+outputs with a device-scope fence and bumps its group counter; the block that
+observes the last arrival is ordered after every other store, so it - and only
+it - re-reads the group 32 floats and runs glu_quant_store. Nobody spins, and
+the closing block zeroes the slot so the counters are self-clearing across a
+HIP graph replay.
+
+Bit-identical by construction: the 32 values are the exact f32 words this launch
+stored, read back through memory as the separate quantize_q8_1 launch would have
+read them, and glu_quant_store is that kernel arithmetic statement for
+statement.
+
+531 -> 491 dispatches/token, exactly -40. GGML_CUDA_MMVQ_Q8_1_TAIL=0 restores
+the standalone launch.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  41 ++++++-
+ ggml/src/ggml-cuda/mmvq.cu      | 187 +++++++++++++++++++++++++-------
+ ggml/src/ggml-cuda/mmvq.cuh     |  23 +++-
+ 3 files changed, 207 insertions(+), 44 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 3c31a402a..23d73b011 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5663,6 +5663,16 @@ static bool ggml_cuda_mmvq_glu_colaunch_enabled() {
+     return e;
+ }
+ 
++// 0053: GGML_CUDA_MMVQ_Q8_1_TAIL=0 restores the standalone quantize_q8_1 launch
++// for the routed SwiGLU activation.
++static bool ggml_cuda_mmvq_q8_1_tail_enabled() {
++    static const bool v = []() {
++        const char * e = getenv("GGML_CUDA_MMVQ_Q8_1_TAIL");
++        return e == nullptr || std::atoi(e) != 0;
++    }();
++    return v;
++}
++
+ static int ggml_cuda_mmvq_glu_colaunch_find(
+         ggml_backend_cuda_context * ctx, ggml_cgraph * cgraph, const int host_idx,
+         const ggml_tensor * host_dst, const ggml_tensor * host_gate_w, mmvq_glu_guest * out) {
+@@ -6286,8 +6296,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                     ? ggml_cuda_mmvq_glu_colaunch_find(cuda_ctx, cgraph, i + 2, glu, gate->src[0], &glu_guest)
+                     : -1;
+ 
++                // 0053: this launch's own destination is the routed SwiGLU
++                // activation that the expert-down MUL_MAT_ID consumes as q8_1.
++                // Register the cache entry now and let the matvec close it with
++                // its cross-block epilogue instead of a separate dispatch.
++                mmvq_q8_1_tail tail{};
++                bool           tail_launched = false;
++                if (op == GGML_OP_MUL_MAT_ID && ggml_cuda_mmvq_q8_1_tail_enabled() &&
++                        cuda_ctx->stream_context().concurrent_events.empty() &&
++                        glu->ne[2] == 1 && glu->ne[3] == 1 && ggml_is_contiguous(glu)) {
++                    tail.q8_1_dst = ggml_cuda_quant_register_for_consumer(cuda_ctx, cgraph, i + 3, glu);
++                }
++
+                 ggml_cuda_mul_mat_vec_q(*cuda_ctx, src0, src1, ids, glu, &fusion_data,
+-                                        guest_idx >= 0 ? &glu_guest : nullptr, &glu_launched);
++                                        guest_idx >= 0 ? &glu_guest : nullptr, &glu_launched,
++                                        tail.q8_1_dst != nullptr ? &tail : nullptr, &tail_launched);
++                static const bool q8_1_tail_debug = getenv("GGML_CUDA_Q8_1_TAIL_DEBUG") != nullptr;
++                if (q8_1_tail_debug) {
++                    fprintf(stderr, "q8tail @%d glu=%s ne=[%lld,%lld] reg=%p launched=%d\n", i, glu->name,
++                            (long long) glu->ne[0], (long long) glu->ne[1], (void *) tail.q8_1_dst,
++                            (int) tail_launched);
++                }
++                if (tail.q8_1_dst != nullptr && !tail_launched) {
++                    // The cache entry was registered before the launch, so a
++                    // declined epilogue MUST still be filled here - otherwise
++                    // the consumer would read an unwritten entry. Same values,
++                    // same kernel the stock path would have run.
++                    const size_t ts_glu = ggml_type_size(glu->type);
++                    quantize_row_q8_1_cuda((const float *) glu->data, nullptr, tail.q8_1_dst, src0->type,
++                                           glu->ne[0], glu->nb[1]/ts_glu, glu->nb[2]/ts_glu, glu->nb[3]/ts_glu,
++                                           glu->ne[0], glu->ne[1], glu->ne[2], glu->ne[3], cuda_ctx->stream());
++                }
+                 if (guest_idx >= 0 && out_glu_colaunched != nullptr) {
+                     // The q8_1 buffer is registered before the launch, so if the
+                     // launch geometry could not carry the guest after all this
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 394f2091c..241fb03f7 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -524,12 +524,19 @@ struct mmvq_glu_guest_args {
+     int64_t       o1       = 0;
+ };
+ 
++// 0053: arrival counters for the cross-block q8_1 epilogue below. One slot per
++// 32-element destination group; every slot is left at 0 by the block that
++// closes it, so the array is self-resetting across launches and across the
++// graph replay. Sized for the largest routed-expert destination this fires on
++// (n_expert_used * ffn_len / QK8_1 = 128 on this model).
++__device__ unsigned int mmvq_q8_1_tail_counters[MMVQ_Q8_1_TAIL_MAX_GROUPS];
++
+ // has_dst_scale is deliberately NOT folded into has_fusion: the gate/bias
+ // machinery costs a second tmp_shared_gate array, which halves the LDS-limited
+ // occupancy of the small ids matvecs and made the fused expert-down launch 14%
+ // slower than the unfused one it replaced.
+ template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool has_dst_scale = false,
+-          bool has_glu_guest = false>
++          bool has_glu_guest = false, bool has_q8_1_tail = false>
+ __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+@@ -537,7 +544,8 @@ static __global__ void mul_mat_vec_q(
+         const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+-        const uint32_t ids_stride, const mmvq_glu_guest_args glu = mmvq_glu_guest_args()) {
++        const uint32_t ids_stride, const mmvq_glu_guest_args glu = mmvq_glu_guest_args(),
++        const mmvq_q8_1_tail tail = mmvq_q8_1_tail()) {
+     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
+     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+@@ -796,6 +804,66 @@ static __global__ void mul_mat_vec_q(
+         }
+     }
+ 
++    // ---- 0053: the routed SwiGLU's q8_1 quantize, as a cross-block epilogue --
++    // The standalone `quantize_q8_1` launch exists only because a q8_1 block
++    // needs 32 CONSECUTIVE destination elements while this kernel gives each
++    // block rows_per_cuda_block of them - the 32 live in QK8_1/rpb different
++    // blocks, so no block can quantize on its own and the guest/fold framings
++    // are both blocked (round 37 closed them for exactly this reason).
++    //
++    // An arrival counter reaches it without a grid barrier. Each block
++    // publishes its outputs with a device-scope fence and bumps its group's
++    // counter; the block that observes the last arrival is, by that
++    // observation, ordered after every other block's store, so it - and only
++    // it - re-reads the group's 32 floats and runs glu_quant_store on them.
++    // Nobody spins: the other QK8_1/rpb-1 blocks retire immediately, and the
++    // closing block resets the slot so the next launch starts at zero.
++    //
++    // Bit-identity is by construction and does not rest on the fence being
++    // fast: the 32 values are the exact f32 words this launch stored, read back
++    // through memory precisely as the separate `quantize_q8_1` launch would
++    // have read them, and glu_quant_store is that kernel's arithmetic
++    // statement for statement - lane L holds flat element 32g+L, the same
++    // warp_reduce_max/warp_reduce_sum over the same 32 lanes, the same
++    // d = amax/127, the same roundf, the same packed ds.
++    if constexpr (has_q8_1_tail) {
++        constexpr int blocks_per_group = QK8_1 / rows_per_cuda_block;
++        static_assert(rows_per_cuda_block <= QK8_1 && QK8_1 % rows_per_cuda_block == 0,
++                      "the q8_1 tail needs rows_per_cuda_block to tile a QK8_1 group");
++        if (tail.q8_1_dst != nullptr) {
++            const uint32_t group_in_ch = (uint32_t) row0 / QK8_1;
++            const uint32_t group       = channel_dst*(stride_channel_dst / QK8_1) + group_in_ch;
++
++            // release: this block's stores are visible before its arrival is
++            __threadfence();
++            unsigned int prev = 0;
++            if (threadIdx.x == 0) {
++                prev = atomicAdd(&mmvq_q8_1_tail_counters[group], 1u);
++            }
++            // broadcast lane 0's ticket; every other lane contributes 0 and the
++            // ticket is non-negative, so a max is an exact broadcast here
++            prev = (unsigned int) warp_reduce_max<warp_size>((float) prev);
++
++            if (prev + 1 == (unsigned int) blocks_per_group) {
++                if (threadIdx.x == 0) {
++                    mmvq_q8_1_tail_counters[group] = 0; // self-reset for the next launch
++                }
++                // acquire: pick up the other blocks' stores rather than a
++                // cached line. `dst` is __restrict__ and this block wrote only
++                // its own rows, so the load has to be volatile as well.
++                __threadfence();
++                const int64_t group_base = (int64_t) group_in_ch*QK8_1;
++                const int64_t rel        = group_base - (int64_t) row0 + (int64_t) threadIdx.x;
++                const float   v          = *(const volatile float *) (dst + rel);
++                // flat contiguous element index of the destination tensor:
++                // the slots sit on ne[1] with stride_channel_dst == nrows
++                const int64_t flat = (int64_t) channel_dst*stride_channel_dst +
++                                     (int64_t) group_in_ch*QK8_1 + (int64_t) threadIdx.x;
++                glu_quant_store(v, tail.q8_1_dst, flat);
++            }
++        }
++    }
++
+     if constexpr (!has_fusion) {
+         GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
+         GGML_UNUSED_VARS(dst_scale_v);
+@@ -1500,7 +1568,8 @@ static void mul_mat_vec_q_switch_fusion(
+         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+         const dim3 & block_nums, const dim3 & block_dims, const int nbytes_shared,
+         const uint32_t ids_stride, cudaStream_t stream,
+-        const mmvq_glu_guest_args * glu_guest = nullptr, bool * glu_launched = nullptr) {
++        const mmvq_glu_guest_args * glu_guest = nullptr, bool * glu_launched = nullptr,
++        const mmvq_q8_1_tail * tail = nullptr, bool * tail_launched = nullptr) {
+ 
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+@@ -1512,19 +1581,46 @@ static void mul_mat_vec_q_switch_fusion(
+         // the guest needs one whole blockIdx.x slice, i.e. block_nums.y blocks
+         // of block_dims.x*block_dims.y threads, over a 3D grid with one sample
+         const uint32_t g_threads = glu_guest != nullptr ? block_dims.x*block_dims.y : 0;
+-        if (glu_guest != nullptr && has_fusion && block_nums.z == 1 && g_threads > 0 &&
++        const bool guest_ok = glu_guest != nullptr && has_fusion && block_nums.z == 1 && g_threads > 0 &&
+                 g_threads % block_dims.x == 0 &&
+-                (uint64_t) ((glu_guest->k + g_threads - 1) / g_threads) <= (uint64_t) block_nums.y) {
++                (uint64_t) ((glu_guest->k + g_threads - 1) / g_threads) <= (uint64_t) block_nums.y;
++        // 0053: the q8_1 epilogue needs the destination to be exactly the flat,
++        // contiguous [stride_col_dst, 1, block_nums.y] the q8_1 cache is keyed
++        // on, whole QK8_1 groups per channel, and one arrival slot per group.
++        const bool tail_ok = tail != nullptr && tail->q8_1_dst != nullptr && has_fusion &&
++                block_nums.z == 1 && stride_channel_dst % QK8_1 == 0 &&
++                tail->nrows == stride_channel_dst &&
++                (uint64_t) block_nums.y * (stride_channel_dst / QK8_1) <= (uint64_t) MMVQ_Q8_1_TAIL_MAX_GROUPS;
++        if (guest_ok || tail_ok) {
+             dim3 block_nums_g = block_nums;
+-            block_nums_g.x += 1;
++            if (guest_ok) {
++                block_nums_g.x += 1;
++            }
++            const mmvq_glu_guest_args ga = guest_ok ? *glu_guest : mmvq_glu_guest_args();
++            const mmvq_q8_1_tail      ta = tail_ok  ? *tail      : mmvq_q8_1_tail();
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums_g, block_dims, nbytes_shared, stream);
+-            ggml_cuda_kernel_launch((mul_mat_vec_q<type, c_ncols_dst, true, small_k, false, true>), launch_params,
+-                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+-                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, *glu_guest);
+-            if (glu_launched != nullptr) {
++            if (guest_ok && tail_ok) {
++                ggml_cuda_kernel_launch((mul_mat_vec_q<type, c_ncols_dst, true, small_k, false, true, true>), launch_params,
++                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
++                     channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
++                     sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, ga, ta);
++            } else if (guest_ok) {
++                ggml_cuda_kernel_launch((mul_mat_vec_q<type, c_ncols_dst, true, small_k, false, true, false>), launch_params,
++                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
++                     channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
++                     sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, ga, ta);
++            } else {
++                ggml_cuda_kernel_launch((mul_mat_vec_q<type, c_ncols_dst, true, small_k, false, false, true>), launch_params,
++                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
++                     channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
++                     sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, ga, ta);
++            }
++            if (guest_ok && glu_launched != nullptr) {
+                 *glu_launched = true;
+             }
++            if (tail_ok && tail_launched != nullptr) {
++                *tail_launched = true;
++            }
+             return;
+         }
+     }
+@@ -1534,7 +1630,7 @@ static void mul_mat_vec_q_switch_fusion(
+             ggml_cuda_kernel_launch((mul_mat_vec_q<type, c_ncols_dst, false, small_k, true>), launch_params,
+                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_glu_guest_args());
++                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_glu_guest_args(), mmvq_q8_1_tail());
+             return;
+         }
+         if (has_fusion) {
+@@ -1542,7 +1638,7 @@ static void mul_mat_vec_q_switch_fusion(
+             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k>, launch_params,
+                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_glu_guest_args());
++                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_glu_guest_args(), mmvq_q8_1_tail());
+             return;
+         }
+     }
+@@ -1553,7 +1649,7 @@ static void mul_mat_vec_q_switch_fusion(
+     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k>, launch_params,
+         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_glu_guest_args());
++        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_glu_guest_args(), mmvq_q8_1_tail());
+ }
+ 
+ template <ggml_type type>
+@@ -1587,7 +1683,8 @@ static void mul_mat_vec_q_switch_ncols_dst(
+         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+         const int ids_stride, cudaStream_t stream,
+-        const mmvq_glu_guest_args * glu_guest = nullptr, bool * glu_launched = nullptr) {
++        const mmvq_glu_guest_args * glu_guest = nullptr, bool * glu_launched = nullptr,
++        const mmvq_q8_1_tail * tail = nullptr, bool * tail_launched = nullptr) {
+ 
+     GGML_ASSERT(ncols_x % ggml_blck_size(type) == 0);
+     GGML_ASSERT(ncols_dst <= MMVQ_MAX_BATCH_SIZE);
+@@ -1686,7 +1783,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
+                     vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                     channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst, sample_ratio_fd,
+                     stride_sample_x, stride_sample_y, stride_sample_dst, dims.first, dims.second, 0, ids_stride,
+-                    stream, glu_guest, glu_launched);
++                    stream, glu_guest, glu_launched, tail, tail_launched);
+             }
+         } break;
+         case 2: {
+@@ -1758,168 +1855,169 @@ static void mul_mat_vec_q_switch_type(
+         const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+         const int nsamples_x, const int nsamples_dst, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+         const int ids_stride, cudaStream_t stream,
+-        const mmvq_glu_guest_args * glu_guest = nullptr, bool * glu_launched = nullptr) {
++        const mmvq_glu_guest_args * glu_guest = nullptr, bool * glu_launched = nullptr,
++        const mmvq_q8_1_tail * tail = nullptr, bool * tail_launched = nullptr) {
+     switch (type_x) {
+         case GGML_TYPE_Q1_0:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q1_0>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_Q2_0:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_0>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_Q4_0:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q4_0>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_Q4_1:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q4_1>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_Q5_0:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q5_0>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_Q5_1:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q5_1>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_Q8_0:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q8_0>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_MXFP4:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_MXFP4>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_NVFP4:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_NVFP4>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_Q2_K:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q2_K>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_Q3_K:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q3_K>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_Q4_K:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q4_K>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_Q5_K:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q5_K>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_Q6_K:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_Q6_K>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_IQ2_XXS:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ2_XXS>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_IQ2_XS:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ2_XS>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_IQ2_S:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ2_S>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_IQ3_XXS:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ3_XXS>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_IQ1_S:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ1_S>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_IQ1_M:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ1_M>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_IQ4_NL:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ4_NL>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_IQ4_XS:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ4_XS>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         case GGML_TYPE_IQ3_S:
+             mul_mat_vec_q_switch_ncols_dst<GGML_TYPE_IQ3_S>
+                 (vx, vy, ids, fusion, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                  nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+                  nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream,
+-                 glu_guest, glu_launched);
++                 glu_guest, glu_launched, tail, tail_launched);
+             break;
+         default:
+             GGML_ABORT("fatal error");
+@@ -2300,7 +2398,8 @@ static bool mul_mat_vec_q_expert_reduce_switch_type(
+ 
+ void ggml_cuda_mul_mat_vec_q(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+-        const ggml_cuda_mm_fusion_args_host * fusion, const mmvq_glu_guest * glu_guest, bool * glu_launched) {
++        const ggml_cuda_mm_fusion_args_host * fusion, const mmvq_glu_guest * glu_guest, bool * glu_launched,
++        const mmvq_q8_1_tail * tail, bool * tail_launched) {
+     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+@@ -2443,12 +2542,16 @@ void ggml_cuda_mul_mat_vec_q(
+         glu_args.o1       = glu_guest->o1;
+     }
+ 
++    mmvq_q8_1_tail tail_local = tail != nullptr ? *tail : mmvq_q8_1_tail();
++    tail_local.nrows = (uint32_t) ne01;
++
+     mul_mat_vec_q_switch_type(
+         src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream,
+-        (glu_guest != nullptr && glu_guest->active) ? &glu_args : nullptr, glu_launched);
++        (glu_guest != nullptr && glu_guest->active) ? &glu_args : nullptr, glu_launched,
++        (tail != nullptr && tail->q8_1_dst != nullptr) ? &tail_local : nullptr, tail_launched);
+ }
+ 
+ bool ggml_cuda_moe_reduce_per_slot_mode() {
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index acec1b3c2..980587ac6 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -109,10 +109,31 @@ struct mmvq_glu_guest {
+     bool          active   = false;
+ };
+ 
++// 0053: the routed SwiGLU's q8_1 quantize, run as a cross-block EPILOGUE of the
++// gate+up matvec that produces it rather than as its own dispatch. A q8_1 block
++// needs 32 consecutive destination elements and this kernel gives each block
++// rows_per_cuda_block of them, so no block can quantize alone - round 37 closed
++// the guest and fold framings on exactly that. An arrival counter per 32-element
++// group reaches it without a grid barrier: each block fences and bumps its
++// group's counter, and the block that observes the last arrival re-reads the 32
++// floats and quantizes them. Nobody spins and nobody waits; the closing block
++// resets the slot, so the counters are self-clearing across a graph replay.
++//
++// `q8_1_dst` is the shared quantized-src1 cache entry the consuming expert-down
++// MUL_MAT_ID will look up. It is registered BEFORE the launch, so a launch whose
++// geometry cannot carry the epilogue must be followed by the standalone
++// quantize into that same buffer - `tail_launched` reports which happened.
++#define MMVQ_Q8_1_TAIL_MAX_GROUPS 2048
++struct mmvq_q8_1_tail {
++    void *   q8_1_dst = nullptr;
++    uint32_t nrows    = 0;   // filled in by ggml_cuda_mul_mat_vec_q
++};
++
+ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+     const ggml_cuda_mm_fusion_args_host * fusion = nullptr,
+-    const mmvq_glu_guest * glu_guest = nullptr, bool * glu_launched = nullptr);
++    const mmvq_glu_guest * glu_guest = nullptr, bool * glu_launched = nullptr,
++    const mmvq_q8_1_tail * tail = nullptr, bool * tail_launched = nullptr);
+ 
+ void ggml_cuda_op_mul_mat_vec_q(
+     ggml_backend_cuda_context & ctx,
+-- 
+2.53.0
+

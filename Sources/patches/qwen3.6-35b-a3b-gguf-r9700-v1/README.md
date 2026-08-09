@@ -3697,3 +3697,142 @@ kernel count is unchanged. Predicted from 3.507 us/matvec: +0.57%. Measured
 **159.97 tok/s** (from 159.26), prefill **2979.5 tok/s** (from 2918.4). The
 ranked decode gain is +0.45% against +0.61% on llama-bench, the usual ~0.98
 ranked/local ratio this track has shown all campaign.
+
+## Round 39: 0053 — a cross-block ARRIVAL COUNTER reaches work no guest or fold could (+0.61% decode, BIT-IDENTICAL)
+
+Round 37 closed the routed-SwiGLU `quantize_q8_1` (40/token) as "arithmetically
+dead": its only possible host was absorbed by 0047, and it cannot fold into the
+producing matvec's epilogue because **in `mul_mat_vec_q` each block produces
+`rows_per_cuda_block` output elements, so the 32 consecutive elements a q8_1
+block needs live in 32 different blocks.** That reasoning is correct about
+guests and folds and wrong about the conclusion. A third mechanism exists.
+
+### The mechanism, and why it is not a grid barrier
+
+Each block finishes its own outputs, publishes them with `__threadfence()`, and
+`atomicAdd`s its group's counter. The block that observes the **last** arrival
+is, by that observation, ordered after every other block's store — so it, and
+only it, re-reads the group's 32 floats and runs `glu_quant_store`. The other
+31 blocks retire immediately; nobody spins.
+
+This is the distinction round 33 did not draw when it measured the software grid
+barrier dead (5.59 µs at 64 blocks, 48.9 µs at 256, against a 2.96 µs
+break-even). **A barrier makes every block wait for every other; an arrival
+counter makes one block per group do a little extra work.** The barrier cost
+that closed persistent kernels does not price this at all.
+
+The closing block zeroes its own slot, so `mmvq_q8_1_tail_counters` is
+self-clearing across launches *and* across a HIP graph replay — no host-side
+memset, no per-launch scratch allocation.
+
+### The probe that decided which pool to spend it on
+
+The fence and the atomic are not free, and where they land decides the result.
+A standalone HIP probe (`fprobe.hip`, kept on the box) runs a matvec-shaped tail
+with and without the fence+counter+quantize epilogue:
+
+| shape | plain | fenced | delta |
+|---|---|---|---|
+| 4104 blocks x 64 thr, k=2048 (MoE gate+up) | 57.8–61.6 µs | 54.8–57.7 µs | **hidden — inside noise, if anything faster** |
+| 1024 blocks x 128 thr, k=512 (GDN scan) | 19.8–20.2 µs | 21.0–21.3 µs | **+1.2 µs** |
+
+The 4104-block arm is bandwidth-saturated and swallows the epilogue whole; the
+1024-block arm is latency-bound and pays for it. **Price an arrival-counter
+epilogue by whether its host is saturated, not by the number of atomics.** That
+sent this round at the MoE gate+up matvec (17.8 µs, 4104 blocks) and away from
+the GDN chain, where the same machinery would have removed 30 dispatches and
+given most of it back.
+
+### Exactness
+
+The 32 values are the exact f32 words this launch stored, read back through
+memory precisely as the separate `quantize_q8_1` launch would have read them —
+so this is a **co-launch, not a fusion**, and the 0050 reassociation hazard
+never arises (no intermediate is kept in a register across the two expressions).
+`glu_quant_store` is `quantize_q8_1`'s arithmetic statement for statement: lane
+L holds flat element 32g+L, the same `warp_reduce_max`/`warp_reduce_sum` over
+the same 32 lanes, the same `d = amax/127`, the same `roundf`, the same packed
+`ds`. Which block closes a group is nondeterministic; what it computes is not.
+
+The load is `volatile` **and** behind the second `__threadfence()`: `dst` is
+`__restrict__` and this block wrote only its own rows, so without both the
+compiler is free to serve the other 31 lanes from a cached line.
+
+### The two shape traps
+
+1. **`stride_col_dst` is not the row count for `MUL_MAT_ID`.** The destination
+   is `[512, 8, 1, 1]` with the expert slots on `ne[1]`, and mmvq maps
+   `ncols_dst = ne2`, `nchannels_dst = ne1`, `stride_col_dst = s2` (4096, the
+   whole slab) and `stride_channel_dst = s1` (512, the row count). The first
+   build keyed the group index off `stride_col_dst` and off `glu->ne[1] == 1`;
+   it compiled, ran, produced correct output and **changed nothing** — the
+   census read 531 on both arms. Keyed off `stride_channel_dst` it fires.
+2. **A census diff cannot distinguish "declined" from "fell back"**, because the
+   fallback is the same `quantize_q8_1` kernel. The registration/launch decision
+   needs its own debug line (`GGML_CUDA_Q8_1_TAIL_DEBUG=1`); it is kept in the
+   patch for the next agent.
+
+### Numbers
+
+Against a binary built from this patch's own parent commit (6d635bd5d), control
+`RUNPATH` overridden with `LD_LIBRARY_PATH` and verified by `ldd`, arms
+alternated, no env set on either arm:
+
+```
+candidate tg128 164.83 164.73 164.54 164.68 164.56   mean 164.67
+control   tg128 163.95 163.73 163.73 163.54 163.39   mean 163.67   -> +0.61%, 5/5 separated
+prefill   pp512 4910.2 vs 4910.7                                   -> -0.01%
+```
+
+The same-binary toggle A/B reads **+0.71%** (on 165.14/164.87/164.94/164.58/164.81
+vs off 163.74/163.65/163.72/163.73/163.68). The 0.10% between the two is the
+cost the extra kernel parameter imposes on *every* mmvq launch, which a toggle
+A/B puts in both arms and cancels — round 26's rule, and it is worth ~1/6 of
+this patch.
+
+Census: **531 -> 491 dispatches/token, exactly -40**; `quantize_q8_1` 41 -> 1
+(the remaining one is per-eval). Every other kernel count unchanged.
+
+Predicted from the round-38 elementwise coefficient (2.238 µs): +1.47%. Measured
++0.61%. **The epilogue costs about 1.2 µs per host launch** — the closing block's
+cold re-read lands at the very end of the kernel, where there is nothing left to
+hide it behind. Price the next arrival-counter epilogue at **~55% of the
+elementwise dispatch rate**, not 100%.
+
+### Correctness
+
+- decode-path perplexity (`-b 512 -ub 1 --chunks 8`, runner corpus) **3.9382 on
+  both arms over three loads each** — bit-identical, and equal to the banked
+  value since 0047;
+- server greedy at the decode shape, 6 prompts including a 1000-token one,
+  **5/6 byte-identical** — and an **off-vs-off control on the same harness also
+  reads 5/6**, differing on the same prompt p5 (936 B vs 958 B). p5 is the
+  1000-token prompt and it is nondeterministic in this harness regardless of the
+  patch. Round 32 saw the same thing; this round pins it to a specific prompt.
+- the path fires **600/600** under `llama-server` with zero declines
+  (`GGML_CUDA_Q8_1_TAIL_DEBUG=1` on the server log, not the wrapper's stderr —
+  `srvid.sh` redirects the server to `$OUT/server.log`), so the ranked path gets
+  it, not just `llama-bench`;
+- prefill is untouched by construction: the hook sits inside the
+  `ggml_cuda_should_fuse_mul_mat_vec_q` branch, and at pp512 the routed
+  `MUL_MAT_ID` goes through MMQ.
+
+`GGML_CUDA_MMVQ_Q8_1_TAIL=0` restores the standalone launch.
+
+### Where this leaves the decode token
+
+**491 dispatches, 164.7 tok/s llama-bench** against round 34's reachable band of
+165–169. The remaining elementwise pool, with the new ~1.2 µs epilogue tax
+priced in:
+
+| move | class | x/tok | modelled | note |
+|---|---|---|---|---|
+| GDN `ssm_norm`+gate into `gated_delta_net` | elem | 30 | **negative** | the probe says the 1024-block host pays +1.2 µs and the saving is 2.2 µs; ~+0.5% at best, and it needs `grid.z == 1`, which costs 4x occupancy. Not worth it. |
+| ATTN q/k-norm + rope + set_rows + gate `cont` | elem | 30 | +0.7% | four block-local per-head ops, only 10 layers; needs a 0050-style fence on the norm->rope hand-off |
+| 6 `copyBuffer` graph-input uploads | copy | 6 | +0.2% | llama.cpp-side batching, unexplored |
+| `flash_attn_combine_results` | elem | 10 | +0.35% | needs `parallel_blocks == 1`, KV-length dependent |
+
+`rms_norm_pre_add` (80/token, 236 µs, one workgroup each) stays the largest
+single pool and stays unreachable: it is serial with both its producer and its
+consumer, and recomputing it inside a 2048-block consumer costs more L2 traffic
+than the launch it saves (round 34).
