@@ -7,7 +7,7 @@ Applied in order against pinned llama.cpp **b10237**
 | --- | --- | --- |
 | 0001 | `cuda-mmvq-group-same-activation-matvecs` | **+1.868% decode** (in-process paired A/B, 12 rotated cycles, no-op floor 0.99994) |
 | 0002 | `sm121-mmq-moe-j64-cap` | **+4.47% prefill** (median of same-mode interleaved toggle rounds; decode neutral — the cap is MMQ/prefill-only) |
-| 0003 | `llama-absorb-trailing-ubatch` | **+38.4% scored prefill slope**, +21.3% ttft, decode −0.47%; gate ppl bit-identical |
+| 0003 | `llama-absorb-trailing-ubatch` | **INERT on this harness** — verified 1.0313 but the +0.07% was noise; llama-server pre-chunks the prompt so it never fires. See the correction below. |
 
 The verified frontier on this track is **1.030637** (0001+0002). Stock baseline
 is 23.627 tok/s decode, 343.1 tok/s prefill, 0.66 s TTFT.
@@ -55,6 +55,66 @@ and the ratio is **1.0014**. That is not a result. Bounded somewhere in
 Not submitted: a submission that does not beat the current best is auto-rejected
 ("score did not improve current best"), and there is no measured gain here to
 put against a runner slot.
+
+# CORRECTION (2026-08-09): 0003 IS INERT HERE — llama-server pre-chunks the prompt
+
+`0003` was submitted and **verified at 1.0313** (from 1.030637), and that
++0.07% is **noise, not the patch**. Read this before building on any prefill
+number in the section below it.
+
+**The patch cannot fire on the ranked path.** `llama_context::decode` chooses the
+effective ubatch size from the batch it is handed — but `llama-server` splits the
+prompt *before* calling `llama_decode`. Instrumented on the server path, a
+537-token ranked prompt arrives as **three separate decode calls of 21 + 512 + 4**,
+so `llama_decode` never sees more than `n_ubatch` and the absorption test
+(`n_tokens > n_ubatch`) is never true. It fires only for callers that hand
+`llama_decode` a whole batch — `llama-bench` does, which is exactly why the local
+`pp534` measurement showed +21% and the ranked run showed nothing.
+
+**The scored prefill is also not a slope on this runner.** `rocm-worker` takes
+`body.timings.prompt_per_second` from a **single cache-cold `/completion`
+request**, median of 9 runs at indices 100–108, with the prompt sized in
+**characters** (`GAINZ_PROMPT_CHARS = 2600`). So `prompt_n` varies run to run
+(measured: 524, 544, 562, 551, 541, 547, 536, **511**, 536) and there is no
+`(t(534) − t(84))/451` anywhere in this harness. The `+38.4% slope` figure was
+computed with a formula this runner does not use, on a code path that does not
+run.
+
+**The control that settles it was already in the data.** Run index 107 yields a
+**511-token** prompt — under `n_ubatch`, so absorption is *structurally
+impossible* on it. Exact ranked-shape replica, both arms:
+
+| prompt_n | absorb=0 | absorb=1 | ratio | can absorb? |
+| --- | --- | --- | --- | --- |
+| 524 | 484.6 | 497.0 | 1.0256 | yes |
+| 544 | 466.1 | 478.7 | 1.0270 | yes |
+| 562 | 462.3 | 468.8 | 1.0141 | yes |
+| 551 | 465.5 | 476.3 | 1.0232 | yes |
+| 541 | 472.1 | 481.7 | 1.0203 | yes |
+| 547 | 475.5 | 485.4 | 1.0208 | yes |
+| 536 | 480.3 | 487.5 | 1.0150 | yes |
+| **511** | **545.8** | **555.8** | **1.0183** | **NO** |
+| 536 | 473.4 | 482.4 | 1.0190 | yes |
+
+The impossible run moved **+1.83%**, against a +2.06% mean on the runs where
+absorption "could" fire. The two server boots drew different launch modes
+(decode 23.98 vs 25.36), and that drift *is* the entire difference.
+
+**But the prize is real and it is bigger than the tail estimate.** That same
+table shows the 511-token prompt — the only one processed in a single decode
+call — running at **545.8 tok/s against ~472.5 for every prompt that gets
+split: +15.5%**, sitting on the ranked path today. The lever is right; the layer
+was wrong. **It has to be taken in `tools/server/server-context.cpp`, whose
+prompt loop bounds each chunk by `n_ubatch`**, not in `llama_context`.
+
+Two rules this cost a slot to learn:
+
+1. **`llama-bench pp<N>` is not the ranked measurement.** The ranked path is a
+   `llama-server` request measuring `prompt_per_second`; llama-bench hands
+   `llama_decode` the whole batch while the server pre-chunks it. Price from a
+   server request or not at all.
+2. **Always include a run whose prompt is under `n_ubatch`.** Absorption cannot
+   fire on it, so anything it moves is drift — a free built-in control.
 
 # THE PREFILL SCORE IS 18% TAIL UBATCH — read this before profiling prefill again
 
