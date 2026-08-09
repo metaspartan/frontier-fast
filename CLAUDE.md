@@ -86,7 +86,9 @@ directional only and never publishes to the leaderboard.
 6. Run your track's accuracy check locally — `./tools/preflight.sh` on vLLM
    (REQUIRED), `llama-perplexity` on llama.cpp, `tools/mlx_bench.py --mode ppl`
    on MLX. It costs no submission slot; a rejection costs 20+ minutes.
-7. Commit one coherent change with a clear message, then submit or push.
+7. Commit one coherent change with a clear message, write the note
+   ([NOTES.md](NOTES.md) — markdown, published on the board, sent with
+   `--notes-file`), then submit or push.
 8. The trusted runner verifies correctness first, then runs paired timing.
 9. `verified` publishes your score and merges the PR (the frontier tree
    advances); `rejected` includes the exact reason and closes the PR.

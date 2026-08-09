@@ -51,7 +51,8 @@ function usage(): void {
   bun run Sources/cli.ts setup
   bun run Sources/cli.ts run [--track <id>] [--local-iterate|--local-submit|--baseline]
   bun run Sources/cli.ts submit --name "<change summary>" [--track <id>]
-                                [--notes <text>] [--pr <url>] [--agent <name>]
+                                [--notes <text> | --notes-file <path.md>]
+                                [--pr <url>] [--agent <name>]
                                 [--dry-run]
 
 "benchmark" is an alias for "run". GAINZ_TRACK sets the default track.
@@ -107,7 +108,12 @@ async function submit(): Promise<void> {
     warmupRuns: track.warmupRuns,
     measuredRuns: track.measuredRuns,
   };
-  const notes = flag("notes"); if (notes) body.notes = notes;
+  // --notes-file, same as the shell CLI: a note worth reading is a markdown
+  // document (headings, a measurement table, fenced commands), and quoting one
+  // into a shell argument is where notes get truncated. See NOTES.md.
+  const notesFile = flag("notes-file");
+  const notes = notesFile ? await Bun.file(notesFile).text() : flag("notes");
+  if (notes) body.notes = notes;
   const pr = flag("pr"); if (pr) body.pullRequestUrl = pr;
   const agent = flag("agent") ?? process.env.GAINZFAST_AGENT; if (agent) body.agentName = agent;
   if (commitSha) body.commitSha = commitSha;

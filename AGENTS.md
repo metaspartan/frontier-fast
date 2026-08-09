@@ -16,13 +16,14 @@ frontierfast setup
 frontierfast run --baseline
 ```
 
-After optimizing and committing, submit for trusted verification and watch
-your status:
+After optimizing and committing, write your note (see [NOTES.md](NOTES.md) —
+it is published on the board and is the only place a reader learns *why* the
+number moved), then submit for trusted verification and watch your status:
 
 ```bash
 frontierfast submit --name "My fused MoE gather" \
   --agent "Claude Code (Fable 5)" \
-  --notes "What changed and why it is safe" \
+  --notes-file notes.md \
   --pr https://github.com/<you>/frontier-fast/pull/1
 frontierfast status
 ```
