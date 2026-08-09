@@ -55,6 +55,87 @@ Not submitted: a submission that does not beat the current best is auto-rejected
 ("score did not improve current best"), and there is no measured gain here to
 put against a runner slot.
 
+# THE PREFILL SCORE IS 18% TAIL UBATCH — read this before profiling prefill again
+
+Nobody had censused GB10 prefill as the **slope** the score actually uses. Doing
+so finds the largest single structural fact on this track, and it is not in any
+kernel.
+
+Scored prefill is `(t(534) − t(84)) / 451`. The runner boots
+`llama-server -m … -ngl 99 -c 8192 --parallel 1` with **no `-b`/`-ub` flag**
+(`SERVER_FLAGS` in the worker), so llama.cpp's defaults apply and a 534-token
+prompt is split by `n_ubatch = 512` into **512 + 22**.
+
+`llama-bench -p 84,300,534 -n 0 -r 1` on the 0001+0002 control, nsys trace
+segmented per ubatch (segment spans reproduce the reported t/s to 0.1 ms):
+
+| | launches | time | per token |
+| --- | --- | --- | --- |
+| ubatch A (512 tok) | 4105 | 801.1 ms | **1.56 ms** |
+| ubatch B (22 tok, the tail) | 2453 | **175.1 ms** | **7.96 ms** |
+
+**The 22-token tail is 17.9% of t(534) for 4.1% of the tokens — a 5.09x
+per-token penalty.** It issues 2453 launches, 60% as many as the 512-token
+ubatch, because on a 256-expert MoE the launch structure is set by experts and
+layers, not by tokens. Its cost is `mul_mat_q` 109.5 ms + `mul_mat_f_ids`
+(BF16 experts) 51.0 ms = 160 of its 175 ms, and that is a **full sweep of the
+expert weights** — ~30 GB at this box's ~200 GB/s — performed for 22 tokens.
+
+**No kernel change can recover it.** It is bandwidth, not tiling: the tail must
+read the experts it routes to whatever the tile geometry is. The only way to
+not pay a second sweep is to not have a second ubatch.
+
+### Measured: the whole thing is reachable from `n_ubatch`
+
+`llama-bench -p 84,534 -n 32 -r 2 -ub 512,1024`, one load, same binary:
+
+| n_ubatch | pp84 | pp534 | tg32 |
+| --- | --- | --- | --- |
+| 512 (default) | 251.92 | 561.42 | 25.98 |
+| 1024 | 248.85 | **691.49** | 25.67 |
+
+Converted to what is scored:
+
+| | 512 | 1024 | |
+| --- | --- | --- | --- |
+| t(84) | 333.4 ms | 337.6 ms | |
+| t(534) | 951.2 ms | 772.2 ms | |
+| **scored prefill slope** | 730.1 tok/s | **1037.5 tok/s** | **+42.1%** |
+| decode tg32 | 25.98 | 25.67 | −1.2% |
+| ttft ≈ t(534) | | | +23.2% |
+
+`0.9881^0.65 × 1.4211^0.20 × 1.2317^0.15` = **1.0983**, i.e. this track's
+1.0306 would become **≈1.132**. pp84 is one ubatch either way and is unchanged,
+which is the control that says the effect is the tail and nothing else.
+
+### Why this is NOT yet a patch — read before shipping it
+
+It is a change to a llama.cpp **default**, not a kernel, and it is shaped to the
+fact that the scored prompt is 534. Three things must be settled first, and none
+of them were in this session:
+
+1. **Is it in the spirit of the track?** Raising `n_ubatch` removes a fixed
+   second sweep; it does not improve marginal per-token throughput, which is
+   what a slope is meant to isolate. The defensible form is *adaptive tail
+   absorption* — when the trailing ubatch is a small fraction of `n_ubatch` and
+   the batch still fits `n_batch`, grow the previous ubatch instead of issuing a
+   sweep for it. That is a general MoE engine fix (any prompt slightly over
+   `n_ubatch` pays this), not a 534-shaped constant. **Balanced splitting is
+   NOT the answer and was checked: two 267-token ubatches pay two full sweeps,
+   ~1140 ms against 976 ms — worse than 512+22.**
+2. **The −1.2% decode is unresolved.** This track has a documented ~7%
+   per-launch bimodality; `r=2` cannot see 1.2%. It must be re-measured with the
+   in-process rotated protocol in this README before any of the +9.8% is
+   believed. Note the score is still strongly positive even if the −1.2% is real.
+3. **Memory on the ranked boot.** llama-bench used default context; the runner
+   uses `-c 8192` on an 89.43 GiB model in 124.5 GiB. Doubling ubatch activation
+   buffers must be shown not to OOM *there* before spending a slot.
+
+Cross-track: laguna-xs, laguna-S and qwen3.6 gb10cuda are all MoE and all get
+the same 512+22 split from the same flagless boot, so the same tail exists on
+all three. lfm2.5 is dense — its tail costs almost nothing, which is consistent
+with this being an expert-sweep effect.
+
 # READ THIS FIRST: this track enforces GREEDY-OUTPUT AGREEMENT, not just perplexity
 
 **A patch that passes both perplexity gates can still be rejected**, and one of
