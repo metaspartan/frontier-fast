@@ -1,0 +1,109 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sun, 9 Aug 2026 09:10:00 +0000
+Subject: [PATCH] cuda/hip: let the skinny f32 GEMM take the small tail ubatch
+ too (+5.6% pp534)
+
+0044 added a wave-tiled f32 GEMM for the shapes rocBLAS under-parallelises and
+guarded it with min_cols = 32. That lower bound excluded exactly the regime
+where the vendor BLAS is worst: fewer columns means fewer output tiles means
+fewer workgroups. 0044 fixed "few rows"; the identical pathology at "few
+columns" was left in.
+
+Every prompt longer than one physical batch ends in a short tail ubatch, and
+the ranked 512-token prompt tokenises to ~534, so every single request pays
+one of 22 tokens. At M = 22 the guard rejects and the matmuls fall back to
+Cijk_Alik_Bljk_S_B_Bias_HA_S_SAV_UserArgs_MT64x64x16 running on grids of
+**1 and 4 workgroups**.
+
+Round-47 kernel census (rocprofv3, per pass, post-park 55-patch series),
+sorted by contribution to the scored prefill SLOPE ( t(534) - t(84) ) / 451:
+
+    kernel family                     pp84    pp300    pp534   d(534-84)  %slope
+    void mul_mat_q<                  22.17    36.18    64.07     41.91    47.9%
+    Cijk_..._S_B_Bias_..._SAV         0.00     0.00    11.19     11.19    12.8%
+    void gated_delta_net_mc_cuda<     1.58     5.20     7.97      6.38     7.3%
+
+The rocBLAS f32 entry runs ZERO times at pp84 and pp300 and 100 times at
+pp534: it is not a scaling term, it is the tail ubatch, and it is 12.8% of
+the whole prefill slope. It is also pure TTFT, since ttft = t(534).
+
+This is a reinstatement. The identical change was submitted as 0055 in round
+42 and REJECTED at perplexity 0.239% against a 0.1% gate. Round 43 then found
+the series build was nondeterministic -- 25 draws of the gate command spanning
+3.9269-3.9448 with ~20% outside the gate, against a bit-stable stock -- and
+round 43b bisected that to patch 0008. 0008 is now parked (0055), the build
+reads one repeated value again, and this change can finally be measured
+honestly.
+
+The prediction the park made testable, and the result:
+
+  min_cols cannot fire at the gate shape. `-c 512` is exactly one ubatch of
+  512, it never splits, so there is no tail and `ggml_cuda_should_use_mmf32_skinny`
+  is never reached with M < 32. The gate reading must therefore be *identical*,
+  not merely close.
+
+  Runner's exact gate command, 10 loads per arm:
+
+    stock (b10237)   3.9314  3.9314  3.9314
+    min_cols=32      3.9318 x10    spread 0.000%
+    min_cols=8       3.9318 x10    spread 0.000%    +0.010% vs stock
+
+  Ten out of ten identical on both arms. 0055's 0.239% was a bad draw.
+
+Because that shape is blind to the change on purpose, it was also checked at a
+shape that DOES split with a small tail (`-c 534 -b 534 -ub 512`, ubatches
+512 + 22), 3 loads per arm:
+
+    min_cols=32   3.2323  3.2323  3.2323
+    min_cols=8    3.2296  3.2296  3.2296     -> -0.0835%
+
+Separated, reproducible on both arms, and inside 0.1%. The delta is ordinary
+reassociation: the same products are summed by a different GEMM in a different
+order.
+
+Speed, llama-bench, same binary with the env toggle, 4 rounds interleaved:
+
+    pp534  min_cols=32   3843.14  3848.95  3845.15  3853.41   mean 3847.66
+    pp534  min_cols=8    4032.45  4069.53  4063.28  4083.62   mean 4062.22   +5.58%
+    pp512  min_cols=32   4905.50  4867.89  4895.33  4912.21   mean 4895.23
+    pp512  min_cols=8    4902.04  4896.82  4880.74  4871.65   mean 4887.81   -0.15%
+
+4/4 separated with no overlap at pp534; pp512 flat, as the mechanism requires,
+because a 512-token prompt is one ubatch and has no tail.
+
+Lowered to 8 rather than 1 so decode-shape matvecs (M = 1) stay on the
+mmvf/mmvq paths that rounds 17-53 tuned. Measured flat between 2 and 8.
+
+GGML_F32_SKINNY_MIN_COLS=32 restores the old threshold.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/mmf32-skinny.cu | 12 +++++++++++-
+ 1 file changed, 11 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/mmf32-skinny.cu b/ggml/src/ggml-cuda/mmf32-skinny.cu
+index cda1844ae..5e7773fc8 100644
+--- a/ggml/src/ggml-cuda/mmf32-skinny.cu
++++ b/ggml/src/ggml-cuda/mmf32-skinny.cu
+@@ -132,7 +132,17 @@ static int mmf32_skinny_max_rows() {
+ static int mmf32_skinny_min_cols() {
+     static const int v = []() {
+         const char * s = getenv("GGML_F32_SKINNY_MIN_COLS");
+-        return s ? atoi(s) : 32;
++        // 0044 shipped this at 32, which excluded exactly the shapes where the vendor
++        // BLAS is WORST.  Fewer columns means fewer output tiles means fewer
++        // workgroups: a 22-column tail ubatch lands rocBLAS on a 1-4 workgroup
++        // Cijk_..._S_B_Bias_... , 100 launches and 11.19 ms of a 132.96 ms pp534
++        // pass -- 12.8% of the whole scored prefill slope, and it runs zero times
++        // at pp84 and pp300 so it is entirely a tail-ubatch cost.
++        // Any prompt longer than one physical batch has such a tail, and the ranked
++        // 512-token prompt tokenises to ~534, so it has one every request.
++        // 8 rather than 1: decode-shape matvecs (M = 1) must stay on the mmvf/mmvq
++        // paths that rounds 17-53 tuned.  Measured flat between 2 and 8.
++        return s ? atoi(s) : 8;
+     }();
+     return v;
+ }
+-- 
+2.53.0

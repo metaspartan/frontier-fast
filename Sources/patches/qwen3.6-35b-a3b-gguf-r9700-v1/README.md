@@ -4610,3 +4610,209 @@ the 2.13% debt with margin.
 Method note for whoever picks this up: measure the achievable rate for this exact
 access pattern with a standalone probe before assuming 640 GB/s is reachable for
 a quantised gather. And count all three grid dimensions.
+
+## Round 47: the quantised gather is at 94-99% of ceiling (lever dead), the tail ubatch is 26% of the slope, and 0055 re-measured honestly
+
+Round 46 handed this round a hypothesis: `mul_mat_q` is 46.2% of the prefill
+slope, it runs at ~444 GB/s against a 640 GB/s peak, and Q5_K's layout blocks
+wide loads. **Measure before you write a kernel. The hypothesis is wrong.**
+
+### 1. The achievable-bandwidth probe — and the widen-the-loads lever is DEAD
+
+A standalone HIP probe (`~/fable-qwen/bw2.hip` on the box) reproduces the exact
+`ggml_cuda_mmq_load_tiles_q4_K` / `_q5_K` mapping — a CTA owning `I = 64` rows,
+`MMQ_ITER_K = 256 = QK_K` so one quant block per row per k-iteration, the
+k-block loop innermost, 128 threads as `(32,4)`, `qs` read as 32 lanes x 4 B,
+`qh` read `txi % 8` (4x replicated), the 16 B block header read by thread
+pairs — over a 3 GiB working set, with no LDS, no MMA and no sync.
+
+| arm | GB/s | % of ceiling |
+|---|---:|---:|
+| REF contiguous `int4` stream | **638.5** | 100% |
+| q4_K nbk=8, exact MMQ mapping (real gate/up, K=2048) | **601.8** | 94.3% |
+| q4_K nbk=8, perfectly-flat tile (the repack ceiling) | 637.9 | 99.9% |
+| q5_K nbk=2, exact MMQ mapping (real down, K=512) | **634.6** | 99.4% |
+| q5_K nbk=2, qh replication removed | 633.5 | 99.2% |
+| q5_K nbk=2, whole-row `int4` wide loads | 639.3 | 100.1% |
+| q5_K nbk=2, flat tile ceiling | 638.4 | 100% |
+
+**The access pattern costs essentially nothing.** Q5_K — the one round 46
+singled out as layout-blocked — is at 99.4% of the machine's contiguous-read
+ceiling, and widening its loads or repacking its layout buys 0.7%. Do not write
+that kernel.
+
+Two method notes that cost this round a false result each:
+
+- **Count the traversal, not just the loads.** A first probe walked tiles with
+  the k-block *outer*, and read 239 GB/s for q4_K — worse than the real kernel.
+  With `kb` innermost (what MMQ actually does) the same loads read 602.
+- **`dim3(128)` is not `dim3(32,4)`.** With a 1-D launch `threadIdx.y` is
+  always 0, so every MMQ-mapping arm silently degenerates. Check `blockDim.y`.
+
+### 2. The real shapes, and the per-class rates the aggregate was hiding
+
+From the GGUF (`qwen35moe`, 40 blocks, n_embd 2048, 256 experts, top-8,
+expert_ffn 512):
+
+```
+ffn_gate_exps / ffn_up_exps   [K=2048, N=512,  256]  Q4_K   ->  8 blocks/row = 1152 B
+ffn_down_exps                 [K=512,  N=2048, 256]  Q5_K   ->  2 blocks/row =  352 B
+```
+
+so per pass gate+up moves 12.08 GB and down moves 7.38 GB. Against the census
+times that is **488 GB/s and 386 GB/s** — not one number at 444. But per §1
+neither is access-pattern limited, so the deficit is LDS/MMA/scheduling, not
+DRAM, and it is not addressable by changing how the bytes are fetched.
+
+### 3. Weight streaming is NOT in the prefill slope at all
+
+At 84 tokens top-8-of-256 already touches ~93% of experts, so the *extra*
+weight bytes between pp84 and pp534 are only ~1.4 GB — about **2.1 ms at
+ceiling, against a 41.9 ms `mul_mat_q` slope**. At most 5% of the MMQ slope is
+weight streaming. The MMQ slope is a work/grid story. The grid is padded to the
+busiest expert (`ntx = ceil(ncols_max / J)` with `ncols_max = ne12` = tokens):
+6 / 10 / 16 token-tiles per expert at pp84 / pp300 / pp534 against mean
+assignments per expert of 2.6 / 9.4 / 16.7. Out-of-range tiles do exit early
+(`jt*J >= col_diff` in `mul_mat_q`, confirmed in source — 0023's comment is
+accurate), so the padding is cheap; the cost is that the *live* J tile is about
+half masking.
+
+### 4. The slope census, post-park (this is the current map)
+
+`rocprofv3 --kernel-trace` at pp84 / pp300 / pp534, ms per pass:
+
+```
+total kernel   45.43     75.14    132.96
+SLOPE NUMERATOR (534-84) = 87.53 ms / 450 tok = 194.5 us/tok -> 5141 tok/s
+```
+
+| kernel family | pp84 | pp300 | pp534 | d(534-84) | %slope |
+|---|---:|---:|---:|---:|---:|
+| `mul_mat_q` | 22.17 | 36.18 | 64.07 | 41.91 | 47.9% |
+| **rocBLAS f32 `Cijk_*_S_B_*`** | **0.00** | **0.00** | **11.19** | **11.19** | **12.8%** |
+| `gated_delta_net_mc_cuda` | 1.58 | 5.20 | 7.97 | 6.38 | 7.3% |
+| rocBLAS f16 `Cijk_*HSS*` (0021's Q6_K route) | 5.70 | 9.38 | 10.90 | 5.20 | 5.9% |
+| `rms_norm_f32` | 0.71 | 1.75 | 4.41 | 3.70 | 4.2% |
+| `flash_attn_tile` | 0.42 | 2.26 | 4.06 | 3.64 | 4.2% |
+| `k_bin_bcast` | 0.90 | 2.20 | 4.50 | 3.60 | 4.1% |
+| `quantize_mmq_q8_1` | 0.81 | 1.46 | 3.38 | 2.57 | 2.9% |
+
+**Kernels that run zero times at pp84 and pp300 and only at pp534 total
+22.95 ms/pass = 26.2% of the slope.** That set is pure 22-token-tail-ubatch
+cost: the rocBLAS f32 above (100 launches on grids of **1 and 4 workgroups**),
+`mul_mat_f32_skinny_cuda<8,8,4,true>` (100, 3.79 ms), and the tail-shape
+`mul_mat_q` classes (4096 blocks x 80 = 6.47 ms, 16384 x 40 = 4.11 ms). Since
+`ttft = t(534)` and `prefill = (t(534)-t(84))/451`, tail cost is charged to
+both scored terms at full weight and is invisible at pp512.
+
+Note the f16 `HSS` family is *not* tail-only — it is 0021's Q6_K
+dequant->f16->rocBLAS route picking a different Tensile tile at 534. Group Cijk
+kernels by family before calling anything tail-only.
+
+### 5. 0056 — the f32 skinny GEMM takes the tail ubatch (the 0055 reinstatement)
+
+The 11.19 ms entry is exactly what 0055 removed in round 42, and 0055 was
+rejected at ppl +0.239%. Round 43 then found the build itself was
+nondeterministic and round 43b bisected it to 0008, which round 46 parked. That
+park is what makes 0055 testable, and it makes a falsifiable prediction:
+
+> `min_cols` **cannot fire at the gate shape.** `-c 512` is one ubatch of 512,
+> it never splits, so there is no tail. The gate reading must be *identical*,
+> not merely close.
+
+Runner's exact gate command, 10 loads per arm, same binary, env toggle:
+
+```
+stock (b10237)   3.9314  3.9314  3.9314
+min_cols=32      3.9318 x10     spread 0.000%
+min_cols=8       3.9318 x10     spread 0.000%    +0.010% vs stock
+```
+
+Ten out of ten identical on both arms. **0055's 0.239% was a bad draw, not
+damage.** Because that shape is blind to the change by construction, also
+checked where it *does* split (`-c 534 -b 534 -ub 512`), 3 loads per arm:
+`3.2323 x3` vs `3.2296 x3` = **-0.0835%**, reproducible on both arms, inside
+the gate. Ordinary reassociation: same products, different GEMM, different
+order.
+
+Speed, llama-bench, 4 rounds interleaved:
+
+```
+pp534  mc=32  3843.14 3848.95 3845.15 3853.41   mean 3847.66
+pp534  mc=8   4032.45 4069.53 4063.28 4083.62   mean 4062.22   +5.58%  4/4 separated
+pp512  mc=32  4905.50 4867.89 4895.33 4912.21   mean 4895.23
+pp512  mc=8   4902.04 4896.82 4880.74 4871.65   mean 4887.81   -0.15%  flat
+```
+
+Ranked replica (`rank40.py`), 4 arms, same binary, env toggle, 9 runs each:
+
+| arm | min_cols | TTFT | prefill tok/s | decode tok/s |
+|---|---|---:|---:|---:|
+| a | 32 | 0.1938 | 4650.33 | 156.87 |
+| b | 8 | 0.1864 | 5113.19 | 156.71 |
+| c | 8 | 0.1877 | 5051.99 | 156.31 |
+| d | 32 | 0.1969 | 4588.09 | 156.66 |
+
+**prefill 4619.21 -> 5082.59 (+10.03%, 2/2 separated), ttft 0.19535 -> 0.18705
+(+4.44% speedup, 2/2 separated), decode flat (-0.16%).** The replica also
+validates itself: arm a's decode 156.87 against the frontier's ranked 161.51
+scaled by the park's -2.82% = 156.94.
+
+### 6. Score accounting — and why NOTHING was submitted this round
+
+Do not project from the replica alone; round 42 projected +2.28% for this exact
+change and the ranked run returned +1.30% (score 1.8066, prefill 1.4718, ttft
+1.6717; back-solving gives decode 1.9590). Building from that *measured* ranked
+run and applying the park's debt (decode -2.82%, prefill -1.22%):
+
+```
+0055 measured ranked      decode 1.9590  prefill 1.4718  ttft 1.6717  score 1.8066
+parked + 0056 (projected) decode 1.9038  prefill 1.4538  ttft ~1.663  score ~1.767
+```
+
+Optimistically (replica deltas applied to a 1.7433 parked baseline) it is
+~1.786. **So 0056 straddles the 1.7835 frontier and is most likely below it.**
+It is committed but **NOT submitted**: a submission below our own verified
+frontier is a rejection and a wasted slot. 0056 needs a companion worth >=1.5%.
+
+### 7. Measured and not worth shipping
+
+`GGML_F32_SKINNY_TILE` sweep at pp534 with `min_cols=8` — 0044 tuned this tile
+when the kernel never saw M=22, so the tail regime is new to it. 3 rounds:
+
+```
+TILE=0   <8,8,4>   4000.25 3978.80 4010.16   mean 3996.40   (default)
+TILE=4   <4,8,4>   3990.59 3997.33 4014.33   mean 4000.75
+TILE=16  <16,8,4>  3990.78 3978.04 3971.60   mean 3980.14
+TILE=84  <8,4,4>   4010.97 4035.28 4021.13   mean 4022.46   +0.65%
+TILE=816 <8,16,4>  3990.83 3978.84 3932.97   mean 3967.55
+mc=32 REF          3804.00 3816.48 3774.13   mean 3798.20
+```
+
+`<8,4,4>` wins 3/3 but by 0.27%, 1.4%, 0.27% against a default arm whose own
+spread is 0.8%. Inside noise. Not shipped; re-run with more rounds if someone
+wants the last half percent.
+
+### 8. Where the next 1.8% is: 0008, and the hypothesis nobody has tested
+
+The park costs **-2.82% decode**, and decode carries exponent 0.65, so 0008
+alone is worth **~1.83% of score** — it is the debt, and it is the largest
+single item on the board. Rounds 43b/44/45 killed two mechanisms (the loop-2
+global read-back; `dst`/`add_dst` aliasing, whose guard demonstrably holds).
+
+**Hypothesis 3, which fits every observation and has not been tested:** round
+45 recorded in passing that *the fold's fusion decision runs at HIP-graph
+capture, not per replay* — only ~80 `prepare()` calls happen per run. The fold
+is **not bit-exact against the unfused path** (round 43b's own cost table shows
+it changes speed and the campaign's standing rule is that fusing lets
+`-funsafe-math-optimizations` reassociate). So if the *set of nodes that get
+folded* differs from one capture to the next, the arithmetic differs per load
+while being fixed within a load — which is precisely the observed signature
+(deterministic within a load, 7-10 distinct values across loads, stock stable).
+
+This does not need a kernel. Count the fusions actually applied per run across
+several loads; if the count or the node set varies, that is the bug, and the
+fix is to make the decision shape-independent and deterministic rather than
+capture-order dependent. A zero-rebuild first probe is to run the gate with the
+fold on and `GGML_CUDA_DISABLE_GRAPHS=1`, which takes the decision out of
+capture entirely.
