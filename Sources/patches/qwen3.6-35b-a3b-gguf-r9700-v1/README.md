@@ -3836,3 +3836,16 @@ priced in:
 single pool and stays unreachable: it is serial with both its producer and its
 consumer, and recomputing it inside a 2048-block consumer costs more L2 traffic
 than the launch it saves (round 34).
+
+**Ranked (trusted runner, verified):** frontier **1.725537 (+72.55%)** from
+1.709903, decode **161.41 tok/s** (from 159.97, **+0.90%**), prefill **2995.2
+tok/s** (from 2979.5), ttft 0.263 s. Submission
+`qwen36-r9700-round39-0053-q8-1-arrival-tail`.
+
+The ranked decode gain (+0.90%) is *larger* than the local llama-bench gain
+(+0.61%) — the first time this campaign the ratio has gone that way; every round
+since 0046 has come in at ~0.98 ranked/local. The plausible reason is that the
+ranked path is `llama-server`, where the debug counter confirms the epilogue
+fires 600/600 with zero declines, and the server carries more per-token host
+work for a removed dispatch to hide behind. Do not assume the 0.98 ratio for an
+arrival-counter epilogue.
