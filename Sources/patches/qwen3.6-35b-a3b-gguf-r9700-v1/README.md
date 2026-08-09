@@ -4422,3 +4422,66 @@ source row, loop 2 would read clobbered inputs. Registers are the fix.
 Do not "fix" this by declining the fold when `dst` overlaps `add_dst` — that
 silently disables it in whatever configuration is currently common and leaves
 the correctness of the rest resting on allocator luck.
+
+## Round 44: the register fix DOES NOT fix it — mechanism was wrong, localisation stands
+
+I implemented the fix proposed in round 43b: keep every loop-1 value in a
+per-thread register array across the block reduction so loop 2 never reads a
+global buffer back. It is correctly implemented — the loop is unrolled over a
+compile-time slot count and the fatbin confirms it is genuinely register
+allocated (`private_segment_fixed_size: 0`, `vgpr_spill_count: 0`, 20–30 VGPRs
+across all 32 instances) — and loop 2 touches no global input at all.
+
+**It does not restore determinism.** Twelve gate loads, runner's exact command:
+
+```
+stock                      3.9314 x12                              spread 0.000%   0/12
+ctl  (racy parent)         3.9292 3.9318 3.9324 3.9318 3.9448 ...  spread 0.397%   1/12   7 distinct
+cand (read-back removed)   3.9420 3.9320 3.9328 3.9318 3.9318 ...  spread 0.277%   1/12  10 distinct
+```
+
+Speed is unaffected (pp512 4909/4884/4914 vs 4913/4876/4888; tg128
+164.47/164.55/164.47 vs 164.59/164.54/164.60), so the rewrite is free — it just
+does not do the job. **Not shipped.** The diff is parked at
+`/tmp/0008-regfix-DID-NOT-FIX.patch` on the box.
+
+### What still stands, and what does not
+
+**Stands — the localisation.** Disabling 0008 alone gives 3.9318 *ten times out
+of ten, every reading identical*, as do `alloff`, `halfB`, `norm` and `normQ`,
+while `nq_only` (0009) and `um_only` (0036) still jitter at 0.186% and 0.379%.
+That is not luck: the clean arms return one repeated value, the way stock does.
+
+**Does not stand — my mechanism.** The loop-2 read-back is not the race, or not
+all of it.
+
+### The two hypotheses left, and how to settle them without writing a kernel
+
+1. **`dst` overlaps `add_dst`.** Loop 1 writes the residual sum to `add_dst`;
+   loop 2 writes the normed product to `dst`. If ggml-alloc places them on top
+   of each other, the residual the *next layer* consumes is clobbered — which
+   removing the read-back cannot fix, and which would vary with allocator
+   placement, i.e. per load.
+2. **`add_dst` overlaps some `args.src[k]` with a different row stride**, giving
+   a cross-thread clobber inside loop 1.
+
+Both are cheap to settle with **no kernel work**: instrument
+`rms_norm_pre_add_prepare` to print the byte ranges of `dst`, `add_dst` and
+every `args.src[k]`, and check for overlap across several model loads. If ranges
+overlap and the overlap varies per load, that is the bug, and the fix is a
+host-side aliasing check with a fallback to the unfused path — not a kernel
+change. **Do that before writing any more kernel code.**
+
+### Sibling tracks carry the same fold
+
+Every track that ships this fold has the identical `add_dst` write-then-read-back
+structure, so if the defect is confirmed they all have it latent:
+
+| track | patch |
+|---|---|
+| `laguna-xs-2.1-gguf-r9700-v1` | 0008-rms-norm-fold-residual-add |
+| `laguna-xs-2.1-gguf-gb10cuda-v1` | 0006/0007 |
+| `lfm2.5-2.6b-gguf-r9700-v1` | 0005-rms-norm-fold-residual-and-q8-1-quant |
+| `lfm2.5-2.6b-gguf-gb10cuda-v1` | 0006/0007 |
+| `maple-preview-gguf-r9700-v1` | 0009-rms-norm-fold-residual-add |
+| `qwen3.6-35b-a3b-gguf-gb10cuda-v1` | 0007-cuda-rms-norm-fold-q8-1-quantize |
