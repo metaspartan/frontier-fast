@@ -4810,9 +4810,31 @@ folded* differs from one capture to the next, the arithmetic differs per load
 while being fixed within a load — which is precisely the observed signature
 (deterministic within a load, 7-10 distinct values across loads, stock stable).
 
-This does not need a kernel. Count the fusions actually applied per run across
-several loads; if the count or the node set varies, that is the bug, and the
-fix is to make the decision shape-independent and deterministic rather than
-capture-order dependent. A zero-rebuild first probe is to run the gate with the
-fold on and `GGML_CUDA_DISABLE_GRAPHS=1`, which takes the decision out of
-capture entirely.
+**Hypothesis 3 is DEAD as well — measured this round, zero rebuild.** Running
+the gate with the fold on and `GGML_CUDA_DISABLE_GRAPHS=1` takes every fusion
+decision out of capture and makes it per-evaluation. It does not fix it:
+
+```
+foldON  graphsON   3.9268 3.9288 3.9357 3.9318 3.9326 3.9287 3.9315 3.9317   8 distinct, spread 0.227%
+foldON  graphsOFF  3.9301 3.9330 3.9285 3.9299 3.9318 3.9339 3.9322 3.9313   8 distinct, spread 0.137%
+foldOFF graphsOFF  3.9318 3.9318 3.9318 3.9318                               stable
+```
+
+That is a strong narrowing, so record it as progress rather than a dead end.
+The third arm matters as much as the second: with the fold **off**, graphs off,
+the build is perfectly stable — so the HIP-graph subsystem is not the vehicle
+and neither is capture order. The defect is in the fold's own execution, and it
+survives:
+
+- removing the loop-2 global read-back entirely (round 44),
+- the `dst`/`add_dst` disjointness guard, which demonstrably holds (round 45),
+- turning off HIP graphs altogether (this round).
+
+What that leaves is loop 1's *write* of the residual to global `add_dst` and
+who else may touch that buffer concurrently — a missing dependency edge or a
+second writer, rather than an alias of `dst`. The next probe should not be
+another kernel rewrite: dump, per load, the full set of `(dst, add_dst)`
+pointers the fold is applied to **and** every other node in the graph that
+reads or writes those byte ranges, then diff that set across loads. Four
+mechanisms have now been guessed and measured; the fifth should be found by
+enumeration, not by guessing.
