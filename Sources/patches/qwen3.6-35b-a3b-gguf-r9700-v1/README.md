@@ -4029,3 +4029,86 @@ the ranked decode of 161.41 tok/s already matches the server's internal timer
   `resize()` + state-read pattern, twice, at 62.81 MiB each.
 - Together those are worth roughly another **+4-5% score** at 0.15 weight, and
   unlike the ubatch lever they cannot move a single bit of arithmetic.
+
+## Round 40 RANKED RESULT, and Round 41: the rest of the TTFT bookkeeping is retention, not allocator behaviour
+
+**0054 VERIFIED on the trusted runner: frontier 1.7835 (+78.35%)** from
+1.725537. decode **161.51 tok/s (ratio 1.9558**, up from 1.9324 — it *rose*),
+prefill 3012.0 (1.4166, from 1.3943), **ttft 0.2047 s (ratio 1.6256**, from
+1.2886). Submission `qwen36-r9700-round40-0054-prompt-cache-ckpt-move`.
+
+Two predictions from round 40 landed: the projected ~1.791 came in at 1.7835,
+and the local -3.49% decode really was the removed measurement artifact — the
+ranked decode ratio went **up**, so nothing regressed. **When a local A/B moves
+decode on this harness, check whether you removed asymmetric per-request
+overhead before believing it is a regression.**
+
+### The post-0054 TTFT budget (re-derived, per-site instrumentation)
+
+```
+195 ms  TTFT
+125 ms    prefill kernel
+ 38 ms    2 x context-checkpoint resize()  (18.9 ms each, 62.81 MiB)
+ 20 ms    prompt-cache alloc resize()      (73 MiB)
+  6 ms    the decode token + HTTP
+```
+
+`cap_before` on every checkpoint `resize()` is **0.00 MiB** — the buffers are
+always freshly allocated.
+
+### Where the 18.9 ms actually goes (CPU probe, no GPU needed)
+
+`alloc41.cpp` on the box, 73 MiB, 8 reps:
+
+| variant | alloc/resize | fill | total |
+|---|---:|---:|---:|
+| A `vector::resize` then fill (what llama.cpp does) | 29.27 ms | 2.42 | 31.69 |
+| B `new uint8_t[N]` (no value-init) then fill | 0.01 ms | 23.18 | **23.19** |
+| C warm buffer reused | 2.10 ms | 2.12 | **4.23** |
+
+**It is first-touch page faults on a fresh mmap, not the memset.** B shows a
+default-init allocator only moves the faults into the copy and recovers ~27%;
+C shows resident pages are worth 7.5x. So the fix has to keep pages, not skip
+initialisation.
+
+### Three ways to keep the pages, all measured dead
+
+**1. `mallopt(M_MMAP_THRESHOLD/M_TRIM_THRESHOLD, 256 MiB)` in `llama-server`.**
+Reproduces the 7.4x in the standalone probe (A: 31.69 -> 4.29 ms). In the
+server it is **flat**, 3 rounds x 9 measured runs:
+
+```
+on   ttft 0.1926 0.1932 0.1961   mean 0.1940   ckpt resize 18.0-18.6 ms
+off  ttft 0.1926 0.1943 0.1954   mean 0.1941   ckpt resize 18.0-18.7 ms
+```
+
+0/3 separated. Not shipped.
+
+**2. A buffer pool. There is nothing to pool.** With 0054 in place the
+checkpoints are *moved* into the prompt cache and retained, and the server logs
+**zero** checkpoint erases across a whole run. Every request genuinely needs
+~199 MiB (2 x 62.81 checkpoint + 73 cache) of brand-new pages. That is also the
+reason (1) is flat — the retained cache eats any pages the allocator holds on
+to.
+
+**3. `LLAMA_STATE_SEQ_FLAGS_ON_DEVICE`.** It exists, is fully implemented
+(`llama_io_write_device` + `llama_memory_buffers mem_storage`, with buffer reuse
+behind a `need_alloc` shape check) and is used by nothing but
+`tests/test-save-load-state.cpp`. It would turn a checkpoint into a few KiB of
+host metadata plus a device-to-device copy. Unusable here for two reasons:
+`mem_storage` is keyed by `seq_id` alone, so two checkpoints of one sequence
+alias and the second overwrites the first; and the prompt cache retains the
+checkpoints, so on-device payloads would move that retention into VRAM
+(27 cached prompts x 125.6 MiB = 3.4 GB).
+
+### What would actually open it — and why it is not a patch I should ship alone
+
+The remaining ~58 ms is **the intrinsic price of the prompt cache retaining
+~199 MiB per request**, not an allocator problem. The one lever that opens it is
+a *behaviour* change: **do not store the context checkpoints in the cache
+entry.** The entry already holds the complete sequence state; the checkpoints
+are 125.6 MiB of rollback points against a 73 MiB full state. Dropping them
+would cut cache memory ~2.7x *and* make the checkpoint buffers free-and-reuse
+each request, at which point pooling recovers the 2 x 18.9 ms and ON_DEVICE
+becomes viable too. It costs rollback fidelity after a cache restore, so it is
+an owner decision, not a unilateral optimisation.
