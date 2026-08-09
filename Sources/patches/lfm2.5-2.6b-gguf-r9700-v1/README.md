@@ -300,6 +300,24 @@ never been tried on this graph.
 
 ### 0013 — the prompt cache pays to fill itself and never hits
 
+**RANKED: verified at 1.2935 (+29.35%)** against 1.2718 — **+1.71% of score**:
+
+```
+                 score      decode             prefill            ttft
+new frontier   1.293529   1.328845 (238.76)  1.168883 (9528.1)  1.317703 (0.06082)
+previous       1.271788   1.328280 (238.66)  1.178332            1.166323
+               +1.71%     +0.04%             -0.80%             +12.98%
+```
+
+**The replica's -0.9% decode did not happen** (ranked +0.04%), the same
+correction the sibling track recorded on the identical patch. The replica
+over-states the decode penalty of a host-side saving because its
+repeated-filler prompt makes the ttft and full requests more asymmetric than
+the runner's prose corpus does.
+
+**Session total: 1.2124 -> 1.2935, +6.69% of score**, entirely in ttft
+(1.0179 -> 1.3177) with decode untouched.
+
 The same shape as 0012, one layer up. `get_available_slot()` runs
 `prompt_save()` on every slot reuse — a full `llama_state_seq_get_data_ext` of
 the sequence state — and on non-overlapping traffic

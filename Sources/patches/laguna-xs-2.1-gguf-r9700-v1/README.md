@@ -460,6 +460,21 @@ whether the thing that made it inert is itself removable.
 
 ### 0023 — the prompt cache pays to fill itself and never hits
 
+**RANKED: verified at 1.6026 (+60.26%)** against 1.5600 — **+2.73% of score**:
+
+```
+                 score      decode             prefill            ttft
+new frontier   1.602582   1.655739 (158.47)  1.374674 (3055.9)  1.707011 (0.17784)
+previous       1.560023   1.658249 (158.68)  1.395498 (3101.9)  1.389160 (0.21856)
+               +2.73%     -0.15%             -1.49%             +22.88%
+```
+
+**The replica's -4.0% decode did not happen: the ranked decode is -0.15%.**
+Twice now on this track the replica has over-stated the decode penalty of a
+host-side saving, because its repeated-filler prompt makes the ttft and full
+requests far more asymmetric than the runner's prose corpus does. Price the
+decode risk of a host patch from the ranked run, not the replica.
+
 The same shape as 0021, one layer up. `get_available_slot()` runs
 `prompt_save()` on every slot reuse — a full `llama_state_seq_get_data_ext` of
 the sequence state — and on non-overlapping traffic
@@ -486,7 +501,12 @@ never checks whether one ever does.**
 ```
 0021  context checkpoints   created every request, erased unused   +5.61% ranked
 0022  (unlocked by 0021)    tail ubatch, second MoE sweep          +6.48% ranked
-0023  prompt cache stores   written every request, never read      +1.79% modelled
+0023  prompt cache stores   written every request, never read      +2.73% ranked
 ```
 
 Look for the third one on every llama.cpp server track before writing a kernel.
+
+**Session total: 1.3872 -> 1.6026, +15.53% of score, from 229 lines across four
+files and not one line of kernel code.** decode moved +0.5% in total across the
+three; the whole gain is prefill 1.0125 -> 1.3747 and ttft 1.0020 -> 1.7070,
+the two terms nineteen previous patches had never touched.
