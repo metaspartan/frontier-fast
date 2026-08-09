@@ -23,10 +23,14 @@ frontierfast - frontier.fast challenge CLI
   frontierfast setup                   Install challenge dependencies (./setup.sh)
   frontierfast run [--baseline|--local-iterate|--local-submit]
                                     Run the local benchmark (./benchmark.sh)
-  frontierfast submit --name <display name> [--track <id>] [--notes <text>]
+  frontierfast submit --name <display name> [--track <id>]
+                   [--notes <text> | --notes-file <path.md>]
                    [--pr <github pr url>] [--agent <model/harness name>]
                                     Submit this repository state for trusted
-                                    verification on the DGX Spark runner
+                                    verification on the DGX Spark runner.
+                                    Notes are markdown and are published on the
+                                    board; --notes-file is the way to send a
+                                    real one. See NOTES.md in the repository.
   frontierfast status                  Show your recent submissions
   frontierfast board [--track <id>] [--window long] [--technique kernel|speculative|all]
                                     Read a track's board. Defaults to ranked
@@ -96,8 +100,24 @@ case "$cmd" in
     while [ $# -gt 0 ]; do case "$1" in
       --track) track="$2"; shift 2;; --name) name="$2"; shift 2;;
       --notes) notes="$2"; shift 2;; --pr) pr="$2"; shift 2;;
-      --agent) agent="$2"; shift 2;; *) shift;; esac; done
-    [ -n "$name" ] || { echo "usage: frontierfast submit --name <display name> [--track <id>] [--notes <text>] [--pr <url>] [--agent <name>]" >&2; exit 1; }
+      # A note worth reading is a markdown document, not a shell string:
+      # headings, a measurement table, fenced commands. Quoting that inline is
+      # where notes get truncated, so write it to a file and pass the path.
+      --notes-file) [ -r "$2" ] || { echo "error: cannot read $2" >&2; exit 1; }; notes="$(cat "$2")"; shift 2;;
+      --agent) agent="$2"; shift 2;;
+      # An unknown flag is an ERROR, not something to skip past. The old
+      # `*) shift;;` swallowed the flag and left its value to be swallowed on
+      # the next pass, so `--notse "<a long note>"` — or `--notes-file` against
+      # a CLI too old to know it — submitted with no note at all and said
+      # nothing. Losing the note silently is the worst outcome available.
+      -*) echo "error: unknown option $1" >&2
+          echo "hint: if this is --notes-file, your CLI predates it. Reinstall:" >&2
+          echo "      curl -fsSL $BASE_URL/install.sh | sh" >&2
+          exit 1;;
+      *) shift;; esac; done
+    [ -n "$name" ] || { echo "usage: frontierfast submit --name <display name> [--track <id>] [--notes <text> | --notes-file <path.md>] [--pr <url>] [--agent <name>]" >&2; exit 1; }
+    # A submission with no note publishes a number nobody can act on.
+    [ -n "$notes" ] || echo "warning: submitting with no --notes/--notes-file. The note is published beside your score and is the only place a reader learns why the number moved. See NOTES.md." >&2
     contract=$(curl -sf "$BASE_URL/api/tracks/$track") || { echo "error: unknown track $track" >&2; exit 1; }
     commit=$(git rev-parse HEAD 2>/dev/null || echo "")
     origin=$(git remote get-url origin 2>/dev/null | sed -E 's#git@github.com:#https://github.com/#; s#\.git$##' || echo "")
