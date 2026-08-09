@@ -397,7 +397,23 @@ before assuming a vendor kernel is doing something clever.
 3. The decode levers from round 1 are unchanged (F32 router matvec, Q6_K V into
    the Q/K group).
 
-### 0022 — 0021 unlocked the tail ubatch, and it was worth more than 0021
+### 0022 — 0021 unlocked the tail ubatch
+
+**RANKED: verified at 1.5600 (+56.00%)** against 1.4651 — **+6.48% of score**:
+
+```
+                 score      decode             prefill            ttft
+new frontier   1.560023   1.658249 (158.68)  1.395498 (3101.9)  1.389160 (0.21856)
+previous       1.465086   1.656118 (158.47)  1.163134 (2585.6)  1.171798 (0.25910)
+               +6.48%     +0.13%             +19.98%            +18.55%
+```
+
+Modelled +7.6%, measured +6.48% — the replica was 1.1 points optimistic this
+time, having been 2.2 points pessimistic on 0021. Decode is flat to two decimal
+places on the runner, exactly as the mechanism requires.
+
+**Session total for this track: 1.3872 -> 1.5600, +12.46% of score, from two
+patches totalling 111 lines and no kernel.**
 
 The sibling `laguna-s-2.1-gguf-gb10cuda-v1` derived tail-ubatch absorption and
 then recorded it **INERT on the ranked path**: `llama-server` pre-chunks the
