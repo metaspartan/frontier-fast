@@ -16,8 +16,7 @@ below are the runner's, not local ones.
 | `0007-mmvf-single-warp-decode-block.patch` | candidate | mmvf single-warp decode + batched k-loads |
 | `0008-ssm-conv-fuse-mul.patch` | candidate | Fuse the shortconv c-gate MUL into ssm_conv |
 | `0009-mmvq-narrow-q6k-output-head.patch` | candidate | Narrow the q6_K output-head matvec |
-| `0010-shortconv-decode-chain-fold.patch` | **+5.38% decode with 0011**, bit-identical | The whole shortconv decode chain in ONE kernel |
-| `0011-rs-state-identity-view.patch` | +1.11% alone, bit-identical | Conv-window gather -> cache view when the mapping is identity |
+| `0010-shortconv-decode-chain-fold.patch` + `0011-rs-state-identity-view.patch` | **won** — score **1.2124 (+21.24%)**, decode 1.3307x / **238.3 tok/s**, prefill 1.0214, ttft 1.0179 | The whole shortconv decode chain in ONE kernel, plus the conv-window gather as a cache view. Took the track from Cybara's 1.1659. |
 
 `0001` measured **+17.177%** decode locally (180.325 -> 211.439 tok/s) and
 landed at **+9.99%** overall on the trusted runner. A clean local figure
@@ -114,6 +113,11 @@ frontier. Maple-specific economics (its degenerate 2-bit loops accept
 ~0.8+) do not transfer.
 
 ## Round 1 (2026-08-09): the shortconv decode chain, 420 -> 347 dispatches/token
+
+**RANKED: verified at 1.2124 (+21.24%), decode 238.3 tok/s** against the previous
+frontier of 1.1659 / 225.0 tok/s. Local bench predicted +5.38% decode; the runner
+read +6.6% (1.2488 -> 1.3307), i.e. the ranked path did slightly BETTER than the
+bench, which matches the llama-server census note below.
 
 ### The census this round is built on
 

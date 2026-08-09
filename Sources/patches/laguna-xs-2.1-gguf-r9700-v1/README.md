@@ -39,7 +39,7 @@ of kernels already near the memory ceiling.
 | 0016 | `mul_mat_id` Q4_K path for RDNA4 | Dispatch-path change for the dominant MoE shape. |
 | 0017-0018 | MoE shared expert as a ninth channel | The shared-expert down projection is **latency**-bound, not bandwidth-bound: standalone it moves 0.86 MB in 8.43 us (102 GB/s) from only 2048 workgroups, while the routed projection doing identical per-row work at 8× the channel count sustains 601 GB/s. Bandwidth here scales with wave count, so the fix is more concurrent work in the same launch. |
 | 0019 | release the q8_1 cache before pool teardown | Fixes an abort, not a speed win — see below. |
-| 0020 | attention gate projection joins the Q/K grouped launch, +1.81% | A one-line graph-order change, bit-identical. Open lever 1 below is now partly closed. |
+| 0020 | attention gate projection joins the Q/K grouped launch | **won** — score **1.3872 (+38.72%)**, decode 1.6474x / **156.8 tok/s**. A one-line graph-order change, bit-identical. Took the track from Cybara's 1.3731. Open lever 1 below is now partly closed. |
 
 ## Dead ends — do not spend a slot re-deriving these
 
@@ -149,6 +149,11 @@ premium); the static n=3 lookup is net-negative on this track's corpus.
 
 
 ## 0020: the attention gate projection was blocked by GRAPH ORDER, not by anything else (+1.81% decode, BIT-IDENTICAL)
+
+**RANKED: verified at 1.3872 (+38.72%), decode 156.8 tok/s / 1.6474**, prefill
+1.0125, ttft 1.0020 - against the previous frontier of 1.3731 / 155.0 tok/s. The
+local +1.81% bench figure landed at +1.76% ranked decode (1.6173 -> 1.6474), the
+closest local-to-ranked agreement this series has recorded.
 
 ### The post-0019 census (start here)
 
