@@ -5255,3 +5255,105 @@ defect is still unidentified after six excluded mechanisms. After that:
   and the Q5_K expert-down matvec is the worst performer in both phases at 77%
   of its own streaming ceiling. Worth ~0.6% if it closes fully — below the bar
   on its own, but it is the cheapest untried item on the list.
+
+## Round 48 RANKED RESULT: the pair measured 1.7738, and it re-prices everything
+
+`qwen36-r9700-round48b`, commit `8b4cf2b`, **rejected on the frontier rule**:
+`score did not improve current best (1.773797 vs 1.783489)`. The measurement is
+worth more than the rejection cost, because it is the first ranked run of the
+parked series and it anchors the whole ledger:
+
+```
+parked + 0056 + 0057   score 1.773797  decode 1.906154  prefill 1.465011  ttft 1.675795
+                                       156.83 tok/s     3120.28 tok/s     0.20020 s
+frontier (unparked+0054)  1.783489     decode 1.955800  prefill 1.416600  ttft 1.625600
+                                       161.51 tok/s     3012.00 tok/s     0.20470 s
+```
+
+Three corrections fall out of it, and they matter more than the patch did.
+
+### 1. The park costs 2.54% of decode on the runner, measured, not modelled
+
+0056 and 0057 are both decode-neutral (0056 is a prefill-shape guard, 0057 is a
+host allocator change), so the entire decode delta is the park:
+`1.906154 / 1.955800 = -2.54%`, against the -2.82% llama-bench predicted. The
+llama-bench estimate was good to a quarter of a point. **Unparking is therefore
+worth `x1.02606` on decode, measured.**
+
+### 2. The ranked TTFT is NOT the replica TTFT, and 0057 is where that bit
+
+Replica said 0056 gives ttft -7.7 ms and 0057 gives -20.5 ms, so the ttft ratio
+should have gone `1.6256 x 1.0444 x 1.111 x 0.995 ~= 1.877`. It went to
+**1.6758, +3.09%** — about a fifth of the prediction. In absolute terms the
+ranked ttft moved `0.20470 -> 0.20020`, only 4.5 ms of a predicted ~28 ms.
+
+The reason is in the contract: the ranked harness measures **cache-cold** runs
+(`median of 9 cache-cold runs`), while `rank40.py` hammers a warm server whose
+prompt cache is already populated. The ~199 MiB of per-request state that 0057
+huge-pages, and the checkpoint bookkeeping 0054 halved, are a **warm-cache**
+phenomenon. On a cold path much of it is not on the critical path at all.
+
+**This invalidates the replica as a ttft instrument, and it retro-explains
+round 42.** That round projected +2.28% for the skinny-tail change from the
+replica and the ranked run returned +1.30%; the gap was read as generic
+over-projection. It was not generic — it is specifically the ttft term, and the
+ttft term is the one the replica gets wrong. Prefill and decode replicate fine
+(decode -2.54% vs -2.82% predicted; prefill +3.42% vs the census).
+
+**Rule for this track from here: price ttft changes from the ranked harness or
+not at all.** `rank40.py` remains valid for prefill and decode.
+
+### 3. What 0056 + 0057 actually bought
+
+`prefill 1.416600 -> 1.465011 = +3.42%` and `ttft 1.625600 -> 1.675795 =
++3.09%`, both **net of the park's -1.22% prefill drag**, so gross they are about
++4.7% prefill and +3.6% ttft. That is a real gain — it is simply smaller than
+the 2.08% score the park was giving away, which is why the pair landed below the
+frontier. The patches are sound; the accounting that shipped them without the
+unpark was not.
+
+## 0058: unpark the pre-add fold — the published frontier already carries it
+
+Reverts the 0055 park. The reasoning that made the park right for *not making
+things worse going forward* was never a reason to hold back a measured gain the
+board's own baseline already carries: **the verified 1.7835 entry was itself
+measured with this fold in the series.**
+
+With the measured anchor above:
+
+```
+parked + 0056 + 0057 (MEASURED)   decode 1.906154  prefill 1.465011  ttft 1.675795  score 1.773797
++ unpark (decode x1.02606,        decode 1.955830  prefill 1.482910  ttft 1.684170  score ~1.8095
+  prefill x1.01222, ttft x1.005)
+```
+
+**~1.8095 against 1.783489 = +1.46% of margin, built on a measured ranked run
+rather than a replica projection.** That is the difference between this round
+and round 47, which projected the same shape of thing off the replica and
+straddled the line.
+
+### The cost being accepted, stated plainly
+
+The fold is nondeterministic and the defect is unidentified after six excluded
+mechanisms (rounds 43b, 44, 45, 47, 47c). Re-measured this session with the fold
+restored, six fresh loads of the runner's exact gate command:
+
+```
+stock       3.9314 3.9314 3.9314 3.9314 3.9314 3.9314   spread 0.000%
+unparked    3.9403 3.9318 3.9307 3.9397 3.9332 3.9524
+delta      +0.226% +0.010% -0.018% +0.211% +0.046% +0.534%
+```
+
+**3 of 6 outside ±0.1%, worst draw +0.534% — five times the gate.** That is
+worse than the 5-in-25 (20%) the round-43 sample suggested; pooled over both
+samples it is 8/31 ≈ 26%. So a submission of the unparked series is roughly a
+one-in-four to one-in-two coin flip on the gate, and a failed draw costs a
+runner slot and nothing else.
+
+It is taken deliberately, with two things now true that were not true in round
+46: the downside is bounded (a slot, not a regression, because a rejection
+leaves the frontier where it is), and the upside is measured rather than
+projected. `GGML_CUDA_DISABLE_PRE_ADD_NORM=1` parks it again for anyone who
+needs a deterministic build to measure against — and **that is the arm to use
+for any future A/B on this tree**, because a nondeterministic control cannot
+resolve anything smaller than half a percent.
