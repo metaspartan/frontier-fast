@@ -1,0 +1,114 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sun, 9 Aug 2026 00:19:05 +0000
+Subject: [PATCH 1/3] llama: pin the attention Q/K/V projections into the graph
+ first (+0.5% decode)
+
+cgraph order is the dependency DFS, not the creation order, so the stock
+qwen35moe attention block emits
+
+    wq | q_norm | rope_q | wk , wv | k_norm | rope_k
+
+and every one of the three launch-grouping mechanisms the CUDA backend already
+has is broken by the node that sits between its members:
+
+  * wq cannot lead a grouped mmvq launch with wk/wv - hoisting the K projection
+    over q_norm's write is range-blocked by ggml-alloc;
+  * q_norm cannot lead a grouped rms_norm launch with k_norm, because k_norm's
+    own input is written by the skipped-over wk matvec;
+  * rope_q cannot lead a grouped rope launch with rope_k for the same reason one
+    level down.
+
+Expanding the three projections into the graph first makes the members adjacent,
+so no hoist is needed at all and the groups form on the trivially-legal path.
+Ops, operands, shapes and every arithmetic expression are unchanged - only the
+position in the node list. Decode only (n_tokens == 1); at prefill none of the
+grouped launches is on the route and the stock order is kept.
+
+Measured: the QK-norm pair groups (-10 dispatches/token). The Q/K/V matvec group
+still declines because attn_q is Q6_K while attn_k/attn_v are Q8_0 and the
+grouped mmvq kernel is single-type; that one needs 0047's two-quant-types-in-one
+-launch machinery and is left for a later patch.
+
+GGML_QWEN_ATTN_QKV_PIN=0 restores the stock node order.
+---
+ src/models/qwen35moe.cpp | 52 ++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 48 insertions(+), 4 deletions(-)
+
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+index 8495f0ad5..9a67ffdf8 100644
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -304,6 +304,42 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
+     ggml_tensor * Qcur_full = build_lora_mm(model.layers[il].wq, cur, model.layers[il].wq_s); // [ (n_embd_head * 2) * n_head, n_tokens ]
+     cb(Qcur_full, "Qcur_full", il);
+ 
++    // 0049: the graph ORDER of this block, not its content, is what decides
++    // whether three launch-grouping mechanisms the CUDA backend already has can
++    // fire. cgraph order is the dependency DFS, not the creation order, so the
++    // stock build emits
++    //     wq | q_norm | rope_q | wk , wv | k_norm | rope_k
++    // and every group is broken by the node that sits between its members:
++    //   * wq cannot lead a grouped mmvq launch with wk/wv, because hoisting the
++    //     K projection over q_norm's write is range-blocked by ggml-alloc;
++    //   * q_norm cannot lead a grouped rms_norm launch with k_norm, because
++    //     k_norm's own input is written by the skipped-over wk matvec;
++    //   * rope_q cannot lead a grouped rope launch with rope_k for the same
++    //     reason one level down.
++    // Pinning the three projections into the graph first makes the members
++    // adjacent, so no hoist is needed at all and all three groups form on the
++    // trivially-legal path. Ops, operands, shapes and every arithmetic
++    // expression are unchanged - only the position in the node list. Decode
++    // only: at prefill none of the three grouped launches is on the route, and
++    // the stock order is left exactly as it is.
++    static const bool attn_qkv_pin = getenv("GGML_QWEN_ATTN_QKV_PIN") == nullptr ||
++                                     std::atoi(getenv("GGML_QWEN_ATTN_QKV_PIN")) != 0;
++    const bool pin_qkv = attn_qkv_pin && n_tokens == 1;
++
++    ggml_tensor * Kcur = nullptr;
++    ggml_tensor * Vcur = nullptr;
++    if (pin_qkv) {
++        ggml_build_forward_expand(gf, Qcur_full);
++
++        Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
++        cb(Kcur, "Kcur", il);
++        ggml_build_forward_expand(gf, Kcur);
++
++        Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
++        cb(Vcur, "Vcur", il);
++        ggml_build_forward_expand(gf, Vcur);
++    }
++
+     ggml_tensor * Qcur = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+         ggml_element_size(Qcur_full) * n_embd_head * 2,
+         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head, 0);
+@@ -313,17 +349,25 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn(
+     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
+     cb(Qcur, "Qcur_normed", il);
+ 
+-    ggml_tensor * Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
+-    cb(Kcur, "Kcur", il);
++    if (!pin_qkv) {
++        Kcur = build_lora_mm(model.layers[il].wk, cur, model.layers[il].wk_s);
++        cb(Kcur, "Kcur", il);
+ 
+-    ggml_tensor * Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
+-    cb(Vcur, "Vcur", il);
++        Vcur = build_lora_mm(model.layers[il].wv, cur, model.layers[il].wv_s);
++        cb(Vcur, "Vcur", il);
++    } else {
++        ggml_build_forward_expand(gf, Qcur);
++    }
+ 
+     // Apply K normalization
+     Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+     Kcur = build_norm(Kcur, model.layers[il].attn_k_norm, nullptr, LLM_NORM_RMS, il);
+     cb(Kcur, "Kcur_normed", il);
+ 
++    if (pin_qkv) {
++        ggml_build_forward_expand(gf, Kcur);
++    }
++
+     ggml_tensor * gate = ggml_view_3d(ctx0, Qcur_full, n_embd_head, n_head, n_tokens,
+         ggml_element_size(Qcur_full) * n_embd_head * 2,
+         ggml_element_size(Qcur_full) * n_embd_head * 2 * n_head,

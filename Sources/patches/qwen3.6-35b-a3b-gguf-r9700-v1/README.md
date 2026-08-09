@@ -3272,3 +3272,197 @@ Remaining from the round-34 list, re-priced at the corrected 4 us/matvec:
 
 Both are still open. The realistic band from round 34 (**165-169 tok/s
 llama-bench**) is unchanged; 159.7 is 60% of the way there from 153.0.
+
+## Round 37: the attention block's graph ORDER was the blocker, and a fusion that was NOT bit-identical (+2.02% decode)
+
+Three patches, 601.1 -> 551.1 dispatches/token, decode-path perplexity
+**3.9382 on every arm** (bit-identical). The round's transferable result is not
+any one of them: it is that **a producer-consumer FUSION is not automatically
+bit-identical on this backend, and a co-launch is.** See 0050.
+
+### Post-0048 census, and where the token actually goes
+
+`rocprofv3 --kernel-trace`, `llama-bench -p 0 -n 34 -r 1`, 601.1 dispatches and
+5325 us of kernel in a ~6250 us token. The attention layer had never been
+written down in this README; it is **13 dispatches**, and the GDN and MoE blocks
+are 7 and 6:
+
+```
+ATTN 1 rms_norm_pre_add        2.7us   input norm + residual add + q8_1
+     2 mmvq  (wq, Q6_K)       24.6us
+     3 rms_norm_f32<256>       1.5us   q_norm
+     4 rope_multi              2.1us
+     5 mmvq_grouped (wk,wv)    5.4us
+     6 rms_norm_f32<256>       1.6us   k_norm
+     7 rope_multi              1.7us
+     8 k_set_rows_grouped      1.4us
+     9 flash_attn_tile         5.7us
+    10 flash_attn_combine      2.1us
+    11 cpy_scalar              1.7us   the gate cont
+    12 unary_gated_op_quant    1.4us   attn * sigmoid(gate) + q8_1
+    13 mmvq  (wo, Q6_K)       13.8us
+```
+
+30 GDN x 7 + 40 MoE x 6 + 10 ATTN x 13 = 580, plus ~21 per-eval
+(`__amd_rocclr_copyBuffer` 12.6/token, `scale_f32` 3.4, lm head, ...) = 601.
+
+### 0049: three grouping mechanisms the backend already had, all blocked by DFS order
+
+cgraph order is the **dependency DFS**, not the creation order. Rows 2-7 above
+interleave as `wq | q_norm | rope_q | wk,wv | k_norm | rope_k`, and each of the
+three grouped launches the backend already implements is broken by the node
+between its members:
+
+| group | blocked by |
+|---|---|
+| mmvq (wq+wk+wv) | hoisting the K projection over q_norm's write is range-blocked by ggml-alloc |
+| rms_norm (q_norm+k_norm) | k_norm's own input is written by the skipped-over wk matvec |
+| rope (rope_q+rope_k) | same, one level down |
+
+`ggml_build_forward_expand` on the three projections before the Q norm makes the
+members adjacent, so **no hoist is needed at all** and the groups form on the
+trivially-legal path. Ops, operands and every expression unchanged; decode only.
+
+Measured: **the QK-norm pair groups, -10/token.** The Q/K/V matvec group still
+declines, and the reason is worth recording because it was not obvious: with a
+per-check debug print in `ggml_cuda_mmvq_collect_group`,
+
+```
+cand @301 Kcur-3: src1=1 type=0(8/14) ne0=1(2048/2048) nb1=0 cg=1 glu=0 hoist=1
+```
+
+`type=0(8/14)` -> **attn_q is Q6_K (14) while attn_k/attn_v are Q8_0 (8)**, and
+the grouped mmvq kernel is single-type. That merge needs 0047's
+two-quant-types-in-one-launch machinery; it is still open and worth ~+0.5%.
+
+### 0050: the GDN gated norm fused - and the reassociation trap
+
+Four nodes, two launches, 30 of each per token:
+
+```
+RMS_NORM -> MUL(ssm_norm.weight)  -> rms_norm_f32<256,true,false>   32 blk
+UNARY(SILU)(z) -> MUL             -> unary_gated_op_quant<silu>     16 blk
+```
+
+The gated kernel reads nothing but the first's output and z, and the norm kernel
+already owns one whole row per block, so gate + product + the folded q8_1 store
+are a register epilogue. A note for the next fusion: the z reshape sits BETWEEN
+the two pairs, so the silu is found by skipping view/noop nodes, not at a fixed
+offset.
+
+**The obvious version of this is wrong.** ggml's HIP backend is compiled with
+
+```
+HIP_FLAGS = -funsafe-math-optimizations -O3 ... --offload-arch=gfx1201
+```
+
+so the compiler may **reassociate a product**. In the two separate launches the
+normalised value is stored to memory and reloaded, and a load is an opaque value
+the gate multiply cannot be reassociated into. Fusing the two expressions into
+one removes that barrier, the merged product reassociates, and the result is a
+real arithmetic change:
+
+```
+decode-path ppl   control 3.9382   fused 3.9148   = -0.59%, SIX times the gate
+```
+
+from a fusion that is algebraically an identity. Bisected with
+`GGML_CUDA_DISABLE_UNARY_MUL_QUANT=1` on both arms, which still differed, so it
+is the f32 value and not the q8_1 store; and the destinations were checked
+range-disjoint from both inputs first (they are - a debug print of the three
+pointer ranges shows no overlap in any layer), so it is not an aliasing race.
+
+An **arithmetic fence** on the normalised value restores exactly the stock
+expression structure - an isolated `scale * x * w` tree, then `op(gate) *
+<opaque>`:
+
+```c
+const float nv  = ggml_cuda_assoc_fence(scale * x[col] * mul[col]);
+const float val = op(gate[col]) * nv;
+```
+
+With it, all four toggle arms read **3.9382**.
+
+> **Rule for this series.** A CO-LAUNCH (0045-0048) is bit-identical by
+> construction: each guest keeps its own statements and its own destination, and
+> the compiler never sees the two bodies as one expression. A producer-consumer
+> **FUSION** is not. Under `-funsafe-math-optimizations`, every value stock
+> materialises through memory is a reassociation barrier; keeping it in a
+> register removes that barrier. Fence it, and re-read perplexity on the decode
+> shape - a fusion that "obviously cannot change anything" changed it by 0.59%.
+
+The q8_1 store is `glu_quant_store`, factored out of `glu_quant_body` and shared
+verbatim, so each warp still covers 32 consecutive 32-aligned flat elements.
+
+### 0051: grouped rope extended to the mrope/imrope family
+
+The grouped rope launch already existed and accepted plain NeoX only, so the
+qwen3.6 pair (GGML_ROPE_TYPE_IMROPE) stayed two dispatches. `rope_multi_grouped`
+is `rope_multi`'s body verbatim with the stock row decomposition replaced by the
+same integer segment scan `rope_neox_grouped` uses - a grouping, not a fusion, so
+the 0050 hazard does not arise and it is byte-identical by construction.
+
+**Trap:** `GGML_ROPE_TYPE_IMROPE` (40) and `GGML_ROPE_TYPE_MROPE` (8) do **not**
+carry the NeoX bit (2). The first attempt admitted mrope but kept
+`!(mode & GGML_ROPE_TYPE_NEOX) -> return false` in front of it, and the group
+silently never fired. -10/token.
+
+### Numbers
+
+Against a binary built from this batch's parent commit (7c910cc / 8c1437775),
+control RUNPATH overridden with `LD_LIBRARY_PATH` and verified by `ldd`, arms
+alternated, no env set on either arm:
+
+```
+control   tg128 158.90 159.34 159.36 159.36   mean 159.24
+candidate tg128 162.32 162.35 162.62 162.55   mean 162.46   -> +2.02%, 4/4 separated
+prefill   pp512 4919.27 -> 4918.02            -0.03%
+```
+
+Census 601.1 -> **551.1 dispatches/token, exactly -50** (-10 QK norm, -30 GDN
+gated norm, -10 rope), and every other kernel count unchanged.
+
+Cost model check: `t(551.1) = 4448.4 + 2.991 x 551.1 = 6096 us` -> 164.0 tok/s,
+against 601.1 -> 6246 us -> 160.1. Predicted +2.4%, measured +2.02%, i.e.
+**~2.5 us per removed elementwise dispatch** against the fit's 2.99. The linear
+model still holds shape 130 dispatches out from where it was fitted, but the
+realised rate is now consistently ~15-20% below the marginal slope; price the
+next elementwise removal at **2.5 us**, and a matvec removal at 4.0 us (0047).
+
+### Measured dead this round - do not re-open
+
+**The attention gate `cont` cannot be elided (`cpy_scalar`, 10/token).** The gate
+is an interleaved column of the joint Q+gate projection and stock materialises
+it with a copy before the sigmoid; the fused unary+mul path reads its unary
+source through a row stride, so the copy looks free to remove by handing the
+strided VIEW straight to the sigmoid and taking the product in the view's own 3D
+shape. It is not: the census went the wrong way by **+30 dispatches**.
+
+```
+cpy_scalar            10 -> 0     (the intended saving)
+unary_gated_op_quant  10 -> 0     the UNARY+MUL fusion stops firing
+quantize_q8_1         41 -> 51    so the product is quantized by its own launch
+k_bin_bcast            1 -> 11    and the MUL runs as a generic broadcast op
+copyBuffer          12.6 -> 22.6  plus a device copy per layer
+```
+
+and the decode-path perplexity moved to **3.9446**. Net zero dispatches and a
+gate failure. The lesson generalises: a non-contiguous operand drops the node
+out of the backend's fused elementwise path and back onto the generic path, which
+costs more than the copy it saves.
+
+### What is left
+
+```
+| move                                            | class   | x/token | est.  |
+| attn wq merged into the wk/wv grouped mmvq      | matvec  | 10      | +0.5% |
+|   (needs two vec_dot types in one grouped       |         |         |       |
+|    launch - Q6_K host, Q8_0 members)            |         |         |       |
+| __amd_rocclr_copyBuffer (graph input uploads)   | copy    | 12.6    | +0.8% |
+|   ~12 small H2D blits per eval at ~4 us each;   |         |         |       |
+|   unexplored, needs llama.cpp-side batching     |         |         |       |
+| flash_attn_combine_results                      | elem    | 10      | +0.4% |
+```
+
+551.1 dispatches, 162.5 tok/s llama-bench. Round 34's reachable band is
+**165-169**; this batch is 75% of the way there from 153.0.

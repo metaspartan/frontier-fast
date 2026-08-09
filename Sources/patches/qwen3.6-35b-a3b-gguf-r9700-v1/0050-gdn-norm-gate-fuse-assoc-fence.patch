@@ -1,0 +1,380 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sun, 9 Aug 2026 00:19:05 +0000
+Subject: [PATCH 2/3] cuda/hip: the GDN gated norm as one kernel, with an
+ association fence (+1.0% decode)
+
+The gated-delta-net tail is four graph nodes that stock runs as two launches:
+
+    RMS_NORM -> MUL(ssm_norm.weight)   -> rms_norm_f32<256,true,false>
+    UNARY(SILU)(z) -> MUL              -> unary_gated_op_quant_kernel<silu>
+
+The second reads nothing but the first's output and z, and the first already
+owns one whole row per block, so the gate, the product and the folded q8_1 store
+are an epilogue the norm kernel can run from registers. 30 launches per decode
+token.
+
+The interesting part is why the obvious version of this is WRONG. ggml's HIP
+backend is compiled with -funsafe-math-optimizations, so the compiler may
+REASSOCIATE a product. In the two separate launches the normalised value is
+stored to memory and reloaded, and a load is an opaque value that the gate
+multiply cannot be reassociated into. Fusing the two expressions into one
+removes that barrier, the merged product reassociates, and the result is a real
+arithmetic change - measured at 0.59% of perplexity (3.9382 -> 3.9148), six
+times the correctness gate, from a fusion that is algebraically an identity.
+
+An arithmetic fence on the normalised value restores exactly the stock
+expression structure: an isolated `scale * x * w` tree, then `op(gate) *
+<opaque>`. With it the decode-path perplexity is 3.9382 on both arms - bit
+identical. This is the general rule for this series: a CO-LAUNCH is
+bit-identical by construction because each guest keeps its own statements, but a
+producer-consumer FUSION is not, and every value stock materialises through
+memory needs a fence where it is kept in a register instead.
+
+The q8_1 store is glu_quant_store, factored out of glu_quant_body and shared
+verbatim with the standalone kernel; each warp covers 32 consecutive, 32-aligned
+flat destination elements exactly as in the standalone launch. The fusion also
+requires the destination to be range-disjoint from both inputs: ggml-alloc frees
+the GDN output as soon as the RMS_NORM is processed, and stock is only safe over
+an overlap because the two kernels are ordered.
+
+GGML_CUDA_RMS_NORM_GATE_FUSE=0 restores the two separate launches.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu       | 101 +++++++++++++++++++
+ ggml/src/ggml-cuda/glu-quant-body.cuh |  40 +++++---
+ ggml/src/ggml-cuda/unary.cu           | 138 ++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/unary.cuh          |   5 +
+ 4 files changed, 269 insertions(+), 15 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index fe9671d02..f4d6595d8 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6456,6 +6456,107 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 2;
+     }
+ 
++    // 0050: GGML_CUDA_RMS_NORM_GATE_FUSE=0 restores the two separate launches.
++    static const bool disable_rms_norm_gate_fuse = getenv("GGML_CUDA_RMS_NORM_GATE_FUSE") != nullptr &&
++                                                   std::atoi(getenv("GGML_CUDA_RMS_NORM_GATE_FUSE")) == 0;
++    static const bool disable_gate_fuse_quant = getenv("GGML_CUDA_DISABLE_UNARY_MUL_QUANT") != nullptr &&
++                                                std::atoi(getenv("GGML_CUDA_DISABLE_UNARY_MUL_QUANT"));
++
++    // 0050: the GDN gated norm - RMS_NORM, MUL(weight), SILU(z), MUL - as one
++    // launch instead of two. Tried before the plain RMS_NORM+MUL fusion, which
++    // is the fallback whenever any condition below does not hold. 30 launches
++    // per decode token on qwen35moe; the attention gate product has no norm in
++    // front of it and is left to the unary+mul path unchanged.
++    // the z reshape sits between the weighted norm and the silu, so the silu is
++    // found by skipping view/noop nodes rather than at a fixed offset
++    int gate_idx = -1;
++    if (!disable_rms_norm_gate_fuse && cgraph->n_nodes > i + 3 &&
++            ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
++        for (int j = i + 2; j + 1 < cgraph->n_nodes && j <= i + 4; ++j) {
++            if (ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
++                continue;
++            }
++            if (ggml_cuda_can_fuse(cgraph, j, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU })) {
++                gate_idx = j;
++            }
++            break;
++        }
++    }
++    if (gate_idx > 0) {
++        ggml_tensor * norm_node = node;
++        ggml_tensor * mul_node  = cgraph->nodes[i + 1];
++        ggml_tensor * un_node   = cgraph->nodes[gate_idx];
++        ggml_tensor * gmul_node = cgraph->nodes[gate_idx + 1];
++
++        const ggml_tensor * x_src = norm_node->src[0];
++        const ggml_tensor * w_src = (mul_node->src[0] == norm_node) ? mul_node->src[1] : mul_node->src[0];
++        const ggml_tensor * g_src = un_node->src[0];
++
++        // the weighted norm must feed nothing but the gate product, and the
++        // gate product must read exactly the two of them
++        const bool wiring =
++            ggml_node_get_use_count(cgraph, i + 1) == 1 &&
++            (mul_node->flags & GGML_TENSOR_FLAG_OUTPUT) == 0 &&
++            ((gmul_node->src[0] == mul_node && gmul_node->src[1] == un_node) ||
++             (gmul_node->src[1] == mul_node && gmul_node->src[0] == un_node));
++
++        // the norm half must be exactly what rms_norm_f32<256,true,false> runs:
++        // 2D, one row per block, and a weight whose fastmodulo indexing is the
++        // identity (mul_ncols == ncols, mul_nrows == 1)
++        const bool norm_shape =
++            wiring &&
++            x_src->type == GGML_TYPE_F32 && w_src->type == GGML_TYPE_F32 &&
++            norm_node->type == GGML_TYPE_F32 && mul_node->type == GGML_TYPE_F32 &&
++            x_src->ne[0] < 1024 && x_src->ne[2] == 1 && x_src->ne[3] == 1 &&
++            x_src->nb[0] == ggml_type_size(x_src->type) &&
++            w_src->ne[0] == x_src->ne[0] && w_src->ne[1] == 1 &&
++            w_src->ne[2] == 1 && w_src->ne[3] == 1 && ggml_is_contiguous(w_src) &&
++            ggml_is_contiguous(mul_node) &&
++            mul_node->ne[0] == x_src->ne[0] && mul_node->ne[1] == x_src->ne[1];
++
++        // the gate half must be exactly what unary_gated_op_quant_kernel runs
++        const bool gate_shape =
++            norm_shape &&
++            g_src->type == GGML_TYPE_F32 && un_node->type == GGML_TYPE_F32 &&
++            gmul_node->type == GGML_TYPE_F32 &&
++            ggml_are_same_shape(g_src, mul_node) && ggml_are_same_shape(gmul_node, mul_node) &&
++            ggml_is_contiguous_1(g_src) && g_src->nb[0] == ggml_type_size(g_src->type) &&
++            ggml_is_contiguous(gmul_node);
++
++        // ggml-alloc frees the GDN output as soon as the RMS_NORM has been
++        // processed, so the gate product's destination is routinely handed a
++        // block that overlaps it. Stock is safe there because the two kernels
++        // are ordered: every read of x has happened before the gated kernel
++        // starts. Merging them makes that overlap a cross-BLOCK race - block r
++        // writes its output row while block r' is still reading its input row -
++        // so the fusion is only legal over disjoint ranges.
++        const bool no_alias =
++            gate_shape &&
++            ggml_cuda_mmvq_ranges_disjoint(gmul_node, x_src) &&
++            ggml_cuda_mmvq_ranges_disjoint(gmul_node, g_src) &&
++            ggml_cuda_mmvq_ranges_disjoint(gmul_node, w_src);
++
++        if (getenv("GGML_CUDA_GATE_FUSE_DEBUG")) {
++            fprintf(stderr, "gate-fuse @%d wiring=%d norm=%d gate=%d alias_x=%d alias_g=%d "
++                            "dst=%p+%zu x=%p+%zu g=%p+%zu\n",
++                    i, (int) wiring, (int) norm_shape, (int) gate_shape,
++                    (int) !ggml_cuda_mmvq_ranges_disjoint(gmul_node, x_src),
++                    (int) !ggml_cuda_mmvq_ranges_disjoint(gmul_node, g_src),
++                    gmul_node->data, ggml_nbytes(gmul_node),
++                    x_src->data, ggml_nbytes(x_src), g_src->data, ggml_nbytes(g_src));
++        }
++
++        if (no_alias) {
++            char * q8_1_dst = nullptr;
++            if (!disable_gate_fuse_quant && cuda_ctx->stream_context().concurrent_events.empty() &&
++                    ggml_nelements(gmul_node) % QK8_1 == 0 && x_src->ne[0] % QK8_1 == 0) {
++                q8_1_dst = ggml_cuda_quant_register_for_consumer(cuda_ctx, cgraph, gate_idx + 2, gmul_node);
++            }
++            ggml_cuda_op_rms_norm_gate_quant(*cuda_ctx, norm_node, mul_node, un_node, gmul_node, q8_1_dst);
++            return gate_idx + 1 - i;
++        }
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
+         ggml_cuda_op_rms_norm_fused(*cuda_ctx, node, cgraph->nodes[i + 1]);
+         return 1;
+diff --git a/ggml/src/ggml-cuda/glu-quant-body.cuh b/ggml/src/ggml-cuda/glu-quant-body.cuh
+index 841576a55..5751b6ce7 100644
+--- a/ggml/src/ggml-cuda/glu-quant-body.cuh
++++ b/ggml/src/ggml-cuda/glu-quant-body.cuh
+@@ -12,21 +12,13 @@
+ // dst whose length is a multiple of QK8_1, because the index is flat. The two
+ // reductions below are then over exactly the same 32 values in the same lanes
+ // as in the standalone kernel, so d, q and ds come out bit for bit the same.
+-template <float (*op)(float)>
+-static __device__ __forceinline__ void glu_quant_body(
+-        const float * x, const float * g, float * dst,
+-        const int64_t k, const int64_t n, const int64_t o0, const int64_t o1,
+-        void * q8_1_dst, const int64_t i) {
+-    if (i >= k) {
+-        return;
+-    }
+-
+-    const int64_t j0 = (i / n) * o0 + (i % n);
+-    const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+-
+-    const float val = op(x[j0]) * g[j1];
+-    dst[i] = val;
+-
++// The q8_1 store half of the body, factored out so that a producer which
++// already holds the destination value in a register (0050: the fused GDN
++// rms_norm + z-gate) runs exactly these statements. `i` is the flat destination
++// element index; the caller guarantees each warp covers 32 consecutive,
++// 32-aligned elements.
++static __device__ __forceinline__ void glu_quant_store(
++        const float val, void * q8_1_dst, const int64_t i) {
+     block_q8_1 * y = (block_q8_1 *) q8_1_dst;
+ 
+     const int64_t ib  = i / QK8_1;
+@@ -47,3 +39,21 @@ static __device__ __forceinline__ void glu_quant_body(
+         y[ib].ds = make_half2(d, sum);
+     }
+ }
++
++template <float (*op)(float)>
++static __device__ __forceinline__ void glu_quant_body(
++        const float * x, const float * g, float * dst,
++        const int64_t k, const int64_t n, const int64_t o0, const int64_t o1,
++        void * q8_1_dst, const int64_t i) {
++    if (i >= k) {
++        return;
++    }
++
++    const int64_t j0 = (i / n) * o0 + (i % n);
++    const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
++
++    const float val = op(x[j0]) * g[j1];
++    dst[i] = val;
++
++    glu_quant_store(val, q8_1_dst, i);
++}
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index b78e89b09..9de064294 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -306,6 +306,144 @@ static __global__ void unary_gated_op_quant_kernel(const float * x, const float
+     GGML_UNUSED_VARS(j0, j1);
+ }
+ 
++
++// Blocks floating-point reassociation across this value under
++// -funsafe-math-optimizations, so a value that stock materialises through
++// memory keeps the same expression structure when it is kept in a register.
++static __device__ __forceinline__ float ggml_cuda_assoc_fence(float v) {
++#if defined(__has_builtin)
++#  if __has_builtin(__builtin_arithmetic_fence)
++    return __builtin_arithmetic_fence(v);
++#  else
++    asm volatile("" : "+v"(v));
++    return v;
++#  endif
++#else
++    asm volatile("" : "+v"(v));
++    return v;
++#endif
++}
++
++// ---- 0050: the GDN gated norm as ONE kernel -------------------------------
++//
++// The gated-delta-net tail is four graph nodes that stock runs as two launches:
++//   RMS_NORM -> MUL(ssm_norm.weight)     -> rms_norm_f32<256,true,false>
++//   UNARY(SILU)(z) -> MUL                -> unary_gated_op_quant_kernel<silu>
++// The second reads nothing but the first's output and z, and the first already
++// owns one whole row per block - so the gate, the product and the q8_1 store
++// are an epilogue the norm kernel can run from registers. 30 launches per
++// decode token.
++//
++// Bit-identity, statement by statement:
++//   * the reduction is block_reduce<SUM, block_size> over the same partial sums
++//     in the same order, and mean/scale are the same two expressions;
++//   * `scale * x[col] * mul[col]` is the norm kernel's own store expression
++//     (with mul_ncols == ncols the fastmodulo in that kernel is the identity),
++//     and an f32 round-trip through memory is exact, so the value the gate
++//     multiplies is the value the separate launch would have loaded back;
++//   * `op(gate) * val` is the gated kernel's own expression, operands in its
++//     own order;
++//   * the q8_1 store is glu_quant_store, shared verbatim with the standalone
++//     kernel. Its only requirement is that each warp cover 32 consecutive,
++//     32-aligned flat destination elements: dst is contiguous with row stride
++//     ncols, the caller requires ncols % QK8_1 == 0, and lane L of warp w of
++//     this block holds col = 32w + L (+ block_size per extra iteration), so
++//     flat index row*ncols + col is 32-aligned per warp exactly as in the
++//     standalone launch. ncols % 32 == 0 also means a warp is entirely inside
++//     or entirely outside the column range, so no warp reduces over a partial
++//     set of lanes.
++template <int block_size, float (*op)(float), bool do_quant>
++static __global__ void rms_norm_gate_quant_f32(const float * x,
++                                               const float * mul,
++                                               const float * gate,
++                                               float *       dst,
++                                               const int     ncols,
++                                               const int64_t stride_row,
++                                               const int64_t gate_stride_row,
++                                               const float   eps,
++                                               void *        q8_1_dst) {
++    ggml_cuda_pdl_lc();
++
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++
++    x    += (int64_t) row * stride_row;
++    gate += (int64_t) row * gate_stride_row;
++    dst  += (int64_t) row * ncols;
++
++    float tmp = 0.0f; // partial sum for thread in warp
++
++    ggml_cuda_pdl_sync();
++    for (int col = tid; col < ncols; col += block_size) {
++        const float xi = x[col];
++        tmp += xi * xi;
++    }
++
++    extern __shared__ float s_sum[];
++    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++
++    const float mean  = tmp / ncols;
++    const float scale = rsqrtf(mean + eps);
++
++    for (int col = tid; col < ncols; col += block_size) {
++        // The backend is compiled with -funsafe-math-optimizations, so the
++        // compiler is free to REASSOCIATE a product. In the two separate
++        // launches the normalised value is stored and reloaded, and a load is
++        // an opaque value the gate multiply cannot be reassociated into; fusing
++        // the two expressions into one removes that barrier and the merged
++        // product reassociates, which is a real (measured: 0.6% perplexity)
++        // arithmetic change. The fence restores exactly the stock structure:
++        // an isolated `scale * x * w` tree, then `op(gate) * <opaque>`.
++        const float nv  = ggml_cuda_assoc_fence(scale * x[col] * mul[col]);
++        const float val = op(gate[col]) * nv;
++        dst[col] = val;
++        if constexpr (do_quant) {
++            glu_quant_store(val, q8_1_dst, (int64_t) row * ncols + col);
++        }
++    }
++}
++
++template <float (*op)(float)>
++static void rms_norm_gate_quant_cuda(const float * x, const float * mul, const float * gate, float * dst,
++                                     const int ncols, const int nrows,
++                                     const int64_t stride_row, const int64_t gate_stride_row,
++                                     const float eps, void * q8_1_dst, cudaStream_t stream) {
++    const dim3 blocks_num(nrows, 1, 1);
++    const dim3 block_dims(256, 1, 1);
++    const ggml_cuda_kernel_launch_params launch_params =
++        {blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, stream};
++    if (q8_1_dst != nullptr) {
++        ggml_cuda_kernel_launch(rms_norm_gate_quant_f32<256, op, true>, launch_params,
++                                x, mul, gate, dst, ncols, stride_row, gate_stride_row, eps, q8_1_dst);
++    } else {
++        ggml_cuda_kernel_launch(rms_norm_gate_quant_f32<256, op, false>, launch_params,
++                                x, mul, gate, dst, ncols, stride_row, gate_stride_row, eps, q8_1_dst);
++    }
++}
++
++void ggml_cuda_op_rms_norm_gate_quant(ggml_backend_cuda_context & ctx,
++                                      ggml_tensor * norm_node, ggml_tensor * mul_node,
++                                      ggml_tensor * unary_node, ggml_tensor * gate_mul_node,
++                                      char * q8_1_dst) {
++    const ggml_tensor * x_src    = norm_node->src[0];
++    const ggml_tensor * w_src    = (mul_node->src[0] == norm_node) ? mul_node->src[1] : mul_node->src[0];
++    const ggml_tensor * gate_src = unary_node->src[0];
++
++    float eps = 0.0f;
++    memcpy(&eps, norm_node->op_params, sizeof(float));
++
++    const int64_t ncols = x_src->ne[0];
++    const int64_t nrows = x_src->ne[1];
++
++    const int64_t stride_row      = x_src->nb[1]    / sizeof(float);
++    const int64_t gate_stride_row = gate_src->nb[1] / sizeof(float);
++
++    GGML_ASSERT(ggml_get_unary_op(unary_node) == GGML_UNARY_OP_SILU);
++    rms_norm_gate_quant_cuda<op_silu>((const float *) x_src->data, (const float *) w_src->data,
++                                      (const float *) gate_src->data, (float *) gate_mul_node->data,
++                                      ncols, nrows, stride_row, gate_stride_row, eps, q8_1_dst, ctx.stream());
++}
++
+ template <float (*op)(float)>
+ static void unary_gated_quant_cuda(const float * x, const float * g, float * dst, const int64_t k,
+                                    const int64_t n, const int64_t o0, const int64_t o1,
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+index d83c77a58..daf5e1307 100644
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -109,6 +109,11 @@ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ // the values this kernel just wrote (the GDN gated norm and the attention gate
+ // product both do). F32 only; the caller must have checked that mul_node is
+ // contiguous and that its element count is a multiple of QK8_1.
++void ggml_cuda_op_rms_norm_gate_quant(ggml_backend_cuda_context & ctx,
++                                      ggml_tensor * norm_node, ggml_tensor * mul_node,
++                                      ggml_tensor * unary_node, ggml_tensor * gate_mul_node,
++                                      char * q8_1_dst);
++
+ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node,
+                             char * q8_1_dst = nullptr);
+ 

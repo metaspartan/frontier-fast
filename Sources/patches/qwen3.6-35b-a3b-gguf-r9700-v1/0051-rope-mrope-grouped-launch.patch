@@ -1,0 +1,224 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sun, 9 Aug 2026 00:19:05 +0000
+Subject: [PATCH 3/3] cuda/hip: grouped rope for the mrope/imrope family (+0.5%
+ decode)
+
+The grouped rope launch already existed but accepted plain NeoX only, so
+qwen3.6 - which ropes Q and K with GGML_ROPE_TYPE_IMROPE - kept two dispatches
+per attention layer. rope_multi_grouped is rope_multi's body verbatim (same
+sector/section routing, same theta_base selection, same rope_yarn call, same two
+output expressions) with the stock row decomposition replaced by the same
+integer segment scan rope_neox_grouped uses, so every element keeps exactly the
+sequence of the individual launch and the result is byte-identical by
+construction. Nothing is merged into anything, so the reassociation hazard that
+0050 documents does not arise here.
+
+One trap worth recording: GGML_ROPE_TYPE_IMROPE (40) and GGML_ROPE_TYPE_MROPE
+(8) do NOT carry the NeoX bit (2), so the mrope family has to be admitted on its
+own test rather than through `mode & GGML_ROPE_TYPE_NEOX`.
+
+-10 dispatches per decode token. GGML_CUDA_ROPE_MROPE_GROUP=0 restores the two
+separate launches.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  18 +++-
+ ggml/src/ggml-cuda/rope.cu      | 150 ++++++++++++++++++++++++++++++++
+ 2 files changed, 165 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f4d6595d8..bcba6760d 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4821,9 +4821,21 @@ static bool ggml_cuda_rope_groupable(const ggml_cgraph * cgraph, const int i) {
+     }
+ 
+     const int mode = ((const int32_t *) node->op_params)[2];
+-    // plain NeoX only: no mrope/imrope/vision section handling in the grouped kernel
+-    if (!(mode & GGML_ROPE_TYPE_NEOX) || (mode & GGML_ROPE_TYPE_MROPE) ||
+-            mode == GGML_ROPE_TYPE_IMROPE || mode == GGML_ROPE_TYPE_VISION) {
++    // NeoX, or (0051) mrope/imrope, which rope_multi_grouped handles with
++    // rope_multi's own section routing. Vision mode stays out: it halves n_dims
++    // against ne00 and the grouped row decomposition is not written for it.
++    static const bool disable_mrope_group = getenv("GGML_CUDA_ROPE_MROPE_GROUP") != nullptr &&
++                                            std::atoi(getenv("GGML_CUDA_ROPE_MROPE_GROUP")) == 0;
++    // NOTE: GGML_ROPE_TYPE_IMROPE (40) and GGML_ROPE_TYPE_MROPE (8) do NOT carry
++    // the NeoX bit, so the mrope family has to be admitted on its own test.
++    const bool is_mrope = (mode & GGML_ROPE_TYPE_MROPE) || mode == GGML_ROPE_TYPE_IMROPE;
++    if (mode == GGML_ROPE_TYPE_VISION) {
++        return false;
++    }
++    if (!is_mrope && !(mode & GGML_ROPE_TYPE_NEOX)) {
++        return false;
++    }
++    if (is_mrope && disable_mrope_group) {
+         return false;
+     }
+     if (src0->ne[0] % 2 != 0) {
+diff --git a/ggml/src/ggml-cuda/rope.cu b/ggml/src/ggml-cuda/rope.cu
+index 1ded56eca..c48e2b1a3 100644
+--- a/ggml/src/ggml-cuda/rope.cu
++++ b/ggml/src/ggml-cuda/rope.cu
+@@ -595,6 +595,143 @@ static __global__ void rope_neox_grouped(const rope_grouped_args args,
+     dst[idst + n_dims / 2] = ggml_cuda_cast<D>(x0 * sin_theta + x1 * cos_theta);
+ }
+ 
++// 0051: the mrope/imrope variant of the grouped launch. Qwen3.6 ropes Q and K
++// with GGML_ROPE_TYPE_IMROPE, which the NeoX grouped kernel above declines, so
++// the pair stayed two dispatches per attention layer. The body below is
++// rope_multi's body verbatim - same sector/section routing, same theta_base
++// selection, same rope_yarn call, same two output expressions - with only the
++// stock row decomposition replaced by the segment scan (integer work, uniform
++// across the block). ne02 == 1 for every member, so i2 == i3 == 0 and the pos
++// lookups reduce to pos[k*ne02]; ne02 is still passed so the index expression
++// is the stock one.
++template <bool forward, bool has_ff, typename T, typename D>
++static __global__ void rope_multi_grouped(const rope_grouped_args args,
++                                          const int              ne00,
++                                          const int              ne02,
++                                          const int              n_dims,
++                                          const int32_t *        pos,
++                                          const float            freq_scale,
++                                          const float            ext_factor,
++                                          const float            attn_factor,
++                                          const rope_corr_dims   corr_dims,
++                                          const float            theta_scale,
++                                          const float *          freq_factors,
++                                          const mrope_sections   sections,
++                                          const bool             is_imrope) {
++    ggml_cuda_pdl_lc();
++    const int i0 = 2*(blockDim.y*blockIdx.y + threadIdx.y);
++
++    if (i0 >= ne00) {
++        return;
++    }
++
++    uint32_t seg       = 0;
++    uint32_t seg_start = 0;
++#pragma unroll
++    for (int s = 0; s < ROPE_MAX_GROUP_SIZE - 1; ++s) {
++        if (blockIdx.x >= args.seg_end[s]) {
++            seg       = s + 1;
++            seg_start = args.seg_end[s];
++        }
++    }
++
++    const T * GGML_CUDA_RESTRICT x   = (const T *) args.x[seg];
++    D * GGML_CUDA_RESTRICT       dst = (D *) args.dst[seg];
++
++    // ne02 == ne03 == 1 for every member, so the stock decomposition
++    //   i3 = row_dst/(ne01*ne02), i2 = ..., i1 = ...
++    // reduces to i1 = row_dst, i2 = i3 = 0.
++    const int      i1 = (int) (blockIdx.x - seg_start);
++    const uint32_t i2 = 0;
++
++    const int idst = i0 / 2 + i1 * args.s1[seg];
++    const int ix   = i0 / 2 + i1 * args.s01[seg];
++    ggml_cuda_pdl_sync();
++
++    if (i0 >= n_dims) {
++        dst[idst + i0/2 + 0] = ggml_cuda_cast<D>(x[ix + i0/2 + 0]);
++        dst[idst + i0/2 + 1] = ggml_cuda_cast<D>(x[ix + i0/2 + 1]);
++
++        return;
++    }
++
++    const int sect_dims = sections.v[0] + sections.v[1] + sections.v[2] + sections.v[3];
++    const int sec_w = sections.v[1] + sections.v[0];
++    const int sector = (i0 / 2) % sect_dims;
++
++    float theta_base = 0.0;
++    if (is_imrope) {
++        if (sector % 3 == 1 && sector < 3 * sections.v[1]) {         // h
++            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, i0 / 2.0f);
++        } else if (sector % 3 == 2 && sector < 3 * sections.v[2]) {  // w
++            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, i0 / 2.0f);
++        } else if (sector % 3 == 0 && sector < 3 * sections.v[0]) {  // t
++            theta_base = pos[i2] * powf(theta_scale, i0 / 2.0f);
++        } else {
++            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, i0 / 2.0f);
++        }
++    } else {
++        if (sector < sections.v[0]) {
++            theta_base = pos[i2] * powf(theta_scale, i0 / 2.0f);
++        } else if (sector >= sections.v[0] && sector < sec_w) {
++            theta_base = pos[i2 + ne02 * 1] * powf(theta_scale, i0 / 2.0f);
++        } else if (sector >= sec_w && sector < sec_w + sections.v[2]) {
++            theta_base = pos[i2 + ne02 * 2] * powf(theta_scale, i0 / 2.0f);
++        } else if (sector >= sec_w + sections.v[2]) {
++            theta_base = pos[i2 + ne02 * 3] * powf(theta_scale, i0 / 2.0f);
++        }
++    }
++
++    const float freq_factor = has_ff ? freq_factors[i0/2] : 1.0f;
++
++    float cos_theta;
++    float sin_theta;
++
++    rope_yarn<forward>(theta_base/freq_factor, freq_scale, corr_dims, i0, ext_factor, attn_factor, cos_theta, sin_theta);
++
++    const float x0 = x[ix + 0];
++    const float x1 = x[ix + n_dims/2];
++
++    dst[idst + 0]          = ggml_cuda_cast<D>(x0 * cos_theta - x1 * sin_theta);
++    dst[idst + n_dims / 2] = ggml_cuda_cast<D>(x0 * sin_theta + x1 * cos_theta);
++}
++
++template <bool forward, typename T, typename D>
++static void rope_multi_grouped_cuda(const rope_grouped_args & args,
++                                    const int                 total_rows,
++                                    const int                 ne00,
++                                    const int                 ne02,
++                                    const int                 n_dims,
++                                    const int32_t *           pos,
++                                    const float               freq_scale,
++                                    const float               freq_base,
++                                    const float               ext_factor,
++                                    const float               attn_factor,
++                                    const rope_corr_dims      corr_dims,
++                                    const float *             freq_factors,
++                                    const mrope_sections      sections,
++                                    const bool                is_imrope,
++                                    cudaStream_t              stream) {
++    GGML_ASSERT(ne00 % 2 == 0);
++    const dim3 block_dims(1, CUDA_ROPE_BLOCK_SIZE, 1);
++    const int  n_blocks_x = (ne00 + 2 * CUDA_ROPE_BLOCK_SIZE - 1) / (2 * CUDA_ROPE_BLOCK_SIZE);
++    const dim3 block_nums(total_rows, n_blocks_x, 1);
++
++    // identical to the individual launches (shared freq_base and n_dims)
++    const float theta_scale = powf(freq_base, -2.0f / n_dims);
++    const ggml_cuda_kernel_launch_params launch_params = {block_nums, block_dims, 0, stream};
++
++    if (freq_factors == nullptr) {
++        ggml_cuda_kernel_launch(rope_multi_grouped<forward, false, T, D>, launch_params,
++            args, ne00, ne02, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
++            freq_factors, sections, is_imrope);
++    } else {
++        ggml_cuda_kernel_launch(rope_multi_grouped<forward, true, T, D>, launch_params,
++            args, ne00, ne02, n_dims, pos, freq_scale, ext_factor, attn_factor, corr_dims, theta_scale,
++            freq_factors, sections, is_imrope);
++    }
++}
++
+ template <bool forward, typename T, typename D>
+ static void rope_neox_grouped_cuda(const rope_grouped_args & args,
+                                    const int                 total_rows,
+@@ -681,6 +818,19 @@ void ggml_cuda_op_rope_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * co
+         args.seg_end[m] = total_rows; // padding: the segment scan never selects these
+     }
+ 
++    const int  mode      = ((const int32_t *) first->op_params)[2];
++    const bool is_mrope  = mode & GGML_ROPE_TYPE_MROPE;
++    const bool is_imrope = mode == GGML_ROPE_TYPE_IMROPE;
++
++    if (is_mrope) {
++        mrope_sections sections;
++        memcpy(&sections.v, (const int32_t *) first->op_params + 11, sizeof(int) * 4);
++        rope_multi_grouped_cuda<true, float, float>(args, (int) total_rows, (int) ne00,
++            (int) src0f->ne[2], n_dims, pos, freq_scale, freq_base, ext_factor, attn_factor,
++            corr_dims, freq_factors, sections, is_imrope, stream);
++        return;
++    }
++
+     rope_neox_grouped_cuda<true, float, float>(args, (int) total_rows, (int) ne00, n_dims, pos, freq_scale,
+         freq_base, ext_factor, attn_factor, corr_dims, freq_factors, stream);
+ }
