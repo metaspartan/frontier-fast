@@ -396,3 +396,48 @@ before assuming a vendor kernel is doing something clever.
    achievable on loads but only 61-81% of a no-LDS/no-MMA probe. Never censused.
 3. The decode levers from round 1 are unchanged (F32 router matvec, Q6_K V into
    the Q/K group).
+
+### 0022 — 0021 unlocked the tail ubatch, and it was worth more than 0021
+
+The sibling `laguna-s-2.1-gguf-gb10cuda-v1` derived tail-ubatch absorption and
+then recorded it **INERT on the ranked path**: `llama-server` pre-chunks the
+prompt at `{4 + n_ubatch, 4}` from the end to build context checkpoints, so
+`llama_decode` never sees more than `n_ubatch` and the absorption test is never
+true. **0021 removes exactly that pre-chunking.** The server now hands
+`llama_decode` all 534 tokens, `llama_context` splits them 512 + 22, and the
+absorption patch fires for the first time on this platform.
+
+Zero-rebuild confirmation first (`-b 2048 -ub 1024`, 4 arms): prefill x1.317,
+ttft x1.134, decode x0.998 → +7.55%. Then the real patch (absorb to
+`n_ubatch + n_ubatch/8` = 576, so buffers grow 12.5% rather than 100%), 8 arms:
+**ttft x1.1367, prefill x1.3096, decode x1.0001 → +7.6%.**
+
+`llama-bench -p 534 -n 0 -r 1` under `rocprofv3`: **6989 → 3611 dispatches**,
+i.e. exactly the single-ubatch count, and pp534 2711.17 → 3349.56 t/s.
+
+**The batch-shape perplexity question, settled properly.** At `-c 534 -b 534
+-ub 512` the arms read 5.3031 vs 5.3163 (+0.249%), which looks like 2.5x the
+gate. It is not the patch's arithmetic — with the **unmodified b10237 binary**
+and only `-ub` changed, stock reads **5.3031 at `-ub 512`** and **5.3163 at
+`-ub 534`**. The candidate's absorbed reading *is* stock's own single-ubatch
+reading to every digit. The sign also flips at `--chunks 16` (−0.253%), so it is
+a draw rather than a bias, and the patch is bit-identical at `-ub 534` where it
+cannot fire and at the runner's `-c 512` gate where it provably cannot fire.
+Served path: 16/16 greedy byte-identical, `max |dlogprob| = 0.000e+00`.
+
+**Carry this**: when a batch-shape change moves the split-shape perplexity, ask
+what STOCK reads at the two shapes before concluding anything. If the candidate
+reproduces one of stock's own readings exactly, it has selected a batching, not
+changed a computation.
+
+### The composition rule this round bought
+
+Two patches, neither of which is worth much alone, that multiply:
+
+```
+0021 (server stops pre-chunking)   ranked +5.61%   and it UNLOCKS ->
+0022 (llama_context absorbs the tail)     +7.6% modelled
+```
+
+Before assuming a lever is dead because a sibling track measured it inert, check
+whether the thing that made it inert is itself removable.
