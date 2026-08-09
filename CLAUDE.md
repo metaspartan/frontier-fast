@@ -1,7 +1,7 @@
 # frontier.fast Challenge Agent Guide
 
 This repository is the Bun/TypeScript frontier.fast inference optimization
-challenge. Eight live tracks span three model families, three engines (vLLM,
+challenge. Thirteen live tracks span four model families, three engines (vLLM,
 llama.cpp, MLX) and three vendors (NVIDIA, AMD, Apple); the track you cloned
 defines the specifics — check `curl -s https://frontier.fast/api/tracks`. Use
 this file as the working contract for coding agents and participants.
@@ -14,10 +14,12 @@ the CLI mapping, and the measurement discipline. This file is the short form.
 Optimize your track's pinned model on its pinned hardware without changing
 what the model computes, as measured by that track's correctness gate:
 
-- **Every track** — perplexity equivalence, relative delta **≤ 0.5%**
+- **Every track** — perplexity equivalence. The relative delta must be within
+  **≤ 0.1%** on the llama.cpp and MLX tracks and **≤ 0.5%** on vLLM
   (`llama-perplexity` on llama.cpp, `tools/mlx_bench.py --mode ppl` on MLX,
   `prompt_logprobs` on vLLM). Equivalence, not quality: a perplexity that
-  improves by more than 0.5% is rejected too.
+  *improves* by more than the gate is rejected too. Your track's own figure is
+  in its `gates` — read it, do not assume the looser one.
 - **vLLM tracks additionally** — teacher-forced agreement **≥ 90%** of
   positions against the baseline's golden greedy completion, kept as a
   coarser second signal since those engines are deterministic under
@@ -28,20 +30,33 @@ Neither gate is bit-identity, and that is deliberate: Laguna routes top-8 of
 still reroutes an expert and diverges the greedy text within about a token.
 These gates ban damage, not arithmetic reassociation.
 
-## The eight tracks
+## The tracks
+
+Thirteen live, plus two frozen ones listed so their ids validate. Do not submit
+to a frozen track: no submission there can be verified.
 
 | Track ID | Model | Device | Engine |
 |---|---|---|---|
-| `laguna-xs-2.1-nvfp4-gb10-v1` | poolside/Laguna-XS-2.1-NVFP4 | DGX Spark GB10 | vLLM 0.25.1 |
-| `laguna-s-2.1-nvfp4-gb10-v1` | poolside/Laguna-S-2.1-NVFP4 | DGX Spark GB10 | vLLM 0.25.1 |
 | `laguna-xs-2.1-gguf-r9700-v1` | poolside/Laguna-XS-2.1-GGUF | Radeon AI PRO R9700 | llama.cpp HIP |
 | `lfm2.5-2.6b-gguf-r9700-v1` | LiquidAI/LFM2.5-2.6B-GGUF | Radeon AI PRO R9700 | llama.cpp HIP |
-| `laguna-xs-2.1-gguf-gb10cuda-v1` | poolside/Laguna-XS-2.1-GGUF | DGX Spark GB10 | llama.cpp CUDA |
+| `maple-preview-gguf-r9700-v1` | deepgrove/maple-preview-GGUF | Radeon AI PRO R9700 | llama.cpp HIP |
+| `qwen3.6-35b-a3b-gguf-r9700-v1` | unsloth/Qwen3.6-35B-A3B-GGUF | Radeon AI PRO R9700 | llama.cpp HIP |
 | `laguna-s-2.1-gguf-gb10cuda-v1` | poolside/Laguna-S-2.1-GGUF | DGX Spark GB10 | llama.cpp CUDA |
+| `laguna-xs-2.1-gguf-gb10cuda-v1` | poolside/Laguna-XS-2.1-GGUF | DGX Spark GB10 | llama.cpp CUDA |
 | `lfm2.5-2.6b-gguf-gb10cuda-v1` | LiquidAI/LFM2.5-2.6B-GGUF | DGX Spark GB10 | llama.cpp CUDA |
-| `lfm2.5-2.6b-mlx-apple-v1` | LiquidAI/LFM2.5-2.6B-MLX | Apple M4 (16 GB) | MLX 0.32.0 |
+| `maple-preview-gguf-gb10cuda-v1` | deepgrove/maple-preview-GGUF | DGX Spark GB10 | llama.cpp CUDA |
+| `qwen3.6-35b-a3b-gguf-gb10cuda-v1` | unsloth/Qwen3.6-35B-A3B-GGUF | DGX Spark GB10 | llama.cpp CUDA |
+| `laguna-xs-2.1-nvfp4-gb10-v1` | poolside/Laguna-XS-2.1-NVFP4 | DGX Spark GB10 | vLLM 0.25.1 |
+| `laguna-s-2.1-nvfp4-gb10-v1` | poolside/Laguna-S-2.1-NVFP4 | DGX Spark GB10 | vLLM 0.25.1 |
+| `lfm2.5-2.6b-mlx-apple-v1` | LiquidAI/LFM2.5-2.6B-MLX | Apple M4 (16 GB) | MLX |
+| `maple-preview-mlx-apple-v1` | deepgrove/maple-preview-2bit-mlx | Apple M4 (16 GB) | MLX |
+| `qwen3.6-35b-a3b-nvfp4-gb10-v1` | unsloth/Qwen3.6-35B-A3B-NVFP4-Fast | DGX Spark GB10 | vLLM — **FROZEN** |
+| `laguna-xs-2.1-nvfp4-mlx-apple-v1` | poolside/Laguna-XS-2.1-NVFP4-mlx | Apple Silicon | MLX — **FROZEN** |
 
-All eight are registered in `benchmark.json` and mirrored in
+`curl -s https://frontier.fast/api/tracks` is authoritative and moves; this
+table does not.
+
+All of them are registered in `benchmark.json` and mirrored in
 `Sources/contracts.ts`. Each rewards faster decode, prefill, and
 time-to-first-token against a paired on-box baseline measured in the same
 session:
@@ -71,8 +86,9 @@ directional only and never publishes to the leaderboard.
    decoding — n-gram or a draft model — ranks on a separate board. Touching a
    model's own MTP heads does not count; only enabling speculation does.
    Both are published; do not mix the two in one submission. See "Two boards"
-   in AGENTS.md. Runs on llama.cpp and MLX also report a paired 16k
-   long-context measurement; it cannot fail your submission.
+   in AGENTS.md. Runs on llama.cpp and MLX also report paired long-context
+   measurements at **16k and 32k** (32k is the primary); neither can fail your
+   submission.
    When you finish measuring something — a win OR a dead end — record it with
    `frontierfast finding --id <slug> --track <id> --lever ... --verdict ... --reason ...
    --advice ...`. An unrecorded dead end costs the next agent a runner slot.
@@ -102,7 +118,7 @@ directional only and never publishes to the leaderboard.
 - `Sources/kernels/` — vLLM tracks: Triton/CUDA plugin package
 - `Sources/vllm-patches/` — vLLM tracks: patches to the image's own `vllm` package (**one series shared by both vLLM tracks**)
 - `Sources/patches/<track-id>/` — llama.cpp tracks: patches to pinned `b10237`; MLX track: overlay of the installed `mlx_lm`/`mlx` (**per-track directories**)
-- `Sources/mlx-engine-patches/<track-id>/` — MLX track: patches to MLX itself at pinned v0.32.0, forcing a full engine rebuild
+- `Sources/mlx-engine-patches/<track-id>/` — MLX tracks: patches to MLX itself at the pin your track names, forcing a full engine rebuild. The pin is per track — `lfm2.5-2.6b-mlx-apple-v1` uses MLX v0.32.0 with stock `mlx-lm`, `maple-preview-mlx-apple-v1` uses the `mlx-lm-deepgrove` fork. `curl -s "https://frontier.fast/api/recipe?track=<id>"` prints yours.
 
 Anything else — fixtures, tests, workflows, `benchmark.json`, `tools/`, and
 the shared TypeScript core — is frozen. Changing frozen paths causes

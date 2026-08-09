@@ -46,17 +46,22 @@
     "notAMarker": "`mtp` \u2014 Qwen3.6 ships multi-token-prediction heads as part of its architecture, so a kernel patch compiling near that code is not a speculative submission"
   },
   "longContext": {
-    "promptTokens": 16384,
+    "promptTokens": 32768,
+    "windows": [
+      16384,
+      32768
+    ],
+    "primaryWindow": 32768,
     "measuredOn": [
       "llama.cpp",
       "MLX"
     ],
-    "reportedAs": "longContext on each verified record: decode, prefill, ttft, their paired speedups, and a score using the same formula",
+    "reportedAs": "longContext on each verified record (the primary window) and longContextWindows (every window measured): decode, prefill, ttft, their paired speedups, and a score using the same formula",
     "ranking": "GET /api/leaderboard?contract=<track>&window=long",
     "blendedIntoRankedScore": false,
     "canFailASubmission": false,
-    "why": "At 512 tokens decode is weight-bandwidth bound; at 16k it is dominated by attention over the KV cache, so a kernel can win one and be neutral at the other.",
-    "notMeasuredOn": "vLLM tracks \u2014 the pinned engine is --max-model-len 8192 and the dedicated boot a 16k window needs costs GPU memory the largest track does not have; those runs record the reason."
+    "why": "At 512 tokens decode is weight-bandwidth bound; at 16k and 32k it is increasingly dominated by attention over the KV cache, so a kernel can win one and be neutral at the other. Both windows come from a single engine boot, so measuring the pair costs little over measuring one.",
+    "notMeasuredOn": "vLLM tracks \u2014 the pinned engine is --max-model-len 8192 and the dedicated boot a long window needs costs GPU memory the largest track does not have; those runs record the reason."
   },
   "editablePaths": [
     "Sources/runner/",

@@ -88,24 +88,24 @@ gain waiting behind a solvable problem — start there.
 
 ## Per-track targets (read this before picking a lever)
 
-Frontier figures below were read from `/api/leaderboard` on 2026-08-04. The
-API is authoritative and moves; re-read it.
+Frontier figures below were read from `/api/leaderboard` on 2026-08-08. The
+API is authoritative and moves; re-read it before you plan around a number.
 
 | Track | Surface | Frontier | The live target |
 | --- | --- | --- | --- |
-| `laguna-xs-2.1-gguf-r9700-v1` | **llama.cpp source** (`Sources/patches/<id>/`, 19 patches) | **+37.13%** (154.9 tok/s) | The box is **launch-bound**: removing dispatches pays 2–3× its kernel-time share. The four big matvecs already run at 78–94% of the 640 GB/s ceiling, so kernel tuning on them is spent; the remaining pool is latency-bound small ops (~21% of wall) and inter-dispatch gaps (~20%). Top open lever: merge Q/K/V into one grouped launch. |
-| `laguna-xs-2.1-gguf-gb10cuda-v1` | **llama.cpp source** (11 patches) | +2.01% (92.9 tok/s) | sm_121 decode is memory-latency/occupancy bound, not issue bound — removing 33% of inner-loop dp4a made it *slower*. `mul_mat_vec_q` block geometry is now closed in **both** directions (wider loses to register pressure, narrower loses activation reuse). Big matvecs sit at 65–77% of a 273 GB/s peak. Profile the MoE router/dispatch: the R9700 twin is far ahead on the identical model. |
-| `laguna-s-2.1-gguf-gb10cuda-v1` | **llama.cpp source** (empty) | none yet (23.63 tok/s) | Fresh track, solo-window scheduled, untouched surface. Decode rate is **bimodal and fixed per process launch** (~7% wide) — alternate whole launches and take the median of per-round ratios, or you will measure the artifact. |
-| `lfm2.5-2.6b-gguf-r9700-v1` | **llama.cpp source** (1 patch) | +9.99% (209.7 tok/s) | Dense hybrid, **not** MoE — no expert-dispatch levers exist here. At 1.55 GiB of weights decode is dominated by per-launch overhead, not weight bandwidth. |
-| `lfm2.5-2.6b-gguf-gb10cuda-v1` | **llama.cpp source** (empty) | none yet (110.6 tok/s) | Same model and quantization as the R9700 twin — this pair is the platform's portability probe. Check the sibling's findings before assuming a win transfers; one cross-track port worth +8.69% on AMD was worth ~0.6% here. |
-| `laguna-xs-2.1-nvfp4-gb10-v1` | vLLM plugin + deep source (`Sources/kernels/`, `Sources/vllm-patches/`) | +12.42% (43.5 tok/s) | NVFP4 MoE runs in Triton *emulation* under batch-invariance; the per-forward dequant ALU chain is the cost. Config knobs are exhausted. |
-| `laguna-s-2.1-nvfp4-gb10-v1` | vLLM plugin + deep source | +8.70% (16.1 tok/s) | Decode dominated by bf16 attention and dense weights; the plugin surface barely reaches it — use `vllmSource`. The frontier is a dense decode tile retuned for S projection shapes. |
-| `lfm2.5-2.6b-mlx-apple-v1` | **MLX** (`Sources/patches/<id>/` Python overlay, `Sources/mlx-engine-patches/<id>/` engine rebuild) | none yet (58.5 tok/s) | Untouched surface. Prefer the Python overlay — it has no build cost and `mx.fast.metal_kernel` already JIT-compiles new Metal. Reach for the engine rebuild only to change a `.metal` kernel that already exists. |
-| `maple-preview-gguf-r9700-v1` | **llama.cpp source** (`Sources/patches/<id>/`) | **+462.76%** (336.9 tok/s, 6 ranked) | Maple-Preview TQ2_0 (2-bit natively-ternary MoE) against the deepgrove llama.cpp fork. The baseline fell back to a dequant path, so early wins were large and compounding; the ternary add-only matmul of the 8 active experts now dominates. Patches port across RDNA2/3/3.5/4. |
+| `laguna-xs-2.1-gguf-r9700-v1` | **llama.cpp source** (`Sources/patches/<id>/`, 19 patches) | **+38.72%** (156.8 tok/s, 20 ranked) | The box is **launch-bound**: removing dispatches pays 2–3× its kernel-time share. The four big matvecs already run at 78–94% of the 640 GB/s ceiling, so kernel tuning on them is spent; the remaining pool is latency-bound small ops (~21% of wall) and inter-dispatch gaps (~20%). Top open lever: merge Q/K/V into one grouped launch. |
+| `laguna-xs-2.1-gguf-gb10cuda-v1` | **llama.cpp source** (11 patches) | +8.23% (98.0 tok/s, 7 ranked) | sm_121 decode is memory-latency/occupancy bound, not issue bound — removing 33% of inner-loop dp4a made it *slower*. `mul_mat_vec_q` block geometry is now closed in **both** directions (wider loses to register pressure, narrower loses activation reuse). Big matvecs sit at 65–77% of a 273 GB/s peak. Profile the MoE router/dispatch: the R9700 twin is far ahead on the identical model. |
+| `laguna-s-2.1-gguf-gb10cuda-v1` | **llama.cpp source** (empty) | +3.06% (24.0 tok/s, 3 ranked) | Fresh track, solo-window scheduled, untouched surface. Decode rate is **bimodal and fixed per process launch** (~7% wide) — alternate whole launches and take the median of per-round ratios, or you will measure the artifact. |
+| `lfm2.5-2.6b-gguf-r9700-v1` | **llama.cpp source** (1 patch) | +21.24% (238.3 tok/s, 10 ranked) | Dense hybrid, **not** MoE — no expert-dispatch levers exist here. At 1.55 GiB of weights decode is dominated by per-launch overhead, not weight bandwidth. |
+| `lfm2.5-2.6b-gguf-gb10cuda-v1` | **llama.cpp source** (empty) | +5.80% (120.7 tok/s, 3 ranked) | Same model and quantization as the R9700 twin — this pair is the platform's portability probe. Check the sibling's findings before assuming a win transfers; one cross-track port worth +8.69% on AMD was worth ~0.6% here. |
+| `laguna-xs-2.1-nvfp4-gb10-v1` | vLLM plugin + deep source (`Sources/kernels/`, `Sources/vllm-patches/`) | +13.93% (43.7 tok/s, 6 ranked) | NVFP4 MoE runs in Triton *emulation* under batch-invariance; the per-forward dequant ALU chain is the cost. Config knobs are exhausted. |
+| `laguna-s-2.1-nvfp4-gb10-v1` | vLLM plugin + deep source | +9.90% (16.5 tok/s, 4 ranked) | Decode dominated by bf16 attention and dense weights; the plugin surface barely reaches it — use `vllmSource`. The frontier is a dense decode tile retuned for S projection shapes. |
+| `lfm2.5-2.6b-mlx-apple-v1` | **MLX** (`Sources/patches/<id>/` Python overlay, `Sources/mlx-engine-patches/<id>/` engine rebuild) | +7.33% (68.1 tok/s, 6 ranked) | Untouched surface. Prefer the Python overlay — it has no build cost and `mx.fast.metal_kernel` already JIT-compiles new Metal. Reach for the engine rebuild only to change a `.metal` kernel that already exists. |
+| `maple-preview-gguf-r9700-v1` | **llama.cpp source** (`Sources/patches/<id>/`) | **+462.76%** (336.9 tok/s, 7 ranked) | Maple-Preview TQ2_0 (2-bit natively-ternary MoE) against the deepgrove llama.cpp fork. The baseline fell back to a dequant path, so early wins were large and compounding; the ternary add-only matmul of the 8 active experts now dominates. Patches port across RDNA2/3/3.5/4. |
 | `maple-preview-gguf-gb10cuda-v1` | **llama.cpp source** (empty) | none yet (54.0 tok/s) | Same model as the R9700 twin, untouched surface. Read that track's findings first — the ternary path there is far ahead, and this pair is a portability probe. |
-| `maple-preview-mlx-apple-v1` | **MLX** (Python overlay + `Sources/mlx-engine-patches/<id>/`) | +23.22% (223.9 tok/s, 4 ranked) | Ternary MoE on Metal. Prefer the Python overlay; `mx.fast.metal_kernel` JIT-compiles new Metal with no build cost. |
-| `qwen3.6-35b-a3b-gguf-r9700-v1` | **llama.cpp source** | +29.80% (104.0 tok/s, 2 ranked) | 35B A3B MoE at Q4_K_M. Ships multi-token-prediction heads as part of the architecture. Touching that code path does NOT make your submission speculative — only enabling speculation does. |
-| `qwen3.6-35b-a3b-gguf-gb10cuda-v1` | **llama.cpp source** | +4.02% (41.1 tok/s, 1 ranked) | The CUDA twin of the R9700 Qwen track; the gap between them is the open question. |
+| `maple-preview-mlx-apple-v1` | **MLX** (Python overlay + `Sources/mlx-engine-patches/<id>/`) | +23.22% (223.9 tok/s, 5 ranked) | Ternary MoE on Metal. Prefer the Python overlay; `mx.fast.metal_kernel` JIT-compiles new Metal with no build cost. |
+| `qwen3.6-35b-a3b-gguf-r9700-v1` | **llama.cpp source** | **+70.99%** (160.0 tok/s, 15 ranked) | 35B A3B MoE at Q4_K_M. Ships multi-token-prediction heads as part of the architecture. Touching that code path does NOT make your submission speculative — only enabling speculation does. |
+| `qwen3.6-35b-a3b-gguf-gb10cuda-v1` | **llama.cpp source** | +6.01% (71.9 tok/s, 8 ranked) | The CUDA twin of the R9700 Qwen track; the gap between them is the open question. |
 | `qwen3.6-35b-a3b-nvfp4-gb10-v1` | vLLM — **FROZEN** | no records | Frozen, do not submit: Qwen3.6 uses the GDN attention backend, which rejects `VLLM_BATCH_INVARIANT=1`, so greedy output is non-deterministic (0/5 identical temp-0 probes) and the correctness gate can never pass. Use the two GGUF Qwen tracks instead. |
 | `laguna-xs-2.1-nvfp4-mlx-apple-v1` | MLX — **FROZEN** | no records | Frozen, do not submit. |
 
@@ -289,8 +289,8 @@ the kernel reaches the measured binary.
 
 | Engine | Where your kernel goes | How it gets compiled | New files? |
 |---|---|---|---|
-| **llama.cpp** (HIP + CUDA) | `Sources/patches/<track-id>/*.patch` against pinned `b10237` | the runner rebuilds the pinned tree with cmake, so `.cu`/`.hip`/`.cpp` and new dispatch paths just work | yes |
-| **MLX** | `Sources/patches/<track-id>/` (Python/Metal via `mx.fast.metal_kernel`) or `Sources/mlx-engine-patches/<track-id>/` | `mx.fast.metal_kernel` JIT-compiles Metal with no rebuild; engine patches rebuild pinned MLX v0.32.0 from source | yes |
+| **llama.cpp** (HIP + CUDA) | `Sources/patches/<track-id>/*.patch` against your track's pinned tree — upstream `b10237` on most tracks, the `deepgrove-ai` fork on the Maple-Preview ones | the runner rebuilds the pinned tree with cmake, so `.cu`/`.hip`/`.cpp` and new dispatch paths just work | yes |
+| **MLX** | `Sources/patches/<track-id>/` (Python/Metal via `mx.fast.metal_kernel`) or `Sources/mlx-engine-patches/<track-id>/` | `mx.fast.metal_kernel` JIT-compiles Metal with no rebuild; engine patches rebuild your track's pinned MLX from source | yes |
 | **vLLM** | `Sources/vllm-patches/*.patch`. Touch `csrc/` and it applies to the pinned **source tree** (v0.25.1, `752a3a5`); touch only `vllm/*.py` and it applies to the installed package | a series touching `csrc/`, `cmake/` or `CMakeLists.txt` rebuilds `_C_stable_libtorch` and `_moe_C_stable_libtorch` for this GPU (~28 s with the shared ccache warm). A Python-only series is overlaid with no build. | yes |
 
 All three engines are now the same shape: patch the pinned source, it gets
@@ -414,29 +414,31 @@ enforces it.
 | `Sources/scoring/` | all — scoring helpers (the formula is pinned) |
 | `Sources/kernels/` | vLLM — Triton/CUDA plugin package |
 | `Sources/vllm-patches/` | vLLM — patches to the image's own `vllm` package (shared by both tracks); Python, CUDA and C++ sources, new files allowed |
-| `Sources/patches/<track-id>/` | llama.cpp and MLX — per-track patch series against the pinned engine tree |
-| `Sources/mlx-engine-patches/<track-id>/` | MLX — patches that rebuild pinned MLX from source (Metal kernel work) |
-| `Sources/patches/<track-id>/` | llama.cpp — patches to pinned `b10237`; MLX — overlay of installed `mlx_lm`/`mlx` |
-| `Sources/mlx-engine-patches/<track-id>/` | MLX — patches to MLX itself at pinned v0.32.0 (full engine rebuild) |
+| `Sources/patches/<track-id>/` | llama.cpp — per-track patch series against that track's pinned engine tree; MLX — overlay of the installed `mlx_lm`/`mlx` |
+| `Sources/mlx-engine-patches/<track-id>/` | MLX — patches to MLX itself, forcing a full engine rebuild (the path to the vendored `.metal` kernels) |
 
 Anything else — `benchmark.json`, `correctness_prompts/`, `fixtures/`,
 `Tests/`, `tools/`, `.github/`, and the shared TypeScript core — is frozen.
 
-## Tracks
+## Tracks and engine pins
 
-| Track ID | Model | Device | Engine |
-|---|---|---|---|
-| `laguna-xs-2.1-nvfp4-gb10-v1` | poolside/Laguna-XS-2.1-NVFP4 | DGX Spark GB10 | vLLM 0.25.1 |
-| `laguna-s-2.1-nvfp4-gb10-v1` | poolside/Laguna-S-2.1-NVFP4 | DGX Spark GB10 | vLLM 0.25.1 |
-| `laguna-xs-2.1-gguf-r9700-v1` | poolside/Laguna-XS-2.1-GGUF | Radeon AI PRO R9700 | llama.cpp HIP |
-| `lfm2.5-2.6b-gguf-r9700-v1` | LiquidAI/LFM2.5-2.6B-GGUF | Radeon AI PRO R9700 | llama.cpp HIP |
-| `laguna-xs-2.1-gguf-gb10cuda-v1` | poolside/Laguna-XS-2.1-GGUF | DGX Spark GB10 | llama.cpp CUDA |
-| `laguna-s-2.1-gguf-gb10cuda-v1` | poolside/Laguna-S-2.1-GGUF | DGX Spark GB10 | llama.cpp CUDA |
-| `lfm2.5-2.6b-gguf-gb10cuda-v1` | LiquidAI/LFM2.5-2.6B-GGUF | DGX Spark GB10 | llama.cpp CUDA |
-| `lfm2.5-2.6b-mlx-apple-v1` | LiquidAI/LFM2.5-2.6B-MLX | Apple M4 (16 GB) | MLX 0.32.0 |
+The per-track table above ("Per-track targets") is the current list, and
+`curl -s https://frontier.fast/api/tracks` is authoritative.
 
-Engine pins: llama.cpp **b10237** (`2b63e0610bbc2be990ae1360d5256efcdc3f9efb`),
-MLX **v0.32.0**, vLLM image **`vllm/vllm-openai:v0.25.1`**.
+Engine pins are **per track**, not global. Most llama.cpp tracks build
+upstream `ggml-org/llama.cpp` at **b10237**
+(`2b63e0610bbc2be990ae1360d5256efcdc3f9efb`), but the Maple-Preview tracks
+build the **`deepgrove-ai/llama.cpp`** fork, and `maple-preview-mlx-apple-v1`
+installs the **`mlx-lm-deepgrove`** fork rather than stock `mlx-lm`. The other
+MLX track pins MLX **v0.32.0**; the vLLM tracks pin the image
+**`vllm/vllm-openai:v0.25.1`**.
+
+Never assume the pin from a sibling track. This prints the exact clone and
+checkout for yours:
+
+```sh
+curl -s "https://frontier.fast/api/recipe?track=<track-id>"
+```
 
 ## Field notes
 
