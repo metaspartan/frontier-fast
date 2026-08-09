@@ -1,6 +1,6 @@
 # laguna-xs-2.1-gguf-gb10cuda-v1 — patch series
 
-**Sixteen** patches, applied in order against pinned llama.cpp `b10237` and
+**Seventeen** patches, applied in order against pinned llama.cpp `b10237` and
 built `GGML_CUDA=ON, CMAKE_CUDA_ARCHITECTURES=121, Release`. Verified bank on
 this track is **1.0276**.
 
@@ -10,6 +10,7 @@ this track is **1.0276**.
 | 0012–0014 | topk sorted-list router + the two SM121 mmvq tables | round-1 submission, **verified 1.0276**; +0.4% decode vs stock on the healthy box (the +7.7% first reading was a degraded-era artifact) |
 | 0015 | `sm121-mmq-moe-j64-cap` | **+5.7% prefill** (5 interleaved toggle rounds), decode neutral |
 | 0016 | `cuda-sm121-wide-q4k-mmvq-vecdot` | **+9.51% decode** — the largest decode lever measured on this track |
+| 0017 | `server-hugepage-state-buffers` | **−9.3% ttft, +2.64% prefill**, decode neutral (12 alternating boots, arms disjoint within each launch mode) — the first non-kernel lever on this track |
 
 0016 is banked and unsubmitted. See the healthy-box status section below —
 the calibration warning that used to sit there is **withdrawn**, XS is
@@ -270,3 +271,91 @@ each model's decode is Q4_K: nearly all of LFM's, and only 40 of ~280 mmvq
 launches per token on qwen. **Q6_K cannot be widened at all** (210-byte
 blocks, 2-byte aligned `ql`/`qh`) and was measured neutral; **Q5_K should be
 widenable** (176-byte blocks, `qs` at offset 48) and is the open follow-up.
+
+
+# THE FIRST TTFT CENSUS ON GB10 — 14.4% of ttft was page faults
+
+Nobody had ever broken GB10's ttft into host versus GPU. Doing so on the ranked
+path (`llama-server` with the runner's exact flags, one cache-cold
+`/completion` at `n_predict=1`, prompt sized in **characters** at
+`GAINZ_PROMPT_CHARS = 2600`, 9 runs at indices 100–108, median as the runner
+takes it) finds a defect that is not in any kernel.
+
+| | laguna-xs | qwen3.6-35b-a3b | lfm2.5-2.6b |
+| --- | --- | --- | --- |
+| ttft wall | 354.1 ms | 400.9 ms | 92.6 ms |
+| engine `prompt_ms` | 302.8 ms | 333.2 ms | 84.9 ms |
+| **gap (host, no GPU)** | **50.9 ms (14.4%)** | **66.4 ms (16.6%)** | **7.4 ms (8.0%)** |
+| minor faults / request | 53,738 | 83,763 | **2,976** |
+| major faults / request | 0 | 0 | 0 |
+| `AnonHugePages` | **0 kB** | **0 kB** | 0 kB |
+
+The gap is `wall − prompt_ms − predicted_ms`, i.e. time the engine does not
+count as prompt processing at all. Zero major faults means none of it is disk;
+it is all first-touch on brand new anonymous pages. THP on this box is
+`madvise` with `hpage_pmd_size = 2097152`, and the server process was getting
+**no huge pages at all**, so ~210 MiB of new per-request host state was faulting
+in ~53,700 4 KiB pages — which at ~1 µs each is the whole 50.9 ms.
+
+Anonymous RSS grows **monotonically** at ~154 MB per bench cycle (660 MB →
+1731 MB over nine cycles on laguna-xs) even with `cache_prompt: false`, so the
+allocator never hands the same page back and the faults recur on every request.
+That is why a buffer pool cannot help here and why the fix has to change the
+**page size**, which is what `0017` does.
+
+## What the census rules out
+
+- **`llama-perplexity` is untouched by any of this.** It is byte-identical
+  across the patch, because checkpoints and the prompt cache are server-only.
+- **glibc arena retention is not a substitute.** Measured directly with
+  `MALLOC_MMAP_THRESHOLD_=1G MALLOC_TRIM_THRESHOLD_=1G` on laguna-xs, same
+  binary, same window: minor faults 53,738 → 37,443 and ttft 0.3418 → 0.3286
+  (−3.9%), against THP's 53,738 → 16,435 and −8.9%. Stacking both gives 15,630
+  faults and −8.3% — i.e. no better than THP alone. **THP does the work; the
+  allocator knob does not.**
+- **The residual 16,435 faults are not the mechanism.** They are allocations
+  below the 16 MiB advise threshold. ttft and prefill move only when
+  `AnonHugePages` moves.
+
+## Where it does NOT apply, measured
+
+**lfm2.5-2.6b-gguf-gb10cuda is dead.** That model's per-request host state is
+~12 MiB, it takes **2,976** minor faults per request against laguna-xs's 53,738,
+nothing clears the 16 MiB threshold, `AnonHugePages` stays 0 on every boot, and
+ttft is flat: off 0.09237 / 0.09259, on 0.09097 / 0.09285 over four alternating
+boots. **The lever is gated on KV/state size, not on the engine** — do not
+re-buy this on any small-state model.
+
+## The risk this carries on larger-state models — READ BEFORE PORTING
+
+`defrag` on this box is `madvise`, which means a `MADV_HUGEPAGE` fault does
+**synchronous direct compaction**. Because the prompt cache grows without bound,
+every request needs *fresh* huge pages forever, so compaction is a per-request
+cost and cannot be warmed away at startup.
+
+On **qwen3.6-35b-a3b** (327 MB of new state per request against laguna-xs's
+210 MB) this bites. Six qwen boots with the toggle on:
+
+| boot | ttft | minflt | AnonHugePages reached | verdict |
+| --- | --- | --- | --- | --- |
+| on1 | 0.4880 | 43,616 | 393 MB | **BAD** |
+| on2 | 0.3537 | 33,130 | 717 MB | good |
+| b_on1 | 0.4942 | 47,159 | 356 MB | **BAD** |
+| b_on2 | 0.3544 | 33,130 | 750 MB | good |
+| b_on3 | 0.3530 | 33,130 | 750 MB | good |
+| v_on | 0.3662 | 33,130 | 750 MB | good |
+
+against a very stable off arm at 0.3875–0.4097. The good boots are **−9 to
+−12%**; the bad ones are **+23%**, and `/proc/vmstat` on a live boot shows
+`compact_stall` with `compact_fail ≈ compact_stall` — the kernel burns time in
+compaction and *fails*, the process only reaches half the huge pages it wants,
+and the shortfall shows up as extra 4 KiB faults. A bad draw would put ttft
+speedup near **0.83, under the hard 0.90 floor**, so on qwen this is a
+**rejection risk, not just a smaller win**. 2 of 6 boots drew it.
+
+**laguna-xs does not draw it: 7 of 7 on-boots clean**, `AnonHugePages` reaching
+the same 761,856 kB every single time and minflt landing on 16,435 to the page.
+That is why 0017 ships here and is only *recorded*, not submitted, on qwen.
+Whoever picks up qwen needs a way to bound huge-page demand or to stop the
+prompt cache growing — and the latter is the declined checkpoint lever, so it
+is not simply available.

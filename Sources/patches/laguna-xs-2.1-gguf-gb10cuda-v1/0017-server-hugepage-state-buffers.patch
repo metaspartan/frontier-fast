@@ -1,0 +1,192 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sun, 9 Aug 2026 14:30:00 +0000
+Subject: [PATCH] server: huge-page the per-request host state buffers (-9.3%
+ ttft, +2.6% prefill)
+
+First TTFT census ever taken on GB10, on the ranked path (llama-server with the
+runner's exact flags, one cache-cold /completion at n_predict=1, prompt sized in
+characters at GAINZ_PROMPT_CHARS=2600). It finds the same defect the R9700 twin
+found, and the twin's fix ports unchanged.
+
+Census, laguna-xs, 9 ranked runs, control binary:
+
+    ttft wall            354.1 ms
+    engine prompt_ms     302.8 ms
+    gap (host, no GPU)    50.9 ms   = 14.4% of ttft
+    minor faults/request  53,738    (major faults 0)
+    AnonHugePages              0 kB
+
+53,738 first-touch faults at ~1 us each accounts for the entire 50.9 ms gap.
+THP on GB10 is "madvise" with a 2 MiB pmd size, and the server process was
+getting NO huge pages at all: llama-server hands out ~210 MiB of brand new host
+pages per request (one server_prompt_cache::alloc state plus two
+common_prompt_checkpoint update_tgt/update_dft buffers) and anonymous RSS grows
+monotonically, so the allocator never hands the same page back.
+
+std::vector::resize() value-initialises, so the first touch happens INSIDE
+resize() -- too late to advise. common_state_buf_resize() reserves first
+(allocate, do not touch), madvises the 2 MiB-aligned interior MADV_HUGEPAGE,
+and only then resizes. It over-reserves by one huge page so the aligned
+interior covers the whole logical range.
+
+Same binary, LLAMA_HUGEPAGE_STATE toggle, ranked-shape replica (2 warm cycles +
+9 measured, medians as the runner takes them). 12 boots strictly alternating
+across two launch modes -- this box has a per-launch fast/slow lottery, so each
+mode is classified against its own cluster:
+
+  slow-mode cluster (decode ~78 tok/s)
+    arm     ttft     prefill   decode   minflt   AnonHugePages
+    off1   0.36112   1779.5    78.15    53,738        0 kB
+    on1    0.32137   1825.4    78.06    16,435   761,856 kB
+    on2    0.31539   1842.6    78.42    16,435   761,856 kB
+    off2   0.35095   1776.3    78.38    53,738        0 kB
+    off3   0.35078   1787.8    78.27    53,738        0 kB
+    on3    0.32298   1835.7    78.53    16,567   761,856 kB
+
+  fast-mode cluster (decode ~92 tok/s)
+    off1   0.33785   1847.5    92.37    53,738        0 kB
+    on1    0.31148   1894.9    92.44    16,435   761,856 kB
+    off2   0.34242   1873.2    92.16    53,738        0 kB
+    on2    0.30822   1906.2    92.31    16,435   761,856 kB
+    off3   0.34193   1849.5    92.01    53,738        0 kB
+    on3    0.31141   1897.3    92.30    16,538   761,856 kB
+
+ttft 0.3475 -> 0.3151 (-9.3%), and the arms are DISJOINT within each mode --
+slow off spans 0.35078-0.36112 against on 0.31539-0.32298, fast off spans
+0.33785-0.34242 against on 0.30822-0.31148. 6/6 boots separated.
+prefill 1819.0 -> 1867.0 (+2.64%), also disjoint within each mode.
+decode 85.2 -> 85.3 (+0.14%), overlapping -- neutral, as expected.
+Modelled +2.1% of score.
+
+Firing is proven structurally, not by the timing: minor faults per request fall
+53,738 -> 16,435 (-69%) and AnonHugePages goes 0 -> 761,856 kB. The 16,435 that
+remain are allocations under the 16 MiB advise threshold and are NOT the
+mechanism -- prefill and ttft both move only when AnonHugePages moves.
+
+The gap the fix removes is host bookkeeping with no arithmetic in it: 50.9 ms
+-> 27.1 ms, measured as wall(ttft request) - prompt_ms - predicted_ms, i.e.
+entirely outside the engine's own timed region.
+
+Correctness: BYTE-IDENTICAL arithmetic. Rebuilt against the parent tree, the
+three artefacts that carry arithmetic are unchanged --
+
+    libggml-cuda.so   1c8dda0e5b11079f9992bb3f99c37f47   (identical)
+    libllama.so       ed20802f4e736cd3430f310925f6adb6   (identical)
+    llama-perplexity  65607a29e7fe14025afb267c41a0ba5a   (identical)
+
+-- only libllama-common.so and libllama-server-impl.so change. llama-perplexity
+being byte-identical means the perplexity gate cannot move by construction; the
+patch changes page size, not arithmetic.
+
+Not portable to every track on this box. Measured dead on lfm2.5-2.6b-gguf-gb10:
+that model's per-request host state is only ~12 MiB, minor faults are 2,976 per
+request against laguna-xs's 53,738, nothing clears the advise threshold,
+AnonHugePages stays 0 and ttft is flat at 0.0924 vs 0.0917 across four boots.
+The lever is gated on KV/state size, not on the engine.
+
+LLAMA_HUGEPAGE_STATE=0 restores plain resize().
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ common/common.cpp            | 33 +++++++++++++++++++++++++++++++--
+ common/common.h              |  9 +++++++++
+ tools/server/server-task.cpp |  4 ++--
+ 3 files changed, 42 insertions(+), 4 deletions(-)
+
+diff --git a/common/common.cpp b/common/common.cpp
+index ff27d392f..0655bec41 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -2123,6 +2123,35 @@ void common_prompt_checkpoint::clear() {
+     data_spec.clear();
+ }
+ 
++
++#if defined(__linux__)
++#include <sys/mman.h>
++#endif
++
++void common_state_buf_resize(std::vector<uint8_t> & buf, size_t n) {
++#if defined(__linux__) && defined(MADV_HUGEPAGE)
++    static const bool enabled = []() {
++        const char * e = getenv("LLAMA_HUGEPAGE_STATE");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    // 2 MiB is the THP size on every arch this ships on; below a few of them the
++    // fault count is too small for the alignment slack to pay for itself.
++    constexpr size_t ps = 2ull << 20;
++    if (enabled && n >= 8*ps && buf.capacity() < n) {
++        // over-reserve by one huge page so the whole logical range [data, data+n)
++        // is covered by the 2 MiB-aligned interior we are allowed to advise
++        buf.reserve(n + ps);
++        const uintptr_t p0 = (uintptr_t) buf.data();
++        const uintptr_t lo = (p0 + ps - 1) & ~(uintptr_t)(ps - 1);
++        const uintptr_t hi = (p0 + buf.capacity()) & ~(uintptr_t)(ps - 1);
++        if (hi > lo) {
++            madvise((void *) lo, (size_t) (hi - lo), MADV_HUGEPAGE);
++        }
++    }
++#endif
++    buf.resize(n);
++}
++
+ void common_prompt_checkpoint::update_pos(
+         int64_t n_tokens,
+         llama_pos pos_min,
+@@ -2142,7 +2171,7 @@ void common_prompt_checkpoint::update_tgt(
+ 
+     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+ 
+-    data_tgt.resize(ckpt_size);
++    common_state_buf_resize(data_tgt, ckpt_size);
+ 
+     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+     if (n != ckpt_size) {
+@@ -2160,7 +2189,7 @@ void common_prompt_checkpoint::update_dft(
+ 
+     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+ 
+-    data_dft.resize(ckpt_size);
++    common_state_buf_resize(data_dft, ckpt_size);
+ 
+     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
+     if (n != ckpt_size) {
+diff --git a/common/common.h b/common/common.h
+index 919c0ea10..ff35cf756 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -1103,6 +1103,15 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
+ // prompt utils
+ //
+ 
++// Resize a large host state buffer so that its first touch faults on transparent
++// huge pages instead of 4 KiB pages.  llama-server allocates ~199 MiB of brand
++// new host pages per request (one prompt-cache state + two context
++// checkpoints); std::vector::resize value-initialises them, so the cost is
++// ~51k first-touch faults, not the memset.  Reserving first lets us madvise the
++// mapping BEFORE anything touches it.  LLAMA_HUGEPAGE_STATE=0 restores plain
++// resize().
++void common_state_buf_resize(std::vector<uint8_t> & buf, size_t n);
++
+ struct common_prompt_checkpoint {
+     int64_t n_tokens;
+ 
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 7d4f60bd2..d26bbef80 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1710,8 +1710,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(server_prompt & prompt, s
+ 
+     // check if we can allocate enough memory for the new state
+     try {
+-        state_data_tgt.resize(state_size_tgt);
+-        state_data_dft.resize(state_size_dft);
++        common_state_buf_resize(state_data_tgt, state_size_tgt);
++        common_state_buf_resize(state_data_dft, state_size_dft);
+     } catch (const std::bad_alloc & e) {
+         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
+ 
+-- 
+2.53.0
+
