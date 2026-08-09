@@ -447,6 +447,37 @@ sorted-list kernel's occupancy interaction appears to cost more than the
 selection saves on sm_121 at this scale. XS result does not transfer.
 
 
+## Measured-dead: 0011 mmvf batched k-loads, ported alone (do not spend a slot)
+
+The family-stack result below left one member untested on its own: `0011`
+(`cuda-mmvf-batched-k-loads`) is the one bit-exact XS patch that applies to this
+track's base without colliding with the dispatcher this track's own `0001`
+rewrote, and a GGUF census said it should hit more work here than on XS — the
+F32 router `ffn_gate_inp` 3072×256 across **47** layers against XS's 39, plus
+BF16 experts in 8 layers (16.4% of elements). `u` ascending reproduces the
+original `col2 += block_size` accumulation order exactly, so it is
+bit-identical, which is what this track's agreement branch requires.
+
+**It is neutral.** Six interleaved ABBA whole-process rounds,
+`llama-bench -p 512 -n 64 -r 3`, control = 0001+0002, candidate = +0011, each
+arm classified against **its own** tg64 clusters (never the other arm's):
+
+| | control (0001+0002) | candidate (+0011) | same-mode ratio |
+| --- | --- | --- | --- |
+| fast mode | 25.873, 25.955, 25.960 | 25.956 | **1.0010** |
+| slow mode | 24.307, 24.342, 24.604 | 24.176, 24.380, 24.408, 24.551 | **0.9984** |
+
+Both modes land inside ±0.2%. One candidate round read **20.42** tok/s, far
+below either cluster, in the same round whose control read 600 pp512 — external
+contention, not a third mode; it is excluded above and including it would only
+make the result more negative.
+
+So the launch-count and k-load classes are now closed on Laguna S member by
+member, not just in aggregate: S's layers are large enough that the router
+matvec is a rounding error regardless of how many layers carry it. The
+prediction from launch counts was wrong for the same reason the family stack
+was — **count the bytes and the share of the token, not the launches.**
+
 ## Measured-neutral: the XS engine family stack (do not spend a slot)
 
 The XS gb10 family (dedupe, norm/rope/set-rows groups, quantize folds, mmvf

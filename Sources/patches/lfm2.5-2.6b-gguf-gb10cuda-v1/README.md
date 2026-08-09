@@ -158,6 +158,65 @@ most of it.** Anyone profiling here again: `ncu` is installed at
 `/usr/local/cuda-13.0/bin/ncu` but returns `ERR_NVGPUCTRPERM` — the counters
 are admin-restricted, so use the standalone probe plus census diffs instead.
 
+## Measured-dead: folding the MMQ-layout q8_1 quantize into its producer
+
+**The whole `quantize_mmq_q8_1` pool is L2-served, so there is no round trip to
+delete.** This closes the lever that used to be item 2 of "Open, in the order I
+would try them", which sized it at +6–8% prefill from a bandwidth argument. The
+bandwidth argument was wrong, and the number that shows it is in this README's
+own census — it just had to be read per instance instead of per bucket.
+
+The patch was built and is correct; it was not submitted because it loses.
+Construction: `glu_silu_quant_mmq_q8_1` emits the MMQ q8_1 blocks from the
+SwiGLU epilogue under `quantize_mmq_q8_1`'s own thread-to-element mapping
+(128-thread block, four consecutive columns per thread, `blockIdx.x` = row),
+with `mul_mat_q` collecting them from the existing quantized-src1 cache keyed
+additionally on `ds_layout`.
+
+**It fires everywhere and it is bit-exact.** Census diff at pp512, same binary,
+`GGML_CUDA_DISABLE_MMQ_QUANT_FOLD` toggled: `unary_gated_op_kernel` 58 → 29,
+`quantize_mmq_q8_1` DS4 292 → 276 and D4 34 → 21, and the two new fold kernels
+appear at 16 and 13 instances. All 29 GLU launches fold; 29 quantize launches
+disappear. Gate ppl is **22.7466 ± 2.12782 on all three arms** (fold on, fold
+off, and a separately built 13-patch control) — identical including the error
+bar, as construction requires.
+
+**And it buys exactly nothing, for a reason that is arithmetic:**
+
+| kernel | per instance |
+| --- | --- |
+| stock silu | 261.6 µs |
+| folded silu+quantize | **342.7 µs** (DS4), 343.8 µs (D4) |
+| the `quantize_mmq_q8_1` it removes | **80.8 µs** (DS4), 84.3 µs (D4) |
+
+The fold adds +81 µs to the SwiGLU and removes an 81 µs quantize. Total kernel
+time over the three affected kernels moves 23.53 ms → 23.62 ms (**+0.4%**), and
+pp512 measures **0.9895 median over 6 interleaved ABBA rounds, negative in
+6/6** (stock 8074–8173, fold 7981–8121 tok/s). Decode is untouched (tg128
+126.2–126.6 both arms) — mmvq never enters this path.
+
+**Why the read is free.** The removed quantize moves 22 MB of f32 in and 5.9 MB
+of q8_1 out in 80.8 µs = **345 GB/s**, which is above this box's measured DRAM
+ceiling of 251.6 GB/s. It is not reading DRAM: the f32 result is still
+L2-resident from the SwiGLU that wrote it microseconds earlier. There was never
+a 44 MB round trip. The separate launch only ever cost the quantization
+arithmetic itself, and the fold still has to do that arithmetic — so the work
+moves and nothing is saved. Meanwhile the SwiGLU runs 66 MB in 261.6 µs =
+**252 GB/s**, exactly at the roof, so it is bandwidth-saturated and cannot hide
+the added shuffles and stores behind anything.
+
+**This generalises to the rest of the pool, so do not re-buy the rms_norm half
+either.** The 276 surviving DS4 quantizes are the 2048-column ones fed by
+`rms_norm_pre_add_f32`; they move 5.3 MB in 17 µs = **312 GB/s**, also above the
+DRAM ceiling, also L2-served. Every `quantize_mmq_q8_1` on this track is reading
+L2, so folding any of them into any producer is work-neutral by construction.
+
+The general rule this establishes for GB10: **before folding a consumer into a
+producer to delete a round trip, divide that consumer's bytes by its time.** If
+the answer is above 251.6 GB/s the round trip is already in L2 and the fold can
+only lose — it keeps the arithmetic and gives up a launch's worth of
+independent scheduling.
+
 ## Dead levers — measured on this track, do not re-buy
 
 | lever | result |
@@ -204,6 +263,18 @@ Notes that cost real runner time to learn:
   memory contention and is not comparable to anything above.
 - **Never run `llama-bench` while a compile is running on this box** — it
   costs every arm a uniform ~8% and produced one discarded round tonight.
+- **`~/fable-lfm-gb10/series` on the runner box is NOT this series.** It is
+  missing `0013` entirely and the `vecdotq.cuh` / `mmvq.cu` halves of `0012`,
+  i.e. it is the ~11-patch family. Any A/B taken against it is against the
+  wrong parent. Build the control with
+  `git archive 2b63e06 | tar -x` followed by this directory's patches — that
+  applies clean and is what `base13` in the 2026-08-09 session is. Two other
+  traps in the same family: `cp -a` of a configured tree keeps
+  `CMAKE_HOME_DIRECTORY` pointing at the **original** source dir, so
+  `cmake --build` silently recompiles the tree you copied *from* and leaves
+  your edits unbuilt (check `grep CMAKE_HOME_DIRECTORY build/CMakeCache.txt`);
+  and `pkill -f <script>` over ssh matches the remote shell running your own
+  command and kills your session.
 
 ## The 11-patch family (0001–0011)
 
@@ -228,12 +299,9 @@ memory-contended conditions noted above.
    overload and the wide `vec_dot_q4_K_q8_1` need adding — and pin their
    `should_use_small_k` predicate to the *stock* vdr so the `rows_per_block`
    decision does not move at the same time.
-2. **Prefill**: `unary_gated_op_kernel` (silu) is **12.9% of pp512** and
-   `quantize_mmq_q8_1` another **6.9%** — the glu writes f32 and a separate
-   pass reads it back to build the MMQ-layout q8_1. 0008 already folds the
-   *mmvq*-layout quantize into the glu; extending
-   `ggml_cuda_norm_quant_register` to the MMQ layout would delete ~44 MB of
-   round-trip per layer. Worth ~6–8% prefill.
+2. ~~**Prefill**: fold the MMQ-layout quantize into the glu~~ — **built,
+   measured, DEAD (−1.05% prefill). See the section below.** The round trip
+   it was supposed to delete does not exist: it is served by L2.
 3. The conv-block bookkeeping (`k_get_rows_float` 86 µs, `k_bin_bcast` 82 µs,
    `concat_cont` 44 µs, `cpy_scalar` 37 µs per token) — the R9700 0030
    recurrent-state identity view is the model, but the whole pool is ~2.5%.
