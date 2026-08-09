@@ -4913,3 +4913,44 @@ were cleared alone by the round-43b bisect, but not in combination with 0008's
 rewritten graph). Note also that the fold is a genuine reassociation, not a
 bit-exact transform, so "0008 on" and "0008 off" are not expected to agree — the
 defect is that "0008 on" does not agree *with itself*.
+
+## Round 47d: the MoE J-cap is worth 21.6%, and the tail's J floor is still open
+
+Following the tail-ubatch surface. At the 22-token tail, 0023's cap computes
+`cols_per_expert = ceil(176/256) = 1`, `target = 2` and then floors it:
+`if (target < 16) target = 16`. So J = 16 and `ntx = ceil(22/16) = 2` — 32
+columns of MMA work for a tile whose experts hold about one token each. The
+uncapped choice would have been J = 24, `ntx = 1`, i.e. 24 columns. On that
+arithmetic the floor *costs* work at the tail even though the cap wins overall.
+
+Zero-rebuild probe of the gradient (`GGML_CUDA_DISABLE_MMQ_MOE_J=1`,
+`min_cols=8`, 3 rounds interleaved):
+
+```
+J-cap ON   pp534 4085.82 4082.10 4051.45  mean 4073.12   pp512 4910.50 4896.63 4913.50  mean 4906.88
+J-cap OFF  pp534 3332.44 3329.51 3290.01  mean 3317.32   pp512 3866.25 3843.66 3828.95  mean 3846.29
+                 -18.6%                                        -21.6%
+```
+
+**The cap is worth 21.6% at pp512, which has no tail at all**, so this knob
+cannot isolate the tail: turning it off wrecks the 512-token ubatch far more
+than it could ever help the 22-token one. J sensitivity is steep in both
+directions, which is consistent with 0023's "2 is a sharp optimum".
+
+What this does establish, and what the next agent should pick up:
+
+- The `target < 16` floor is the only thing setting J at the tail, and it is not
+  reachable from any env knob. Testing J = 8 there needs a rebuild.
+- The correctness profile is favourable and mirrors 0056's. The floor only binds
+  when `cols_per_expert < 8`, i.e. fewer than 256 tokens in the ubatch. The
+  runner gate shape is one ubatch of 512, where `cols_per_expert = 16` and
+  `target = 32` — well clear of the floor. So lowering the floor should be
+  **bit-identical at the gate**, exactly as `min_cols` is, and must therefore be
+  verified at a shape that actually splits (`-c 534 -b 534 -ub 512`), never at
+  `-c 512` alone.
+- Size of the prize: the tail-shape `mul_mat_q` classes are 10.58 ms/pass
+  (4096 blocks x 80 = 6.47 ms, 16384 x 40 = 4.11 ms). Score sensitivity to a
+  tail saving of D ms is about `0.20*D/79.5 + 0.15*D/195 = 0.33% per ms`, so
+  clearing the ~1.5% still needed means finding about **4.6 ms**. A 16 -> 8 floor
+  cuts tail MMA columns from 32 to 24 (-25%), which is in range but not
+  guaranteed, since fewer columns per tile also means more tiles.
