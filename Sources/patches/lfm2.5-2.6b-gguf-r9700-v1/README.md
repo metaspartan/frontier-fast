@@ -297,3 +297,37 @@ The round-1 census stands: 347.5 dispatches/token, matvecs closed on bandwidth,
 the attackable pool is `quantize_q8_1` (60/token) and `rms_norm_pre_add`
 (61/token). The co-launch / guest-relocation family from the qwen series has
 never been tried on this graph.
+
+### 0013 — the prompt cache pays to fill itself and never hits
+
+The same shape as 0012, one layer up. `get_available_slot()` runs
+`prompt_save()` on every slot reuse — a full `llama_state_seq_get_data_ext` of
+the sequence state — and on non-overlapping traffic
+`server_prompt_cache::load()` never finds an `it_best`. On this model that is
+2,761 minor faults and ~11 MiB per request, against a **59 ms** total, which is
+why it is worth more here than the fault count suggests: this track's algebra
+gives a ttft-only saving +0.10% of score per millisecond.
+
+`--cache-ram 0` priced it at +2.29%; the adaptive form measures **ttft x1.1179,
+prefill x1.0678, decode x0.9906 → +2.37%**, with the ttft and decode arms both
+fully disjoint. Gate 22.5182 = stock, served path 16/16 greedy byte-identical
+with `max |dlogprob| = 0` — unlike 0012 there is no batch-shape question here,
+because nothing about how the prompt is evaluated changes.
+
+### Measured and DECLINED: tail-ubatch absorption
+
+The sibling `laguna-xs` track took +6.48% ranked from absorbing the trailing
+ubatch, unlocked by 0012. Ported and measured here: **ttft x1.0253, prefill
+x1.0330, decode x0.9984 → +0.92%.** LFM2.5 is dense, so its 19-token tail costs
+almost nothing — the whole MoE second-expert-sweep mechanism is absent.
+
+It is **not shipped**, and the reason is worth carrying. At the split shape
+(`-c 534 -b 534 -ub 512`) the arms read 19.4218 vs 19.2504, **−0.883%**. That is
+stock's own number — unmodified b10237 reads 19.4218 at `-ub 512` and 19.2504 at
+`-ub 534` — and the runner's `-c 512` gate is bit-identical, so it would pass.
+But the platform's stated equivalence band is 0.5% **in both directions**
+("a perplexity that improves by more than 0.5% is rejected too"), and 0.883%
+is outside it. LFM2.5's recurrent scan is simply much more shape-sensitive than
+Laguna's attention stack: the same probe on Laguna reads 0.249%. **+0.9% is not
+worth shipping something the platform's own equivalence rule would reject if it
+measured at the shape the change actually affects.**

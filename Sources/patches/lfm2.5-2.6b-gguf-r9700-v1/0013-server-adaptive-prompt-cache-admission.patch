@@ -1,0 +1,154 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sun, 9 Aug 2026 22:00:00 +0000
+Subject: [PATCH] server: adaptive prompt-cache admission -- a cache with a zero
+ hit rate should stop paying to fill itself (+2.4% score)
+
+`get_available_slot()` calls `prompt_save()` on every slot reuse, which runs a
+full `llama_state_seq_get_data_ext` of the slot's sequence state into a freshly
+resized `std::vector`. It is the single largest host cost left in a request:
+**2,761 minor faults per ranked request on this model, about 11 MiB of first-touch host memory, against a total request of only 59 ms**.
+
+That store only ever pays for itself if a later request finds a cached entry
+sharing enough of a prefix for `server_prompt_cache::load()` to pick an
+`it_best`. When prompts do not overlap, the hit rate is exactly zero and the
+fill cost is pure loss, forever.
+
+`admit()` makes the store demand-driven with the same credit shape as 0021:
+storing is allowed while there is credit, any hit refills it to 4, a reuse that
+produced no hit spends one, and a probe entry is admitted every 64 dry reuses so
+a workload that starts sharing prefixes recovers on its own.
+
+The **load** path is untouched: entries already held stay searchable, so the
+cache never becomes stale-but-unreadable. And a slot's own prompt continuity
+does not go through this cache at all -- a repeated prompt still hits the slot's
+`prompt.tokens` prefix reuse -- so the case users actually notice is unaffected.
+`LLAMA_ADAPTIVE_PROMPT_CACHE=0` restores stock and is the A/B toggle below.
+
+Measured on the trusted-runner box against the current verified frontier, same
+binary with the env toggle, **8 arms interleaved off/on/on/off/off/on/on/off**,
+ranked-harness replica, 9 measured runs each:
+
+| arm | TTFT | prefill tok/s | decode tok/s | minflt / ttft req |
+|---|---:|---:|---:|---:|
+| off | 0.05926 | 11744.2 | 237.71 | 2761 |
+| on  | 0.05327 | 12261.1 | 235.72 | 38 |
+| on  | 0.05312 | 12293.9 | 235.38 | 38 |
+| off | 0.05952 | 11334.1 | 237.79 | 2757 |
+| off | 0.05942 | 11665.4 | 237.75 | 2761 |
+| on  | 0.05333 | 12273.6 | 235.03 | 38 |
+| on  | 0.05312 | 12305.7 | 235.60 | 38 |
+| off | 0.05951 | 11342.5 | 237.20 | 2757 |
+
+Medians **ttft 0.059465 -> 0.053195 (x1.1179), prefill 11504.0 -> 12283.8
+(x1.0678), decode 237.73 -> 235.49 (x0.9906)**. Both the ttft and the decode
+arms are fully disjoint, in opposite directions. Modelled score
+`0.9906^0.65 x 1.0678^0.20 x 1.1179^0.15` = **+2.37%**.
+
+Correctness:
+
+* Only `libllama-server-impl.so` changes. `libggml-hip.so.0`, `libllama.so.0`
+  and the `llama-perplexity` executable are not rebuilt and the symbols added
+  are unreachable from the perplexity path, so the gate is bit-identical by
+  construction. Runner's exact gate command
+  (`-ngl 99 -c 512 --chunks 8`, no `-b`/`-ub`), stock 2 loads / candidate 3
+  loads in one session: **22.5182** on every load, both arms.
+* Served path: 16 varied prompts x 64 greedy tokens through `llama-server`,
+  both arms of the same binary: **16/16 byte-identical**, sampled-token logprobs
+  agreeing at **max |dlogprob| = 0.000e+00**. Nothing numeric changes -- on this
+  traffic the cache produced no hits under either arm, so the only difference is
+  whether the state was copied out and thrown away.
+* Firing proven by fault count, not by a clock: minor faults per ttft request
+  **2,761 -> 38** (and 453 -> 40 on the full request).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 4655b518e..b18e5490c 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1671,7 +1671,11 @@ private:
+ 
+                 const int64_t t_start = ggml_time_us();
+ 
+-                ret->prompt_save(*prompt_cache);
++                // [gainz] adaptive admission: skip the state copy while this cache
++                // is not producing hits.  The load below is unaffected.
++                if (prompt_cache->admit()) {
++                    ret->prompt_save(*prompt_cache);
++                }
+ 
+                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                     ret->prompt_clear();
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 070f1ade2..41fc6c6cd 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1810,6 +1810,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+         prompt = std::move(it_best->prompt);
+ 
+         states.erase(it_best);
++
++        // [gainz] this cache just paid for itself -- see admit()
++        last_hit = true;
+     }
+ 
+     return true;
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 411d91807..58f9a12b9 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -650,6 +650,53 @@ struct server_prompt_cache {
+ 
+     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+ 
++    // [gainz] adaptive admission.
++    //
++    // Filling this cache costs a full llama_state_seq_get_data_ext of the slot's
++    // sequence state on every slot reuse -- tens to hundreds of MiB per request
++    // on a large-context model, all of it first-touch host memory.  It only pays
++    // for itself if a later request finds a cached entry that shares enough of a
++    // prefix (`load()` picking an `it_best`).  On traffic where prompts do not
++    // overlap the hit rate is exactly zero and the fill cost is pure loss.
++    //
++    // A cache with a zero hit rate should stop paying to fill itself: `admit()`
++    // suspends the store after a run of misses, any hit restores it in full, and
++    // a probe entry is admitted periodically so a workload that starts sharing
++    // prefixes recovers on its own.  The LOAD path is untouched -- entries
++    // already held stay searchable, and a slot's own prompt continuity does not
++    // go through this cache at all.
++    bool adaptive = [] {
++        const char * e = getenv("LLAMA_ADAPTIVE_PROMPT_CACHE");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    int  credit    = 2;
++    int  idle      = 0;
++    bool last_hit  = false;
++
++    static const int CREDIT_MAX  = 4;
++    static const int PROBE_EVERY = 64;
++
++    bool admit() {
++        if (!adaptive) {
++            return true;
++        }
++
++        if (last_hit) {
++            credit   = CREDIT_MAX;
++            idle     = 0;
++            last_hit = false;
++        } else if (credit > 0) {
++            credit--;
++        }
++
++        if (credit == 0 && ++idle >= PROBE_EVERY) {
++            credit = 1;
++            idle   = 0;
++        }
++
++        return credit > 0;
++    }
++
+     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+ 
+     void update();

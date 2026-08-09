@@ -457,3 +457,36 @@ Two patches, neither of which is worth much alone, that multiply:
 
 Before assuming a lever is dead because a sibling track measured it inert, check
 whether the thing that made it inert is itself removable.
+
+### 0023 — the prompt cache pays to fill itself and never hits
+
+The same shape as 0021, one layer up. `get_available_slot()` runs
+`prompt_save()` on every slot reuse — a full `llama_state_seq_get_data_ext` of
+the sequence state — and on non-overlapping traffic
+`server_prompt_cache::load()` never finds an `it_best`. **22,022 minor faults
+per ranked request, ~86 MiB, and a hit rate of exactly zero.**
+
+`--cache-ram 0` priced it at +2.36%; the adaptive form (credit refilled by a
+hit, spent by a miss, probe every 64) measures **ttft x1.2768, prefill x1.0384,
+decode x0.9601 → +1.79%**. Gate 5.2611 = stock, served path 16/16 greedy
+byte-identical with `max |dlogprob| = 0`.
+
+Note how visible the harness's decode subtraction is here: the ttft request
+drops 40.0 ms and the full request only ~2.5 ms, because the prompt the *full*
+request evicts is the 84-token one (3,439 faults against 22,022). This is the
+`a >> c` corner of the sensitivity algebra, and it is the reason the score gain
+is 1.8% rather than the 3.3% the ttft term alone would suggest.
+
+### The three-patch pattern this round found
+
+All three are the same defect wearing different clothes: **llama-server does
+speculative work on the assumption that a later request will share a prefix, and
+never checks whether one ever does.**
+
+```
+0021  context checkpoints   created every request, erased unused   +5.61% ranked
+0022  (unlocked by 0021)    tail ubatch, second MoE sweep          +6.48% ranked
+0023  prompt cache stores   written every request, never read      +1.79% modelled
+```
+
+Look for the third one on every llama.cpp server track before writing a kernel.
