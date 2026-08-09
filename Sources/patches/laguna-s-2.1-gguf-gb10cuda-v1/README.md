@@ -7,30 +7,79 @@ Applied in order against pinned llama.cpp **b10237**
 | --- | --- | --- |
 | 0001 | `cuda-mmvq-group-same-activation-matvecs` | **+1.868% decode** (in-process paired A/B, 12 rotated cycles, no-op floor 0.99994) |
 | 0002 | `sm121-mmq-moe-j64-cap` | **+4.47% prefill** (median of same-mode interleaved toggle rounds; decode neutral — the cap is MMQ/prefill-only) |
-| 0003–0005 | sm_121 mmvq tables + **wide Q4_K mmvq vec_dot** | **+3.2% decode** (same-mode medians +3.09% / +3.31%, arms disjoint within mode); prefill neutral. **Verified on the trusted runner: score 1.050258** |
+| 0003 | `laguna-attn-gate-graph-order-pin` | bit-identical; see its section |
 
-The verified frontier on this track is **1.050258** (was 1.030637). Stock
-baseline is 23.627 tok/s decode, 343.1 tok/s prefill, 0.66 s TTFT.
+The verified frontier on this track is **1.030637** (0001+0002). Stock baseline
+is 23.627 tok/s decode, 343.1 tok/s prefill, 0.66 s TTFT.
 
-### 0003–0005 as the trusted runner measured it
+# READ THIS FIRST: this track enforces GREEDY-OUTPUT AGREEMENT, not just perplexity
 
-Worth recording because it validates the local protocol below. Paired rounds
-against stock: **1.0544 / 1.0391 / 1.0482**, spread 0.0153, median **1.0482**.
-The local same-mode analysis predicted the runner would read
-`1.0187 (0001) × 1.032 (this patch) = 1.051`; it read 1.0482, and the score
-came in at 1.050258 against a projection of ~1.0497.
+**A patch that passes both perplexity gates can still be rejected**, and one of
+mine was. This is the single most expensive thing to learn here, so it is at the
+top.
 
-Had the naive three-round reading been published instead, the same prediction
-would have been `1.0187 × 1.09 = 1.11` — off by five points. **The same-mode
-protocol is what made the local number predictive.**
+`s-gb10-sm121-wide-q4k-vecdot-r1` (the sm_121 wide Q4_K mmvq vec_dot, formerly
+0003–0005 of this series) was **REJECTED**:
 
-Long-context arms (published, not gated): 16350 tok 21.56 → 22.44 (+3.85%),
-32743 tok 19.80 → 20.52 (+3.93%). Both positive and consistent with the short
-window. Text diverges there, as expected for a non-bit-identical float
-regrouping on top-8-of-256 routing — this patch touches neither KV indexing nor
-RoPE, so the divergence carries no bug signal.
+```
+status        = rejected
+statusReason  = correctness gate failed - agreement over 11 short fixtures: 43.8%
+                (fixture divergence points: 0%, 47%, 49%, 4%, 2%, 100%, 100%,
+                 65%, 7%, 7%, 100%)
+measured      = score 1.0502577, decode 1.0482, prefill 1.0518, ttft 1.0574
+```
 
-## 0003–0005: the sm_121 wide Q4_K mmvq vec_dot (+3.2% decode)
+The timing was real and excellent — the runner computed a **1.0502577** score,
+which would have been this track's frontier. It was thrown away on correctness.
+
+**The patches were removed from this series** (commit that follows this README
+edit). They are not merely unrewarded: the runner applies the *whole* track
+series, so leaving them in would have failed the agreement gate on every future
+submission from this track regardless of what the new patch did.
+
+### The stale guidance that caused it
+
+Every GB10 README in this repo — including this one — carried some form of
+"perplexity is the arbiter" and treated greedy divergence on a top-8-of-256 MoE
+as *expected and acceptable*. The laguna-xs twin's 0016 section says so
+explicitly ("1/6 byte-exact … Perplexity is the arbiter"), and that patch was
+**verified** under the older regime. That is no longer true. Both readings can
+be immaculate and the submission still dies:
+
+| gate | this patch | verdict |
+| --- | --- | --- |
+| gate-shape ppl `-c 512 --chunks 8` | 4.7508 both arms, **0.000%** | pass |
+| decode-path ppl `-b 512 -ub 1`, 15 chunks | 5.7682 → 5.7669, **−0.023%** | pass |
+| greedy agreement, 11 fixtures | **43.8%** | **REJECT** |
+
+The signal was in my own harness before I submitted: the server-greedy check
+reported **6/6 completions diverging**. I read that against the READMEs' advice
+instead of treating it as the gate it now is.
+
+### What to do instead
+
+**Treat bit-identity as the requirement on this track, not as a nice-to-have.**
+Before spending a runner slot, ask whether the change moves any addition between
+lanes or reorders any reduction. If it does, on a 256-expert top-8 router it will
+reroute an expert within a token or two and agreement will collapse — 43.8% here,
+with 4 of 11 fixtures diverging in the first 7% of their output.
+
+A float-reassociation lever is now worth a slot only if you can make it exact.
+For the wide `vec_dot` specifically you cannot: the two columns genuinely live in
+different lanes at stock `vdr`, so the addition that moves cannot be moved back
+(the lfm2.5 README's 0038-trick note explains why).
+
+**Cross-track warning.** `laguna-xs` 0016, `lfm2.5` 0012 and `qwen3.6` 0017 are
+the same lever and are all still in their series, verified under the older
+regime. If the agreement gate applies to them as it did here, those series are
+blocked for future submissions until the patch is dropped. Verify before
+spending a slot on any of those tracks.
+
+## The rejected 0003–0005: the sm_121 wide Q4_K mmvq vec_dot (+3.2% decode)
+
+Kept as a record because the *timing* result and the measurement protocol are
+sound and reusable; only the exactness was unacceptable. The patch files
+themselves have been removed from this directory.
 
 Port of the lever that is `0016` on laguna-xs gb10cuda (+9.51%), `0012` on
 lfm2.5 gb10cuda (+7.76%) and `0017` on qwen3.6 gb10cuda (+1.77%). Stock
@@ -91,8 +140,11 @@ the only reason that did not happen. **Classify each arm against its own
 historical tg64 clusters, never against the other arm's, and never stop a
 whole-process A/B on this track at three agreeing rounds.**
 
-### Correctness
+### Correctness (both perplexity gates passed — and it was rejected anyway)
 
+- **greedy agreement, the gate that actually decided it**: 43.8% over 11 short
+  fixtures. My local server-greedy check had already reported 6/6 completions
+  diverging; I recorded that as expected-for-this-model instead of disqualifying.
 - **gate-shape ppl** (`-c 512 --chunks 8`, runner corpus): **4.7508 ± 0.27989
   on both arms**, identical to five significant figures including the error
   bar, and equal to the stock gate value this README already records. This is
