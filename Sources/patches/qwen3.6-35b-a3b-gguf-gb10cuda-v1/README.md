@@ -288,3 +288,64 @@ restores the rolled loop.
   exactly eaten by the target types' lower dense-shape kernel efficiency
   (Q6_K dense mmvq runs near the LPDDR5 ceiling; Q5_K/Q5_1 dense do not).
   Byte cuts only pay when the destination kernel is at least as efficient.
+
+# TTFT census: 16.6% is page faults — a bigger prize than laguna-xs, and it is BLOCKED
+
+The GB10 TTFT census (2026-08-09; full version in the laguna-xs README) measured
+this track too, and **qwen has the largest ttft prize of the four GB10 tracks and
+the one that cannot currently be collected.**
+
+Ranked-path census, `llama-server` with the runner's exact flags, one cache-cold
+`/completion` at `n_predict=1`, `GAINZ_PROMPT_CHARS = 2600`, median of 9:
+
+| | qwen3.6-35b-a3b | laguna-xs | lfm2.5 |
+| --- | --- | --- | --- |
+| ttft wall | 400.9 ms | 354.1 ms | 92.6 ms |
+| engine `prompt_ms` | 333.2 ms | 302.8 ms | 84.9 ms |
+| **host gap** | **66.4 ms (16.6%)** | 50.9 ms (14.4%) | 7.4 ms (8.0%) |
+| minor faults / request | **83,763** | 53,738 | 2,976 |
+| major faults / request | 0 | 0 | 0 |
+| `AnonHugePages` | 0 kB | 0 kB | 0 kB |
+
+Zero major faults, so none of the gap is disk — it is all first touch on new
+anonymous pages, and the process was getting no huge pages at all.
+
+## Why the laguna-xs fix (`0017`) is not submitted here
+
+`/sys/kernel/mm/transparent_hugepage/defrag` on this box is **`madvise`**, so a
+`MADV_HUGEPAGE` fault does **synchronous direct compaction**. qwen's per-request
+state is **327 MB against laguna-xs's 210 MB**, and because the prompt cache
+grows without bound, every request needs *fresh* huge pages — the compaction is a
+**per-request** cost and cannot be warmed away at startup.
+
+Six on-boots with the `LLAMA_HUGEPAGE_STATE` toggle, against a very stable off
+arm at **0.3875–0.4097**:
+
+| boot | ttft | minflt | AnonHugePages reached | |
+| --- | --- | --- | --- | --- |
+| on1 | 0.4880 | 43,616 | 393 MB | **BAD** |
+| on2 | 0.3537 | 33,130 | 717 MB | good |
+| b_on1 | 0.4942 | 47,159 | 356 MB | **BAD** |
+| b_on2 | 0.3544 | 33,130 | 750 MB | good |
+| b_on3 | 0.3530 | 33,130 | 750 MB | good |
+| v_on | 0.3662 | 33,130 | 750 MB | good |
+
+Good boots are **−9 to −12% ttft**; bad boots are **+23%**. `/proc/vmstat` on a
+live boot shows `compact_fail ≈ compact_stall` — the kernel burns time compacting
+and **fails**, the process reaches only half the huge pages it wants, and the
+shortfall reappears as extra 4 KiB faults. A bad draw puts ttft speedup near
+**0.83, under the hard 0.90 floor**: this is a **rejection risk, not a smaller
+win**. 2 of 6 boots drew it. laguna-xs never does — 7 of 7 on-boots landed on
+exactly 761,856 kB and minflt 16,435.
+
+## What would unlock it
+
+Bound the huge-page demand, or stop the prompt cache growing. **The second is the
+declined checkpoint-suppression lever and is not available.** For the first,
+note that a buffer pool cannot help — anonymous RSS grows monotonically, so
+nothing is freed to recycle — and glibc arena retention was measured on
+laguna-xs at only −3.9% ttft against THP's −8.9%, and adds nothing on top of it.
+
+**When testing any THP lever on this box, sample `/proc/vmstat`
+`compact_stall` / `compact_fail` / `thp_fault_fallback` around each request.** A
+stalling boot is visible there before it is visible in the timing.

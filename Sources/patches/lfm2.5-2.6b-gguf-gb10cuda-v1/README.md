@@ -369,3 +369,34 @@ memory-contended conditions noted above.
 3. The conv-block bookkeeping (`k_get_rows_float` 86 µs, `k_bin_bcast` 82 µs,
    `concat_cont` 44 µs, `cpy_scalar` 37 µs per token) — the R9700 0030
    recurrent-state identity view is the model, but the whole pool is ~2.5%.
+
+# TTFT is already almost all engine time here — measured, nothing to take
+
+The GB10 TTFT census (2026-08-09; full version in the laguna-xs README) found
+that **14.4% of laguna-xs's ttft was first-touch 4 KiB page faults** and fixed it
+for **−9.3% ttft** with `MADV_HUGEPAGE` on the per-request host state. **That
+lever is dead on this track and it is dead for a structural reason.**
+
+Ranked-path census, `llama-server` with the runner's exact flags, one cache-cold
+`/completion` at `n_predict=1`, prompt at `GAINZ_PROMPT_CHARS = 2600`, median of
+9 runs:
+
+| | lfm2.5-2.6b | laguna-xs (for contrast) |
+| --- | --- | --- |
+| ttft wall | 92.6 ms | 354.1 ms |
+| engine `prompt_ms` | 84.9 ms | 302.8 ms |
+| host gap | **7.4 ms (8.0%)** | 50.9 ms (14.4%) |
+| minor faults / request | **2,976** | 53,738 |
+| `AnonHugePages` with the fix on | **0 kB (never fires)** | 761,856 kB |
+
+lfm2.5's per-request host state is only ~12 MiB, so **nothing clears the 16 MiB
+advise threshold** and the patch is inert. Four alternating boots on one binary
+with the `LLAMA_HUGEPAGE_STATE` toggle: off 0.09237 / 0.09259, on 0.09097 /
+0.09285 — flat, and the arms interleave.
+
+**The rule, so nobody re-buys it:** this lever is gated on per-request KV/state
+**size**, not on the engine or the vendor. Before porting any page-fault fix to a
+track, sum field 10 of `/proc/<pid>/task/*/stat` around one `n_predict=1` request
+— under ~10k faults there is no prize. On this track ttft is 92.6 ms wall against
+84.9 ms of engine time, so **the only way to move lfm2.5's ttft is to make the
+engine faster**, which is the same prefill/decode work already on the list.
