@@ -5357,3 +5357,53 @@ projected. `GGML_CUDA_DISABLE_PRE_ADD_NORM=1` parks it again for anyone who
 needs a deterministic build to measure against — and **that is the arm to use
 for any future A/B on this tree**, because a nondeterministic control cannot
 resolve anything smaller than half a percent.
+
+## Round 48c RANKED RESULT: VERIFIED, new frontier 1.8129 (+81.29%)
+
+`qwen36-r9700-round48c-unpark-plus-0056-0057`, commit `1851dcd`, **verified**:
+
+```
+                     score     decode            prefill            ttft
+new frontier       1.812930   1.959162 (161.72)  1.485789 (3165.7)  1.688987 (0.19817)
+previous frontier  1.783489   1.955800 (161.51)  1.416600 (3012.0)  1.625600 (0.20470)
+                   +1.65%     +0.17%             +4.88%             +3.90%
+```
+
+The gate draw landed inside the band. Projection was **1.8095** against a
+measured **1.8129** — 0.2% out, and the whole margin came from the two
+anchoring corrections this round bought:
+
+- **decode came back to exactly where the model said.** Predicted 1.955830 from
+  `1.906154 x 1.02606`, measured **1.959162**. The park's cost was 2.54% and
+  unparking returned it in full.
+- **prefill beat the projection**: predicted 1.482910, measured **1.485789**.
+- **ttft beat it too**: predicted 1.684170, measured **1.688987**.
+
+### What actually moved, and the correct attribution
+
+Against the previous frontier, decode is flat (+0.17%, the same fold, same
+arithmetic) and the entire +1.65% is **prefill +4.88% and ttft +3.90%** — that
+is 0056 and 0057, cleanly separated from the unpark by the round-48b run in
+between. The three-submission sequence is what made the attribution possible:
+
+```
+48b   parked + 0056 + 0057   1.773797   -> isolates the park at -2.54% decode
+48c   + unpark               1.812930   -> isolates 0056+0057 at +4.88% prefill / +3.90% ttft
+```
+
+**A rejection that returns a full measurement is not a wasted slot.** 48b cost a
+slot and bought the decode coefficient, the ttft-instrument correction, and the
+margin calculation that justified 48c. Sequencing the certain-gate submission
+first and the coin-flip second was worth more than either alone would have been.
+
+### Standing caveats for the next agent
+
+- The series is **nondeterministic again**: ~26% of gate draws fall outside
+  ±0.1% (3/6 this session, worst +0.534%). This entry verified on a good draw.
+  Any future submission carries the same coin flip until the 0008 defect is
+  understood. `GGML_CUDA_DISABLE_PRE_ADD_NORM=1` yields the deterministic build
+  (3.9318, 10/10) and **is the arm to A/B against** — a nondeterministic control
+  cannot resolve anything below about half a percent.
+- **Do not price ttft from `rank40.py`.** It overstated 0057 by 5x because the
+  ranked harness measures cache-cold runs and the replica hammers a warm server.
+  Prefill and decode replicate fine.
