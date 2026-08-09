@@ -4551,3 +4551,62 @@ ten**, and it leaves 0009/0036 intact — they share the kernel through the
 
 **The defect remains unidentified.** It is in or triggered by 0008, it is not the
 loop-2 read-back, and it is not buffer aliasing.
+
+## Round 46: park verified, and the mul_mat_q starting point (corrected)
+
+### The park
+
+`0055-park-rms-norm-pre-add-fold.patch` flips the pre-add fold off by default
+(`GGML_CUDA_PRE_ADD_NORM=1` re-enables it for investigation). Verified at the
+runner's exact gate command, 10 loads:
+
+```
+stock  (b10237)   3.9314 x10     spread 0.000%
+parked            3.9318 x10     spread 0.000%    +0.010% vs stock
+```
+
+**The parked build behaves the way stock does — one repeated value, every load.**
+That is the property the series has been missing since 0008 landed.
+
+Cost, frontier library vs parked library, 3 rounds:
+
+```
+prefill  4911.7 -> 4851.9   -1.22%
+decode    164.58 ->  159.94  -2.82%
+score debt -2.08%     series 1.7835 -> ~1.746
+```
+
+**Do not submit until the debt is cleared.** A submission at 1.746 is below our
+own verified 1.7835 and would be rejected on the frontier rule. `mul_mat_q` has
+to recover **> 2.13%** before a submission makes sense.
+
+### mul_mat_q: the corrected starting point
+
+It is 46.2% of the prefill slope (42.05 ms of 91.02 ms), the largest remaining
+lever. A first pass at its launch geometry read "8 and 32 blocks on a 64 CU
+part" and looked like the 0044 under-parallelisation pathology all over again.
+**That was wrong** — it counted only `Grid_Size_X` and ignored Y and Z. With all
+three dimensions:
+
+| blocks | thr | n/pass | ms/pass | us each | what |
+|---:|---:|---:|---:|---:|---|
+| 32768 | 128 | 80 | 24.77 | 309.6 | Q4_K expert gate+up |
+| 131072 | 128 | 40 | 19.12 | 478.0 | Q5_K expert down |
+| 4096 | 128 | 80 | 6.21 | 77.6 | |
+| 16384 | 128 | 40 | 4.05 | 101.3 | |
+
+(pp534, per pass.) **There is no occupancy problem** — these are tens of
+thousands of blocks. MMQ is a bandwidth story, not a parallelism one: ~28.5 GB
+of expert weights per pp534 pass in 64.2 ms is **~444 GB/s against a 640 GB/s
+peak, about 69%**, which matches round 29's independent 448 GB/s.
+
+So the lever is bandwidth efficiency on the expert weights, and the two classes
+above are 43.9 ms of the 64.2 ms. Note the Q5_K down projection is the worst per
+launch (478 us) and round 11 already recorded why: **Q5_K's layout blocks wide
+loads, forcing strided 16 B pairs.** Getting MMQ from 69% to ~90% of peak would
+be about 15 ms of the 91 ms slope, i.e. roughly +3.6% score — enough to clear
+the 2.13% debt with margin.
+
+Method note for whoever picks this up: measure the achievable rate for this exact
+access pattern with a standalone probe before assuming 640 GB/s is reachable for
+a quantised gather. And count all three grid dimensions.

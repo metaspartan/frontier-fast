@@ -1,0 +1,65 @@
+From 9e1d9e12800044c370327de652ae1084390a06f6 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sun, 9 Aug 2026 07:57:59 +0000
+Subject: [PATCH] cuda/hip: park the rms_norm pre-add fold - it makes the build
+ nondeterministic
+
+Stock b10237 reads one repeated perplexity value across 20 loads of the runner
+gate command; the folded build spans 3.9269-3.9448, and about 20% of single
+draws land outside the 0.1% gate. Since the runner takes ONE measurement per
+arm, that is a ~20% false-rejection rate on any submission, and the excursions
+are real wrong numbers rather than measurement noise.
+
+A grouped bisect (10 loads per arm, spread as the statistic) pins it to this
+fold alone: disabling it returns 3.9318 ten times out of ten, as do all-off,
+norm-off and folds-off, while 0009 and 0036 alone still jitter at 0.186% and
+0.379%.
+
+Two mechanisms were proposed and both measured DEAD:
+ - the loop-2 global read-back: removed it entirely (values kept in a register
+   array, confirmed register-allocated from the fatbin, speed-neutral) and the
+   jitter survived at 1/12 outside the gate;
+ - buffer aliasing: the disjointness guard in ggml_cuda_rms_norm_pre_add_detect
+   already covers dst vs add_dst and a host-side audit saw it hold 3/3 loads,
+   while the overlaps that do exist are byte-identical across loads whose
+   perplexity differs.
+
+So the defect is real, localised and unidentified. Off by default until it is
+understood; GGML_CUDA_PRE_ADD_NORM=1 re-enables it for investigation.
+
+Verified: parked build reads 3.9318 ten times out of ten, exactly the way stock
+reads 3.9314 ten times out of ten. Cost pp512 4911.7 -> 4851.9 (-1.22%) and
+tg128 164.58 -> 159.94 (-2.82%).
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 13 +++++++++++--
+ 1 file changed, 11 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 23d73b011..ee7a95e2d 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6769,8 +6769,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_ROPE_GROUP"));
+             static const bool disable_set_rows_group = getenv("GGML_CUDA_DISABLE_SET_ROWS_GROUP") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_SET_ROWS_GROUP"));
+-            static const bool disable_pre_add_norm = getenv("GGML_CUDA_DISABLE_PRE_ADD_NORM") != nullptr &&
+-                                                   std::atoi(getenv("GGML_CUDA_DISABLE_PRE_ADD_NORM"));
++            // PARKED (round 45).  This fold makes the build nondeterministic at the
++            // runner gate shape: stock reads one repeated value across 20 loads and
++            // the folded build spans 3.9269-3.9448, ~20% of single draws outside the
++            // 0.1% gate.  A grouped bisect pins it to this fold alone; two proposed
++            // mechanisms (the loop-2 global read-back, and dst/add_dst aliasing) were
++            // both implemented or instrumented and both measured DEAD, so the defect
++            // is real but unidentified -- see README rounds 43-45.  Off by default
++            // until it is understood; correctness before 2.98% of decode.
++            // GGML_CUDA_PRE_ADD_NORM=1 re-enables it, for investigation only.
++            static const bool disable_pre_add_norm = !(getenv("GGML_CUDA_PRE_ADD_NORM") != nullptr &&
++                                                       std::atoi(getenv("GGML_CUDA_PRE_ADD_NORM")));
+             static const bool disable_norm_quant = getenv("GGML_CUDA_DISABLE_NORM_QUANT") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_NORM_QUANT"));
+             static const bool disable_l2_norm_group = getenv("GGML_CUDA_DISABLE_L2_NORM_GROUP") != nullptr &&
+-- 
+2.53.0
+
