@@ -107,6 +107,48 @@ split: +15.5%**, sitting on the ranked path today. The lever is right; the layer
 was wrong. **It has to be taken in `tools/server/server-context.cpp`, whose
 prompt loop bounds each chunk by `n_ubatch`**, not in `llama_context`.
 
+### And the split is NOT `n_ubatch` chunking — it is context checkpointing
+
+Chasing the server-side fix found the real cause, and it closes the follow-up
+rather than opening it. `tools/server/server-context.cpp` deliberately breaks the
+prompt at `checkpoint_offsets = {4 + n_ubatch, 4}` counted **from the end** of the
+prompt — *"process the last few tokens of the prompt separately in order to allow
+for a checkpoint to be created"* (ref llama.cpp PR 20288). At `n_ubatch = 512`
+those offsets are 516 and 4, which reproduces every observed split exactly:
+
+| prompt_n | decode calls | |
+| --- | --- | --- |
+| 511 | **2** | 507 + 4 (under the 516 offset) |
+| 524 | 3 | 8 + 512 + 4 |
+| 537 | 3 | 21 + 512 + 4 |
+| 562 | 3 | 46 + 512 + 4 |
+
+The accumulation loop is bounded by `n_batch` (2048), **not** `n_ubatch` — the
+earlier reading in this README was wrong. And `do_checkpoint` keys off
+`params_base.n_ctx_checkpoints > 0`, default **32**, a *server startup* parameter
+(`--ctx-checkpoints`) that the runner does not pass and that is **not**
+conditioned on the request's `cache_prompt`. So the ranked path builds context
+checkpoints on every cache-cold request that can never be reused.
+
+**Size of the prize, controlling for prompt length.** Within the eight ranked
+prompts that get three decode calls, rate falls linearly with length at
+0.59 tok/s per token (`rate = 793.2 − 0.591·n`), which extrapolates to
+**491.2 tok/s** at n=511. The one prompt that gets two calls measures **545.8**.
+So one fewer decode call is worth **+11.1%** prefill — and the earlier headline
+"+15.5%" was partly a length effect, now corrected.
+
+**Not built.** Suppressing checkpoint creation *is* the prompt-cache-checkpoint
+removal already declined as harness-fitting, and there is no per-request gate to
+hook. The general form — skip checkpoint creation when the request sets
+`cache_prompt: false`, since those checkpoints can never be reused — is arguably
+a real fix, but it is the same category and needs a ruling before anyone spends a
+slot on it.
+
+**The mechanism is worth carrying to every llama.cpp server track:** on a
+sparse-MoE model every extra `llama_decode` call costs a full routed-expert
+sweep, and the server splits prompts by default at `4 + n_ubatch` and `4` tokens
+from the end.
+
 Two rules this cost a slot to learn:
 
 1. **`llama-bench pp<N>` is not the ranked measurement.** The ranked path is a
