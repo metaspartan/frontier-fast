@@ -1,0 +1,190 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH] llama: replace the shortconv recurrent-state gather with a cache view when the slot mapping is identity (+1.1% decode, bit-identical)
+
+Every LFM2.5 shortconv layer materializes its conv window before the block
+runs: build_rs gathers it with k_get_rows_float, 22 launches and ~39 us of
+pure copy kernel per decode token, purely to move 16 KB to a new address so
+the next kernel can read it. The gather exists for seq-copy migration and
+rollback-snapshot restore; during steady single-slot decode its ids are the
+identity.
+
+This is the qwen3.6 0030 lever ported to LFM2.5. The identity case is
+detected side-effect-free at graph build time
+(llama_memory_recurrent_context::s_copy_main_is_identity: cells[head+i].src0
+== head+i with no pending rollback restore) and the gather is replaced by a
+contiguous ggml_view_2d of the cache rows. Byte-identical values reach the
+consumer and the get_rows kernel disappears.
+
+Reuse safety is the trap this lever carries: the fork reuses built graphs
+across decode steps, and a view bakes its offset at build time while
+get_rows refreshes through the s_copy input tensor. The view is therefore
+restricted to the single-slot serving shape (n_seqs == 1, head == 0,
+n_rs == 1), where the baked offset is row 0 always - which is exactly the
+ranked configuration (--parallel 1). Multi-slot, migrated or rollback states
+fall back to the stock gather.
+
+It also does something for 0010 that no backend-side check can: with the
+window living in the persistent recurrent cache instead of a compute-buffer
+temporary, the shortconv fold's state source can no longer alias the block
+its own output lands on, and the fold goes from 14 of 22 layers to 21 of 22.
+
+Measured on the trusted R9700 runner box against a binary built from the
+parent commit (patches 0001-0009), arms alternated:
+
+  - census: k_get_rows_float 24 -> 2 per decode token.
+  - decode tg128, 5 interleaved rounds, this patch alone: median ratio
+    1.0111 (+1.11%), 5/5 rounds separated. It reads low in isolation on
+    llama-bench because removing the gather nodes shifts the allocator
+    layout enough to block the grouped mmvq and grouped rms_norm detectors
+    in the 8 attention layers; under llama-server both groupings survive
+    (verified by rocprofv3 census of the serving path), so the ranked figure
+    should be at least this.
+  - perplexity: bit-identical on both shapes (22.4212 decode-path, 22.5182
+    gate-shape, 3 loads per arm).
+  - server greedy identity vs the parent-commit build: 6/6 byte-identical.
+
+LLAMA_DISABLE_RS_STATE_VIEW=1 restores the stock gather everywhere.
+---
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index e12a8cdc2..dd50a0eb1 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3287,7 +3287,8 @@ ggml_tensor * llm_graph_context::build_rs(
+            uint32_t   rs_head,
+            uint32_t   rs_size,
+             int32_t   rs_zero,
+-        const llm_graph_get_rows_fn & get_state_rows) const {
++        const llm_graph_get_rows_fn & get_state_rows,
++              bool   state_is_identity) const {
+ 
+     GGML_UNUSED(rs_size);
+     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+@@ -3300,7 +3301,19 @@ ggml_tensor * llm_graph_context::build_rs(
+     // copy states
+     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
+     // {state_size, rs_size} -> {state_size, n_seqs}
+-    ggml_tensor * output_states = get_state_rows(ctx0, states, state_copy_main);
++    // When every source row is the destination row itself (steady-state decode:
++    // no seq-copy migration, no rollback-snapshot restore - detected side-effect-
++    // free at graph build time), the gather is a pure materialization of rows
++    // [rs_head, rs_head + n_seqs) and is replaced by a contiguous view of the
++    // cache: byte-identical values reach the consumer and the per-layer state
++    // copy disappears. The view keeps the same execution-order reliance on the
++    // rs_zero clear that the get_rows form already has.
++    ggml_tensor * output_states;
++    if (state_is_identity) {
++        output_states = ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], rs_head*states->nb[1]);
++    } else {
++        output_states = get_state_rows(ctx0, states, state_copy_main);
++    }
+     ggml_build_forward_expand(gf, output_states);
+ 
+     // copy extra states which won't be changed further (between n_seqs and n_rs)
+@@ -3348,12 +3361,25 @@ ggml_tensor * llm_graph_context::build_rs(
+         ggml_tensor * s,
+             int32_t   state_size,
+             int32_t   n_seqs,
+-        const llm_graph_get_rows_fn & get_state_rows) const {
++        const llm_graph_get_rows_fn & get_state_rows,
++              bool   allow_state_view) const {
+     const auto * kv_state = inp->mctx;
+ 
++    // Reuse safety: a built graph bakes the view offset while the fork reuses
++    // graphs across decode steps (only ~27 builds serve a 256-token completion
++    // here), so the view is additionally restricted to the single-slot serving
++    // shape (n_seqs == 1, head == 0, n_rs == 1). There the baked offset is row 0
++    // always - a reused view graph can never go stale - and this is exactly the
++    // ranked serving configuration (--parallel 1), so the full decode gain is
++    // kept. Multi-slot or migrated states fall back to the stock gather.
++    static const bool disable_state_view = getenv("LLAMA_DISABLE_RS_STATE_VIEW") != nullptr;
++    const bool state_is_identity = allow_state_view && !disable_state_view &&
++        n_seqs == 1 && kv_state->get_head() == 0 && kv_state->get_n_rs() == 1 &&
++        kv_state->s_copy_main_is_identity(n_seqs);
++
+     return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
+                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
+-                    get_state_rows);
++                    get_state_rows, state_is_identity);
+ }
+ 
+ ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 160e29413..b67d2d1fe 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1256,7 +1256,8 @@ struct llm_graph_context {
+                uint32_t   rs_head,
+                uint32_t   rs_size,
+                 int32_t   rs_zero,
+-            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
++            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows,
++                   bool   state_is_identity = false) const;
+ 
+     llm_graph_input_rs * build_rs_inp() const;
+ 
+@@ -1265,7 +1266,8 @@ struct llm_graph_context {
+             ggml_tensor * s,
+                 int32_t   state_size,
+                 int32_t   n_seqs,
+-            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
++            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows,
++                   bool   allow_state_view = false) const;
+ 
+     ggml_tensor * build_rwkv_token_shift_load(
+         llm_graph_input_rs * inp,
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index ef82eb976..348bfdafd 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -1243,6 +1243,22 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
+     return mem->s_l[il];
+ }
+ 
++bool llama_memory_recurrent_context::s_copy_main_is_identity(int32_t n_seqs) const {
++    for (int32_t i = 0; i < n_seqs; ++i) {
++        const uint32_t cell_idx = i + mem->head;
++        if (mem->cells[cell_idx].src0 != (int32_t) cell_idx) {
++            return false;
++        }
++        if (mem->n_rs_seq != 0 && !mem->cells[cell_idx].seq_id.empty()) {
++            const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
++            if (seq >= 0 && (size_t) seq < mem->rs_idx.size() && mem->rs_idx[seq] != 0) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
+ int32_t llama_memory_recurrent_context::s_copy(int i) const {
+     const uint32_t cell_idx = i + mem->head;
+     const int32_t  src0     = mem->cells[cell_idx].src0;
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index b13b7b748..3bf6ee22c 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -173,6 +173,11 @@ public:
+ 
+     int32_t s_copy(int i) const;
+ 
++    // true when every state source for the n_seqs ubatch rows is the row itself
++    // (no seq-copy migration pending, no rollback-snapshot restore pending), i.e.
++    // s_copy(i) == head + i for all i without the side effects of s_copy().
++    bool s_copy_main_is_identity(int32_t n_seqs) const;
++
+ private:
+     const llama_memory_status status;
+ 
+diff --git a/src/models/lfm2.cpp b/src/models/lfm2.cpp
+index 70e837d6e..d89c23c17 100644
+--- a/src/models/lfm2.cpp
++++ b/src/models/lfm2.cpp
+@@ -188,7 +188,7 @@ llama_model_lfm2::graph<iswa>::graph(const llama_model & model, const llm_graph_
+ 
+         // read conv state
+         auto * conv_state = mctx_cur->get_r_l(il);
+-        auto * conv_rs    = build_rs(inp_recr, conv_state, hparams.n_embd_r(), n_seqs);
++        auto * conv_rs    = build_rs(inp_recr, conv_state, hparams.n_embd_r(), n_seqs, ggml_get_rows, /*allow_state_view=*/true);
+         auto * conv       = ggml_reshape_3d(ctx0, conv_rs, d_conv, hparams.n_embd, n_seqs);
+ 
+         // causal prepends the state, non-causal pads symmetrically for a centered window

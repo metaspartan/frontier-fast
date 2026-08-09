@@ -1,0 +1,558 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH] CUDA/HIP: collapse the LFM shortconv decode chain into one kernel (+4.2% decode, bit-identical)
+
+At decode the LFM2.5 shortconv block spends four kernel launches on about
+80 KB of data, in a strictly serial chain:
+
+    MUL(b, x) -> TRANSPOSE -> CONCAT(conv_window, bx)
+                                 |-> CPY(trailing cols) -> conv-state cache
+                                 `-> SSM_CONV(., conv_w) -> MUL(c, .)
+
+22 of LFM2.5's 30 layers are shortconv layers, so that is 88 of the 420
+dispatches in a decode token, for 178 us of kernel time that is entirely
+launch latency and redundant staging traffic: the window is copied into the
+concat buffer, the trailing columns are copied back out to the cache, and
+ssm_conv then reads the copy.
+
+This collapses all four into ONE kernel. A thread per channel reads its conv
+window and its b/x pair, multiplies, runs the stock accumulation loop, writes
+the new window straight back to the cache in place and applies the c-gate.
+Detection runs at the b*x MUL (the earliest node at which every input is
+live) and marks the other four nodes done; the launch is gated on the decode
+shape (n_tokens == 1, one sequence), so prefill keeps the stock nodes.
+
+Bit-identity is by construction:
+
+  - the accumulation is the stock loop nest over the same three values in the
+    same order, including the `sumf += bias` add with the zero bias register;
+  - b*x reaches the accumulator through an arithmetic fence. In stock it is
+    stored to memory and reloaded, and a load is an opaque value that
+    x[nc-1] * w[nc-1] cannot be reassociated into; without the fence the
+    -funsafe-math-optimizations build is free to re-tree (b*x)*w as b*(x*w);
+  - the writeback reads its window into registers before storing, so it is
+    alias-safe when the state source IS the cache slot (which it is once
+    0011 lands).
+
+HOISTING LEGALITY IS THE WHOLE CORRECTNESS STORY, and it cost this round a
+debugging cycle. The fold issues both of its stores at the b*x node, up to
+~20 nodes earlier than the CPY and the gate MUL it replaces. ggml-alloc
+reuses blocks across disjoint lifetimes, and the NEXT conv layer's state
+gather is emitted inside exactly that window and lands on exactly that class
+of block - so the early stores silently corrupted a state some later layer
+still needed. Perplexity went to 1.7e5 while llama-bench reported a clean
++2% and never noticed. The detector now requires both destinations to be
+disjoint from every input and output of every node that stays in the window;
+with that check 21 of 22 layers still fold.
+
+Measured on the trusted R9700 runner box against a binary built from this
+patch's own parent commit (patches 0001-0009), arms alternated:
+
+  - census: 420.5 -> 347 dispatches/token with 0011; shortconv_fold_f32<3>
+    fires 21x/token and concat_cont, cpy_scalar, ssm_conv_f32 and the b*x
+    k_bin_bcast all drop to ~0. Verified under llama-server as well as
+    llama-bench - the fusion is NOT bench-only on this model.
+  - decode tg128, 5 interleaved rounds with 0011: 238.3-241.8 vs
+    226.9-228.8 -> median ratio 1.0538 (+5.38%), 5/5 rounds separated.
+    0011 alone is +1.11%, so the fold carries about +4.2%.
+  - decode-path perplexity (-b 512 -ub 1 --chunks 8, runner corpus, 3 loads
+    per arm): 22.4212 on every load of both arms - BIT-IDENTICAL.
+  - gate-shape perplexity (-c 512 --chunks 8, 3 loads per arm): 22.5182 on
+    every load of both arms - bit-identical, and equal to the stock figure
+    recorded in this series' README.
+  - server greedy identity vs the parent-commit build, 6 prompts including a
+    ~1000-token one: 6/6 byte-identical, all completions >= 400 bytes.
+  - prefill pp512: neutral (median ratio 1.0005), gated off by construction.
+
+GGML_CUDA_DISABLE_SHORTCONV_FOLD=1 restores the stock four-node chain;
+GGML_SHORTCONV_FOLD_THREADS sets the block width (default 128).
+---
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 3c86cb8aa..de5da6cc2 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -120,6 +120,24 @@
+ #    define GGML_CUDA_USE_PDL
+ #endif  // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA) && (CUDART_VERSION >= 12030 || (!(defined(_MSC_VER) && !defined(__clang__)) && CUDART_VERSION >= 11080))
+ 
++// Blocks floating-point reassociation across this value under
++// -funsafe-math-optimizations: the value becomes opaque to the surrounding
++// expression tree, exactly as a store/reload pair makes it opaque in the
++// unfused graph.
++static __device__ __forceinline__ float ggml_cuda_assoc_fence(float v) {
++#if defined(__clang__)
++#  if __has_builtin(__builtin_arithmetic_fence)
++    return __builtin_arithmetic_fence(v);
++#  else
++    asm volatile("" : "+v"(v));
++    return v;
++#  endif
++#else
++    asm volatile("" : "+v"(v));
++    return v;
++#endif
++}
++
+ static __device__ __forceinline__ void ggml_cuda_pdl_sync() {
+ #if defined(GGML_CUDA_USE_PDL) && defined(__CUDA_ARCH__) && __CUDA_ARCH__ >= GGML_CUDA_CC_HOPPER
+     cudaGridDependencySynchronize();
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index eb501d20b..7a90b7a75 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3795,6 +3795,276 @@ static bool ggml_cuda_norm_quant_plain_ok(const ggml_cgraph * cgraph, const int
+ }
+ 
+ // try and fuse nodes and return the number of nodes to skip
++// ----- LFM shortconv decode-shape chain fold --------------------------------
++//
++// At decode the shortconv block spends four launches on ~80 KB of data:
++//
++//   i    MUL(b, x)                    (b, x are chunks of the in_proj result)
++//        TRANSPOSE                    metadata
++//   ic   CONCAT(conv_window, bx)      [d_conv, n_embd]
++//   ip   CPY(concat[1..], cache)      recurrent conv-state writeback
++//   iv   SSM_CONV(concat, conv_w)
++//   ig   MUL(c, ssm_conv)             the c-gate, already fused into SSM_CONV
++//
++// All four compute nodes collapse into one kernel per layer. Detection runs at
++// the b*x MUL because that is the earliest point at which every input is live:
++// the conv window for layer L+1 is gathered into the SAME allocator block a few
++// nodes later, so a fold issued at the CONCAT or SSM_CONV position would read a
++// window that has already been overwritten.
++static const ggml_tensor * ggml_cuda_view_root(const ggml_tensor * t) {
++    while (t != nullptr && t->view_src != nullptr) {
++        t = t->view_src;
++    }
++    return t;
++}
++
++static bool ggml_cuda_ranges_disjoint(const void * a, size_t na, const void * b, size_t nb) {
++    const char * a0 = (const char *) a, * a1 = a0 + na;
++    const char * b0 = (const char *) b, * b1 = b0 + nb;
++    return a1 <= b0 || b1 <= a0;
++}
++
++static bool ggml_cuda_shortconv_fold_collect(const ggml_cgraph * cgraph, int i, ggml_shortconv_fold_plan & p) {
++    ggml_tensor * mul_bx = cgraph->nodes[i];
++    if (mul_bx->op != GGML_OP_MUL || mul_bx->type != GGML_TYPE_F32) {
++        return false;
++    }
++    const ggml_tensor * bt = mul_bx->src[0];
++    const ggml_tensor * xt = mul_bx->src[1];
++    if (bt == nullptr || xt == nullptr) {
++        return false;
++    }
++    // decode shape only: one token, one sequence
++    if (mul_bx->ne[1] != 1 || mul_bx->ne[2] != 1 || mul_bx->ne[3] != 1) {
++        return false;
++    }
++    if (bt->type != GGML_TYPE_F32 || xt->type != GGML_TYPE_F32) {
++        return false;
++    }
++    if (!ggml_are_same_shape(bt, mul_bx) || !ggml_are_same_shape(xt, mul_bx)) {
++        return false;
++    }
++
++    const int64_t n_ch = mul_bx->ne[0];
++
++    // forward search window: the chain is emitted within a handful of nodes
++    const int window = 64;
++    const int last   = cgraph->n_nodes < i + 1 + window ? cgraph->n_nodes : i + 1 + window;
++
++    ggml_tensor * concat = nullptr; int ic = -1;
++    for (int k = i + 1; k < last; ++k) {
++        ggml_tensor * n = cgraph->nodes[k];
++        if (n->op == GGML_OP_CONCAT && n->src[1] != nullptr && ggml_cuda_view_root(n->src[1]) == mul_bx) {
++            concat = n; ic = k; break;
++        }
++    }
++    if (concat == nullptr || concat->type != GGML_TYPE_F32) {
++        return false;
++    }
++    const ggml_tensor * state = concat->src[0];
++    if (state == nullptr || state->type != GGML_TYPE_F32) {
++        return false;
++    }
++    const int64_t nc = concat->ne[0];
++    if (nc < 2 || nc > 5 || state->ne[0] != nc - 1 || concat->src[1]->ne[0] != 1) {
++        return false;
++    }
++    if (concat->ne[1] != n_ch || concat->ne[2] != 1 || concat->ne[3] != 1) {
++        return false;
++    }
++    if (state->ne[1] != n_ch || state->ne[2] != 1) {
++        return false;
++    }
++
++    ggml_tensor * conv = nullptr; int iv = -1;
++    for (int k = ic + 1; k < last; ++k) {
++        ggml_tensor * n = cgraph->nodes[k];
++        if (n->op == GGML_OP_SSM_CONV && n->src[0] == concat) {
++            conv = n; iv = k; break;
++        }
++    }
++    if (conv == nullptr || conv->type != GGML_TYPE_F32) {
++        return false;
++    }
++    const ggml_tensor * w = conv->src[1];
++    if (w == nullptr || w->type != GGML_TYPE_F32 || w->ne[0] != nc || w->ne[1] != n_ch) {
++        return false;
++    }
++    if (conv->ne[0] != n_ch || conv->ne[1] != 1 || conv->ne[2] != 1) {
++        return false;
++    }
++
++    ggml_tensor * cpy = nullptr;
++    for (int k = ic + 1; k < last; ++k) {
++        ggml_tensor * n = cgraph->nodes[k];
++        if (n->op == GGML_OP_CPY && n->src[0] != nullptr && ggml_cuda_view_root(n->src[0]) == concat) {
++            cpy = n; break;
++        }
++    }
++    if (cpy == nullptr || cpy->type != GGML_TYPE_F32 || cpy->src[0]->type != GGML_TYPE_F32) {
++        return false;
++    }
++    // the writeback must be exactly the trailing (nc-1) columns of the window,
++    // contiguous at the destination
++    const ggml_tensor * cpy_src = cpy->src[0];
++    if (cpy_src->ne[0] != nc - 1 || cpy_src->ne[1] != n_ch ||
++        (size_t) ((const char *) cpy_src->data - (const char *) concat->data) != sizeof(float) ||
++        cpy_src->nb[1] != concat->nb[1] || cpy_src->nb[0] != sizeof(float)) {
++        return false;
++    }
++    if (!ggml_is_contiguous(cpy) || ggml_nelements(cpy) != (nc - 1) * n_ch) {
++        return false;
++    }
++
++    // the c-gate multiply that patch 0008 already folds into ssm_conv
++    ggml_tensor * mul_g = nullptr;
++    for (int k = iv + 1; k < last; ++k) {
++        ggml_tensor * n = cgraph->nodes[k];
++        if (ggml_cuda_is_view_or_noop(n)) {
++            continue;
++        }
++        if (n->op == GGML_OP_MUL && (n->src[0] == conv || n->src[1] == conv)) {
++            mul_g = n;
++        }
++        break;  // must be the first compute node after the conv
++    }
++    if (mul_g == nullptr || mul_g->type != GGML_TYPE_F32 || !ggml_are_same_shape(mul_g, conv)) {
++        return false;
++    }
++    const ggml_tensor * g = (mul_g->src[0] == conv) ? mul_g->src[1] : mul_g->src[0];
++    if (g->type != GGML_TYPE_F32 || !ggml_are_same_shape(g, mul_g)) {
++        return false;
++    }
++
++    // strides must be expressible per channel
++    if (bt->nb[0] != sizeof(float) || xt->nb[0] != sizeof(float) ||
++        g->nb[0] != sizeof(float) || mul_g->nb[0] != sizeof(float) ||
++        state->nb[0] != sizeof(float) || w->nb[0] != sizeof(float)) {
++        return false;
++    }
++    // b/x/g are single-token views: their per-channel stride is nb[0]
++    if (!ggml_is_contiguous(bt) || !ggml_is_contiguous(xt) || !ggml_is_contiguous(g) ||
++        !ggml_is_contiguous(mul_g)) {
++        return false;
++    }
++
++    p.b     = (const float *) bt->data;
++    p.x     = (const float *) xt->data;
++    p.g     = (const float *) g->data;
++    p.state = (const float *) state->data;
++    p.w     = (const float *) w->data;
++    p.dst   = (float *) mul_g->data;
++    p.cache = (float *) cpy->data;
++
++    p.b_stride     = 1;
++    p.x_stride     = 1;
++    p.g_stride     = 1;
++    p.dst_stride   = 1;
++    p.state_stride = (int) (state->nb[1] / sizeof(float));
++    p.w_stride     = (int) (w->nb[1] / sizeof(float));
++    p.cache_stride = (int) (nc - 1);
++    p.n_ch         = (int) n_ch;
++    p.nc           = (int) nc;
++
++    // The kernel reads every input before it stores, but only within a thread.
++    // Require the two destinations to be disjoint from all inputs, except the
++    // window/cache pair which may be the SAME buffer (the identity mapping) -
++    // there each thread rewrites exactly the slots it just read.
++    const size_t dst_bytes   = (size_t) n_ch * sizeof(float);
++    const size_t cache_bytes = (size_t) (nc - 1) * n_ch * sizeof(float);
++    const size_t state_bytes = (size_t) state->nb[1] * n_ch;
++    const size_t bx_bytes    = (size_t) n_ch * sizeof(float);
++
++    if (!ggml_cuda_ranges_disjoint(p.dst, dst_bytes, p.b, bx_bytes) ||
++        !ggml_cuda_ranges_disjoint(p.dst, dst_bytes, p.x, bx_bytes) ||
++        !ggml_cuda_ranges_disjoint(p.dst, dst_bytes, p.g, bx_bytes) ||
++        !ggml_cuda_ranges_disjoint(p.dst, dst_bytes, p.state, state_bytes) ||
++        !ggml_cuda_ranges_disjoint(p.dst, dst_bytes, p.cache, cache_bytes)) {
++        return false;
++    }
++    const bool cache_is_window = (const void *) p.cache == (const void *) p.state &&
++                                 p.cache_stride == p.state_stride;
++    if (!cache_is_window &&
++        !ggml_cuda_ranges_disjoint(p.cache, cache_bytes, p.state, state_bytes)) {
++        return false;
++    }
++    if (!ggml_cuda_ranges_disjoint(p.cache, cache_bytes, p.b, bx_bytes) ||
++        !ggml_cuda_ranges_disjoint(p.cache, cache_bytes, p.x, bx_bytes) ||
++        !ggml_cuda_ranges_disjoint(p.cache, cache_bytes, p.g, bx_bytes)) {
++        return false;
++    }
++
++    // nothing later in the graph may read the intermediates we stop writing
++    for (int k = iv + 1; k < cgraph->n_nodes; ++k) {
++        ggml_tensor * n = cgraph->nodes[k];
++        if (n == mul_g) {
++            continue;
++        }
++        for (int sidx = 0; sidx < GGML_MAX_SRC; ++sidx) {
++            const ggml_tensor * src = n->src[sidx];
++            if (src == nullptr) {
++                continue;
++            }
++            const ggml_tensor * r = ggml_cuda_view_root(src);
++            if (r == mul_bx || r == concat || r == conv) {
++                return false;
++            }
++        }
++    }
++    if ((mul_bx->flags & GGML_TENSOR_FLAG_OUTPUT) || (concat->flags & GGML_TENSOR_FLAG_OUTPUT) ||
++        (conv->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return false;
++    }
++
++    // Hoisting legality. The fold issues BOTH stores - the layer output and the
++    // conv-state writeback - at node i, which is up to ~20 nodes earlier than
++    // the CPY and the gate MUL it replaces. ggml-alloc reuses blocks across
++    // disjoint lifetimes, so an early store can land on a block some node in
++    // between still reads or writes (the next conv layer's state gather is
++    // emitted inside this window and lands on exactly this class of block).
++    // Require both destinations to be disjoint from every input and output of
++    // every node that stays in the window.
++    {
++        int i_mulg = -1;
++        for (int k = iv + 1; k < cgraph->n_nodes; ++k) {
++            if (cgraph->nodes[k] == mul_g) { i_mulg = k; break; }
++        }
++        if (i_mulg < 0) {
++            return false;
++        }
++        const size_t d_bytes = (size_t) n_ch * sizeof(float);
++        const size_t c_bytes = (size_t) (nc - 1) * n_ch * sizeof(float);
++        for (int k = i + 1; k < i_mulg; ++k) {
++            ggml_tensor * n = cgraph->nodes[k];
++            if (n == concat || n == cpy || n == conv || ggml_cuda_is_view_or_noop(n)) {
++                continue;
++            }
++            if ((n->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
++                continue;
++            }
++            const ggml_tensor * ranges[1 + GGML_MAX_SRC];
++            int n_ranges = 0;
++            ranges[n_ranges++] = n;
++            for (int sidx = 0; sidx < GGML_MAX_SRC; ++sidx) {
++                if (n->src[sidx] != nullptr) { ranges[n_ranges++] = n->src[sidx]; }
++            }
++            for (int r = 0; r < n_ranges; ++r) {
++                const void * base = ranges[r]->data;
++                if (base == nullptr) { continue; }
++                const size_t nb = ggml_nbytes(ranges[r]);
++                if (!ggml_cuda_ranges_disjoint(p.dst, d_bytes, base, nb)) { return false; }
++                if (!ggml_cuda_ranges_disjoint(p.cache, c_bytes, base, nb)) { return false; }
++            }
++        }
++    }
++
++    p.folded[0] = concat;
++    p.folded[1] = cpy;
++    p.folded[2] = conv;
++    p.folded[3] = mul_g;
++    return true;
++}
++
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
+@@ -4629,6 +4899,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
+             // Members of grouped mmvq launches already issued earlier in this pass.
+             std::unordered_set<const ggml_tensor *> mmvq_grouped_done;
++            std::unordered_set<const ggml_tensor *> shortconv_fold_done;
++            static const bool disable_shortconv_fold = getenv("GGML_CUDA_DISABLE_SHORTCONV_FOLD") != nullptr &&
++                                                       std::atoi(getenv("GGML_CUDA_DISABLE_SHORTCONV_FOLD"));
+             // Members of grouped rms_norm launches already issued earlier in this pass.
+             std::unordered_set<const ggml_tensor *> norm_grouped_done;
+             static const bool disable_norm_group = getenv("GGML_CUDA_DISABLE_NORM_GROUP") != nullptr &&
+@@ -4697,6 +4970,24 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue; // already computed as part of a grouped mmvq launch
+                 }
+ 
++                if (shortconv_fold_done.count(node) != 0) {
++                    continue; // already computed as part of a shortconv chain fold
++                }
++
++                if (!disable_shortconv_fold && node->op == GGML_OP_MUL) {
++                    ggml_shortconv_fold_plan plan;
++                    if (ggml_cuda_shortconv_fold_collect(cgraph, i, plan)) {
++                        ggml_cuda_op_shortconv_fold(*cuda_ctx, plan);
++                        for (int m = 0; m < 4; ++m) {
++                            shortconv_fold_done.insert(plan.folded[m]);
++                            if (plan.folded[m]->view_src != nullptr) {
++                                cuda_ctx->quantized_src1_cache.invalidate_views_of(plan.folded[m]);
++                            }
++                        }
++                        continue;
++                    }
++                }
++
+                 if (norm_grouped_done.count(node) != 0) {
+                     continue; // already computed as part of a grouped rms_norm launch
+                 }
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index 549d99c18..03b26cfe3 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -243,3 +243,103 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
+                           out->nb[2], gate_nb0, gate_nb1, gate_nb2, nc, nr, n_t, n_s, stream);
+     }
+ }
++
++// ---------------------------------------------------------------------------
++// LFM shortconv decode-shape chain fold
++//
++// At decode (n_tokens == 1, one sequence) the shortconv block is six graph
++// nodes over ~80 KB of data:
++//
++//   MUL(b, x)  ->  TRANSPOSE  ->  CONCAT(state_window, bx)
++//                                    |-> CPY(last d_conv-1 cols) -> conv cache
++//                                    `-> SSM_CONV(.., conv_w) -> MUL(c, .)
++//
++// Every one of those is a separate kernel launch whose kernel time is pure
++// latency. This collapses the four compute nodes into ONE kernel: a thread per
++// channel reads its conv window and its b/x pair, multiplies, runs the stock
++// accumulation loop, writes the new window back to the cache in place and
++// applies the c-gate.
++//
++// Bit-identity is by construction:
++//   - the accumulation is the stock loop nest over the same three values in the
++//     same order, with the same (absent) bias add;
++//   - b*x reaches the accumulator through an arithmetic fence, because in stock
++//     it is stored to memory and reloaded, and a load is an opaque value that
++//     `x[nc-1] * w[nc-1]` cannot be reassociated into. Without the fence the
++//     -funsafe-math build is free to re-tree (b*x)*w into b*(x*w);
++//   - the writeback reads its window into registers before storing, so it is
++//     alias-safe when the state source IS the cache slot.
++template <int nc>
++static __global__ void shortconv_fold_f32(
++        const float * __restrict__ b_ptr,     const float * __restrict__ x_ptr,
++        const float * __restrict__ g_ptr,     const float * __restrict__ state_ptr,
++        const float * __restrict__ w_ptr,
++        float * __restrict__ dst_ptr,         float * __restrict__ cache_ptr,
++        const int b_stride,   const int x_stride, const int g_stride,
++        const int state_stride, const int w_stride,
++        const int dst_stride, const int cache_stride,
++        const int n_ch) {
++    ggml_cuda_pdl_lc();
++    const int c = blockIdx.x * blockDim.x + threadIdx.x;
++    ggml_cuda_pdl_sync();
++    if (c >= n_ch) {
++        return;
++    }
++
++    float x[nc];
++#pragma unroll
++    for (int j = 0; j < nc - 1; ++j) {
++        x[j] = state_ptr[c * state_stride + j];
++    }
++    x[nc - 1] = ggml_cuda_assoc_fence(b_ptr[c * b_stride] * x_ptr[c * x_stride]);
++
++    float w[nc];
++#pragma unroll
++    for (int j = 0; j < nc; ++j) {
++        w[j] = w_ptr[c * w_stride + j];
++    }
++
++    // stock ssm_conv_f32 accumulation at n_t == 1 (i == 0, so (i+j)%nc == j)
++    float sumf = 0.0f;
++#pragma unroll
++    for (int j = 0; j < nc; ++j) {
++        sumf += x[j] * w[j];
++    }
++    sumf += 0.0f;  // stock adds the bias register, which is 0 when unfused
++
++    // conv-state writeback: the last nc-1 entries of the window
++#pragma unroll
++    for (int j = 0; j < nc - 1; ++j) {
++        cache_ptr[c * cache_stride + j] = x[j + 1];
++    }
++
++    dst_ptr[c * dst_stride] = sumf * g_ptr[c * g_stride];
++}
++
++void ggml_cuda_op_shortconv_fold(ggml_backend_cuda_context & ctx, const ggml_shortconv_fold_plan & p) {
++    static const int fold_threads = [] {
++        const char * e = getenv("GGML_SHORTCONV_FOLD_THREADS");
++        const int    v = e ? atoi(e) : 128;
++        return (v == 64 || v == 128 || v == 256 || v == 512) ? v : 128;
++    }();
++
++    const dim3   blocks((p.n_ch + fold_threads - 1) / fold_threads, 1, 1);
++    cudaStream_t stream = ctx.stream();
++
++    const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(blocks, fold_threads, 0, stream);
++
++#define GGML_SHORTCONV_FOLD_CASE(NC)                                                                      \
++    case NC:                                                                                              \
++        ggml_cuda_kernel_launch(shortconv_fold_f32<NC>, lp, p.b, p.x, p.g, p.state, p.w, p.dst, p.cache,   \
++                                p.b_stride, p.x_stride, p.g_stride, p.state_stride, p.w_stride,           \
++                                p.dst_stride, p.cache_stride, p.n_ch);                                    \
++        break;
++
++    switch (p.nc) {
++        GGML_SHORTCONV_FOLD_CASE(3)
++        GGML_SHORTCONV_FOLD_CASE(4)
++        GGML_SHORTCONV_FOLD_CASE(5)
++        default: GGML_ABORT("shortconv fold: unsupported d_conv %d", p.nc);
++    }
++#undef GGML_SHORTCONV_FOLD_CASE
++}
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cuh b/ggml/src/ggml-cuda/ssm-conv.cuh
+index 7d549152e..b4f83f128 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cuh
++++ b/ggml/src/ggml-cuda/ssm-conv.cuh
+@@ -4,3 +4,32 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                            ggml_tensor * bias_add_node = nullptr,
+                            ggml_tensor * silu_dst = nullptr,
+                            ggml_tensor * mul_dst = nullptr);
++
++// ----- LFM shortconv decode-shape chain fold --------------------------------
++// Everything the fused kernel needs, resolved host-side from the four graph
++// nodes it replaces (CONCAT, the conv-state writeback CPY, SSM_CONV and the
++// c-gate MUL) plus the b*x MUL it is detected at.
++struct ggml_shortconv_fold_plan {
++    const float * b     = nullptr;
++    const float * x     = nullptr;
++    const float * g     = nullptr;
++    const float * state = nullptr;
++    const float * w     = nullptr;
++    float *       dst   = nullptr;
++    float *       cache = nullptr;
++
++    int b_stride     = 0;   // all strides in floats
++    int x_stride     = 0;
++    int g_stride     = 0;
++    int state_stride = 0;
++    int w_stride     = 0;
++    int dst_stride   = 0;
++    int cache_stride = 0;
++
++    int n_ch = 0;
++    int nc   = 0;
++
++    ggml_tensor * folded[4] = { nullptr, nullptr, nullptr, nullptr };  // concat, cpy, conv, mul_gate
++};
++
++void ggml_cuda_op_shortconv_fold(ggml_backend_cuda_context & ctx, const ggml_shortconv_fold_plan & p);
