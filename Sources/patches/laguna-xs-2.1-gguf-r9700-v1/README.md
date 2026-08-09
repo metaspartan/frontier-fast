@@ -307,7 +307,31 @@ they land almost entirely on the ttft and short requests, which is exactly the
 `a` and `b` profile the algebra above punishes. Prefill cancels because both
 arms of the slope lose the same fixed cost. **Do not port 0057 here.**
 
-### 0021 — the server creates context checkpoints it always throws away (SHIPPED)
+### 0021 — the server creates context checkpoints it always throws away
+
+**RANKED: verified at 1.4651 (+46.51%)** against the previous frontier of
+1.3872 — **+5.61% of score in one patch**, and the largest single jump this
+track has recorded:
+
+```
+                   score      decode             prefill            ttft
+new frontier     1.465086   1.656118 (158.47)  1.163134 (2585.6)  1.171798 (0.25910)
+previous         1.387200   1.647400 (156.80)  1.012500            1.002000
+                 +5.61%     +0.53%             +14.88%            +16.91%
+```
+
+**The replica under-predicted it by 65%** (modelled +3.39%, measured +5.61%),
+and the error is in the decode term: the replica said decode would lose 1.4% to
+the harness's ttft subtraction and the ranked run returned **+0.53%**. The
+saving lands more evenly across the ttft and full requests on the runner's own
+prose corpus than on the replica's filler prompt. Two rules from that:
+
+- **the replica is a lower bound for this class**, not an over-estimate — the
+  opposite of the qwen 0057 lesson, because this saving is GPU work (two decode
+  calls) and not only page faults;
+- prefill and ttft both landed within a point of each other (+14.9%, +16.9%),
+  which is the signature the mechanism predicts: a fixed per-request cost that
+  is paid twice at 534 tokens and once at 84.
 
 `llama-server -v` on a 528-token request:
 

@@ -242,7 +242,12 @@ Unlike the MoE track next door, a **ttft-only saving is score-POSITIVE here**
 1/3. Fixed per-request host cost is worth attacking on LFM2.5 and is not worth
 attacking on Laguna-XS. Check the ratio before porting anything between them.
 
-### 0012 — the server creates context checkpoints it always throws away (SHIPPED)
+### 0012 — the server creates context checkpoints it always throws away
+
+The sibling `laguna-xs-2.1-gguf-r9700-v1` shipped the identical patch the same
+session and it **verified at 1.4651 (+46.51%), i.e. +5.61% of score** — prefill
++14.88%, ttft +16.91%, decode +0.53%. The replica had modelled +3.39% there, so
+**treat the replica as a lower bound for this class.**
 
 `llama-server -v` on a 529-token request:
 
