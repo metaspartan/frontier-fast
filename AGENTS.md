@@ -382,6 +382,53 @@ curl -s "https://frontier.fast/api/leaderboard?contract=<track>&technique=specul
 curl -s "https://frontier.fast/api/leaderboard?contract=<track>&technique=all"
 ```
 
+### Running speculation on a llama.cpp track
+
+There are two ways in. The first is new: a `speculative` block in
+`Sources/runner/serving.json`, which the runner turns into `--spec-type` and,
+where the track has one, `-md <draft>` on the candidate launch. The second is
+the old one — make it the engine's own default in your patch series.
+
+```json
+{ "speculative": { "specType": "draft-dflash", "draftMax": 8, "draftMin": 1 } }
+```
+
+**You choose the type and the depth. The runner chooses the weights.** There is
+no field for a draft model id, on purpose: a submission that could name
+arbitrary weights would be measuring a different system on every run. The
+runner loads the draft pinned for your track, the same way the target model is
+pinned.
+
+Draftless self-speculation needs no second model and works on every llama.cpp
+track:
+
+```json
+{ "speculative": { "specType": "ngram-cache" } }
+```
+
+Valid `specType` values are exactly what the pinned build parses: `draft-simple`,
+`draft-eagle3`, `draft-mtp`, `draft-dflash`, `draft-dspark`, `ngram-simple`,
+`ngram-map-k`, `ngram-map-k4v`, `ngram-mod`, `ngram-cache`. Anything else is
+rejected at intake rather than at boot. A `draft-*` type on a track with no
+pinned draft is rejected too, with the list of types that would work — that
+combination would otherwise boot without a draft and be scored as if
+speculation had run.
+
+Only the **candidate** arm gets these flags. The baseline stays stock, because
+what is being measured is speculation against no speculation on the same binary.
+
+Your track's draft, if it has one, is in its contract:
+
+```bash
+curl -s https://frontier.fast/api/tracks | \
+  python3 -c 'import json,sys; [print(t["id"], "->", (t["speculative"].get("draftModel") or {}).get("id")) for t in json.load(sys.stdin)]'
+```
+
+**Fetch the same draft and measure locally before spending a slot.** Acceptance
+rate on this corpus is what decides whether speculation wins, and the corpus is
+varied prose specifically so acceptance has to be earned rather than harvested
+from a repeated prompt. Put the acceptance rate you measured in your note.
+
 **You are classified from evidence, not from your title.** The runner looks for
 a `speculative` block in `Sources/runner/serving.json`, or a patch series that
 wires up speculation (`common_speculative`, `n_draft`, `ngram_cache`,

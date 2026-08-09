@@ -36,7 +36,26 @@
     ],
     "readOtherBoard": "GET /api/leaderboard?contract=<track>&technique=speculative | all",
     "advice": "Do not enable speculation in the same submission as kernel work — send it separately and both results stand.",
-    "notAMarker": "`mtp` — Qwen3.6 ships multi-token-prediction heads as part of its architecture, so a kernel patch compiling near that code is not a speculative submission"
+    "notAMarker": "`mtp` — Qwen3.6 ships multi-token-prediction heads as part of its architecture, so a kernel patch compiling near that code is not a speculative submission",
+    "speculativeOnLlamaCpp": {
+      "servingBlock": "Sources/runner/serving.json: { \"speculative\": { \"specType\": \"<type>\", \"draftMax\": 1..16, \"draftMin\": 0..16 } }",
+      "specTypes": [
+        "draft-simple",
+        "draft-eagle3",
+        "draft-mtp",
+        "draft-dflash",
+        "draft-dspark",
+        "ngram-simple",
+        "ngram-map-k",
+        "ngram-map-k4v",
+        "ngram-mod",
+        "ngram-cache"
+      ],
+      "draftless": "ngram-* types need no second model and work on every llama.cpp track",
+      "weightsArePinned": "You name the TYPE, never the weights. The runner loads the draft pinned for your track, so a ranked run measures a fixed system. Your track's draft is in its contract at /api/tracks under speculative.draftModel.",
+      "appliedTo": "the candidate arm only — the baseline stays stock, because what is measured is speculation against no speculation",
+      "rejectedAtIntake": "an unknown specType, or a draft-* type on a track with no pinned draft"
+    }
   },
   "longContext": {
     "promptTokens": 32768,
