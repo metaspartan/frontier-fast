@@ -3466,3 +3466,229 @@ costs more than the copy it saves.
 
 551.1 dispatches, 162.5 tok/s llama-bench. Round 34's reachable band is
 **165-169**; this batch is 75% of the way there from 153.0.
+
+## Round 38: the matvec census, the matvec-specific cost coefficient, and why 205 tok/s is not a dispatch problem
+
+Round 34's ceiling (188 tok/s) assumed the 291 matvec launches were fixed;
+round 35 then measured a merged matvec at ~4.0 us against a separate one at
+5.8, which reads as "merging gives back a third of the ramp" and would make the
+ceiling soft. This round settles it by measuring the two classes **separately**
+instead of inferring their difference, and by writing down what the 271 matvec
+launches actually are.
+
+### First correction: the per-token dispatch count was 541, not 551.1
+
+Every previous census divided total dispatches by tokens. That over-counts:
+**249 of the 441 `__amd_rocclr_copyBuffer` and all 120 `scale_f32` are
+load-time**, not per-token. Sorting by `Dispatch_Id` and taking one period
+between two `k_get_rows_float` markers gives exact integers on every arm:
+
+```
+541 dispatches/token = 271 matvec-class + 270 other
+```
+
+= 10 ATTN x 11 + 30 GDN x 6 + 40 MoE x 6 + 11 per-eval (6 copyBuffer, the lm
+head, get_rows, one quantize_q8_1, one rms_norm, one bin_bcast). Slopes are
+unaffected (all arms shift by the same 10), the intercept is not.
+
+### The matvec census: all 271, by shape, kernel and layer
+
+`rocprofv3 --kernel-trace`, one steady-state token, `blocks` = Grid_X/Workgroup_X:
+
+| kernel | n/tok | blocks x warps | us ea | what it is | type |
+|---|---|---|---|---|---|
+| `mul_mat_vec_q` | 1 | 124160 x 4 | 672.1 | lm head | Q6_K |
+| `mul_mat_vec_q` | 10 | 8192 x 4 | 24.5 | attn wq | Q6_K |
+| `mul_mat_vec_q` | 40 | 2048 x 8 | 15.8 | 30 GDN ssm_out + 10 attn wo | Q6_K |
+| `mul_mat_vec_q` | 40 | 513 x 2 | 17.8 | MoE routed gate+up (rpb=4) + 0048 guest | Q4_K |
+| `mul_mat_vec_q_grouped` | 30 | 12352 x 4 | 36.6 | GDN qkv+z + 0045 F32 tail | Q6_K |
+| `mul_mat_vec_q_grouped` | 40 | 1025 x 8 | 5.9 | MoE shexp gate/up + 0046 topk guest | Q8_0 |
+| `mul_mat_vec_q_grouped` | 10 | 1024 x 8 | 6.9 | attn wk + wv | Q8_0 |
+| `mul_mat_vec_q_expert_reduce` | 40 | 2560 x 8 | 16.0 | MoE routed down + 0047 shexp down | Q5_K |
+| `mul_mat_vec_f_grouped<16>` | 40 | 257 x 1 | 5.0 | MoE shexp_gate + router | F32 |
+| `flash_attn_tile` | 10 | 1 x 4 (gridy 32) | 5.7 | | |
+| `flash_attn_combine_results` | 10 | 1 x 1 | 2.1 | | |
+
+**251 weight matvecs + 20 flash-attn = 271.** (Round 34's "291" was the same
+count before 0047 removed the 40 standalone shexp-down launches.)
+
+### Mergeability: which of the 251 are independent inside their layer
+
+| block | pair | verdict |
+|---|---|---|
+| ATTN | wq (Q6_K) vs wk+wv (Q8_0) | **independent** - both read only the normed activation. Merged by 0052 below. |
+| ATTN | wo | serial after flash-attn. Never. |
+| GDN | qkv+z -> ssm_out | serial through ssm_conv -> gated_delta_net -> ssm_norm. Never. |
+| MoE | mmvf(shexp_gate, router) vs mmvq_grouped(shexp gate/up) | independent **as matvecs**, but the mmvq_grouped launch already carries the 0046 topk guest, which consumes the router output. Merging evicts topk into its own dispatch. Priced below. |
+| MoE | gate+up -> quantize -> down/reduce | serial. Never. |
+| any | across blocks | serial through the residual stream. Never. |
+
+After 0052 there is **exactly one** mergeable matvec pair left in the whole
+graph, and it is the topk-blocked one. This is the end of the merge program,
+not a pause in it.
+
+### The ladder, split by class
+
+Nine arms, each a toggle that moves matvec count or elementwise count but
+(mostly) not both, exact steady-state counts from a per-arm census, three
+timing sweeps alternating direction:
+
+| arm | mv/tok | el/tok | tg128 | us/token |
+|---|---|---|---|---|
+| base (0051 stack) | 271 | 270 | 162.00 | 6172.8 |
+| `+DISABLE_UNARY_MUL_QUANT` | 271 | 310 | 159.62 | 6264.4 |
+| `+DISABLE_NORM_QUANT` | 271 | 350 | 157.56 | 6346.8 |
+| `+SHEXP_DOWN_COLAUNCH=0` | 311 | 270 | 158.40 | 6313.1 |
+| `+MMVQ_F32_COLAUNCH=0` | 301 | 270 | 159.81 | 6257.6 |
+| `+DISABLE_MMVQ_GROUP` | 321 | 310 | 154.79 | 6460.5 |
+| `+DISABLE_MMVF_GROUP` | 371 | 400 | 143.85 | 6951.7 |
+| `+both of the last two` | 411 | 400 | 141.14 | 7085.2 |
+| `+ ... +F32_COLAUNCH=0` | 411 | 400 | 141.03 | 7090.7 |
+
+**Clean single-toggle isolations** (one class held exactly fixed):
+
+```
+elementwise   +40 el -> +91.5 us   = 2.29 us / dispatch
+              +80 el -> +173.9 us  = 2.17 us / dispatch
+matvec        +40 real matvecs     (shexp down, Q8_0, 2048 rows, 1.1 MB)
+                     -> +140.3 us  = 3.51 us / matvec
+              +30 tiny F32 tails   -> +84.7 us = 2.82 us / matvec
+```
+
+Global two-variable least squares over all nine arms:
+
+```
+t(mv, el) = 4263.6 us + 4.192 us*mv + 2.768 us*el     R2 = 0.99809
+(one-variable, for comparison:  4226.6 + 3.478*d      R2 = 0.99308)
+```
+
+The class split is a real improvement on the single-slope model, and the
+global slopes bracket the clean isolations from above. Anchoring the clean
+coefficients at the base point gives the local model:
+
+```
+t = 4618 us + 3.507 us*mv + 2.238 us*el
+```
+
+### The number the strategic question turned on
+
+**Ramp recovered per merged matvec = 3.507 - 2.238 = 1.27 us**, not the 2.85 us
+round 34 inferred from the 5.8-vs-2.99 gap. A matvec launch costs 57% more than
+an elementwise launch, not 94% more. Round 35's 4.0 us was measured in the
+merge direction on one pair; 3.51 us is the same quantity measured in the
+removal direction on a clean 40-launch toggle, and it is the number to price
+with.
+
+So merging matvecs *does* attack the intercept - it just recovers 1.27 us, not
+2.9. The ceiling moves, but barely.
+
+### Re-derived ceiling
+
+| scenario | mv | el | t | tok/s |
+|---|---|---|---|---|
+| today (0052) | 261 | 270 | 6136 | 163.7 measured |
+| every remaining merge lands (-40 mv, +40 el) | 221 | 310 | 6086 | 164.3 |
+| **every non-matvec dispatch deleted** (impossible) | 271 | 0 | 5569 | **179.6** |
+| same, global fit | 271 | 0 | 5400 | **185.2** |
+| mv = 0 and el = 0 (the asymptote) | 0 | 0 | 4618 | 216.5 |
+
+**205 tok/s (4878 us) requires mv = 74 (local) or 147 (global) with el = 0.**
+The model issues 251 weight matvecs and exactly one mergeable pair remains.
+**205 is unreachable, and so is 200.** The honest band is unchanged at
+**165-169 llama-bench**.
+
+### The specific residual term, since the ceiling question deserves one
+
+It is not launch overhead and it is not the dispatch count. Achieved bandwidth,
+per class, from the same census:
+
+```
+lm head          417 MB in 672.1 us = 621 GB/s    <- at the 627 GB/s reference
+GDN qkv+z        21.2 MB in 36.6 us = 579 GB/s
+attn wq          13.8 MB in 24.5 us = 562 GB/s
+MoE gate+up      9.4 MB in 17.8 us  = 528 GB/s
+attn wk+wv       2.2 MB in 6.9 us   = 323 GB/s
+MoE shexp g/u    2.2 MB in 5.9 us   = 378 GB/s
+```
+
+The one launch big enough to reach it **saturates the memory system**. The
+small ones do not, and the deficit is the startup ramp: 2.35 GB/token at
+621 GB/s is 3784 us, measured matvec kernel time is 4503 us, so the entire
+ramp budget is **719 us over 251 launches = 2.9 us each** - round 34's "~700 us"
+now measured directly instead of inferred from an intercept.
+
+205 tok/s means a 4878 us token. Pure matvec execution is already 4503 us of
+that, leaving 375 us for 270 elementwise dispatches (they cost 604 us) and
+every launch gap. **The blocking term is 2.35 GB of weight reads at a
+saturated 621 GB/s.** The only lever that reaches it is streaming fewer bytes:
+205 tok/s needs about 1.7 GB/token, a 28% cut, i.e. requantization - which the
+0.1% perplexity gate closed at 0.7% ppl per bit. There is no kernel program on
+this box that reaches 205.
+
+### What is left after 0052
+
+| move | class | x/tok | modelled | note |
+|---|---|---|---|---|
+| MoE mmvf -> the 0045 F32 tail of the shexp gate/up mmvq | -40 mv / +40 el | 40 | +0.8% | evicts the 0046 topk guest, which round 34 measured at -2.0% standalone; honest net ~+0.3% and possibly negative |
+| 6 `copyBuffer` graph-input uploads per token (13.2 us) | copy | 6 | +0.2% | llama.cpp-side batching |
+| `flash_attn_combine_results` (21.3 us) | elem | 10 | +0.35% | needs parallel_blocks=1, which is KV-length dependent |
+
+## 0052: the attention Q projection co-launched inside the K/V grouped mmvq (+0.61% decode, BIT-IDENTICAL)
+
+Round 37 identified this and could not build it: after 0049 the attention block
+order is Q, K, V and all three share one activation, but the grouped mmvq kernel
+is single-type and 0021 leaves `attn_q` at Q6_K while `attn_k`/`attn_v` stay
+Q8_0.
+
+0047's machinery, applied to a **grouped** host. `mul_mat_vec_q_grouped` gains a
+second-vec_dot-type guest that is a whole standalone
+`mul_mat_vec_q<type_g,1,false,false>`:
+
+- `gw` = the warps the guest's own launch gives one row (4, for Q6_K at
+  ncols=2048 after `calc_nwarps_launched` trims 8 to 4), so `blockDim.y/gw = 2`
+  guest rows share a host block;
+- `blocks_per_iter_g` stays derived from the guest type's **full** compile-time
+  nwarps, so no k-block moves between threads;
+- the cross-warp exchange keeps the trimmed warps' slots at exactly `+0.0f`.
+
+**The 0045 block-order rule inverts here.** In 0045-0048 the guest was the small
+kernel and went at the FRONT. Here the guest is the *large* launch (8192 rows,
+24.5 us) and the host the small one (1024 rows, 6.9 us), so the guest goes at
+the **TAIL** and the small host keeps the front. Merged grid: 5120 blocks x 8
+warps = exactly the 32768 + 8192 warps the two separate launches had, with no
+idle-warp tax.
+
+Host-side the pair declines unless the guest would have run as the plain
+(non-`small_k`) launch this body is byte-exact against - which on RDNA4 means
+declining exactly where the 0024 Q6_K multi-row opt-in would have fired.
+`ggml_cuda_mmvq_grouped_xguest_blocks` answers that **before** the detector
+marks any node consumed, so a decline leaves both launches standing.
+
+### Numbers
+
+Against a binary built from this patch's own parent commit (f741ad9ad), control
+RUNPATH overridden with `LD_LIBRARY_PATH` and verified by `ldd`, arms
+alternated, no env set on either arm:
+
+```
+control    tg128 163.18 162.68 162.42 162.45   mean 162.68
+candidate  tg128 163.95 163.84 163.65 163.25   mean 163.67   -> +0.61%, 4/4 separated
+prefill    pp512 4910.8 -> 4910.0                            -0.02%
+```
+
+Census **541 -> 531 dispatches/token, exactly -10, all matvec**; the merged
+launch is 28.8 us against 24.5 + 6.9 = 31.5 us for the pair, and every other
+kernel count is unchanged. Predicted from 3.507 us/matvec: +0.57%. Measured
++0.61%. The coefficient holds on the first patch fitted with it.
+
+- decode-path perplexity (`-b 512 -ub 1 --chunks 8`, runner corpus) **3.9382 on
+  both arms over three loads each** - bit-identical;
+- server greedy at the decode shape, 6 prompts including a 1000-token one,
+  **6/6 byte-identical** against the same-binary toggle-off control (the
+  same-arm-twice control read 5/6, the known harness noise from round 32);
+- prefill flat, and the path is decode-only by construction
+  (`ggml_cuda_mmvq_can_group` requires `src1->ne[1] == 1`).
+
+`GGML_CUDA_MMVQ_XTYPE_GUEST=0` restores the two separate launches.
+
+531 dispatches, 163.7 tok/s llama-bench.

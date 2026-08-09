@@ -1,0 +1,401 @@
+From 6d635bd5d070f5297c7361f35fe997899da1327e Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sun, 9 Aug 2026 01:19:03 +0000
+Subject: [PATCH] cuda/hip: the attention Q projection co-launched inside the
+ K/V grouped mmvq (+0.6% decode)
+
+Round 37 found the last independent matvec pair in the graph and could not
+merge it: after 0049 pinned the attention block order to Q, K, V the three
+projections are adjacent and share one activation, but the grouped mmvq
+kernel is single-type and 0021 leaves attn_q at Q6_K while attn_k/attn_v
+stay Q8_0.
+
+This is 0047 machinery applied to a grouped host: mul_mat_vec_q_grouped
+gains a second-vec_dot-type guest that is a WHOLE standalone
+mul_mat_vec_q<type_g,1,false,false>. gw is the warp count the guest own
+launch gives one row (4 for Q6_K/ncols=2048 after the trim), so
+blockDim.y/gw = 2 guest rows share a host block, blocks_per_iter_g stays
+derived from the guest FULL compile-time nwarps, and the cross-warp
+exchange keeps the trimmed warps +0.0f slots. Bit-identical by
+construction, same as 0045-0048.
+
+Block order follows the 0045 rule, and it inverts here: the guest is the
+LARGE launch (8192 rows, 24.6us) and the host the small one (1024 rows,
+6.9us), so the guest goes at the TAIL. Merged grid is 5120 blocks x 8
+warps = exactly the 32768 + 8192 warps the two separate launches had.
+
+541 -> 531 dispatches/token (-10, all matvec); the pair costs 28.8us
+instead of 24.6 + 6.9 = 31.5us.
+
+vs a binary built from the parent commit (f741ad9ad), LD_LIBRARY_PATH +
+ldd verified, arms alternated: tg128 162.68 -> 163.67 (+0.61%, 4/4
+separated), pp512 4910.8 -> 4910.0 (flat). Decode-path perplexity
+3.9382 on both arms over three loads each; server greedy 6/6
+byte-identical at the decode shape including a 1000-token prompt.
+
+GGML_CUDA_MMVQ_XTYPE_GUEST=0 restores the two separate launches.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  68 +++++++++++
+ ggml/src/ggml-cuda/mmvq.cu      | 207 +++++++++++++++++++++++++++++++-
+ ggml/src/ggml-cuda/mmvq.cuh     |   9 +-
+ 3 files changed, 279 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index bcba6760d..3c31a402a 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6771,6 +6771,12 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 const char * e = getenv("GGML_CUDA_SHEXP_DOWN_COLAUNCH");
+                 return e == nullptr || std::atoi(e) != 0;
+             }();
++            // 0052: attention Q (Q6_K) co-launched inside the K/V grouped mmvq
++            // (Q8_0). GGML_CUDA_MMVQ_XTYPE_GUEST=0 restores the two launches.
++            static const bool mmvq_xtype_guest_enabled = []() -> bool {
++                const char * e = getenv("GGML_CUDA_MMVQ_XTYPE_GUEST");
++                return e == nullptr || std::atoi(e) != 0;
++            }();
+             static const bool log_mmvq_group_stats = getenv("GGML_MMVQ_GROUP_STATS") != nullptr;
+             int64_t mmvq_group_stats_buf[2] = {0, 0};
+             int64_t * mmvq_group_stats = log_mmvq_group_stats ? mmvq_group_stats_buf : nullptr;
+@@ -7076,6 +7082,68 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                         }
+                         continue;
+                     }
++
++                    // 0052: this matvec found no same-type partner. If the very
++                    // next groupable matvec over the SAME activation has a
++                    // different quant type, that group can carry this one as a
++                    // second-vec_dot-type guest, and the pair costs one launch
++                    // instead of two. The attention block is the site: after
++                    // 0049 the order is Q, K, V and 0021 leaves Q at Q6_K while
++                    // K/V stay Q8_0, which is exactly what kept them apart.
++                    if (mmvq_xtype_guest_enabled && n_members < 2 &&
++                            !ggml_cuda_mmvq_would_glu_fuse(cgraph, i)) {
++                        int hstart = -1;
++                        for (int j = i + 1; j < cgraph->n_nodes; ++j) {
++                            ggml_tensor * cand = cgraph->nodes[j];
++                            if (ggml_cuda_is_view_or_noop(cand)) {
++                                continue;
++                            }
++                            if (cand->op == GGML_OP_MUL_MAT && cand->src[1] == node->src[1] &&
++                                    cand->src[0]->type != node->src[0]->type &&
++                                    ggml_cuda_mmvq_can_group(cand) &&
++                                    !ggml_cuda_mmvq_would_glu_fuse(cgraph, j)) {
++                                hstart = j;
++                            }
++                            break; // adjacency only: no hoist over a real node
++                        }
++                        ggml_tensor * hmembers[MMVQ_MAX_GROUP_SIZE];
++                        int n_h = hstart > 0 ? ggml_cuda_mmvq_collect_group(cgraph, hstart, hmembers) : 0;
++                        if (n_h >= 2 &&
++                                ggml_cuda_mmvq_grouped_xguest_blocks(
++                                    hmembers[0]->src[0]->type, (int) node->src[1]->ne[0],
++                                    node->src[0]->type, (int) node->src[0]->ne[0],
++                                    node->src[0]->ne[1]) > 0) {
++                            // Inside one kernel the guest and the host group run
++                            // with no ordering between them where the separate
++                            // launches were strictly ordered, so every write has
++                            // to be disjoint from every other write and input
++                            // (the 0045 lesson, re-applied).
++                            bool ok = true;
++                            for (int m = 0; m < n_h && ok; ++m) {
++                                ok = ggml_cuda_mmvq_ranges_disjoint(node, hmembers[m]) &&
++                                     ggml_cuda_mmvq_ranges_disjoint(node, hmembers[m]->src[0]);
++                            }
++                            for (int m = 0; m < n_h && ok; ++m) {
++                                int idx = -1;
++                                for (int k = hstart; k < cgraph->n_nodes; ++k) {
++                                    if (cgraph->nodes[k] == hmembers[m]) { idx = k; break; }
++                                }
++                                ok = idx >= 0 && ggml_cuda_mmvq_hoist_legal(cgraph, i, idx);
++                            }
++                            if (ok) {
++                                ggml_cuda_mul_mat_vec_q_grouped(*cuda_ctx, hmembers, n_h,
++                                                                nullptr, nullptr, 0, nullptr, node);
++                                for (int m = 0; m < n_h; ++m) {
++                                    mmvq_grouped_done.insert(hmembers[m]);
++                                }
++                                if (mmvq_group_stats != nullptr) {
++                                    mmvq_group_stats[0] += 1;
++                                    mmvq_group_stats[1] += n_h + 1;
++                                }
++                                continue;
++                            }
++                        }
++                    }
+                 }
+ 
+                 // 0047: the shared-expert down projection co-launched inside the
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 311acd1f0..394f2091c 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1022,6 +1022,18 @@ struct mmvq_grouped_args {
+     uint32_t      f_stride_row;
+     uint8_t       f_postop[MMVQ_F32_TAIL_MAX];
+ 
++    // 0052 cross-quant-type guest: a WHOLE standalone mul_mat_vec_q of a
++    // different vec_dot type, co-launched at the TAIL of this grid. The 0045
++    // rule (the small kernel goes first) puts it last: here the guest is the
++    // LARGE launch (attn wq, 8192 rows) and the host the small one (wk+wv).
++    // xg_nblocks == 0 disables.
++    const void * xg_vx;
++    float      * xg_dst;
++    uint32_t     xg_ncols_x;
++    uint32_t     xg_stride_row_x;
++    uint32_t     xg_block0;
++    uint32_t     xg_nblocks;
++
+     // 0046 topk_moe co-launch guest. Runs as warp 0 of block 0 (the FRONT of
+     // the grid - see 0045 on block order); the quantized rows shift up by one.
+     const float * tk_logits;
+@@ -1033,7 +1045,8 @@ struct mmvq_grouped_args {
+     uint8_t       tk_with_norm;
+ };
+ 
+-template <ggml_type type, bool small_k = false, bool has_topk = false>
++template <ggml_type type, bool small_k = false, bool has_topk = false,
++          ggml_type type_g = GGML_TYPE_Q6_K, int gw = 1, bool has_xguest = false>
+ __launch_bounds__(calc_nwarps(type, 1, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q_grouped(
+         const mmvq_grouped_args args, const void * vy_ptr,
+@@ -1059,6 +1072,70 @@ static __global__ void mul_mat_vec_q_grouped(
+ 
+     const int tid = warp_size*threadIdx.y + threadIdx.x;
+ 
++    // ---- 0052: cross-quant-type guest matvec, at the TAIL of the grid -------
++    // The guest is a whole standalone mul_mat_vec_q<type_g,1,false,false>: gw is
++    // the number of warps its own launch gives one row (so the thread->k-block
++    // map is untouched), blockDim.y/gw of its rows share a block, and
++    // blocks_per_iter_g stays derived from the guest type FULL compile-time
++    // nwarps exactly as in mul_mat_vec_q.
++    constexpr int nwarps_xg = calc_nwarps(type_g, 1, table_id);
++    if constexpr (has_xguest && gw >= 1 && gw <= nwarps_xg) {
++        if (blockIdx.x >= args.xg_block0) {
++            constexpr int qk_g  = ggml_cuda_type_traits<type_g>::qk;
++            constexpr int qi_g  = ggml_cuda_type_traits<type_g>::qi;
++            constexpr int vdr_g = get_vdr_mmvq(type_g, table_id);
++            constexpr vec_dot_q_cuda_t vec_dot_g = get_vec_dot_q_cuda(type_g);
++            constexpr int blocks_per_iter_g = vdr_g * nwarps_xg*warp_size / qi_g;
++            constexpr int nwarps_host  = calc_nwarps(type, 1, table_id);
++            constexpr int max_rows_pb  = nwarps_host/gw > 0 ? nwarps_host/gw : 1;
++
++            const uint32_t rows_per_block_g = blockDim.y / gw;
++            const uint32_t wr = threadIdx.y / gw;   // which guest row in this block
++            const uint32_t wl = threadIdx.y % gw;   // warp index within that row
++            const int grow = (int) ((blockIdx.x - args.xg_block0)*rows_per_block_g + wr);
++            const int ltid = warp_size*wl + threadIdx.x;
++            const int blocks_per_row_g = args.xg_ncols_x / qk_g;
++
++            ggml_cuda_pdl_sync();
++
++            float tmp_g = 0.0f;
++            const block_q8_1 * yg = (const block_q8_1 *) vy_ptr;
++            const int kbx_offset_g = grow*args.xg_stride_row_x;
++            for (int kbx = ltid / (qi_g/vdr_g); kbx < blocks_per_row_g; kbx += blocks_per_iter_g) {
++                const int kby = kbx * (qk_g/QK8_1);
++                const int kqs = vdr_g * (ltid % (qi_g/vdr_g));
++                tmp_g += vec_dot_g(args.xg_vx, &yg[kby], kbx_offset_g + kbx, kqs);
++            }
++
++            __shared__ float xg_shared[max_rows_pb][gw > 1 ? gw-1 : 1][warp_size];
++            if constexpr (gw > 1) {
++                if (wl > 0) {
++                    xg_shared[wr][wl-1][threadIdx.x] = tmp_g;
++                }
++                __syncthreads();
++                if (wl > 0) {
++                    return;
++                }
++            }
++            // warp 0 of the standalone launch reduces slots 0..nwarps_xg-2: the
++            // first gw-1 hold the launched warps partials, the rest are the
++            // exact +0.0f the trimmed warps would have written.
++#pragma unroll
++            for (int l = 0; l < gw - 1; ++l) {
++                tmp_g += xg_shared[wr][l][threadIdx.x];
++            }
++#pragma unroll
++            for (int l = gw - 1; l < nwarps_xg - 1; ++l) {
++                tmp_g += 0.0f;
++            }
++            tmp_g = warp_reduce_sum<warp_size>(tmp_g);
++            if (threadIdx.x == 0) {
++                args.xg_dst[grow] = tmp_g;
++            }
++            return;
++        }
++    }
++
+     // ---- 0046: topk_moe co-launch guest --------------------------------------
+     // One warp of one block, the same 32 lanes the standalone launch gives it.
+     // The body is warp-local (no shared memory, no __syncthreads), so the ids
+@@ -1279,9 +1356,101 @@ static void mul_mat_vec_q_grouped_launch(
+     ggml_cuda_kernel_launch(mul_mat_vec_q_grouped<type, false, has_topk>, launch_params, args_in, vy, ncols_x, stride_row_x);
+ }
+ 
++// 0052: warps per guest row = what the guest own standalone launch would use
++// (calc_launch_params + the untrim rule), so the guest thread->k-block map is
++// unchanged. Returns 0 when the guest cannot be expressed at this block shape.
++template <ggml_type type_g>
++static int mmvq_grouped_xguest_warps(const int ncols_g, const int64_t nrows_g, const int host_warps,
++                                     const int warp_size, const mmvq_parameter_table_id table_id) {
++    constexpr int qk_g = ggml_cuda_type_traits<type_g>::qk;
++    const int nwarps_g = calc_nwarps(type_g, 1, table_id);
++    if (calc_rows_per_block(1, table_id, /*small_k=*/false, nwarps_g) != 1) {
++        return 0;
++    }
++    if (ncols_g % qk_g != 0 || host_warps < 1) {
++        return 0;
++    }
++    // the guest must be the plain (non-small_k) launch this body is byte-exact
++    // against: on RDNA4 the only route to small_k is the 0024 Q6_K multi-row
++    // opt-in, so decline exactly where that would have fired.
++    if (table_id == MMVQ_PARAMETERS_RDNA4 && type_g == GGML_TYPE_Q6_K &&
++            mmvq_r4_rpb_enabled() && nrows_g >= (int64_t) mmvq_r4_rpb_min_rows()) {
++        return 0;
++    }
++    int gw = calc_nwarps_launched<type_g>(ncols_g, nwarps_g, warp_size, table_id);
++    if (nrows_g < (int64_t) mmvq_untrim_below_blocks()) {
++        gw = nwarps_g;
++    }
++    if (gw < 1 || gw > nwarps_g || gw > host_warps || host_warps % gw != 0) {
++        return 0;
++    }
++    const int rows_per_block_g = host_warps / gw;
++    if (rows_per_block_g < 1 || nrows_g % rows_per_block_g != 0) {
++        return 0;
++    }
++    return gw;
++}
++
++// Host-side sizing for the 0052 guest: returns the block count it needs, or 0
++// when this (host, guest) pair cannot carry it. Kept as a free function so the
++// graph-side detector can decide BEFORE it marks nodes as consumed.
++int ggml_cuda_mmvq_grouped_xguest_blocks(const ggml_type host_type, const int host_ncols,
++                                         const ggml_type guest_type, const int guest_ncols,
++                                         const int64_t guest_nrows) {
++    if (host_type != GGML_TYPE_Q8_0 || guest_type != GGML_TYPE_Q6_K) {
++        return 0; // the only instantiated pair (see mul_mat_vec_q_grouped_switch_type)
++    }
++    if (host_ncols != guest_ncols) {
++        return 0; // one shared q8_1 activation
++    }
++    const int device    = ggml_cuda_get_device();
++    const int cc        = ggml_cuda_info().devices[device].cc;
++    const int warp_size = ggml_cuda_info().devices[device].warp_size;
++    const mmvq_parameter_table_id table_id = get_device_table_id(cc);
++    const int host_warps = calc_nwarps_launched<GGML_TYPE_Q8_0>(
++            host_ncols, calc_nwarps(GGML_TYPE_Q8_0, 1, table_id), warp_size, table_id);
++    const int gw = mmvq_grouped_xguest_warps<GGML_TYPE_Q6_K>(guest_ncols, guest_nrows, host_warps, warp_size, table_id);
++    if (gw == 0) {
++        return 0;
++    }
++    return (int) (guest_nrows / (host_warps / gw));
++}
++
++template <ggml_type type, ggml_type type_g, int gw>
++static void mul_mat_vec_q_grouped_launch_xg(
++        const mmvq_grouped_args & args, const void * vy, const uint32_t total_rows,
++        const uint32_t ncols_x, const uint32_t stride_row_x, cudaStream_t stream) {
++    const int device    = ggml_cuda_get_device();
++    const int cc        = ggml_cuda_info().devices[device].cc;
++    const int warp_size = ggml_cuda_info().devices[device].warp_size;
++    const mmvq_parameter_table_id table_id = get_device_table_id(cc);
++    const int nwarps = calc_nwarps(type, 1, table_id);
++
++    // The host keeps EXACTLY the block shape and block count it launches alone;
++    // the guest only appends blocks at the tail.
++    const dim3 block_nums(total_rows + args.f_nrows + args.xg_nblocks, 1, 1);
++    const dim3 block_dims(warp_size, calc_nwarps_launched<type>(ncols_x, nwarps, warp_size, table_id), 1);
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, 0, stream);
++    ggml_cuda_kernel_launch((mul_mat_vec_q_grouped<type, false, false, type_g, gw, true>),
++                            launch_params, args, vy, ncols_x, stride_row_x);
++}
++
+ static void mul_mat_vec_q_grouped_switch_type(
+         const ggml_type type, const mmvq_grouped_args & args, const void * vy, const uint32_t total_rows,
+-        const uint32_t ncols_x, const uint32_t stride_row_x, cudaStream_t stream, const bool has_topk = false) {
++        const uint32_t ncols_x, const uint32_t stride_row_x, cudaStream_t stream, const bool has_topk = false,
++        const int xg_gw = 0) {
++    if (xg_gw != 0) {
++        // 0052: exactly one instantiated pair - the Q8_0 attention K/V group
++        // carrying the Q6_K Q projection. Everything else declines host-side.
++        GGML_ASSERT(type == GGML_TYPE_Q8_0 && !has_topk && args.xg_nblocks != 0);
++        switch (xg_gw) {
++            case 1: mul_mat_vec_q_grouped_launch_xg<GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, 1>(args, vy, total_rows, ncols_x, stride_row_x, stream); return;
++            case 2: mul_mat_vec_q_grouped_launch_xg<GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, 2>(args, vy, total_rows, ncols_x, stride_row_x, stream); return;
++            case 4: mul_mat_vec_q_grouped_launch_xg<GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, 4>(args, vy, total_rows, ncols_x, stride_row_x, stream); return;
++            case 8: mul_mat_vec_q_grouped_launch_xg<GGML_TYPE_Q8_0, GGML_TYPE_Q6_K, 8>(args, vy, total_rows, ncols_x, stride_row_x, stream); return;
++            default: GGML_ABORT("0052: unsupported guest warp count");
++        }
++    }
+     if (has_topk) {
+         // 0046: exactly one extra instantiation - the shared-expert gate/up pair
+         // this GGUF ships as Q8_0. Every other type declines host-side, so the
+@@ -2463,7 +2632,7 @@ void ggml_cuda_op_mul_mat_vec_q(
+ 
+ void ggml_cuda_mul_mat_vec_q_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes,
+                                      ggml_tensor * const * f32_nodes, const mmvf_epilogue * f32_epilogues, int n_f32_nodes,
+-                                     const mmvq_topk_guest * topk_guest) {
++                                     const mmvq_topk_guest * topk_guest, const ggml_tensor * xtype_guest) {
+     GGML_ASSERT(n_nodes >= 2 && n_nodes <= MMVQ_MAX_GROUP_SIZE);
+ 
+     const ggml_tensor * src1       = nodes[0]->src[1];
+@@ -2601,5 +2770,35 @@ void ggml_cuda_mul_mat_vec_q_grouped(ggml_backend_cuda_context & ctx, ggml_tenso
+         has_topk              = true;
+     }
+ 
+-    mul_mat_vec_q_grouped_switch_type(type, args, src1_q8_1, total_rows, (uint32_t) ne10, (uint32_t) stride_row_x, stream, has_topk);
++    // ---- 0052: attach the cross-quant-type guest matvec --------------------
++    int xg_gw = 0;
++    if (xtype_guest != nullptr) {
++        const ggml_tensor * gs0 = xtype_guest->src[0];
++        GGML_ASSERT(xtype_guest->op == GGML_OP_MUL_MAT);
++        GGML_ASSERT(xtype_guest->src[1] == src1 && xtype_guest->src[2] == nullptr);
++        GGML_ASSERT(gs0->ne[0] == ne10 && gs0->ne[2] == 1 && gs0->ne[3] == 1);
++        GGML_ASSERT(xtype_guest->type == GGML_TYPE_F32 && xtype_guest->ne[0] == gs0->ne[1]);
++        GGML_ASSERT(xtype_guest->ne[1] == 1 && xtype_guest->ne[2] == 1 && xtype_guest->ne[3] == 1);
++        GGML_ASSERT(topk_guest == nullptr || !topk_guest->active);
++        GGML_ASSERT(n_f32_nodes == 0);
++
++        const int device    = ggml_cuda_get_device();
++        const int cc        = ggml_cuda_info().devices[device].cc;
++        const int warp_size = ggml_cuda_info().devices[device].warp_size;
++        const mmvq_parameter_table_id table_id = get_device_table_id(cc);
++        const int host_warps = calc_nwarps_launched<GGML_TYPE_Q8_0>(
++                (int) ne10, calc_nwarps(GGML_TYPE_Q8_0, 1, table_id), warp_size, table_id);
++        GGML_ASSERT(type == GGML_TYPE_Q8_0 && gs0->type == GGML_TYPE_Q6_K);
++        xg_gw = mmvq_grouped_xguest_warps<GGML_TYPE_Q6_K>((int) ne10, gs0->ne[1], host_warps, warp_size, table_id);
++        GGML_ASSERT(xg_gw > 0);
++
++        args.xg_vx           = gs0->data;
++        args.xg_dst          = (float *) xtype_guest->data;
++        args.xg_ncols_x      = (uint32_t) ne10;
++        args.xg_stride_row_x = (uint32_t) (gs0->nb[1] / ggml_type_size(gs0->type));
++        args.xg_block0       = total_rows;
++        args.xg_nblocks      = (uint32_t) (gs0->ne[1] / (host_warps / xg_gw));
++    }
++
++    mul_mat_vec_q_grouped_switch_type(type, args, src1_q8_1, total_rows, (uint32_t) ne10, (uint32_t) stride_row_x, stream, has_topk, xg_gw);
+ }
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index 3c7c5caaf..acec1b3c2 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -44,7 +44,14 @@ struct mmvq_topk_guest {
+ void ggml_cuda_mul_mat_vec_q_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes,
+                                      ggml_tensor * const * f32_nodes = nullptr,
+                                      const mmvf_epilogue * f32_epilogues = nullptr, int n_f32_nodes = 0,
+-                                     const mmvq_topk_guest * topk_guest = nullptr);
++                                     const mmvq_topk_guest * topk_guest = nullptr,
++                                     const ggml_tensor * xtype_guest = nullptr);
++
++// 0052: block count the cross-quant-type guest needs inside a grouped launch,
++// or 0 when the pair cannot carry it. The detector must ask BEFORE it marks
++// nodes consumed, because declining has to leave both launches standing.
++int ggml_cuda_mmvq_grouped_xguest_blocks(ggml_type host_type, int host_ncols,
++                                         ggml_type guest_type, int guest_ncols, int64_t guest_nrows);
+ 
+ // Maximum number of MoE expert slots whose partial results the expert-reduce
+ // kernel below can fold into one store (n_expert_used).
