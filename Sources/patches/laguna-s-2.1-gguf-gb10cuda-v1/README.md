@@ -74,7 +74,10 @@ so `llama_decode` never sees more than `n_ubatch` and the absorption test
 **The scored prefill is also not a slope on this runner.** `rocm-worker` takes
 `body.timings.prompt_per_second` from a **single cache-cold `/completion`
 request**, median of 9 runs at indices 100–108, with the prompt sized in
-**characters** (`GAINZ_PROMPT_CHARS = 2600`). So `prompt_n` varies run to run
+**characters** (`GAINZ_PROMPT_CHARS`, **2950 on this box** — `rocm-worker.ts`
+defaults to 2600 but `~/gainz-runner-cuda/.env` overrides it, and the 2600
+figure originally recorded here was wrong; see the laguna-xs README correction
+of 2026-08-09). So `prompt_n` varies run to run
 (measured: 524, 544, 562, 551, 541, 547, 536, **511**, 536) and there is no
 `(t(534) − t(84))/451` anywhere in this harness. The `+38.4% slope` figure was
 computed with a formula this runner does not use, on a code path that does not
