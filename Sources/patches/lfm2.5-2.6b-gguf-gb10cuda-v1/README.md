@@ -158,6 +158,68 @@ most of it.** Anyone profiling here again: `ncu` is installed at
 `/usr/local/cuda-13.0/bin/ncu` but returns `ERR_NVGPUCTRPERM` — the counters
 are admin-restricted, so use the standalone probe plus census diffs instead.
 
+## Measured-dead by census: guest relocation at decode (no kernel was written)
+
+**PDL already does it, in hardware, and the ceiling is 2.76%.** The R9700 twin's
+guest-relocation family — hoist a warp-local kernel body into a saturated host
+kernel's grid, bit-identical by construction — looked like the best-evidenced
+open lever here, because this README's own census says decode is 91% matvec with
+the remaining ~9% fragmented over ~285 tiny launches per token. That framing
+counts *summed kernel time*, and summed kernel time is the wrong quantity: it
+double-counts everything the GPU is already running concurrently.
+
+An ordered `cuda_gpu_trace` at `-p 0 -n 24` on `base13`, reduced to interval
+unions rather than sums, over four disjoint analysis windows:
+
+| | 35–95% | 45–85% | 55–99% | 30–70% |
+| --- | --- | --- | --- | --- |
+| matvec union / wall | 94.14% | 94.21% | 94.11% | 94.18% |
+| all-kernel union / wall | 96.90% | 96.94% | 96.87% | 96.95% |
+| **non-matvec adds** | **2.76%** | **2.73%** | **2.76%** | **2.76%** |
+| GPU idle | 3.10% | 3.06% | 3.13% | 3.05% |
+
+Everything that is not a `mul_mat_vec_q` adds only **2.76% to the decode wall**,
+not 9%. Per kernel, the fraction of its time already overlapping another kernel:
+
+| kernel | n | ms | overlapped | static shmem |
+| --- | --- | --- | --- | --- |
+| `ssm_conv_f32` | 330 | 0.79 | **100%** | 0 |
+| `rope_neox` | 242 | 0.48 | **100%** | 0 |
+| `flash_attn_combine_results` | 121 | 0.68 | **100%** | 0 |
+| `k_get_rows_float` | 362 | 1.34 | 97.4% | 0 |
+| `flash_attn_ext_vec` | 121 | 0.64 | 93.6% | 4.1 kB |
+| `quantize_q8_1` | 903 | 2.09 | 91.4% | 0 |
+| `k_bin_bcast<op_mul>` | 661 | 1.18 | 88.3% | 0 |
+| `k_set_rows` | 121 | 0.26 | 86.2% | 0 |
+| `rms_norm_pre_add_f32` | 918 | 3.16 | 84.5% | 0 |
+| `cpy_scalar` | 331 | 0.55 | 74.7% | 0 |
+| `rms_norm_f32` | 242 | 0.43 | 72.0% | 0 |
+| `concat_cont` | 331 | 0.60 | 46.9% | 0 |
+| `mul_mat_vec_q` | 2063 | 116.12 | 4.0% | 1 kB |
+
+The shared-memory column is the `__shared__`/`__syncthreads` screen done from
+the trace instead of the source: nearly the whole pool *is* warp-local and *is*
+relocatable. It is simply already relocated. **Programmatic dependent launch is
+on by default on this box** (this README already records `GGML_CUDA_PDL=0` at
+−3%), and a PDL successor begins in the tail of its predecessor, so these
+kernels are executing inside the matvecs' shadow exactly as a hand-written guest
+would. Summing their exposed (non-overlapped) time gives **~1.5 ms of a 123.3 ms
+decode wall, 1.2%**.
+
+So the arithmetic against building it is: upper bound 2.76% decode assuming
+relocation is *free and perfect*, tighter estimate 1.2% — against the **−2.5%**
+that co-launching measures on this very track (`GGML_CUDA_ENABLE_MMVQ_GROUP=1`,
+in the dead-lever table below). Even the ceiling is worth only
+`1.0276^0.65 = +1.8%` of score, and the realistic capture is under the 0.6%
+noise floor. Not built.
+
+**The transferable rule: price a hiding lever against the interval UNION, never
+the sum.** `sum/union` on this trace is 1.074 — 7.4% of all kernel time is
+already concurrent, which is most of the pool the lever was aimed at. On a box
+with PDL on and CUDA graphs capturing, "n launches × t each" is not headroom.
+The R9700 twin's guests pay there because that backend is HIP without this
+overlap, not because the ops are inherently exposed.
+
 ## Measured-dead: folding the MMQ-layout q8_1 quantize into its producer
 
 **The whole `quantize_mmq_q8_1` pool is L2-served, so there is no round trip to
@@ -263,7 +325,9 @@ Notes that cost real runner time to learn:
   memory contention and is not comparable to anything above.
 - **Never run `llama-bench` while a compile is running on this box** — it
   costs every arm a uniform ~8% and produced one discarded round tonight.
-- **`~/fable-lfm-gb10/series` on the runner box is NOT this series.** It is
+- **Treat every number measured against the old `series` tree as unverified.**
+  That includes this README's own pre-2026-08-09 A/B rows unless they name
+  `base13`. **`~/fable-lfm-gb10/series` on the runner box is NOT this series.** It is
   missing `0013` entirely and the `vecdotq.cuh` / `mmvq.cu` halves of `0012`,
   i.e. it is the ~11-patch family. Any A/B taken against it is against the
   wrong parent. Build the control with
