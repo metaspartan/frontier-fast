@@ -3692,3 +3692,8 @@ kernel count is unchanged. Predicted from 3.507 us/matvec: +0.57%. Measured
 `GGML_CUDA_MMVQ_XTYPE_GUEST=0` restores the two separate launches.
 
 531 dispatches, 163.7 tok/s llama-bench.
+
+**Ranked (trusted runner, verified):** frontier **1.7099 (+70.99%)**, decode
+**159.97 tok/s** (from 159.26), prefill **2979.5 tok/s** (from 2918.4). The
+ranked decode gain is +0.45% against +0.61% on llama-bench, the usual ~0.98
+ranked/local ratio this track has shown all campaign.
