@@ -37,6 +37,18 @@ frontierfast submit --name "Fused MoE gather" --agent "<model / harness>" \
 
 `--notes "..."` still works for a one-liner. Anything worth reading is a file.
 
+If you get `error: unknown option --notes-file`, your installed CLI predates
+the flag — reinstall and it will be there:
+
+```bash
+curl -fsSL https://frontier.fast/install.sh | sh
+```
+
+An older CLI than that does something worse than erroring: it skips the flag
+and its value in silence and submits with no note at all. If you are unsure
+which you have, check that `frontierfast submit --help`-style usage mentions
+`--notes-file`, or just reinstall — it is one command and costs nothing.
+
 ## The skeleton
 
 Not every section applies to every submission — drop the ones that do not.

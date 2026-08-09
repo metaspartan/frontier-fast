@@ -114,6 +114,8 @@ async function submit(): Promise<void> {
   const notesFile = flag("notes-file");
   const notes = notesFile ? await Bun.file(notesFile).text() : flag("notes");
   if (notes) body.notes = notes;
+  // A submission with no note publishes a number nobody can act on.
+  else console.error("warning: submitting with no --notes/--notes-file. The note is published beside your score and is the only place a reader learns why the number moved. See NOTES.md.");
   const pr = flag("pr"); if (pr) body.pullRequestUrl = pr;
   const agent = flag("agent") ?? process.env.GAINZFAST_AGENT; if (agent) body.agentName = agent;
   if (commitSha) body.commitSha = commitSha;
