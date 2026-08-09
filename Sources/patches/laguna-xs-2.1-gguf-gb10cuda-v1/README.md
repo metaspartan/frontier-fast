@@ -359,3 +359,73 @@ That is why 0017 ships here and is only *recorded*, not submitted, on qwen.
 Whoever picks up qwen needs a way to bound huge-page demand or to stop the
 prompt cache growing — and the latter is the declined checkpoint lever, so it
 is not simply available.
+
+# CORRECTION (2026-08-09, post-verdict): `GAINZ_PROMPT_CHARS` ON THIS BOX IS **2950**, NOT 2600 — and 0017's real value is about half the headline
+
+`0017` **verified at 1.083132** (from 1.082349). Read this before trusting any
+number in the section above it, and before building any replica on this box.
+
+## The harness error
+
+Every replica on this track — including the one that produced the `−9.3% ttft`
+headline — sized the prompt at **2600 characters**, the code default in
+`rocm-worker.ts` (`Number(process.env.GAINZ_PROMPT_CHARS ?? 2600)`). **The GB10
+runner's `.env` overrides it to `GAINZ_PROMPT_CHARS=2950`**, which is ~600
+prompt tokens rather than ~540. The laguna-S README documents 2600 and **that is
+wrong for this box**.
+
+Re-measured with the runner's **own built binary** at **2950** characters, four
+alternating boots, same `LLAMA_HUGEPAGE_STATE` toggle:
+
+| arm | ttft | prefill | decode | minflt | AnonHugePages |
+| --- | --- | --- | --- | --- | --- |
+| off1 | 0.38496 | 1832.6 | 100.31 | 56,154 | 0 kB |
+| on1 | 0.36686 | 1884.3 | 100.24 | 19,106 | 774,144 kB |
+| off2 | 0.37492 | 1852.4 | 100.09 | 56,475 | 0 kB |
+| on2 | 0.36076 | 1902.1 | 100.05 | 19,421 | 763,904 kB |
+
+Still disjoint, still fires (minflt 56k → 19k, `AnonHugePages` 0 → 774 MB), but
+the effect is **ttft −4.2% and prefill +2.75%**, not −9.3%. The host gap it
+removes is **53.6 ms → 32.9 ms**, i.e. **~20 ms**, and at 2600 characters that
+20 ms sits on a smaller ttft and reads as twice the percentage. **The mechanism
+was right; the operating point was wrong.**
+
+## What the ranked runner actually paid
+
+| | 0016 (predecessor) | 0017 (this patch) |
+| --- | --- | --- |
+| score | 1.082349 | **1.083132** |
+| candidate ttft (abs) | 0.3901 | **0.3905** |
+| stock ttft (abs) | 0.4098 | 0.4147 |
+| ttftSpeedup | 1.0503 | 1.0619 |
+| candidate prefill (abs) | 1819.31 | 1837.99 |
+| stock prefill (abs) | 1703.63 | 1706.43 |
+
+**The candidate's absolute ttft did not move: 0.3901 → 0.3905.** The +1.10% in
+`ttftSpeedup` is the **stock arm drifting 1.21% slower** between sessions, not
+the candidate getting faster. Prefill is the one leg with a real candidate
+component (+1.03% candidate against +0.16% stock). Net score **+0.072%** —
+**at the noise floor.**
+
+The arithmetic explains it. The saving is ~20 ms; session-to-session drift in the
+stock ttft arm alone is 0.4098 → 0.4147, **~5 ms**, and the ranked ttft is a
+median of 9 runs in each of 3 paired rounds. A 20 ms effect on a 390 ms
+measurement, at 0.15 weight, is worth ~0.8% of score at best and the harness
+cannot resolve it against its own drift.
+
+## Rules this cost a submission slot
+
+1. **Read the runner's `.env` before building a replica.** `GAINZ_PROMPT_CHARS`
+   is **2950** here, `GAINZ_BENCH_PORT` is 8012, `GAINZ_GPU_ENV` is
+   `CUDA_VISIBLE_DEVICES=0`, and `GAINZ_MODEL_PATHS` is a per-track JSON map.
+   The defaults in `rocm-worker.ts` are **not** what this box runs.
+2. **A local A/B with disjoint arms is still only a local A/B.** Six disjoint
+   boots said −9.3%; the true operating point said −4.2%; the runner realised
+   ~0. Before spending a slot, divide the absolute saving in milliseconds by the
+   ranked measurement's own session drift — if the ratio is not comfortably
+   above 1, the runner cannot see it.
+3. **`safe_gpu_wait` matches on the string
+   `gainz-runner-cuda.*/work/[a-f0-9]*/llama-tree/build`.** Running anything
+   whose command line contains the runner's work path makes the box think a
+   worker is busy and **deadlocks your own wait**. Copy the binary somewhere
+   neutral first.
