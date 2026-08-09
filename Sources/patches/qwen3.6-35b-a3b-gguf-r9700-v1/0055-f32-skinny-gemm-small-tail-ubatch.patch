@@ -1,0 +1,57 @@
+From 10ca4348c9b399e0b3863af90ddef5eb5470ca63 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sun, 9 Aug 2026 06:29:11 +0000
+Subject: [PATCH] cuda/hip: let the skinny f32 GEMM take the small tail ubatch
+ too (+8.6% prefill)
+
+0044 added a wave-tiled f32 GEMM for the shapes rocBLAS under-parallelises and
+guarded it with min_cols = 32. That lower bound excluded exactly the shapes
+where the vendor BLAS is worst: fewer columns means fewer output tiles means
+fewer workgroups.
+
+Any prompt longer than one physical batch ends in a short tail ubatch, and the
+ranked 512-token prompt tokenises to ~534, so every request has one of 22
+tokens. At M = 22 the guard rejects and 100 matmuls per pass land on
+Cijk_Alik_Bljk_S_B_Bias_HA_S_SAV running on 1 to 4 workgroups of a 64 CU part:
+11.49 ms of a 135.59 ms pp534 pass. The same 100 launches in this kernel are
+3.21 ms.
+
+Measured by kernel census at pp534: the rocBLAS kernel disappears entirely and
+mul_mat_f32_skinny_cuda<8,8,4,false> takes its place, f32/GEMM time per pass
+26.63 -> 18.30 ms.
+
+Lowered to 8 rather than 1 so decode-shape matvecs (M = 1) stay on the
+mmvf/mmvq paths rounds 17-53 tuned; measured flat between 2 and 8.
+
+GGML_F32_SKINNY_MIN_COLS=32 restores the old threshold.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ ggml/src/ggml-cuda/mmf32-skinny.cu | 11 ++++++++++-
+ 1 file changed, 10 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/mmf32-skinny.cu b/ggml/src/ggml-cuda/mmf32-skinny.cu
+index cda1844ae..5e7773fc8 100644
+--- a/ggml/src/ggml-cuda/mmf32-skinny.cu
++++ b/ggml/src/ggml-cuda/mmf32-skinny.cu
+@@ -132,7 +132,16 @@ static int mmf32_skinny_max_rows() {
+ static int mmf32_skinny_min_cols() {
+     static const int v = []() {
+         const char * s = getenv("GGML_F32_SKINNY_MIN_COLS");
+-        return s ? atoi(s) : 32;
++        // 0044 shipped this at 32, which excluded exactly the shapes where the vendor
++        // BLAS is WORST.  Fewer columns means fewer output tiles means fewer
++        // workgroups: a 22-column tail ubatch lands rocBLAS on a 1-4 workgroup
++        // Cijk_..._S_B_Bias_... on a 64 CU part, 100 launches and 11.49 ms of a
++        // 135.59 ms pp534 pass.  The same work in this kernel is 3.21 ms.
++        // Any prompt longer than one physical batch has such a tail, and the ranked
++        // 512-token prompt tokenises to ~534, so it has one every request.
++        // 8 rather than 1: decode-shape matvecs (M = 1) must stay on the mmvf/mmvq
++        // paths that rounds 17-53 tuned.  Measured flat between 2 and 8.
++        return s ? atoi(s) : 8;
+     }();
+     return v;
+ }
+-- 
+2.53.0
+

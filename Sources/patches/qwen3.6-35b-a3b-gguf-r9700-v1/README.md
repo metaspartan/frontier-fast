@@ -4112,3 +4112,104 @@ would cut cache memory ~2.7x *and* make the checkpoint buffers free-and-reuse
 each request, at which point pooling recovers the 2 x 18.9 ms and ON_DEVICE
 becomes viable too. It costs rollback fidelity after a cache restore, so it is
 an owner decision, not a unilateral optimisation.
+
+## Round 42: decompose the prefill SLOPE, and 0055 — the tail ubatch nobody was looking at
+
+Round 40 established that prefill is scored as `( t(534) - t(84) ) / 451`, so the
+right census is not "share of a pp512 pass" but **d(ms)/d(token) across that
+range**. `rocprofv3 --kernel-trace` at pp84, pp300 and pp534:
+
+```
+kernel-time per pass:  pp84 44.57 ms   pp300 74.79 ms   pp534 135.59 ms
+SLOPE NUMERATOR (534-84) = 91.02 ms over 450 tokens = 202.3 us/token -> 4944 tok/s
+```
+
+| pp84 | pp300 | pp534 | d(534-84) | % of slope | kernel |
+|---:|---:|---:|---:|---:|---|
+| 22.15 | 35.87 | 64.20 | **42.05** | **46.2%** | `mul_mat_q` |
+| 0.00 | 0.00 | 14.43 | **14.43** | **15.9%** | `Cijk_..._S_B_Bias_..._MT64x64x32` |
+| 1.58 | 5.19 | 7.94 | 6.37 | 7.0% | `gated_delta_net_mc` |
+| 0.00 | 0.00 | 5.60 | 5.60 | 6.2% | `Cijk_..._HSS_BH_..._MT128x128x32` |
+| 0.41 | 2.26 | 4.06 | 3.65 | 4.0% | `flash_attn_tile` |
+| 0.83 | 1.49 | 3.54 | 2.72 | 3.0% | `quantize_mmq_q8_1` |
+
+`mul_mat_q` is indeed the largest single term at 46.2% — **but the second entry
+is a kernel that runs ZERO times at pp84 and pp300 and 100 times at pp534.**
+That is not a scaling effect, it is a threshold, and it was worth chasing first.
+
+### What it is
+
+534 tokens is two physical batches: 512 + a **22-token tail**. 0044 added a
+wave-tiled f32 GEMM for the shapes rocBLAS under-parallelises and guarded it
+with `min_cols = 32`. At M = 22 the guard rejects, and 100 matmuls per pass fall
+back to `Cijk_Alik_Bljk_S_B_Bias_HA_S_SAV` — grids of **(256,64) and (64,64),
+i.e. 4 and 1 workgroups on a 64 CU part.** That lower bound was excluding
+exactly the regime where the vendor BLAS is worst: fewer columns means fewer
+output tiles means fewer workgroups. 0044 fixed "few rows"; the same pathology
+at "few columns" was left in.
+
+**Every prompt longer than one physical batch has such a tail**, and the ranked
+prompt tokenises to ~534, so it pays this on every single request.
+
+### The measurement
+
+`GGML_F32_SKINNY_MIN_COLS` is already an env knob, so the hypothesis cost one
+bench, no rebuild. llama-bench, 3 rounds:
+
+| shape | min_cols=32 | min_cols=8 | min_cols=2 |
+|---|---:|---:|---:|
+| pp534 | 3852.10 / 3875.55 / 3896.14 | **4127.13 / 4151.94 / 4103.56** | 4114.45 / 4158.15 / 4112.65 |
+| pp512 | 4980.35 / 4994.95 / 4985.02 | 5015.27 / 4998.15 / 5014.59 | 4992.96 / 4988.38 / 4989.63 |
+
+pp534 **+6.5%, 3/3 separated**; pp512 (one ubatch, no tail) flat, as the
+mechanism requires. Census at pp534 confirms it exactly — the rocBLAS kernel
+disappears and f32/GEMM time per pass goes **26.63 -> 18.30 ms**:
+
+```
+min_cols=32   100 x 11.49 ms  Cijk_Alik_Bljk_S_B_Bias_HA_S_SAV
+min_cols=8    100 x  3.21 ms  mul_mat_f32_skinny_cuda<8,8,4,false>
+```
+
+8 rather than 1, so decode-shape matvecs (M = 1) stay on the mmvf/mmvq paths
+rounds 17-53 tuned. 2 and 8 measure the same.
+
+### Correctness — and the gate-shaped blind spot, handled
+
+The `-c 512` gate shape is **one** ubatch of 512, so `min_cols` never fires there
+and the gate is bit-identical by construction. That is precisely the trap round
+41 recorded, so the ppl check was run at a shape that **does** split with a small
+tail, `-c 534 -b 534 -ub 512` (ubatches 512 + 22), 3 loads per arm:
+
+```
+min_cols=32   2.9399  2.9399  2.9407     mean 2.94017
+min_cols=8    2.9391  2.9389  2.9390     mean 2.93900   -> -0.040%
+```
+
+Separated but **-0.040%, well inside the 0.1% gate**. Ranked gate shape
+(`-b 512 -ub 1 --chunks 8`) reads **3.9382 on all four runs, both arms** —
+bit-identical. Decode `tg128` flat: 163.84 vs 163.86 over 3 rounds.
+
+### Ranked-replica result (cross-binary, control lib = parent commit)
+
+`LD_LIBRARY_PATH`-selected and `ldd`-verified, no env set on either arm, 9
+measured runs per server start:
+
+| arm | TTFT | prefill tok/s | decode tok/s | server PE(534) |
+|---|---:|---:|---:|---:|
+| ctl1 | 0.1938 | 4665.91 | 161.82 | 163.45 ms |
+| cand1 | 0.1862 | 5038.60 | 161.64 | 155.33 ms |
+| cand2 | 0.1862 | 5069.86 | 161.67 | 155.15 ms |
+| ctl2 | 0.1939 | 4639.89 | 161.53 | 163.17 ms |
+
+**prefill 4652.90 -> 5054.23 (+8.62%, 2/2 separated), ttft 0.19385 -> 0.18620
+(-3.95%), decode flat (-0.01%).** Server prompt-eval drops 8.1 ms, matching the
+8.28 ms the census predicted.
+
+Projected ranked: prefill **1.4166 -> 1.5388**, ttft **1.6256 -> 1.6924**, decode
+unchanged 1.9558, score **1.7835 -> ~1.824 (+2.28%)** — of which prefill is
++1.67% and ttft +0.61%.
+
+### Still open on the slope
+
+`mul_mat_q` remains **46.2% of the slope** (42.05 ms) and is untouched by this
+round. That is the next lever and it is the largest one left.
