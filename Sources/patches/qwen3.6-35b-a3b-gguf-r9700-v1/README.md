@@ -5000,3 +5000,258 @@ reverted and the tree rebuilt to the parked state. The series holds at the
 verified frontier of 1.7835 with a deterministic build, with 0056 banked and
 waiting for a companion that reaches the tail's *weight traffic* rather than its
 geometry — or for the 0008 defect to be understood.
+
+## Round 48: the census with 0056 applied, three levers priced dead by probe, and 0057 — the page SIZE nobody had changed
+
+0056 was banked and needed a companion worth >=1.5%. This round re-censused
+every scored term with 0056 applied, priced three candidate mechanisms with
+standalone probes *before* writing any kernel, and found the companion somewhere
+none of the kernel work had been looking: the host allocator.
+
+### 1. The prefill slope, re-censused WITH 0056 (this replaces round 47 §4)
+
+`rocprofv3 --kernel-trace` at pp84 / pp300 / pp534, `GGML_F32_SKINNY_MIN_COLS=8`,
+ms per pass. The rocBLAS f32 `Cijk_*_S_B_*` family is **gone** from the trace —
+that is 0056 firing, proven by the census diff and not by a timing:
+
+```
+total kernel   45.20     73.60    123.57
+SLOPE NUMERATOR (534-84) = 78.37 ms / 450 tok = 174.1 us/tok -> 5742 tok/s
+                                          (was 87.53 ms / 5141 tok/s)
+```
+
+| kernel family | pp84 | pp300 | pp534 | d(534-84) | %slope |
+|---|---:|---:|---:|---:|---:|
+| `mul_mat_q` | 22.48 | 35.33 | 63.12 | 40.64 | **51.9%** |
+| `gated_delta_net_mc_cuda` | 1.58 | 5.16 | 7.89 | 6.31 | 8.1% |
+| rocBLAS f16 `HSS` (0021's Q6_K route) | 5.14 | 8.86 | 10.99 | 5.84 | 7.5% |
+| `k_bin_bcast` | 0.92 | 2.13 | 4.54 | 3.62 | 4.6% |
+| `flash_attn_tile` | 0.41 | 2.25 | 4.02 | 3.61 | 4.6% |
+| `rms_norm_f32` | 0.71 | 1.77 | 4.30 | 3.59 | 4.6% |
+| `mul_mat_f32_skinny_cuda` | 3.44 | 4.07 | 6.93 | 3.49 | 4.5% |
+| `quantize_mmq_q8_1` | 0.83 | 1.49 | 3.31 | 2.48 | 3.2% |
+| `unary_gated_op_kernel` | 0.47 | 1.32 | 2.65 | 2.19 | 2.8% |
+| `dequantize_block_q6_K` | 4.26 | 4.28 | 4.26 | **0.00** | 0.0% |
+
+Score sensitivity at this shape is `0.20*D/78.37 + 0.15*D/186 = 0.336% per ms`
+of pp534 time removed, so **1.5% of score needs ~4.5 ms**. Read the table with
+that number in hand:
+
+- **No non-MMQ term is worth 1.5% even if it were deleted outright.** The two
+  largest are GDN (2.25%) and the Q6_K f16 route (2.38%), and those are whole-
+  kernel deletions, not achievable improvements. Everything below them is under
+  1.3%.
+- **`mul_mat_q` is the only lever big enough**, and it needs a 10% improvement.
+  Round 47 measured its loads at 94-99% of achievable and round 47e measured its
+  cost invariant to tile geometry. Nothing in this round reopens either.
+- `dequantize_block_q6_K` is **constant across all three shapes** (4.26 / 4.28 /
+  4.26). It therefore cancels out of the slope completely and is worth only
+  0.15*4.26/186 = **0.34%** in ttft. Hoisting 0021's dequant to load time is not
+  the lever it looks like; price fixed per-pass costs against the SLOPE, not
+  against the pass.
+
+### 2. The machine constant this round is worth carrying: the HIP-graph node floor is 2.14 us
+
+A graph-replayed probe (`~/fable-qwen/bw4.hip`) times N empty kernels captured
+into one HIP graph:
+
+```
+blocks       1      2.160 us        blocks    2560     3.558 us
+blocks       8      2.144 us        blocks    4104     4.538 us
+blocks      32      2.136 us        blocks   12352     9.451 us
+blocks     257      2.146 us        blocks  124160    99.535 us
+                                    => ~2.14 us fixed + ~0.8 ns per block
+```
+
+**Every small kernel in the decode token is exactly this floor and nothing
+else.** The 276 non-matvec dispatches per token measure 585 us against a
+predicted 276 x 2.14 = 591 us. There is no work in them to optimise — only
+dispatches to remove. It also independently confirms round 38's elementwise
+coefficient (2.238 us) by a completely different method, so that model can now
+be trusted rather than merely fitted.
+
+Concretely: `rms_norm_pre_add_f32` runs 80x/token at 2.71 us on **one block**,
+`k_bin_bcast` 70x at 1.80 us on **eight**. Their bytes/time is 6.6 and 9.0 GB/s
+— three orders of magnitude below DRAM, i.e. pure dispatch latency.
+
+### 3. Decode matvecs are at 77-111% of the graph-replayed streaming ceiling
+
+Same probe, reading the real byte counts at the real grid sizes, so the ceiling
+is measured at the launch size rather than assumed to be 638 GB/s:
+
+| decode launch | blocks | MB | real us | probe us | real GB/s | probe GB/s | % |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| GDN qkv+z grouped | 12352 | 21.20 | 36.47 | 40.36 | 581 | 551 | **111%** |
+| lm head (Q6_K) | 124160 | 417.0 | 664.8 | 698.4 | 627 | 626 | **105%** |
+| MoE gate+up (Q4_K) | 4104 | 9.44 | 19.66 | 17.84 | 480 | 555 | 86% |
+| ssm_out / attn wo | 2048 | 8.91 | 15.69 | 16.99 | 438 | 550 | ~83% |
+| expert_reduce (Q5_K) | 2560 | 5.77 | 15.23 | 12.34 | 379 | 490 | **77%** |
+
+Two of the five are **faster than a pure `int4` stream at the same size** — the
+real kernels read contiguous rows per block where the probe grid-strides, so the
+probe is a floor, not a ceiling, for the large launches. Closing every remaining
+gap to the pure-read rate would be ~297 us = 3.1% of score, spread over three
+classes with no common mechanism, and unreachable in practice because the real
+kernels also do vec_dot ALU and a cross-warp reduction. **Decode matvec
+bandwidth is not where the next lever is.**
+
+Note for anyone re-running this: a first pass measured wall time over stream
+launches and read a ~4 us per-launch floor. llama.cpp replays a HIP graph at
+decode, so the stream-launch number is not the right ceiling. Capture the probe
+into a graph.
+
+### 4. The arrival-counter epilogue is DEAD for the 2048-wide norm family (priced, not guessed)
+
+The most promising decode framing was to absorb the `k_bin_bcast` residual add
+and the `rms_norm_pre_add` into the preceding matvec as a 0053-style arrival
+counter: 150 dispatches x 2.14 us = 321 us = 3.3% of score if free. A 30-line
+probe (`~/fable-qwen/ac.hip`) puts a real epilogue — fence, atomic, last block
+re-reads the whole 2048-float row, reduces it, writes it — on hosts sized like
+the real ones:
+
+| host | blocks | plain us | +fence/atomic | +full epilogue | delta |
+|---|---:|---:|---:|---:|---:|
+| expert_reduce | 2560 | 12.125 | 16.471 | 18.081 | **+5.96** |
+| MoE gate+up | 4104 | 20.848 | 24.319 | 25.989 | **+5.14** |
+| ssm_out / attn wo | 2048 | 17.267 | 17.787 | 19.455 | +2.19 |
+| shexp gate/up | 1025 | 6.155 | 8.138 | 9.722 | +3.57 |
+| `k_bin_bcast` | 8 | 2.204 | 2.463 | 4.069 | **+1.87** |
+| small elementwise | 32 | 2.198 | 2.513 | 4.124 | +1.93 |
+| GDN qkv+z | 12352 | 40.730 | 80.985 | 82.848 | **+42.12** |
+
+**Against a 2.14 us dispatch saving, every arm is a wash or a loss.** Even on an
+8-block host the epilogue costs 1.87 us to save 2.14. The reason is visible in
+the fence column: on the tiny hosts the fence is nearly free (+0.26 us) and the
+cost is the *work* — one block re-reading and reducing 2048 floats is about as
+expensive as a whole dispatch. 0053 pays only because its epilogue touches 32
+floats, not 2048. This is why round 33's "norm recompute into large-grid hosts"
+also died, and it closes the family for anything row-wide.
+
+**Carry this one forward: a single global arrival counter costs +42 us at 12352
+blocks.** 0053's per-group counters are not a stylistic choice; anyone reusing
+the pattern on a large host must shard the counter or it is catastrophic.
+
+### 5. The ranked server decode path is the same kernel set as llama-bench
+
+Every fusion in this series is gated on `stream_ctx.concurrent_events.empty()`,
+and an earlier note recorded that the server path bypasses inline fusions — so
+it was worth checking whether the *ranked* decode was silently running unfused.
+It is not. `rocprofv3` on `llama-server` across a 128-token generation:
+
+```
+10160 mul_mat_vec_q_grouped     5080 mul_mat_vec_q_expert_reduce
+10240 rms_norm_pre_add_f32      5080 mul_mat_vec_f_grouped
+ 1270 rms_norm_f32_grouped      1270 rope_multi_grouped
+```
+
+= exactly 80 / 40 / 80 / 40 / 10 / 10 per token, identical to the llama-bench
+census. The multi-stream analysis returns early unless `use_cuda_graph` is set
+and only targets `attn_norm` fan-out, which 0025/0049/0052 already restructured.
+**Local llama-bench decode A/Bs are representative of the ranked path.** The
+`mul_mat_vec_q_moe` launches visible in a mixed trace are the single first token
+after a prompt eval, before the graph is captured.
+
+### 6. Where TTFT actually goes after 0056 — and the term nobody had touched
+
+Censusing the server at the ttft shape shows each request splits into two
+segments with a hard boundary:
+
+```
+seg A   419 dispatches   span 64.3 ms   kernel  6.0 ms    <- 58 ms of idle GPU
+seg B  5414 dispatches   span 108.6 ms  kernel 124.8 ms   <- the prompt eval
+```
+
+Segment A reproduced at **57.98 / 58.35 / 58.41 ms** across three requests. That
+is round 41's residual ~58 ms, and it is 30% of a ~195 ms TTFT at 0.15 weight —
+by far the largest single reachable term left on this track.
+
+Round 41 measured three ways to **retain** pages (mallopt, a buffer pool,
+`ON_DEVICE` state) and all three were flat or unusable, correctly concluding
+that with 0054 retaining the buffers there is nothing to pool. **It never tried
+changing the page size.** `/sys/kernel/mm/transparent_hugepage/enabled` is
+`madvise` on this box and the server's `AnonHugePages` was **0 kB** — nothing in
+the process was getting huge pages at all. 199 MiB of 4 KiB pages is ~51,000
+first-touch faults; at ~1 us each that is the entire 58 ms.
+
+Zero-rebuild confirmation first, `GLIBC_TUNABLES=glibc.malloc.hugetlb=1`, 4 arms
+interleaved: ttft 0.18605 -> 0.16575 (-10.9%), prefill 5005 -> 5157 (+3.0%),
+`AnonHugePages` 0 kB -> 5.46 GB. The tunable cannot ship (llama.cpp tracks ignore
+`Sources/runner/serving.json`; it is vLLM-only), so it became 0057.
+
+### 0057: `common_state_buf_resize` — reserve, madvise, then resize
+
+`std::vector::resize()` value-initialises, so the first touch happens *inside*
+resize and there is no moment to advise the mapping. The helper reserves first
+(allocate, do not touch), madvises the 2 MiB-aligned interior `MADV_HUGEPAGE`,
+and only then resizes. It over-reserves by one huge page so the aligned interior
+covers the whole logical range. Three call sites, all of them per-request:
+`server_prompt_cache::alloc` (73 MiB) and `common_prompt_checkpoint::update_tgt`
+/ `update_dft` (62.81 MiB each).
+
+Same binary, `LLAMA_HUGEPAGE_STATE` toggle, 4 arms off/on/on/off, 9 runs each:
+
+| arm | TTFT | prefill tok/s | decode tok/s | AnonHugePages |
+|---|---:|---:|---:|---|
+| off1 | 0.1847 | 5051.78 | 157.23 | 0 kB |
+| on1 | 0.1639 | 5095.21 | 156.46 | 5185536 kB |
+| on2 | 0.1645 | 5153.94 | 157.14 | 5189632 kB |
+| off2 | 0.1846 | 5071.65 | 156.59 | 0 kB |
+
+**ttft 0.18465 -> 0.16420 (-11.1%), prefill +1.24%, decode flat (-0.07%).** The
+raw draws are disjoint — off spans 0.1838-0.1863, on spans 0.1617-0.1652.
+Firing is proven by `AnonHugePages`, not by the timing.
+
+The mechanism predicts its own signature and the data agrees: the 84-token
+request improves *more* in relative terms (0.0955 -> 0.0765, -20%) than the
+534-token one, because most of the bookkeeping is fixed per request. Prefill is
+a two-point slope, so that fixed part cancels and prefill gains only 1.24% while
+ttft gains 11%. **If you find a ttft win that does not also shrink the short
+request, suspect it.**
+
+Correctness is unusually strong, the same argument 0054 used: `libggml-hip.so.0`,
+`libllama.so.0` and the `llama-perplexity` executable are **byte-identical** to
+the parent commit. Only `libllama-common.so.0` changes, and the symbol it gains
+is unreachable from the perplexity path. Runner's exact gate command, 4 loads:
+
+```
+stock (b10237)   3.9314 3.9314 3.9314 3.9314   spread 0.000%
+candidate        3.9318 3.9318 3.9318 3.9318   spread 0.000%   +0.010%
+```
+
+### Score accounting for the pair, and why it ships now
+
+Building from round 47's measured-ranked anchor rather than from the replica:
+
+```
+0055 measured ranked        decode 1.9590  prefill 1.4718  ttft 1.6717  score 1.8066
+parked + 0056 (projected)   decode 1.9038  prefill 1.4538  ttft ~1.663  score ~1.767
+parked + 0056 + 0057        decode 1.9025  prefill 1.4719  ttft ~1.853  score ~1.800
+```
+
+0057 is modelled at **+1.97%** of score, of which +1.78% is the ttft term. The
+pair projects to **~1.800 against the standing frontier of 1.7835**, i.e. about
++0.9% of margin on the conservative anchor and more on the optimistic one. That
+is thinner than one would like, but 0056 alone straddled the frontier and has
+been banked for a round; the debt is now cleared with the deterministic build
+intact, and the ttft absolute saving (~20 ms) is a fixed quantity that transfers
+to the ranked harness more reliably than a throughput ratio does.
+
+### What is left, honestly
+
+The park is still the largest single item at ~1.83% of score, and the 0008
+defect is still unidentified after six excluded mechanisms. After that:
+
+- **`mul_mat_q` at 51.9% of the prefill slope.** Its loads are at 94-99% of
+  achievable (round 47) and its cost is invariant to tile geometry (round 47e),
+  but the kernel still achieves only 81% (Q4_K gate+up) and 61% (Q5_K down) of
+  what the same bytes read at the same grid size in a probe with no LDS and no
+  MMA. **That 19-39% has never been censused** — it is LDS/MMA/scheduling, not
+  DRAM, and it is the one remaining item large enough to matter. Extend
+  `bw2.hip` stage by stage (loads -> LDS store -> MMA) to find which stage owns
+  it before writing any kernel.
+- **The remaining ~40 ms of ttft** after 0057. Segment A was 58 ms and is now
+  roughly 38; the same census will say what is left in it.
+- `Q5_K` is absent from 0028's RDNA4 `get_vdr_mmvq` overrides (Q6_K=2, Q4_K=4)
+  and the Q5_K expert-down matvec is the worst performer in both phases at 77%
+  of its own streaming ceiling. Worth ~0.6% if it closes fully — below the bar
+  on its own, but it is the cheapest untried item on the list.

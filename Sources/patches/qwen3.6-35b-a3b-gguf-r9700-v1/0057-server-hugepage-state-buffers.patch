@@ -1,0 +1,164 @@
+From 9267eb057e13031d54146098256f22a6c2ec62a1 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sun, 9 Aug 2026 10:55:33 +0000
+Subject: [PATCH] server: huge-page the per-request host state buffers (-11.1%
+ ttft)
+
+Round 41 traced the residual ~58 ms of TTFT to first-touch page faults on
+genuinely new host pages, and measured three ways to RETAIN pages -- all dead.
+It never tried changing the PAGE SIZE.
+
+llama-server allocates ~199 MiB of brand new host memory per request: one
+73 MiB prompt-cache state (server_prompt_cache::alloc) plus two 62.81 MiB
+context checkpoints (common_prompt_checkpoint::update_tgt/update_dft). With
+0054 those buffers are moved into the cache and retained, so the allocator has
+nothing to hand back -- round 41 own conclusion, and the reason mallopt() and
+a buffer pool both measured flat. At 4 KiB that is ~51,000 first-touch faults
+per request, which at ~1 us each is the whole 58 ms.
+
+THP on this box is "madvise", and AnonHugePages was 0 kB for the entire
+process: nothing was getting huge pages. std::vector::resize() value-
+initialises, so the first touch happens inside resize() -- too late to advise.
+common_state_buf_resize() reserves first (allocate, do not touch), madvises
+the 2 MiB-aligned interior MADV_HUGEPAGE, and only then resizes, so the
+faults land on 2 MiB pages: ~100 instead of ~51,000. It over-reserves by one
+huge page so the aligned interior covers the whole logical range.
+
+Ranked replica (rank40.py), same binary, LLAMA_HUGEPAGE_STATE toggle, 4 arms
+interleaved off/on/on/off, 9 measured runs each:
+
+    arm    TTFT     prefill tok/s  decode tok/s  AnonHugePages
+    off1   0.1847   5051.78        157.23        0 kB
+    on1    0.1639   5095.21        156.46        5185536 kB
+    on2    0.1645   5153.94        157.14        5189632 kB
+    off2   0.1846   5071.65        156.59        0 kB
+
+ttft 0.18465 -> 0.16420 (-11.1%, 2/2 separated -- the raw draws are disjoint,
+off spans 0.1838-0.1863 and on spans 0.1617-0.1652), prefill 5061.7 -> 5124.6
+(+1.24%), decode flat (-0.07%). Firing is proven by AnonHugePages, not by the
+timing. Modelled +1.97% of score, almost all of it the 0.15-weight ttft term.
+
+The 84-token request moves further in relative terms (0.0955 -> 0.0765, -20%)
+than the 534-token one, which is why prefill -- a two-point SLOPE -- gains only
+1.24% while ttft gains 11%: most of the bookkeeping is fixed per request and
+cancels out of the slope. That is the mechanism predicting its own signature.
+
+Correctness: the three arithmetic-carrying artefacts are BYTE-IDENTICAL to the
+parent commit --
+
+    4cb7d974de530a6e6702fa150f331052  build/bin/libggml-hip.so.0
+    32c1c78dd92e42814807c8bb667f067c  build/bin/libllama.so.0
+    852dda6479a47a9eaf45cdf87711b3bf  build/bin/llama-perplexity
+
+-- and the only library that changes, libllama-common.so.0, gains one symbol
+that llama-perplexity never reaches (checkpoints and the prompt cache are
+server-only). Runner exact gate command, 4 loads per arm:
+
+    stock (b10237)  3.9314 3.9314 3.9314 3.9314   spread 0.000%
+    candidate       3.9318 3.9318 3.9318 3.9318   spread 0.000%   +0.010%
+
+LLAMA_HUGEPAGE_STATE=0 restores plain resize().
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ common/common.cpp            | 33 +++++++++++++++++++++++++++++++--
+ common/common.h              |  9 +++++++++
+ tools/server/server-task.cpp |  4 ++--
+ 3 files changed, 42 insertions(+), 4 deletions(-)
+
+diff --git a/common/common.cpp b/common/common.cpp
+index ff27d392f..0655bec41 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -2123,6 +2123,35 @@ void common_prompt_checkpoint::clear() {
+     data_spec.clear();
+ }
+ 
++
++#if defined(__linux__)
++#include <sys/mman.h>
++#endif
++
++void common_state_buf_resize(std::vector<uint8_t> & buf, size_t n) {
++#if defined(__linux__) && defined(MADV_HUGEPAGE)
++    static const bool enabled = []() {
++        const char * e = getenv("LLAMA_HUGEPAGE_STATE");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    // 2 MiB is the THP size on every arch this ships on; below a few of them the
++    // fault count is too small for the alignment slack to pay for itself.
++    constexpr size_t ps = 2ull << 20;
++    if (enabled && n >= 8*ps && buf.capacity() < n) {
++        // over-reserve by one huge page so the whole logical range [data, data+n)
++        // is covered by the 2 MiB-aligned interior we are allowed to advise
++        buf.reserve(n + ps);
++        const uintptr_t p0 = (uintptr_t) buf.data();
++        const uintptr_t lo = (p0 + ps - 1) & ~(uintptr_t)(ps - 1);
++        const uintptr_t hi = (p0 + buf.capacity()) & ~(uintptr_t)(ps - 1);
++        if (hi > lo) {
++            madvise((void *) lo, (size_t) (hi - lo), MADV_HUGEPAGE);
++        }
++    }
++#endif
++    buf.resize(n);
++}
++
+ void common_prompt_checkpoint::update_pos(
+         int64_t n_tokens,
+         llama_pos pos_min,
+@@ -2142,7 +2171,7 @@ void common_prompt_checkpoint::update_tgt(
+ 
+     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+ 
+-    data_tgt.resize(ckpt_size);
++    common_state_buf_resize(data_tgt, ckpt_size);
+ 
+     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+     if (n != ckpt_size) {
+@@ -2160,7 +2189,7 @@ void common_prompt_checkpoint::update_dft(
+ 
+     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
+ 
+-    data_dft.resize(ckpt_size);
++    common_state_buf_resize(data_dft, ckpt_size);
+ 
+     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
+     if (n != ckpt_size) {
+diff --git a/common/common.h b/common/common.h
+index 919c0ea10..ff35cf756 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -1103,6 +1103,15 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
+ // prompt utils
+ //
+ 
++// Resize a large host state buffer so that its first touch faults on transparent
++// huge pages instead of 4 KiB pages.  llama-server allocates ~199 MiB of brand
++// new host pages per request (one prompt-cache state + two context
++// checkpoints); std::vector::resize value-initialises them, so the cost is
++// ~51k first-touch faults, not the memset.  Reserving first lets us madvise the
++// mapping BEFORE anything touches it.  LLAMA_HUGEPAGE_STATE=0 restores plain
++// resize().
++void common_state_buf_resize(std::vector<uint8_t> & buf, size_t n);
++
+ struct common_prompt_checkpoint {
+     int64_t n_tokens;
+ 
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 7d4f60bd2..d26bbef80 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1710,8 +1710,8 @@ server_prompt_cache_state * server_prompt_cache::alloc(server_prompt & prompt, s
+ 
+     // check if we can allocate enough memory for the new state
+     try {
+-        state_data_tgt.resize(state_size_tgt);
+-        state_data_dft.resize(state_size_dft);
++        common_state_buf_resize(state_data_tgt, state_size_tgt);
++        common_state_buf_resize(state_data_dft, state_size_dft);
+     } catch (const std::bad_alloc & e) {
+         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
+ 
+-- 
+2.53.0
+
