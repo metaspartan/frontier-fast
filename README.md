@@ -168,8 +168,13 @@ recipe and bandwidth ceiling report.
 
 **Speculative decoding** — n-gram/prompt-lookup, a draft model, or multi-token
 prediction — is also ranked and published, on a **separate board**. Not a
-penalty: exact verification emits the identical greedy sequence, so
-speculation passes the correctness gate by construction and wins on almost any
+penalty. A drafted token is accepted only if the target would have produced
+it, so the speed is not a quality trade. It is NOT exempt from the correctness
+gate: the verifying pass batches positions, which reorders reductions and can
+flip a knife-edge argmax — measured on the R9700, four of six draft depths
+produced text differing from stock and one was byte-identical. Speculation
+faces the same perplexity equivalence check as everything else. It is ranked
+separately because it wins on almost any model
 model, and ranking it beside a kernel result would make one board answer two
 questions.
 

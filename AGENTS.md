@@ -367,8 +367,12 @@ and build changes. Speculative decoding is ranked and published too, on a
 **separate board**.
 
 This is not a penalty and nothing is rejected or capped. Exact verification
-emits the identical greedy sequence, so speculation passes the correctness gate
-by construction and lands a large gain on almost any model — on one track it
+A drafted token is accepted only if the target would have produced
+it, so the speed is not a quality trade. It is NOT exempt from the correctness
+gate: the verifying pass batches positions, which reorders reductions and can
+flip a knife-edge argmax — measured on the R9700, four of six draft depths
+produced text differing from stock and one was byte-identical. Speculation
+faces the same perplexity equivalence check as everything else. It lands a large gain on almost any model — on one track it
 took 4.98x of compounded kernel work to 6.77x, a 1.36x multiplier that says
 nothing about the kernels underneath it. Ranking the two together would make one
 board answer two questions.
@@ -390,8 +394,24 @@ where the track has one, `-md <draft>` on the candidate launch. The second is
 the old one — make it the engine's own default in your patch series.
 
 ```json
-{ "speculative": { "specType": "draft-dflash", "draftMax": 8, "draftMin": 1 } }
+{ "speculative": { "specType": "draft-dflash", "draftMax": 3, "draftMin": 1 } }
 ```
+
+**Depth is measured, not guessed.** On `qwen3.6-35b-a3b-gguf-r9700-v1`, 128
+greedy tokens, two reps per arm:
+
+| --spec-draft-n-max | tok/s | vs stock |
+|---|---:|---:|
+| stock | 81.9, 82.1 | — |
+| 2 | 104.2, 109.2 | +30% |
+| **3** | **107.5, 112.4** | **+34%** |
+| 4 | 101.7, 106.5 | +27% |
+| 5 | 92.1, 95.6 | +14% |
+| 6 | 96.4, 100.7 | +20% |
+| 8 | 66.9, 69.4 | **slower than stock** |
+
+Deeper is not better: past the acceptance rate the drafted tokens are thrown
+away and you paid for them anyway.
 
 **You choose the type and the depth. The runner chooses the weights.** There is
 no field for a draft model id, on purpose: a submission that could name
@@ -423,6 +443,12 @@ Your track's draft, if it has one, is in its contract:
 curl -s https://frontier.fast/api/tracks | \
   python3 -c 'import json,sys; [print(t["id"], "->", (t["speculative"].get("draftModel") or {}).get("id")) for t in json.load(sys.stdin)]'
 ```
+
+Note that this particular draft does **not** load as published — three
+metadata names differ from what llama.cpp reads. `tools/gguf-rename-key.py`
+in the challenge repo renames them with the tensor data untouched, and the
+runner holds the converted file. The track's `speculative.howToRun` prints the
+exact download → convert → run sequence.
 
 **Fetch the same draft and measure locally before spending a slot.** Acceptance
 rate on this corpus is what decides whether speculation wins, and the corpus is

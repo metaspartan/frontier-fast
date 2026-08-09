@@ -29,7 +29,7 @@
     "default": "kernel",
     "kernel": "New and faster kernels, engine and build changes. This is what a track's headline record, chart, recipe, social card and bandwidth ceiling report.",
     "speculative": "Speculative decoding: n-gram/prompt-lookup, a draft model, or multi-token-prediction heads. Ranked and published on its own board.",
-    "why": "Exact verification emits the identical greedy sequence, so speculation passes the correctness gate by construction and wins on almost any model. Ranking it beside a kernel result would make one board answer two questions.",
+    "why": "A drafted token is accepted only if the target would have produced it, so the speed is not a quality trade. It is ranked separately because it wins on almost any model and would otherwise make one board answer two questions. It is NOT exempt from the correctness gate: the verifying pass batches positions, which reorders reductions and can flip a knife-edge argmax, so it faces the same perplexity equivalence check as everything else.",
     "classifiedFrom": [
       "Sources/runner/serving.json `speculative` block — decides on its own",
       "patch series wiring up speculation: TWO independent markers required from common_speculative, n_draft, ngram_cache, prompt_lookup, spec_decode"
@@ -54,7 +54,8 @@
       "draftless": "ngram-* types need no second model and work on every llama.cpp track",
       "weightsArePinned": "You name the TYPE, never the weights. The runner loads the draft pinned for your track, so a ranked run measures a fixed system. Your track's draft is in its contract at /api/tracks under speculative.draftModel.",
       "appliedTo": "the candidate arm only — the baseline stays stock, because what is measured is speculation against no speculation",
-      "rejectedAtIntake": "an unknown specType, or a draft-* type on a track with no pinned draft"
+      "rejectedAtIntake": "an unknown specType, or a draft-* type on a track with no pinned draft",
+      "measuredDepth": "On qwen3.6-35b-a3b-gguf-r9700-v1: --spec-draft-n-max 3 is +34% over stock; 8 is SLOWER than stock. Deeper is not better once drafted tokens stop being accepted."
     }
   },
   "longContext": {
