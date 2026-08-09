@@ -4954,3 +4954,49 @@ What this does establish, and what the next agent should pick up:
   clearing the ~1.5% still needed means finding about **4.6 ms**. A 16 -> 8 floor
   cuts tail MMA columns from 32 to 24 (-25%), which is in range but not
   guaranteed, since fewer columns per tile also means more tiles.
+
+## Round 47e: the tail's mul_mat_q cost is INVARIANT to J — the floor lever is dead
+
+Round 47d left one precisely-defined lever: the `target < 16` floor is the only
+thing setting J at the 22-token tail, it is unreachable from any env knob, and
+16 -> 8 would cut tail MMA columns from 32 to 24. Built it, as a knob
+(`GGML_CUDA_MMQ_MOE_J_FLOOR`, default 16 so the default build is unchanged and
+the A/B has a same-binary control).
+
+**First: 16 -> 8 does not even fire.** Census diff at pp534, `mul_mat_q` grouped
+by block count, is byte-for-byte the same shape on both arms — tail classes
+`4096 x 80` and `16384 x 40` either way, 62.22 vs 63.03 ms total. `J = 8` is not
+a valid `ggml_cuda_mmq_get_config` for these types on RDNA4, so the search skips
+it and lands back on 16. Always prove firing with a census before believing an
+A/B; this one would have read as "no effect, within noise" and been recorded as
+a weak negative instead of a non-event.
+
+**Going the other way does fire, and it still does not pay.** The uncapped
+natural choice at the tail is J = 24 (`ntx = ceil(22/24) = 1`, 24 columns of MMA
+work) against the floored J = 16 (`ntx = 2`, 32 columns), so the floor was
+costing work on paper. Raising the floor halves the tail grid exactly as
+predicted — tail classes move from `4096`/`16384` to `2048`/`8192` — while
+leaving the main-ubatch classes (`32768`, `131072`) untouched:
+
+| J_FLOOR | all kernels | mul_mat_q | main-ubatch mmq | **tail mmq** | tail classes |
+|---|---:|---:|---:|---:|---|
+| 16 (default) | 124.18 | 63.31 | 44.15 | **9.73** | 4096, 16384 |
+| 24 | 124.72 | 63.61 | 44.30 | **9.91** | 2048, 8192 |
+| 32 | 123.46 | 62.84 | 43.82 | **9.61** | 2048, 8192 |
+| 48 | 127.79 | 67.06 | 47.31 | **10.34** | 2048, 8192 |
+
+**Half the blocks and 25% fewer MMA columns buys nothing: 9.73 -> 9.61 ms.** The
+tail `mul_mat_q` cost is invariant to how the 22 tokens are tiled. (J_FLOOR=48
+also perturbs the *main* ubatch classes to `22528`/`90112` and costs 3 ms — a
+floor that high is not tail-only and must be rejected on that ground alone.)
+
+That is consistent with everything round 47 established: the tail ubatch has to
+touch ~160 of the 256 experts' weights whatever the token tiling is, and per the
+round-47 probe those reads already run at 94-99% of achievable. The tail cost is
+weight traffic, not tile geometry, and J cannot reach it.
+
+**Lever closed. Nothing was shipped and nothing was submitted.** The knob was
+reverted and the tree rebuilt to the parked state. The series holds at the
+verified frontier of 1.7835 with a deterministic build, with 0056 banked and
+waiting for a companion that reaches the tail's *weight traffic* rather than its
+geometry — or for the 0008 defect to be understood.
