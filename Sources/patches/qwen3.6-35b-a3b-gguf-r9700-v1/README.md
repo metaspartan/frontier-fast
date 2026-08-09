@@ -4485,3 +4485,69 @@ structure, so if the defect is confirmed they all have it latent:
 | `lfm2.5-2.6b-gguf-gb10cuda-v1` | 0006/0007 |
 | `maple-preview-gguf-r9700-v1` | 0009-rms-norm-fold-residual-add |
 | `qwen3.6-35b-a3b-gguf-gb10cuda-v1` | 0007-cuda-rms-norm-fold-q8-1-quantize |
+
+## Round 45: CORRECTION — the disjointness guard exists, and aliasing is not the mechanism
+
+**Correction to rounds 43b/44.** Those write-ups state that nothing checks
+whether `dst` and `add_dst` overlap. **That is factually wrong.** The check is in
+`ggml_cuda_rms_norm_pre_add_detect`, `ggml/src/ggml-cuda/ggml-cuda.cu:5300`, in
+this series too:
+
+```c
+if (!ggml_cuda_mmvq_ranges_disjoint(mul, add_last)) {
+    return 0;
+}
+```
+
+Credit to the GB10 agent for catching it. The earlier mechanism claim should not
+be trusted, and the sentences asserting it are superseded by this section.
+
+### The host-side audit, and what it found
+
+`rms_norm_pre_add_prepare` instrumented (env `GGML_RMS_PRE_ADD_ALIAS=1`) to print
+the byte range of `dst`, `add_dst` and every `args.src[k]`, test all pairs, and
+repeat across three fresh model loads.
+
+**The guard works.** `OVERLAP(dst,add_dst)` occurs **0 times in all three loads**
+— exactly the pair the guard covers, and it never gets through.
+
+Overlaps that *do* occur are `add_dst`↔`srcA/srcB` and `dst`↔`srcA/srcB`: these
+are in-place residual adds (`x = x + y` writing into one of its own operands),
+benign by construction because each block owns one row and reads and writes the
+same row of the same buffer.
+
+**And the overlap does not move.** All three loads produce byte-identical
+structure — same offsets `c00000 / c04600 / c08680 / c0c680`, same overlap pairs,
+same order — with only the pool's base address differing:
+
+```
+load 1  ppl 3.9405   call=2 dst=[+0x0) add_dst=[+0x8680) srcA=[+0x8680) srcB=[+0xc680) srcB=[+0x0)
+load 2  ppl 3.9287   call=2 dst=[+0x0) add_dst=[+0x8680) srcA=[+0x8680) srcB=[+0xc680) srcB=[+0x0)
+load 3  ppl 3.9350   call=2 dst=[+0x0) add_dst=[+0x8680) srcA=[+0x8680) srcB=[+0xc680) srcB=[+0x0)
+```
+
+**The perplexity moves; the aliasing does not.** A fixed allocation pattern
+cannot produce load-to-load variation, so aliasing is not the mechanism. Second
+hypothesis dead, same as the first.
+
+(Caveat worth recording: the fold's fusion decision runs at HIP-graph capture,
+not per replay, so only ~80 `prepare()` calls happen per run and the captured
+shape here is `nrows=2`. The audit therefore covers the capture-time shapes, not
+every evaluated batch.)
+
+### Decision: park 0008
+
+Two mechanisms proposed, two measured dead, and the localisation to 0008 is the
+only thing that has survived. Per the agreed rule, 0008 is parked rather than
+fixed on a third guess: **drop the pre-add fold, take the -2.98% decode /
+-1.19% prefill (about -2.2% score), and get a series whose gate readings can be
+trusted.** At +78% a deterministic series that measures honestly is worth more
+than 2.2%, and it makes every subsequent round cheaper.
+
+The parking mechanism is the existing toggle: the fold's default flips to off.
+That is the exact configuration the bisect measured at **3.9318 ten times out of
+ten**, and it leaves 0009/0036 intact — they share the kernel through the
+`n_adds == 0` path, which the bisect showed is not implicated.
+
+**The defect remains unidentified.** It is in or triggered by 0008, it is not the
+loop-2 read-back, and it is not buffer aliasing.
