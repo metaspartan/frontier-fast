@@ -39,6 +39,7 @@ of kernels already near the memory ceiling.
 | 0016 | `mul_mat_id` Q4_K path for RDNA4 | Dispatch-path change for the dominant MoE shape. |
 | 0017-0018 | MoE shared expert as a ninth channel | The shared-expert down projection is **latency**-bound, not bandwidth-bound: standalone it moves 0.86 MB in 8.43 us (102 GB/s) from only 2048 workgroups, while the routed projection doing identical per-row work at 8× the channel count sustains 601 GB/s. Bandwidth here scales with wave count, so the fix is more concurrent work in the same launch. |
 | 0019 | release the q8_1 cache before pool teardown | Fixes an abort, not a speed win — see below. |
+| 0020 | attention gate projection joins the Q/K grouped launch, +1.81% | A one-line graph-order change, bit-identical. Open lever 1 below is now partly closed. |
 
 ## Dead ends — do not spend a slot re-deriving these
 
@@ -145,3 +146,102 @@ synthetic 6-seed mean (+14.2%) does not represent the ranked corpus's
 acceptance. Do not resubmit without a mechanism that prices acceptance
 online (propose only when the recent accept rate clears the verify
 premium); the static n=3 lookup is net-negative on this track's corpus.
+
+
+## 0020: the attention gate projection was blocked by GRAPH ORDER, not by anything else (+1.81% decode, BIT-IDENTICAL)
+
+### The post-0019 census (start here)
+
+`rocprofv3 --kernel-trace`, `llama-bench -p 0 -n 34 -r 1`, **sorted by
+`Dispatch_Id`, not `Start_Timestamp`**. 28658 dispatches / 35 tokens =
+**818.8/token, 5143 us of kernel in a 6244 us token** (160.2 tok/s local).
+Kernel is 82% of wall, so the inter-dispatch gap is about **1.35 us**.
+
+| n/tok | us/tok | each | kernel |
+|---|---|---|---|
+| 202 | 2854 | 14.13 | `mul_mat_vec_q` (18432/4608/2048/1024-block shapes) |
+| 39 | 840 | 21.53 | `mul_mat_vec_q_grouped` (Q+K only) |
+| 39 | 227 | 5.83 | `mul_mat_vec_f<f32,1,32>` (the F32 router) |
+| 40 | 209 | 5.2 | `flash_attn_tile` (two instantiations) |
+| 79 | 134 | 1.70 | `k_bin_bcast` |
+| 80 | 228 | 2.85 | `rms_norm_pre_add_f32<1024,{1,2,3}>` |
+| 38 | 114 | 2.99 | `rms_norm_f32_grouped<256>` (q/k norm) |
+| 78 | 107 | 1.37 | `quantize_q8_1` |
+| 39 | 100 | 2.58 | `topk_moe_cuda<256>` (ONE workgroup) |
+| 40 | 80 | 2.00 | `flash_attn_combine_results<128>` |
+| 38 | 61 | 1.60 | `rope_neox_grouped` |
+| 40 | 57 | 1.43 | `k_mul_bcast0_quant` (softplus gate + q8_1) |
+| 40 | 49 | 1.23 | `k_set_rows_grouped` |
+
+Split by shape, `mul_mat_vec_q` is: 39 routed gate+up (4608 = 512x9 - 0018's
+ninth channel), 39 routed down (18432 = 2048x9 - 0017's), 40 attn o_proj plus
+1 (2048), **40 attention gate projections (64 or 48 rows each)**, 40 V
+projections, the lm head and the dense layer. The MoE block is 6 dispatches
+and the attention block 9.
+
+### What 0020 changes, and why it was invisible for nineteen patches
+
+The four attention projections all read `attn_norm`, and only Q and K are
+grouped. V is out on type (Q4_K_M stores `attn_v` as Q6_K in half the layers).
+The **gate** is out for a reason that is not about arithmetic at all: the DFS
+reaches it only through the post-attention multiply, so it is emitted ~25 nodes
+after `Qcur` and ggml-alloc gives it the block `Kcur` writes. 0004's hoist check
+sees the overlap and refuses. **The refusal is the allocator's doing, not the
+detector's** - the same shape as the round-31 lesson on qwen3.6.
+
+One `ggml_build_forward_expand(gf, gate)` before `Qcur` is emitted fixes it:
+818.8 -> 780.8 dispatches/token, `mul_mat_vec_q` 202 -> 162, every other kernel
+count unchanged, decode +1.81% over 4/4 separated rounds against a
+parent-commit control. Perplexity is bit-identical at both shapes and server
+greedy is 6/6 byte-identical.
+
+**Before assuming a grouping is impossible on this model, check the emission
+order.** Three of this series' grouping mechanisms were already in the backend
+and one of them was being starved by a single DFS edge.
+
+### Measured DEAD this round: pinning Q/K/V as well (do not re-derive)
+
+Expanding `Qcur`, `Kcur` and `Vcur` before the gate makes the Q4_K V
+projections join too - `mul_mat_vec_q` 202 -> **140**, a further -22
+dispatches - and it reads +1.60% on the bench. Do not ship it:
+
+- it **breaks two other groupings**: `rope_neox_grouped` 38 -> 0 (replaced by
+  40 `rope_neox<f32,f32>` plus 40 `rope_neox<f32,__half>`) and
+  `k_set_rows_grouped` 40 -> 0. Net dispatches are **794.8, worse than mode 1's
+  780.8**;
+- decode-path perplexity moves **5.2682 -> 5.2419, -0.499%, five times the
+  0.1% gate** - perfectly reproducible on both arms, while the `-c 512`
+  gate shape stays bit-identical at 5.2611 on both. A reorder that reads clean
+  at the gate shape can still be a half-percent numeric change at the shape it
+  actually runs at.
+
+It is kept behind `GGML_LAGUNA_QKV_GATE_PIN=2` so the next agent can see the
+census rather than rebuild it. Getting V in legitimately needs the
+cross-quant-type guest (qwen3.6's 0052) inside `mul_mat_vec_q_grouped`, not a
+reorder.
+
+### The gate-shape perplexity IS reproducible on this model
+
+Contrary to the qwen3.6 note, `llama-perplexity -c 512 --chunks 8` on
+Laguna-XS returned **5.2611 on 6 of 6 loads across two binaries** in this
+session, and the decode-path shape returned 5.2682 on 6 of 6. Both shapes are
+usable here; read both, because they disagree about mode 2 (above).
+
+### Open levers after 0020, priced against the census
+
+The cost constant on this track is about **2.6 us per removed small dispatch**
+(38 removed, +1.81% of a 6244 us token). Priced from the table above:
+
+1. **The F32 router matvec, 39/token at 5.83 us and only 256 blocks.** One warp
+   per row over 2 MB of F32 weights is 360 GB/s against a 640 GB/s part, and
+   256 blocks x 1 warp is exactly one wave per SIMD - it is occupancy-starved,
+   not bandwidth-starved. Patch 0014 forced single-warp for this class; a
+   per-shape revisit is worth ~+1.2%. Cheapest remaining lever.
+2. **The Q6_K V projections into the Q/K group** via a second vec_dot type
+   (port qwen3.6 0052). -20 dispatches, ~+0.8%.
+3. `flash_attn_combine_results`, 40/token, ~134 us with its gap - but changing
+   the FA split changes the reduction, so it is not a bit-identical class.
+4. `topk_moe` (39/token, ONE workgroup) has no independent host in this graph:
+   it consumes the router and feeds the routed matvec, and 0017/0018 already
+   moved the shared expert inside the routed launch. Unlike qwen3.6 there is
+   nothing left running beside it. Do not re-open without first un-folding 0018.

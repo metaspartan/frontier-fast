@@ -1,0 +1,110 @@
+From: Claude Fable 5 <noreply@anthropic.com>
+Subject: [PATCH] laguna: emit the attention gate projection adjacent to Q/K so it joins the grouped matvec (+1.81% decode, bit-identical)
+
+Laguna's attention runs four quantized matvecs over the SAME activation -
+Q, K, V and the softplus output gate - and after 0004 only Q and K are
+grouped. V is excluded on type (Q4_K_M stores attn_v as Q6_K in half the
+layers, and the grouped kernel is single-type). The gate is excluded for a
+reason that has nothing to do with arithmetic: the DFS reaches it only
+through the post-attention multiply, so stock emits `attn_gate_proj` about
+25 nodes after `Qcur`, and by then ggml-alloc has handed it the block `Kcur`
+writes. 0004's hoist check sees the overlap and correctly refuses it. The
+refusal is the allocator's doing, not the detector's - so no backend change
+can fix it, and the 40 gate launches a token stayed separate.
+
+One `ggml_build_forward_expand` fixes it. Emitting the gate before Qcur puts
+its destination on a block the allocator picks while nothing else in the
+group is live, the hoist becomes legal, and the gate joins the Q/K launch.
+Pure reordering of independent work: the ops, operands and shapes are
+untouched, and the grouped kernel gives every row exactly the thread
+geometry, k-loop and reduction sequence of the individual launch, so the
+result is bit-identical by construction (0004's argument, unchanged).
+
+Gated on `ubatch.n_tokens == 1`: at prefill the projections are GEMMs, the
+grouped matvec never applies, and the reorder would only perturb the
+allocator for no gain.
+
+REORDERING MORE IS A TRAP, and the patch records it as mode 2 rather than
+deleting it. Pinning Q, K and V as well makes the Q4_K V projections join
+too (`mul_mat_vec_q` 202 -> 140 per token instead of 202 -> 162), but
+reordering the whole attention block costs the grouped rope and grouped
+set_rows launches - `rope_neox_grouped` 38 -> 0, `k_set_rows_grouped`
+40 -> 0, with 40 of the ropes moving onto a different (f16-writing)
+instantiation - and that moves decode-path perplexity from 5.2682 to 5.2419,
+**-0.499%, five times the gate**. It is also SLOWER in dispatch terms once
+the regression is counted (794.8 vs 780.8 per token). Mode 1 leaves every
+other node of the attention block exactly where stock puts it.
+`GGML_LAGUNA_QKV_GATE_PIN=0` restores stock order; `=2` selects the rejected
+variant.
+
+Measured on the trusted R9700 runner box against a binary built from this
+patch's own parent commit (patches 0001-0019), each arm loading its own
+libggml from its own build directory (`ldd` verified), arms alternated:
+
+  - census (rocprofv3, sorted by Dispatch_Id): 818.8 -> 780.8
+    dispatches/token; `mul_mat_vec_q` 202 -> 162, `mul_mat_vec_q_grouped`
+    39 -> 41, and **every other kernel count unchanged**.
+  - decode tg128: 162.79/162.46/161.91/161.74 vs control
+    159.72/159.86/158.85/159.03 -> median per-round ratio **1.0181
+    (+1.81%), 4/4 rounds separated**.
+  - prefill pp512: median ratio 0.9997 over 4 rounds - neutral, and gated
+    off by construction.
+  - perplexity, runner corpus, 2 loads per arm at each shape:
+    decode-path (-b 512 -ub 1 --chunks 8) **5.2682 on every load of both
+    arms**; gate-shape (-c 512 --chunks 8) **5.2611 on every load of both
+    arms**. Bit-identical, and 5.2611 is the figure this series has carried
+    since 0017.
+  - server greedy identity vs the parent-commit build, 6 prompts including a
+    ~1000-token one: **6/6 byte-identical**, all completions >= 390 bytes.
+  - verified firing under `llama-server -ngl 99 -c 8192 --parallel 1`, not
+    only llama-bench: a rocprofv3 census of the serving path shows
+    `mul_mat_vec_q_grouped` at 41/token with `rope_neox_grouped` and
+    `k_set_rows_grouped` both intact.
+---
+diff --git a/src/models/laguna.cpp b/src/models/laguna.cpp
+index 422e12ff1..69a977397 100644
+--- a/src/models/laguna.cpp
++++ b/src/models/laguna.cpp
+@@ -208,7 +208,41 @@ llama_model_laguna::graph::graph(const llama_model & model, const llm_graph_para
+             // g_proj on the *pre-attention* hidden state (matches HF
+             // reference: gate is computed from the same `hidden_states`
+             // input as q/k/v, not from the attn output).
+-            ggml_tensor * gate = build_lora_mm(model.layers[il].wqkv_gate, attn_inp);
++            //
++            // GRAPH ORDER, not arithmetic: the four projections all read
++            // `attn_norm`, but the DFS reaches the gate only through the
++            // post-attention multiply, so stock emits it ~25 nodes after Qcur -
++            // by which point ggml-alloc has given it the block Kcur writes, and
++            // the grouped-mmvq hoist check correctly refuses it. Expanding the
++            // four in projection order makes them adjacent, so the allocator
++            // keeps them live together and the gate joins the Q/K launch.
++            // Pure reordering of independent work; the ops, operands and shapes
++            // are untouched.
++            // Mode 1 (default) moves ONLY the gate node: it is emitted before
++            // Qcur, so the allocator keeps it clear of the block Kcur writes and
++            // the group forms by hoisting Q/K down onto it. Mode 2 also pins
++            // Q/K/V, which lets the Q4_K V projections join - but reordering the
++            // whole block costs the grouped rope and grouped set_rows launches
++            // and moves decode-path perplexity 0.5%. Mode 1 leaves every other
++            // node of the attention block exactly where stock puts it.
++            static const int qkv_gate_pin = [] {
++                const char * e = getenv("GGML_LAGUNA_QKV_GATE_PIN");
++                return e == nullptr ? 1 : atoi(e);
++            }();
++
++            ggml_tensor * gate = nullptr;
++            if (qkv_gate_pin >= 2 && ubatch.n_tokens == 1) {
++                ggml_build_forward_expand(gf, Qcur);
++                ggml_build_forward_expand(gf, Kcur);
++                ggml_build_forward_expand(gf, Vcur);
++            }
++            gate = build_lora_mm(model.layers[il].wqkv_gate, attn_inp);
++            // decode shape only: at prefill the projections are GEMMs, the
++            // grouped matvec never applies, and the reorder would only perturb
++            // the allocator for no gain.
++            if (qkv_gate_pin >= 1 && ubatch.n_tokens == 1) {
++                ggml_build_forward_expand(gf, gate);
++            }
+             cb(gate, "attn_gate_proj", il);
+ 
+             // QK RMSNorm at head_dim level (Qwen3 style)
