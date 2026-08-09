@@ -1,0 +1,117 @@
+From 406f44327f455ed07a9bcf107785bd9f3ca45a7d Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Sun, 9 Aug 2026 05:40:11 +0000
+Subject: [PATCH] server: move the context-checkpoint payloads into the prompt
+ cache instead of deep-copying them (-22% TTFT)
+
+get_available_slot() saves the outgoing slot state into the prompt cache before
+launching a new task. On a hybrid GDN model that save is dominated not by the
+device copy but by host bookkeeping: measured on the ranked shape it is 74.7 ms,
+of which only 5.6 ms is the actual device-to-host state read (80 copies, 73 MiB,
+13 GB/s) while 46.7 ms is a deep copy of 125.6 MiB of context-checkpoint payloads
+and 21.2 ms is value-initialising a 73 MiB vector that the state read overwrites
+immediately.
+
+The 46.7 ms is pure waste. On that call path the slot prompt is dead the moment
+prompt_save() returns: the very next statement is prompt_load(), which either
+assigns the whole prompt from a cache entry or falls through to prompt_clear().
+So the checkpoint payloads can be moved into the cache entry rather than copied.
+alloc() takes an explicit consume flag so the other caller - the cache_idle_slots
+path, which keeps using the slot afterwards when the KV cache is not unified -
+still gets the copying behaviour it needs.
+
+No arithmetic, no kernel and no graph is touched; llama-perplexity, libllama.so
+and libggml-hip.so all build byte-identical to the parent commit.
+
+LLAMA_SERVER_PROMPT_CACHE_MOVE=0 restores the deep copy.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+ tools/server/server-context.cpp | 13 ++++++++++---
+ tools/server/server-task.cpp    |  4 ++--
+ tools/server/server-task.h      |  5 ++++-
+ 3 files changed, 16 insertions(+), 6 deletions(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 4655b518e..a9d5b07cb 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -253,11 +253,16 @@ struct server_slot {
+ 
+     server_prompt prompt;
+ 
+-    bool prompt_save(server_prompt_cache & prompt_cache) const {
++    bool prompt_save(server_prompt_cache & prompt_cache, bool consume = false) {
+         if (prompt.tokens.size() == 0) {
+             return false;
+         }
+ 
++        // opt-out for A/B measurement
++        static const bool no_consume = getenv("LLAMA_SERVER_PROMPT_CACHE_MOVE") &&
++                                       atoi(getenv("LLAMA_SERVER_PROMPT_CACHE_MOVE")) == 0;
++        consume = consume && !no_consume;
++
+         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+ 
+@@ -266,7 +271,7 @@ struct server_slot {
+         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
+                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
+ 
+-        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
++        auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft, consume);
+         if (cur == nullptr) {
+             return false;
+         }
+@@ -1671,7 +1676,9 @@ private:
+ 
+                 const int64_t t_start = ggml_time_us();
+ 
+-                ret->prompt_save(*prompt_cache);
++                // [TAG_PROMPT_SAVE_CONSUME] on this path the slot prompt is dead on
++                // return: prompt_load() either overwrites it wholesale or we clear it.
++                ret->prompt_save(*prompt_cache, /* consume */ true);
+ 
+                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                     ret->prompt_clear();
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 070f1ade2..7d4f60bd2 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1656,7 +1656,7 @@ size_t server_prompt_cache::n_tokens() const {
+     return res;
+ }
+ 
+-server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
++server_prompt_cache_state * server_prompt_cache::alloc(server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft, bool consume) {
+     // first check if the current state is contained fully in the cache
+     for (auto it = states.begin(); it != states.end(); ++it) {
+         const int cur_lcp_len = it->prompt.tokens.get_common_prefix(prompt.tokens);
+@@ -1727,7 +1727,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
+     states.push_back({
+         /*.prompt =*/ {
+             /*.tokens      =*/ prompt.tokens.clone(),
+-            /*.checkpoints =*/ prompt.checkpoints,
++            /*.checkpoints =*/ consume ? std::move(prompt.checkpoints) : prompt.checkpoints,
+         },
+         /*.data   =*/ {
+             /*.main =*/ std::move(state_data_tgt),
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 411d91807..9c542b5bc 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -648,7 +648,10 @@ struct server_prompt_cache {
+ 
+     size_t n_tokens() const;
+ 
+-    server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
++    // when `consume` is set the caller guarantees that `prompt` is dead on return
++    // (it is either replaced by load() or cleared), so the checkpoint payloads may be
++    // moved into the cache entry instead of deep-copied.
++    server_prompt_cache_state * alloc(server_prompt & prompt, size_t state_size_main, size_t state_size_drft, bool consume);
+ 
+     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+ 
+-- 
+2.53.0
+

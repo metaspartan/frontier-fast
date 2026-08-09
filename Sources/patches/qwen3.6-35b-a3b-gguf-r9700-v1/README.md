@@ -3849,3 +3849,183 @@ ranked path is `llama-server`, where the debug counter confirms the epilogue
 fires 600/600 with zero declines, and the server carries more per-token host
 work for a removed dispatch to hide behind. Do not assume the 0.98 ratio for an
 arrival-counter epilogue.
+
+## Round 40: TTFT is 42% host bookkeeping, prefill is scored as a SLOPE, and the ubatch lever is numerically dead
+
+This round stopped profiling `llama-bench` and profiled the thing that is
+actually scored. Three results, and the first one changes how every future
+prefill/ttft claim on this track has to be reasoned about.
+
+### 1. Read the scoring code before optimising prefill
+
+`Sources/runner/base.ts` does not measure prefill as a rate. It measures a
+**two-point slope**: a `max_tokens=1` request at `contract.promptTokens` (512,
+which tokenises to ~534 with the harness prefix) minus a second one at
+`promptTokens/8` (~84 tokens), divided by the token difference.
+
+```
+ttft            = t(534)
+prefill s/tok   = ( t(534) - t(84) ) / 451
+decode  s/tok   = ( t_full(534,128) - t(534) ) / 127
+```
+
+Three consequences, all of which invalidate the obvious plan:
+
+- **Any fixed per-request cost cancels out of prefill entirely** and shows up
+  only in ttft (weight 0.15). Conversely anything that scales with prompt
+  length is worth 0.20/97 ms + 0.15/248 ms ≈ **0.2% of score per ms**.
+- **MoE expert streaming barely moves the ranked prefill number.** At 84 tokens
+  top-8-of-256 routing already touches ~93% of the experts, so the ~19.5 GB
+  weight stream is common to both arms of the slope and cancels. The round-29
+  observation that "MoE prefill is 44% of a pass at 70% of achievable" is true
+  and is *not* where the prefill ratio lives. It is a ttft lever only.
+- **Measured decode is contaminated by the ttft request.** The subtraction is
+  exact only if the two requests carry the same fixed overhead, and they do not
+  (see below). On a local replica the control reads decode **167.4 tok/s** while
+  the server's own timer says **161.9**.
+
+A faithful local replica of the harness is kept on the box as
+`~/fable-qwen/rank40.py` + `srv40.sh`; it reproduces ttft to about 5% of the
+ranked value and is the right instrument for this class of work.
+
+### 2. Where the 248 ms TTFT goes (measured, `--verbosity 4` + instrumentation)
+
+```
+248 ms  total TTFT
+ 76 ms    prompt cache "update" -- between slot selection and launch_slot
+166 ms    prompt eval   (server timer)  = ~133 ms GPU kernel + ~33 ms host
+  6 ms    the one decode token + HTTP
+```
+
+The 76 ms decomposes, with a stderr timer around each part:
+
+```
+21.2 ms   value-initialising a 73 MiB std::vector the state read overwrites
+46.7 ms   deep-copying 125.6 MiB of context-checkpoint payloads into the entry
+ 5.6 ms   the actual device->host state read (80 copies, 73 MiB = 13 GB/s)
+```
+
+**The copies are not the problem.** A standalone HIP probe (`d2h.hip`, kept on
+the box) measures a single 64 MiB D2H at **55.7 GB/s pageable and 56.4 GB/s
+pinned** — pinning is worth nothing here. It only starts to matter when the
+transfer is chopped up: 64 MiB in 300 chunks reads 6.4 GB/s pageable against
+23.0 GB/s pinned. Do not reach for pinned staging on this box without first
+checking the chunk size.
+
+On top of that, the 166 ms prompt eval carries **two 62.81 MiB context
+checkpoints** created per request (`create_checkpoint`, hybrid/recurrent
+models), each one another `resize()` + state read. In total **~105 ms of the
+248 ms TTFT — 42% — is host-side state bookkeeping with no arithmetic in it.**
+
+### 3. The ubatch lever: +8.8% score, and unshippable
+
+The ~534-token ranked prompt is *just* over the default `n_ubatch = 512`, so it
+runs as a 512-token physical batch plus a ~22-token one — and on a 256-expert
+MoE each extra physical batch re-streams essentially the whole model. Server
+prompt eval at ub=1024 is **138.7 ms against 166.2 ms**, and the ranked-replica
+numbers are dramatic:
+
+| server cfg | TTFT | prefill tok/s | decode tok/s | modelled Δscore |
+|---|---|---|---|---|
+| base | 0.2483 | 4682 | 167.83 | — |
+| `-ub 1024` | 0.1925 | 6822 | 161.44 | **+8.8%** |
+| `-b 2048 -ub 2048` | 0.1943 | 6565 | 161.89 | +8.1% |
+| `--cache-ram 0` | 0.1742 | 4572 | 162.67 | +2.8% |
+| both | 0.1397 | 6664 | 160.98 | +13.0% |
+
+**It is not numerically neutral.** `llama-perplexity -c 1024 --chunks 32`, four
+loads per arm:
+
+```
+ub=512    1.2751  1.2803  1.2749  1.2768      (spread 0.42%)
+ub=1024   1.2813  1.2819  1.2813  1.2813      (spread 0.05%)
+ub=2048   1.2682  1.2682  1.2682  1.2682      (spread 0.00%)
+```
+
+Up to **1.03% relative — ten times the gate** — and note ub=1024 vs ub=2048
+differ even though a 1024-token chunk is one physical batch in both. The
+chunked GDN recurrent scan re-associates across a physical-batch boundary.
+Rejected, not shipped. Two things to carry forward:
+
+- **Never ppl-check a physical-batch change at `-c 512`.** That shape never
+  splits, so it reports bit-identical while the served path diverges by 1%.
+- ub=512 is the *only* arm that is irreproducible across loads. That is very
+  likely the same effect behind the campaign note that `-c 512` gate-shape ppl
+  stopped being reproducible on this box.
+
+### 4. 0054 — move the checkpoint payloads instead of copying them
+
+`get_available_slot()` calls `prompt_save()` and then, on the very next line,
+`prompt_load()` — which either assigns the whole `prompt` from a cache entry or
+falls through to `prompt_clear()`. **The slot's prompt is dead the moment
+`prompt_save()` returns on that path**, so the 125.6 MiB of checkpoint payloads
+can be moved into the cache entry rather than deep-copied. `alloc()` takes an
+explicit `consume` flag; the other caller (the `cache_idle_slots` path, which
+keeps using the slot when the KV cache is not unified) keeps the copy.
+
+**Exactness is unusually strong here: the gate binary is the same file.**
+Building the parent commit and the candidate and diffing the artefacts:
+
+```
+852dda6479a47a9eaf45cdf87711b3bf  build/bin/llama-perplexity
+32c1c78dd92e42814807c8bb667f067c  build/bin/libllama.so.0
+284c5e39af4d8371f9436e4e11960af1  build/bin/libggml-hip.so.0
+e56d4c795bb4409a59c0bba1e017e9e9  build/bin/libllama-bench-impl.so
+```
+
+— identical on both arms. The change lives entirely in
+`libllama-server-impl.so`. No kernel, no graph, no arithmetic.
+
+Cross-binary A/B, control lib selected with `LD_LIBRARY_PATH` and confirmed by
+`ldd`, 9 measured runs per server start:
+
+| arm | TTFT | prefill tok/s | decode tok/s | cache update |
+|---|---|---|---|---|
+| ctl1 | 0.2473 | 4746.6 | 167.63 | 71-76 ms |
+| cand1 | 0.1945 | 4592.5 | 161.54 | 23-29 ms |
+| cand2 | 0.1945 | 4606.2 | 161.56 | 23-29 ms |
+| ctl2 | 0.2500 | 4597.5 | 167.00 | 71-76 ms |
+
+and a same-binary toggle A/B (`LLAMA_SERVER_PROMPT_CACHE_MOVE`), 3 rounds:
+
+```
+on   ttft 0.1920 0.1953 0.1949   prefill 4726 4648 4598   decode 161.93 161.42 161.29
+off  ttft 0.2496 0.2480 0.2502   prefill 4640 4678 4543   decode 167.47 167.34 167.52
+```
+
+Pooled over both experiments, 5 arms each: **ttft 0.2490 -> 0.1942 (-22.0%,
+5/5 separated with no overlap), prefill 4641 -> 4634 (-0.15%, flat as the
+mechanism predicts), decode 167.39 -> 161.55 (-3.49%)**.
+
+**The decode "loss" is the artifact from §1 being removed, not a regression.**
+The prompt-cache cost differs between the two requests the decode subtraction
+uses (74.7 ms before the ttft request, which follows a 659-token full request,
+vs 47.4 ms before the full request, which follows an 84-token short one); that
+28 ms asymmetry divided by 127 is +0.22 ms/token of fake decode. Removing the
+waste removes the inflation. Real decode is untouched — `llama-bench` tg128 is
+the same binary — and the server's own timer reads 161.8 tok/s on both arms.
+
+Correctness: `llama-perplexity -b 512 -ub 1 --chunks 8` = **3.9382** on both
+loads, equal to the banked value since 0047 (and necessarily so — same binary).
+Server greedy identity, the 640-token prompt that disagreed once in the first
+pass, replayed **5x per server start, 2 starts per arm: 20/20 byte-identical
+across both arms.** The single earlier mismatch was the known long-prompt
+flakiness (rounds 32 and 39 saw it on their own long prompt), and it did not
+reproduce in 10 candidate replays.
+
+Local modelled Δscore: **+1.4%** if the ranked harness shares the decode
+artifact, **+3.7%** if it does not — and the evidence says it does not, because
+the ranked decode of 161.41 tok/s already matches the server's internal timer
+(161.9) rather than the inflated 167.4 a contaminated subtraction produces.
+
+### What is still on the table, in the same direction
+
+- **21.2 ms** per request still spent value-initialising the 73 MiB state
+  buffer. `std::vector::resize` zero-fills; the state read overwrites every
+  byte. Needs a default-init allocator or a buffer pool — the ripple through
+  `common_prompt_checkpoint` and `common_speculative_get_state` is why it is
+  not in this patch.
+- **~30 ms** per request in `create_checkpoint`, which is the same
+  `resize()` + state-read pattern, twice, at 62.81 MiB each.
+- Together those are worth roughly another **+4-5% score** at 0.15 weight, and
+  unlike the ubatch lever they cannot move a single bit of arithmetic.
