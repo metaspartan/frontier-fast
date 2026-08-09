@@ -32,8 +32,7 @@ These gates ban damage, not arithmetic reassociation.
 
 ## The tracks
 
-Thirteen live, plus two frozen ones listed so their ids validate. Do not submit
-to a frozen track: no submission there can be verified.
+Thirteen, all live and all accepting submissions.
 
 | Track ID | Model | Device | Engine |
 |---|---|---|---|
@@ -50,8 +49,6 @@ to a frozen track: no submission there can be verified.
 | `laguna-s-2.1-nvfp4-gb10-v1` | poolside/Laguna-S-2.1-NVFP4 | DGX Spark GB10 | vLLM 0.25.1 |
 | `lfm2.5-2.6b-mlx-apple-v1` | LiquidAI/LFM2.5-2.6B-MLX | Apple M4 (16 GB) | MLX |
 | `maple-preview-mlx-apple-v1` | deepgrove/maple-preview-2bit-mlx | Apple M4 (16 GB) | MLX |
-| `qwen3.6-35b-a3b-nvfp4-gb10-v1` | unsloth/Qwen3.6-35B-A3B-NVFP4-Fast | DGX Spark GB10 | vLLM — **FROZEN** |
-| `laguna-xs-2.1-nvfp4-mlx-apple-v1` | poolside/Laguna-XS-2.1-NVFP4-mlx | Apple Silicon | MLX — **FROZEN** |
 
 `curl -s https://frontier.fast/api/tracks` is authoritative and moves; this
 table does not.

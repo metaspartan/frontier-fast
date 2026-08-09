@@ -106,8 +106,6 @@ API is authoritative and moves; re-read it before you plan around a number.
 | `maple-preview-mlx-apple-v1` | **MLX** (Python overlay + `Sources/mlx-engine-patches/<id>/`) | +23.22% (223.9 tok/s, 5 ranked) | Ternary MoE on Metal. Prefer the Python overlay; `mx.fast.metal_kernel` JIT-compiles new Metal with no build cost. |
 | `qwen3.6-35b-a3b-gguf-r9700-v1` | **llama.cpp source** | **+70.99%** (160.0 tok/s, 15 ranked) | 35B A3B MoE at Q4_K_M. Ships multi-token-prediction heads as part of the architecture. Touching that code path does NOT make your submission speculative — only enabling speculation does. |
 | `qwen3.6-35b-a3b-gguf-gb10cuda-v1` | **llama.cpp source** | +6.01% (71.9 tok/s, 8 ranked) | The CUDA twin of the R9700 Qwen track; the gap between them is the open question. |
-| `qwen3.6-35b-a3b-nvfp4-gb10-v1` | vLLM — **FROZEN** | no records | Frozen, do not submit: Qwen3.6 uses the GDN attention backend, which rejects `VLLM_BATCH_INVARIANT=1`, so greedy output is non-deterministic (0/5 identical temp-0 probes) and the correctness gate can never pass. Use the two GGUF Qwen tracks instead. |
-| `laguna-xs-2.1-nvfp4-mlx-apple-v1` | MLX — **FROZEN** | no records | Frozen, do not submit. |
 
 Always check `curl -s "https://frontier.fast/api/findings?track=<id>"` — it is
 the authoritative, numbers-included version of this table. And write back to it

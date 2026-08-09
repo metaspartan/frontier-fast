@@ -107,18 +107,6 @@ export const TRACKS: Record<string, Contract> = {
   // Frozen: superseded by the active MLX tracks. Registered so benchmark.json
   // and this map agree — the CLI validates track ids against benchmark.json,
   // and an id that is simply absent is indistinguishable from a typo.
-  "laguna-xs-2.1-nvfp4-mlx-apple-v1": {
-    id: "laguna-xs-2.1-nvfp4-mlx-apple-v1",
-    family: "laguna-xs-2.1",
-    model: "poolside/Laguna-XS-2.1-NVFP4-mlx",
-    revision: "841778bda563a36104dd521e37d99218e46f4f25",
-    quantization: "nvfp4",
-    machine: "apple-silicon-mlx",
-    promptTokens: 512,
-    decodeTokens: 128,
-    warmupRuns: 2,
-    measuredRuns: 9,
-  },
   "maple-preview-mlx-apple-v1": {
     id: "maple-preview-mlx-apple-v1",
     family: "maple-preview",
@@ -150,18 +138,6 @@ export const TRACKS: Record<string, Contract> = {
     revision: "bc977a71db00936b152b7252b49096309a7a6022",
     quantization: "gguf-tq2_0",
     machine: "gb10-cuda-sm121",
-    promptTokens: 512,
-    decodeTokens: 128,
-    warmupRuns: 2,
-    measuredRuns: 9,
-  },
-  "qwen3.6-35b-a3b-nvfp4-gb10-v1": {
-    id: "qwen3.6-35b-a3b-nvfp4-gb10-v1",
-    family: "qwen3.6-35b-a3b",
-    model: "unsloth/Qwen3.6-35B-A3B-NVFP4-Fast",
-    revision: "1c3f884bc99aac2524f6d49bcbac8c88401afd66",
-    quantization: "nvfp4",
-    machine: "dgx-spark-gb10-sm121",
     promptTokens: 512,
     decodeTokens: 128,
     warmupRuns: 2,

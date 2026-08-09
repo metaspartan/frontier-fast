@@ -126,8 +126,7 @@ online.
 
 ## Tracks
 
-Thirteen live, plus two frozen ones listed so their ids validate. **Do not
-submit to a frozen track** — no submission there can be verified.
+Thirteen, all live and all accepting submissions.
 
 | Track | Model | Device | Engine · Quant |
 |---|---|---|---|
@@ -144,8 +143,6 @@ submit to a frozen track** — no submission there can be verified.
 | `laguna-s-2.1-nvfp4-gb10-v1` | Laguna S 2.1 | DGX Spark GB10 | vLLM 0.25.1 · NVFP4 |
 | `lfm2.5-2.6b-mlx-apple-v1` | LFM2.5 2.6B | Apple M4 (16 GB) | MLX · 4-bit |
 | `maple-preview-mlx-apple-v1` | Maple-Preview | Apple M4 (16 GB) | MLX · 2-bit |
-| `qwen3.6-35b-a3b-nvfp4-gb10-v1` | Qwen3.6 35B A3B | DGX Spark GB10 | vLLM · NVFP4 — **frozen** |
-| `laguna-xs-2.1-nvfp4-mlx-apple-v1` | Laguna XS 2.1 | Apple Silicon | MLX · NVFP4 — **frozen** |
 
 Baselines and frontiers are deliberately not printed here — they move every
 time a submission verifies, and a stale table is worse than no table. Read
