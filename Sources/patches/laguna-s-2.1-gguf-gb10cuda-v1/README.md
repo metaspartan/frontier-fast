@@ -7,10 +7,53 @@ Applied in order against pinned llama.cpp **b10237**
 | --- | --- | --- |
 | 0001 | `cuda-mmvq-group-same-activation-matvecs` | **+1.868% decode** (in-process paired A/B, 12 rotated cycles, no-op floor 0.99994) |
 | 0002 | `sm121-mmq-moe-j64-cap` | **+4.47% prefill** (median of same-mode interleaved toggle rounds; decode neutral — the cap is MMQ/prefill-only) |
-| 0003 | `laguna-attn-gate-graph-order-pin` | bit-identical; see its section |
 
 The verified frontier on this track is **1.030637** (0001+0002). Stock baseline
 is 23.627 tok/s decode, 343.1 tok/s prefill, 0.66 s TTFT.
+
+## Measured-neutral and removed: the attention-gate graph-order pin
+
+The R9700 laguna-xs twin's `0020` is worth **+1.81% decode, bit-identical**
+there. Ported here it is **not resolvable at six rounds** and was removed. It is
+documented rather than deleted because the *reason* is a fact about this model,
+not about the lever.
+
+**It does fire, and it is exactly as exact as advertised.** Same-binary
+`GGML_MMVQ_GROUP_STATS`: grouped-mmvq goes `groups=93 members=233` →
+`groups=95 members=238`, with `n_nodes` unchanged at **3806** (a pure reorder),
+and `GGML_LAGUNA_QKV_GATE_PIN=0` on the candidate binary returns exactly
+`groups=93 members=233`. Greedy output is **byte-exact** across three arms
+(parent, candidate pin-on, candidate pin-off — 3325 bytes each).
+
+**But it only recruits 5 of 233 members.** On the R9700 twin the gate joins in
+all 40 attention layers; here it joins in a couple. One
+`ggml_build_forward_expand` is evidently *necessary but not sufficient* on this
+model — most layers' gates are still refused by the hoist-legality check for a
+reason the reorder does not address. **That diagnosis, not the timing, is what
+the next agent should pick up**: find why the other ~40 gates still fail, and
+the lever may be worth its R9700 value.
+
+Six interleaved ABBA rounds, control = 0001+0002, candidate = +pin:
+
+| round | order | parent pp512 | parent tg64 | cand pp512 | cand tg64 | naive ratio |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1 | A,B | 639.98 | 24.608 | 638.11 | 24.437 | 0.9931 |
+| 2 | B,A | 600.33 | 24.138 | 630.56 | 24.350 | 1.0088 |
+| 3 | A,B | 657.98 | 25.877 | 633.78 | 24.477 | 0.9459 |
+| 4 | B,A | 633.38 | 23.512 | 635.06 | 24.197 | 1.0291 |
+| 5 | A,B | 639.29 | 24.143 | 648.23 | 25.859 | 1.0711 |
+| 6 | B,A | 641.11 | 24.563 | 644.24 | 24.387 | 0.9928 |
+
+Same-mode: slow (n=5 each) parent 24.143 vs cand 24.387 = **1.0101**; fast
+(n=1 each) 25.877 vs 25.859 = **0.9993**. Unlike 0003–0005, **the arms overlap
+within the mode** (parent slow spans 23.512–24.608, candidate 24.197–24.477),
+and the +1.01% rests entirely on the single parent outlier at 23.512 — drop it
+and the ratio is **1.0014**. That is not a result. Bounded somewhere in
+−0.1%…+1%, below what six whole-process rounds resolve on this track.
+
+Not submitted: a submission that does not beat the current best is auto-rejected
+("score did not improve current best"), and there is no measured gain here to
+put against a runner slot.
 
 # READ THIS FIRST: this track enforces GREEDY-OUTPUT AGREEMENT, not just perplexity
 
