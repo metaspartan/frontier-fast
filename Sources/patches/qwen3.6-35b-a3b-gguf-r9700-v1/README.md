@@ -4344,3 +4344,81 @@ more than any single kernel round: at a 20% false-rejection rate the series is
 losing roughly one submission in five, and a nondeterministic engine is a
 correctness defect in its own right. Detecting a 20% rate needs ~10 loads per
 arm (~6 min), so a grouped binary search over the toggle list is ~30-40 minutes.
+
+## Round 43b: the nondeterminism is patch 0008, and it is a genuine data race
+
+Grouped binary search over the prefill-active toggles, **10 loads per arm**,
+statistic is SPREAD (we are detecting a ~20% tail, not a mean shift), gate
+command exactly as the runner runs it:
+
+| arm | what is disabled | spread | fail ±0.1% |
+|---|---|---:|---:|
+| baseline | nothing | 0.511% | 2/10 |
+| `alloff` | every group | **0.000%** | 0/10 |
+| `halfA` | MMQ + GDN + skinny | 0.654% | 5/10 |
+| `halfB` | norm + moe + co-launch | **0.000%** | 0/10 |
+| `norm` | the norm group only | **0.000%** | 0/10 |
+| `normG` | the 4 grouped launches | 0.641% | 6/10 |
+| `normQ` | the 3 folds | **0.000%** | 0/10 |
+| `nq_only` | 0009 only | 0.186% | 2/10 |
+| `um_only` | 0036 only | 0.379% | 2/10 |
+| **`pa_only`** | **0008 only** | **0.000%** | **0/10** |
+
+**Disabling patch 0008 alone (`GGML_CUDA_DISABLE_PRE_ADD_NORM=1`) restores
+perfect determinism: 3.9318 ten times out of ten.** Neither of the other two
+folds does, and the grouped launches are innocent.
+
+### The race
+
+`rms_norm_pre_add_f32` (`ggml/src/ggml-cuda/norm.cu`) writes the residual sum to
+**global** `add_dst` in its first loop and then, in the second loop, **reads it
+back while concurrently writing `dst`**:
+
+```c
+for (col = tid; col < ncols; col += block_size) {   // loop 1
+    ...
+    if constexpr (n_add > 1) add_dst[col] = acc;
+    tmp += xi*xi;
+}
+tmp = block_reduce<SUM, block_size>(tmp, s_sum);
+for (col = tid; col < ncols; col += block_size) {   // loop 2
+    const float x_col = (n_add > 1) ? add_dst[col] : ...;   // <-- re-read
+    dst[col] = scale * x_col * mul[mul_col];                // <-- concurrent write
+}
+```
+
+Nothing checks that `dst` and `add_dst` do not overlap. `ggml-alloc` is free to
+place the `mul` output over the residual buffer when it considers the residual
+dead after this node, and **which buffers overlap depends on allocator placement,
+which varies from one model load to the next** — exactly the per-load signature
+observed (deterministic within a load, different across loads). Two threads in
+the same block handle different `col`s, so thread A's `dst[colA]` store can
+clobber `add_dst[colB]` before thread B reads it. The `__syncthreads()` inside
+`block_reduce` orders loop 1 against loop 2 but does nothing about loop 2
+racing with itself.
+
+### Fix versus drop
+
+**Cost of dropping** (llama-bench, 3 rounds, mean):
+
+```
+0008 ON    pp512 4904.2   tg128 164.60
+0008 OFF   pp512 4845.9   tg128 159.69
+           prefill -1.19%        decode -2.98%      ~= -2.2% score
+```
+
+**Cost of fixing: small, and bit-identical by construction.** The second loop
+does not need `add_dst` at all — the value it wants is the `acc` the same thread
+computed in loop 1. Each thread owns columns `{tid, tid+bs, tid+2bs, ...}`, so
+for the shapes this fold sees that is a handful of values; keeping them in a
+small register array across the `block_reduce` removes the global re-read
+entirely, cannot alias anything, and produces the identical bits (same operands,
+same order, same rounding). A fallback to the current path covers any shape with
+more values per thread than the array holds.
+
+Note the recompute-from-`args.src` variant is **not** safe: if `dst` aliases a
+source row, loop 2 would read clobbered inputs. Registers are the fix.
+
+Do not "fix" this by declining the fold when `dst` overlaps `add_dst` — that
+silently disables it in whatever configuration is currently common and leaves
+the correctness of the rest resting on allocator luck.
