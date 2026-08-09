@@ -4838,3 +4838,78 @@ pointers the fold is applied to **and** every other node in the graph that
 reads or writes those byte ranges, then diff that set across loads. Four
 mechanisms have now been guessed and measured; the fifth should be found by
 enumeration, not by guessing.
+
+## Round 47c: the 0008 ENUMERATION — the graph-level state is identical across loads, so the defect is intra-kernel
+
+Four mechanisms had been proposed and measured dead by hypothesising first. This
+round stopped hypothesising and dumped the actual state, per model load: every
+`(dst, add_dst)` pair the fold is applied to, every other graph node whose byte
+range intersects `add_dst` (node index, op, tensor name, read/write role, and
+whether it sits before or after the fold), and the value of the *dynamic* gate
+`stream_ctx.concurrent_events.size()` that decides whether the fold fires at
+all.
+
+The instrumentation is `~/fable-qwen/enum_instr.py` on the box — it patches
+`ggml-cuda.cu` to add a `GGML_RMS_PRE_ADD_ENUM=1`-gated dump plus a counter for
+ADD nodes skipped because `concurrent_events` was non-empty. It is deliberately
+**not** part of the shipped series; it is debug scaffolding and the series
+should not carry it.
+
+Four loads, runner's exact gate command, fold forced on
+(`GGML_CUDA_PRE_ADD_NORM=1`):
+
+```
+load1 ppl=3.9318   folds=710   ovl_lines=1065830
+load2 ppl=3.9318   folds=710   ovl_lines=1065830
+load3 ppl=3.9265   folds=710   ovl_lines=1065830
+load4 ppl=3.9307   folds=710   ovl_lines=1065830
+```
+
+The nondeterminism reproduced (three distinct values). And:
+
+**1. The enumeration is byte-identical across all four loads.** `md5sum` of the
+complete `[PREADD]` dump is `4896a70ba225e3032d140f88f1f4bdd5` for every load,
+including load 3 and load 4 whose perplexity differs. Same 710 folds, same node
+indices, same tensor names, same byte offsets, same overlap set. So the applied
+fold set does not vary, the allocation does not vary, and the set of nodes
+touching `add_dst` does not vary.
+
+**2. Nothing writes `add_dst` while it is live. 0 of 710 folds.** For each fold,
+taking the node that produces `add_dst` and the last node that reads it, and
+searching for any other node writing into that byte range in between: zero hits
+across the whole graph, every fold. There is no second writer and no missing
+dependency edge — which is the specific thing this pass was sent to find.
+
+**3. The dynamic gate never varies.** `conc=0` and `skipconc=0` on every one of
+the 710 folds. The `concurrent_events.empty()` condition at the call site is a
+real dynamic gate (it is why the server path bypasses inline fusions), but under
+the gate command it is constant, so it is not the trigger either.
+
+**4. One block per row.** `rms_norm_pre_add_launch` uses
+`dim3 blocks_num(nrows, 1, 1)`, so no two blocks ever share a row and there is
+no cross-block hazard on `add_dst` within a row.
+
+**5. PDL is not the vehicle.** The kernel calls `ggml_cuda_pdl_lc()` and
+`ggml_cuda_pdl_sync()`, which is programmatic dependent launch — a real
+producer/consumer overlap whose pairing this fold changes. On this build it is
+compiled out: `common.cuh` defines `GGML_CUDA_USE_PDL` only when
+`!defined(GGML_USE_HIP)`, so both are no-ops on gfx1201.
+
+### What this leaves
+
+Every level that can be enumerated statically is deterministic and identical
+across loads: graph structure, allocation, fold set, overlap set, launch
+geometry, and the dynamic gate. The defect is therefore **inside the kernel's
+execution with a fixed set of participants** — an outcome that varies while the
+inputs and the schedule do not.
+
+That is a much smaller box than this started in, and it is the artifact of this
+pass. Six mechanisms are now excluded. The next agent should **not** open a
+seventh hypothesis about buffers or scheduling; the remaining candidates are all
+inside `rms_norm_pre_add_f32` itself or in what the fold *removes* from the
+graph (the `k_bin_bcast` chain it replaces, and whether
+`ggml_cuda_norm_quant_register` fires differently in its presence — 0009/0036
+were cleared alone by the round-43b bisect, but not in combination with 0008's
+rewritten graph). Note also that the fold is a genuine reassociation, not a
+bit-exact transform, so "0008 on" and "0008 off" are not expected to agree — the
+defect is that "0008 on" does not agree *with itself*.
