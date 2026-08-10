@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Mon, 10 Aug 2026 06:00:00 +0000
+Subject: [PATCH] cuda/hip: park the rms_norm pre-add fold again -- it cost a
+ measured 1.9443 on the trusted runner
+
+Round 48c took the fold's nondeterminism as a bounded, one-in-four bet and won
+it. Round 49 lost it, and lost a **1.944290** measurement with it:
+
+```
+submission  0059-adaptive-context-checkpoints-...-1786336537
+measured    score 1.944290   decode 1.9630   prefill 1.8813   ttft 1.9490
+verdict     rejected: perplexity 3.9314 -> 3.9775 (1.173% delta, limit 0.1%)
+```
+
+That is +7.24% over the standing frontier of 1.812930, thrown away by a gate
+draw. **1.173% is 2.2x the worst draw ever recorded for this fold** (+0.534% in
+round 48c), so the tail is heavier than the 26%-outside-band sample suggested.
+Pooling every recorded draw of `|cand - stock|/stock` on the runner's exact gate
+command:
+
+```
++0.226  +0.010  -0.018  +0.211  +0.046  +0.534      (rounds 43/48c, local)
++0.112  +0.025  -0.043                              (round 49, local)
++1.173                                              (round 49, TRUSTED RUNNER)
+```
+
+**4 of 10 inside the 0.1% band.** That is not a bet worth making for 1.97% of
+score, which is what the fold is worth (round 48b isolated it at decode x1.02606,
+prefill x1.01222, ttft x1.005). Parked, the build reads **3.9318 on 10 of 10
+loads** and the gate is a formality rather than a coin flip.
+
+Arithmetically this is the exact revert of 0058; `GGML_CUDA_PRE_ADD_NORM=1`
+re-enables the fold for anyone continuing the round-43b..47c hunt for the
+defect, and **that env-var build is the arm any future A/B on this tree must use
+as its control** -- a nondeterministic control cannot resolve anything under
+about half a percent.
+
+Projected effect on the round-49 measurement, using round 48c's measured park
+factors: decode 1.9630 -> 1.9130, prefill 1.8813 -> 1.8586, ttft 1.9490 ->
+1.9393, **score 1.9443 -> ~1.906**, still +5.1% over the frontier. Unparking is
+worth ~+2% and remains available as a separate coin-flip submission once this
+one is banked.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 23d73b011..325de2b64 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -6769,8 +6769,17 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_ROPE_GROUP"));
+             static const bool disable_set_rows_group = getenv("GGML_CUDA_DISABLE_SET_ROWS_GROUP") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_SET_ROWS_GROUP"));
+-            static const bool disable_pre_add_norm = getenv("GGML_CUDA_DISABLE_PRE_ADD_NORM") != nullptr &&
+-                                                   std::atoi(getenv("GGML_CUDA_DISABLE_PRE_ADD_NORM"));
++            // PARKED AGAIN (round 49).  This fold is nondeterministic at the runner
++            // gate shape and the defect is still unidentified after six excluded
++            // mechanisms (README rounds 43b-47c).  Recorded draws of |cand-stock|
++            // on the runner's exact gate command: +0.226, +0.010, -0.018, +0.211,
++            // +0.046, +0.534, +0.112, +0.025, -0.043 percent locally and **+1.173
++            // percent on the trusted runner**, which rejected an otherwise verified
++            // 1.9443 measurement.  Parked reads 3.9318 on 10 of 10 loads.  The fold
++            // is worth ~1.97% of score; a coin flip on the whole submission is worth
++            // more than that.  GGML_CUDA_PRE_ADD_NORM=1 re-enables it.
++            static const bool disable_pre_add_norm = !(getenv("GGML_CUDA_PRE_ADD_NORM") != nullptr &&
++                                                       std::atoi(getenv("GGML_CUDA_PRE_ADD_NORM")));
+             static const bool disable_norm_quant = getenv("GGML_CUDA_DISABLE_NORM_QUANT") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_NORM_QUANT"));
+             static const bool disable_l2_norm_group = getenv("GGML_CUDA_DISABLE_L2_NORM_GROUP") != nullptr &&
+-- 
+2.53.0
+
