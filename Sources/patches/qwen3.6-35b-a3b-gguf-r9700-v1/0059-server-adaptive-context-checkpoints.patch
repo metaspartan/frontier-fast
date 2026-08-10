@@ -1,0 +1,234 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Mon, 10 Aug 2026 05:00:00 +0000
+Subject: [PATCH] server: adaptive context checkpointing -- the checkpoints this
+ track creates are restored exactly zero times (+2.4% score)
+
+`llama-server` creates context checkpoints while evaluating a prompt for any
+model whose memory cannot be partially rolled back (SWA, recurrent, hybrid).
+Qwen3.6-35B-A3B is hybrid, so it pays in full. Two things are bought each time:
+
+  * the prompt is deliberately BROKEN at `{4 + n_ubatch, 4}` tokens from its
+    end (`checkpoint_offsets`, ref llama.cpp PR 20288) so the state can be
+    captured before those tokens are evaluated -- the ranked 534-token prompt
+    therefore runs as **three** `llama_decode` calls of 18 + 512 + 4;
+  * `llama_state_seq_get_data` copies the whole sequence state on each break --
+    **62.813 MiB per checkpoint, two per ranked request.**
+
+A checkpoint can only ever pay for itself if a LATER request into the same slot
+shares a prefix long enough to reach it. The ranked harness gives every request
+a unique prefix (`Sources/runner/base.ts`: `ttft <session> <i>: ...`), so none
+ever does.
+
+**Census, `llama-server --verbosity 4`, one replica session (14 tasks):**
+
+```
+created context checkpoint  ... 19 of them, 62.813 MiB each
+restored context checkpoint ...  0
+erased invalidated ckpt     ...  0
+found better prompt (cache) ...  0
+```
+
+**A restore rate of exactly zero, and note the erase rate is zero too.** That is
+the reason 0021's waste signal from the sibling track does not transfer: since
+0054 moves the checkpoint payloads into the prompt-cache entry instead of
+deep-copying them, this server never logs `erased invalidated context
+checkpoint` at all, so a credit driven by erases would never decrement and the
+port would be structurally inert. The signal used here is the one that survives
+0054: **a task created checkpoints and no restore ever followed.**
+
+The patch replaces the unconditional `params_base.n_ctx_checkpoints > 0` gate
+with that credit: creation is allowed while credit remains, a successful
+restore refills it to 4, a task that created checkpoints without a restore
+spends one, and after 64 dry tasks a single probe task is let through so
+traffic that starts sharing prefixes turns the feature back on by itself.
+Multi-turn chat, which restores checkpoints constantly, never loses the
+feature. `LLAMA_ADAPTIVE_CKPT=0` restores stock behaviour and is the A/B toggle
+used below.
+
+Nothing about what the model computes changes in kind: a missing checkpoint
+only ever means the prompt is re-evaluated from a shorter cached prefix, which
+is precisely what stock already does whenever no checkpoint matches.
+
+**Firing is proven structurally, from the server log, not from a clock**
+(`--verbosity 4`, 14 tasks):
+
+```
+task  0 | created context checkpoint 1, 2      <- the credit, 2 tasks
+task 11 | created context checkpoint 1, 2
+task 22 | cached n_tokens = 0                  <- ONE llama_decode call
+   (12 further tasks, zero checkpoints, one chunk each)
+`cached n_tokens` lines: 18 over 14 tasks  =  2 x 3 + 12 x 1
+```
+
+so the ranked prompt goes from **three `llama_decode` calls to one**, and
+`prompt cache update took` drops from 7.79-10.37 ms to 0.00-0.01 ms on the
+tasks that no longer carry 125.6 MiB of checkpoint payload into the entry.
+
+**Timing.** Same binary, env toggle, 8 arms interleaved
+ctl/ck/pc/both/both/pc/ck/ctl x 9 measured runs, replica of
+`Sources/runner/base.ts` with unique prompts (so every request is cache-cold
+exactly as the ranked harness is):
+
+| arm | TTFT | prefill tok/s | decode tok/s | minflt/ttft req | AnonHugePages |
+|---|---:|---:|---:|---:|---:|
+| ctl | 0.16037 | 5350.6 | 161.47 | 891 | 5033984 kB |
+| ck  | 0.14134 | 5537.1 | 162.18 | 267 | 2293760 kB |
+| ck  | 0.14081 | 5596.9 | 161.47 | 333 | 2293760 kB |
+| ctl | 0.16251 | 5230.7 | 161.01 | 840 | 5185536 kB |
+
+Medians: **ttft 0.16144 -> 0.14108 (x1.1444), prefill 5290.6 -> 5567.0
+(x1.0522), decode 161.24 -> 161.82 (x1.0036)**. The ttft arms are fully
+disjoint. Retained huge-page state falls 5.03 GB -> 2.29 GB, which is the
+125.6 MiB/request of checkpoint payload measured without a clock.
+
+Cross-checked against a zero-rebuild probe on the frontier binary
+(`--ctx-checkpoints 0`, 2 rounds): ttft 0.16155 -> 0.14080, prefill 5228.6 ->
+5564.8, decode 161.87 -> 161.76. The adaptive form reaches the flag ceiling.
+
+**Priced against this track's own score algebra, not the replica's.** With
+`ttft = t(534)`, `prefill = (t(534)-t(84))/451`, `decode = (t_full-t(534))/127`
+and the published frontier's numbers (0.19817 s, 0.14246 s, 0.78531 s):
+
+```
+dScore/Score = 1.3331*a + 0.8277*c - 1.4039*b     (a,b,c in seconds, saved on
+                                                   the ttft / short / full req)
+```
+
+This patch measures **a = 20.4 ms, b = 16.1 ms, c = 23.2 ms**, i.e. the saving
+lands on all three requests and slightly harder on the full one, which is why
+decode does not pay for it here (it rose 0.36%). Ranked-priced: **+2.37%**, so
+1.812930 -> ~1.856. The replica's own ratios model +3.28%; the smaller ranked
+figure is the honest one, because the ranked harness has a 1.7x larger prefill
+numerator and therefore values a fixed per-request saving less.
+
+**Correctness.**
+
+* **The gate binary is the same file.** Building the parent commit and the
+  candidate and diffing the artefacts:
+
+```
+c787f9f16dfc419c329bab94a39b7121  bin/libggml-hip.so.0
+32c1c78dd92e42814807c8bb667f067c  bin/libllama.so.0
+852dda6479a47a9eaf45cdf87711b3bf  bin/llama-perplexity
+c76719480218ce6def4fd0fae7f9507a  bin/libllama-common.so.0.0.10276
+```
+
+  identical on both arms; the change lives entirely in
+  `libllama-server-impl.so`, which `llama-perplexity` does not load. The
+  runner's gate command is therefore unaffected by construction, and the
+  standing gate was re-drawn anyway (below).
+* Runner's exact gate command, 3 loads per arm in one session: see the series
+  README. The nondeterminism in this series is the 0008 pre-add fold and is
+  unchanged by this patch.
+* Served-path greedy identity: see the series README section for this round.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index a9d5b07cb..3f12834cc 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -963,6 +963,44 @@ private:
+     int slots_debug = 0;
+     int n_empty_consecutive = 0;
+ 
++    // [gainz] adaptive context checkpointing.
++    //
++    // For models whose memory cannot be partially rolled back (SWA, recurrent,
++    // hybrid -- Qwen3.6 is hybrid) the prompt loop creates context checkpoints
++    // while evaluating a prompt.  Each one costs an extra llama_decode call --
++    // the prompt is deliberately broken at {4 + n_ubatch, 4} tokens from its end
++    // purely so the state can be captured before those tokens are evaluated --
++    // plus a full llama_state_seq_get_data copy of the sequence state (62.81 MiB
++    // each on this model, two per 534-token request).
++    //
++    // A checkpoint only ever pays for itself if a LATER request into the same
++    // slot shares a prefix long enough to reach it.  When it does not, the whole
++    // cost was loss.  Note that with the checkpoint payloads moved into the
++    // prompt cache (see prompt_save/alloc consume) the server no longer logs
++    // "erased invalidated context checkpoint" at all, so the ONLY usable waste
++    // signal is "this task created checkpoints and no restore ever followed".
++    //
++    // The credit below makes creation self-tuning instead of unconditional: it
++    // is allowed while credit remains, a successful restore refills it, a task
++    // that created checkpoints without any restore spends one, and after a long
++    // dry spell a single probe task is let through so traffic that starts
++    // sharing prefixes turns the feature back on by itself.  Nothing about what
++    // the model computes changes -- a missing checkpoint only ever means the
++    // prompt is re-evaluated from a shorter cached prefix, which is exactly what
++    // stock already does whenever no checkpoint matches.
++    static constexpr int CKPT_CREDIT_MAX  = 4;
++    static constexpr int CKPT_PROBE_EVERY = 64;
++
++    bool ckpt_adaptive = [] {
++        const char * e = getenv("LLAMA_ADAPTIVE_CKPT");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    int  ckpt_credit    = 2;
++    int  ckpt_idle      = 0;
++    int  ckpt_created   = 0;
++    bool ckpt_hit       = false;
++    int  ckpt_last_task = -1;
++
+     std::unique_ptr<server_prompt_cache> prompt_cache;
+ 
+     server_metrics metrics;
+@@ -2390,6 +2428,9 @@ private:
+         // stash the draft's speculative state with the checkpoint
+         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+ 
++        // [gainz] speculative work performed; only a later restore validates it
++        ckpt_created++;
++
+         SLT_TRC(slot,
+                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
+                 (int) slot.prompt.checkpoints.size(), params_base.n_ctx_checkpoints, cur.pos_min,
+@@ -3359,6 +3400,11 @@ private:
+                                         // restore the draft's speculative state
+                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+ 
++                                        // [gainz] a restore proves checkpoints are paying off on this traffic
++                                        ckpt_credit = CKPT_CREDIT_MAX;
++                                        ckpt_idle   = 0;
++                                        ckpt_hit    = true;
++
+                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+@@ -3445,6 +3491,32 @@ private:
+ 
+                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+ 
++                    // [gainz] adaptive context checkpointing -- see ckpt_credit above.
++                    // Settled once per task, before the first chunk of its prompt is
++                    // assembled, so every chunk of one prompt makes the same decision.
++                    if (ckpt_adaptive) {
++                        if (ckpt_last_task != slot.task->id) {
++                            ckpt_last_task = slot.task->id;
++
++                            if (ckpt_hit) {
++                                // a restore already refilled the credit
++                                ckpt_hit = false;
++                            } else if (ckpt_created > 0 && ckpt_credit > 0) {
++                                // created, never restored
++                                ckpt_credit--;
++                            }
++
++                            ckpt_created = 0;
++
++                            if (ckpt_credit == 0 && ++ckpt_idle >= CKPT_PROBE_EVERY) {
++                                ckpt_credit = 1;
++                                ckpt_idle   = 0;
++                            }
++                        }
++
++                        do_checkpoint = do_checkpoint && ckpt_credit > 0;
++                    }
++
+                     // make checkpoints only for completion tasks
+                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
+ 
+-- 
+2.53.0
+

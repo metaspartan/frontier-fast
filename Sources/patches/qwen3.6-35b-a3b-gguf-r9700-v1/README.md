@@ -5407,3 +5407,149 @@ first and the coin-flip second was worth more than either alone would have been.
 - **Do not price ttft from `rank40.py`.** It overstated 0057 by 5x because the
   ranked harness measures cache-cold runs and the replica hammers a warm server.
   Prefill and decode replicate fine.
+
+## Round 49: the host-side family from the sibling tracks, censused here — the
+## server does ~199 MiB of speculative bookkeeping per request and NONE of it is
+## ever read
+
+The sibling R9700 tracks (`laguna-xs`, `lfm2.5`) took their largest gains of the
+campaign from three host-side patches and no kernel code, on one framing:
+**`llama-server` performs speculative work betting that a later request will
+share a prefix with this one, and never checks whether one ever does.** This
+round censuses all three on qwen, and prices each against *this track's own*
+score algebra before building anything.
+
+### 1. This track's sensitivity algebra — derive it, do not import it
+
+From `Sources/runner/base.ts`: `ttft = t(534)`,
+`prefill = (t(534)-t(84))/451`, `decode = (t_full(534,128)-t(534))/127`. Write a
+candidate's savings as `a` on the ttft request, `b` on the short request and `c`
+on the full request, all in seconds. With the published frontier's own numbers
+(ttft 0.19817 s, prefill numerator 0.14246 s, decode numerator 0.78531 s):
+
+```
+dScore/Score = 1.3331*a + 0.8277*c - 1.4039*b
+```
+
+Compare the sibling laguna track, which is `1.631*a + 0.853*c - 1.876*b`. The
+shape is the same but qwen values a fixed per-request saving **~1.8x less**,
+because its prefill numerator is 1.7x larger (0.14246 s against 0.107 s) and the
+`b` term therefore cancels less of the `a` term. **Every ranked-priced figure in
+this section uses these coefficients, not the replica's own ratios**, which run
+30-40% optimistic for this class.
+
+### 2. The census (`llama-server --verbosity 4`, replica session, 14 tasks)
+
+| thing | measured |
+|---|---|
+| `llama_decode` calls for the ranked 534-token prompt | **3** (chunks 18 / 512 / 4) |
+| `llama_decode` calls for the 84-token short prompt | **2** (chunks 79 / 4) |
+| context checkpoints created | **2 per long request, 1 per short**, 62.813 MiB each |
+| context checkpoints **restored** | **0** |
+| context checkpoints erased-invalidated | **0** (0054 moves them into the cache) |
+| prompt-cache entry | ~73 MiB, `prompt cache update took 7.79-10.37 ms` |
+| prompt-cache **hits** (`found better prompt`) | **0** — `lcp` is 0 or 11 of 534 |
+| retained huge-page state | **5.03-5.19 GB** across a 27-request run |
+
+**Both hit rates are exactly zero.** That is the number that turns these from
+features into waste, and it is the one no previous round on this track had
+measured: rounds 40/41 correctly costed the checkpoint and prompt-cache
+bookkeeping and then optimised *how* it was done (0054 moves instead of copies,
+0057 huge-pages the buffers) without ever asking whether it needed doing at all.
+
+### 3. Zero-rebuild pricing before writing a line (flag probes, 2 rounds each)
+
+| arm | TTFT | prefill tok/s | decode tok/s | minflt/ttft req |
+|---|---:|---:|---:|---:|
+| base | 0.16155 | 5228.6 | 161.87 | 786-891 |
+| `--ctx-checkpoints 0` | 0.14080 | 5564.8 | 161.76 | 242-247 |
+| `--cache-ram 0` | 0.15455 | 5302.5 | 161.26 | 485 |
+| both | 0.13085 | 5507.9 | 161.16 | **5** |
+
+### 4. What ported, and the one that did not port as written
+
+**0059 (context checkpoints) — ported, +2.37% ranked-priced.** The sibling's
+credit is driven by `erased invalidated context checkpoint`. On this track that
+event **never fires**, because 0054 moves the payloads into the prompt-cache
+entry rather than leaving them on the slot to be erased. A verbatim port would
+have been structurally inert — the credit would never decrement. The waste
+signal that survives 0054 is *"this task created checkpoints and no restore ever
+followed"*, and that is what shipped. **Before porting a self-tuning credit,
+check that the event it counts still happens on this tree.**
+
+**0060 (prompt-cache admission) — ported unchanged, +0.45% alone, +0.29% on top
+of 0059.** `load()` marking `last_hit` works here exactly as on the sibling.
+
+**The sibling's third patch (tail-ubatch absorption) is NOT ported.** 0059
+unlocks it in the same way it did there — the 534-token prompt now reaches
+`llama_context` whole and splits 512 + 22 — but round 40 measured this model's
+perplexity moving up to **1.03%** between `-ub` settings, because the chunked
+GDN recurrent scan re-associates across a physical-batch boundary. It stays
+declined until someone runs the stock-at-split comparison properly.
+
+### 5. The served-path question, settled with a control
+
+0059 moves batch boundaries, so unlike the sibling it is **not** bit-identical on
+the served path. Measured on the **deterministic build**
+(`GGML_CUDA_DISABLE_PRE_ADD_NORM=1` — a nondeterministic control cannot resolve
+this), 16 varied prompts x 64 greedy tokens:
+
+```
+stock vs stock (CONTROL)        16/16 byte-identical
+stock vs candidate              12/16
+--ctx-checkpoints 0 vs cand     16/16 byte-identical
+```
+
+**The candidate reproduces stock's own `--ctx-checkpoints 0` configuration to
+the byte.** It has selected a chunking that stock already offers through a
+documented flag — and the canonical one, the single `llama_decode` that
+`llama-cli`, `llama-bench` and `llama-perplexity` all use — not changed a
+computation. (One of the four differences is prompt 14, where *stock* returns an
+empty completion and the candidate returns 290 characters.)
+
+The gate is unaffected by construction: `libggml-hip.so.0`, `libllama.so.0`,
+`llama-perplexity` and `libllama-common.so.0.0.10276` are **md5-identical** to
+the parent commit on both patches; only `libllama-server-impl.so` changes, and
+`llama-perplexity` does not load it. Standing gate re-drawn anyway, 3 loads each:
+stock **3.9314 / 3.9314 / 3.9314**, candidate **3.9358 / 3.9324 / 3.9297**
+(+0.112% / +0.025% / -0.043%) — the unchanged 0008 coin flip, nothing new.
+
+### 6. Firing, proven structurally
+
+`--verbosity 4`, 14 tasks, both patches on:
+
+```
+created context checkpoint   4        <- tasks 0 and 11 only (the credit)
+cached n_tokens lines       18        =  2 x 3  +  12 x 1
+prompt cache update took   0.00 ms    on 13 of 14 tasks (was 7.79-10.37 ms)
+minflt per ttft request        5      (was 786-891)
+AnonHugePages retained       0 kB     (was 5.03-5.19 GB)
+```
+
+The ranked prompt goes from **three `llama_decode` calls to one**.
+
+### 7. The 8-arm A/B (same binary, env toggles, 9 measured runs per arm)
+
+| arm | TTFT | prefill tok/s | decode tok/s |
+|---|---:|---:|---:|
+| ctl | 0.16037 | 5350.6 | 161.47 |
+| ck | 0.14134 | 5537.1 | 162.18 |
+| pc | 0.15456 | 5236.2 | 161.44 |
+| both | 0.13008 | 5454.4 | 161.08 |
+| both | 0.13174 | 5485.1 | 161.23 |
+| pc | 0.15477 | 5299.9 | 160.96 |
+| ck | 0.14081 | 5596.9 | 161.47 |
+| ctl | 0.16251 | 5230.7 | 161.01 |
+
+| patch | a (ttft) | b (short) | c (full) | replica dScore | **ranked-priced** |
+|---|---:|---:|---:|---:|---:|
+| 0059 | 20.4 ms | 16.1 ms | 23.2 ms | +3.28% | **+2.37%** |
+| 0060 | 6.8 ms | 7.1 ms | 6.6 ms | +0.54% | **+0.45%** |
+| both | 30.5 ms | 27.7 ms | 30.1 ms | +3.78% | **+2.67%** |
+
+**Decode does not pay for either patch here** (0059 measures decode *up* 0.36%),
+because `c > a`: the saving lands slightly harder on the full request than on
+the ttft one, which is the opposite of the sibling's profile and the reason the
+harness's decode subtraction does not claw it back.
+
+Projection: 1.812930 -> **~1.856** for 0059, **~1.861** for the pair.
