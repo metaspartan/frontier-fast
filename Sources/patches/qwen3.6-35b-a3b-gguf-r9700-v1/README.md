@@ -5632,3 +5632,70 @@ re-associating when the checkpoint break is removed, it is not a gate, and the
 16k arm — which fits inside one checkpoint interval — is identical. Decode at
 long context is *unaffected* by the patch (both arms are +68% and +65% over
 stock, which is this series' kernel work).
+
+## Round 49b RANKED RESULT: VERIFIED, new frontier 1.956583 (+95.66%)
+
+`0059-0060-server-speculative-bookkeeping-on-the-deterministic-parked-build`,
+commit `bbc470e`, **verified**:
+
+```
+                     score      decode            prefill            ttft
+new frontier       1.956583   1.908895 (157.70)  1.833964 (3907.6)  2.373620 (0.14037)
+previous frontier  1.812930   1.959162 (161.72)  1.485789 (3165.7)  1.688987 (0.19817)
+                   +7.92%     -2.58%             +23.43%            +40.53%
+
+accuracy gate passed on perplexity — 3.9314 -> 3.9318 (0.010% delta)
+```
+
+**+7.92% of score in one round, from two server patches totalling 128 lines and
+not one line of kernel code**, on a track where nineteen kernel rounds had moved
+prefill from 1.0 to 1.49 and ttft from 1.0 to 1.69. The whole gain is those two
+terms: prefill 1.4858 -> 1.8340 and ttft 1.6890 -> 2.3736.
+
+### The parked build scored HIGHER than the unparked one
+
+```
+49   unparked + 0059          1.944290   REJECTED (ppl draw)
+49b  parked + 0059 + 0060     1.956583   VERIFIED
+```
+
+The park costs decode 1.9630 -> 1.9089 (-2.76%) and prefill 1.8813 -> 1.8340
+(-2.5%), and 0060 more than paid for both by itself: ttft 1.9490 -> **2.3736**,
++21.8%. **Do not take the pre-add fold's coin flip again for 2% when a
+deterministic patch on the table is worth more.**
+
+### The replica understates this class, twice over
+
+| | 0059 predicted | 0059 ranked | 0060 predicted | 0060 ranked |
+|---|---|---|---|---|
+| score | +2.37% | +7.24% | +0.29% | +21.8% of the ttft term |
+
+Both patches beat their projection by 3x or more, and the reason is the same
+both times: **the replica's `b` (the 84-token short request) is wrong**, and `b`
+carries this track's largest coefficient. The replica said the short request
+would save 16.1 ms on 0059; the runner measured it 4.8 ms *slower*. Anything
+whose value is a fixed per-request cost should be treated as **at least** what
+the replica says, never at most.
+
+### Where the ranked terms now stand
+
+```
+ttft     0.14037 s     <- was 0.19817; host bookkeeping is essentially gone
+prefill  3907.6 tok/s  <- was 3165.7
+decode   157.70 tok/s  <- the parked number; unparking is worth ~+2.6% decode
+```
+
+The two obvious follow-ups, in order:
+
+1. **Tail-ubatch absorption.** 0059 unlocks it exactly as 0021 did on the
+   sibling (which then took +6.48% from 0022): the 534-token prompt now reaches
+   `llama_context` whole and splits 512 + 22, so the 22-token tail still buys a
+   second full sweep of a 256-expert MoE. Round 40 declined it on evidence that
+   this round shows was **stock's own**: unmodified b10237 at `-c 534 -b 534`
+   reads **3.2687 / 3.2687 / 3.2687 at `-ub 512`** and **3.2459 / 3.2459 /
+   3.2459 at `-ub 576`** — zero spread on both arms, -0.698% apart. The
+   sensitivity is the GDN scan re-associating in *stock*, so an absorption
+   reproduces stock's own `-ub 576` reading rather than inventing one, and the
+   runner gate at `-c 512` is one ubatch and can never split.
+2. **Unparking the pre-add fold**, once the above is banked: ~+2.6% decode,
+   ~+2% score, at a ~50%-per-submission gate risk.
