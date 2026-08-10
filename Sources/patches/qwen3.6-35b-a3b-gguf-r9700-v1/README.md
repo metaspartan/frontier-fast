@@ -5699,3 +5699,64 @@ The two obvious follow-ups, in order:
    runner gate at `-c 512` is one ubatch and can never split.
 2. **Unparking the pre-add fold**, once the above is banked: ~+2.6% decode,
    ~+2% score, at a ~50%-per-submission gate risk.
+
+## Round 49c: 0062 — the tail ubatch, and the correctness test that should have been run in round 40
+
+0059 unlocked it, exactly as the sibling's 0021 unlocked its 0022. The ranked
+534-token prompt now reaches `llama_context` whole and splits 512 + 22, and on a
+256-expert MoE that 22-token tail buys a second full sweep of the expert weights.
+
+### The measurement round 40 needed and did not take
+
+Round 40 saw perplexity move up to 1.03% between `-ub` settings and concluded the
+change was arithmetic. Two arms settle it, and neither is the one that round ran:
+
+```
+STOCK b10237, -c 534 -b 534 --chunks 8, 3 loads per arm
+  -ub 512                       3.2687  3.2687  3.2687
+  -ub 576                       3.2459  3.2459  3.2459    -0.698%, ZERO spread
+
+CANDIDATE (this series), same shape
+  -ub 576  LLAMA_UBATCH_ABSORB=0   3.2755  3.2755  3.2755
+  -ub 512  LLAMA_UBATCH_ABSORB=1   3.2755  3.2755  3.2755   <- IDENTICAL
+  -ub 512  LLAMA_UBATCH_ABSORB=0   3.2296  3.2296  3.2296
+```
+
+The first pair says the shape sensitivity is **stock's own**, deterministic, and
+is the chunked `gated_delta_net` scan re-associating across a physical-batch
+boundary in unmodified llama.cpp. The second pair says the patch **reproduces to
+every digit what this same binary computes when handed `-ub 576`**. It selects a
+batching llama.cpp already supports through a documented flag.
+
+At the runner gate shape it provably cannot fire — 512 tokens is exactly
+`n_ubatch` — and reads `3.9318 / 3.9318 / 3.9318` with `ABSORB` on or off
+against stock's `3.9314`.
+
+**Carry this: when a batch-shape change moves a split-shape perplexity, run two
+arms before concluding anything — stock at both shapes, and the candidate with
+the equivalent `-ub` instead of the patch. Round 40 lost this lever for nine
+rounds by running neither.**
+
+### Timing: prefill x1.2350, decode flat to four decimal places
+
+6 arms interleaved off/on/on/off/off/on, same binary, `LLAMA_UBATCH_ABSORB`
+toggle, 9 measured runs each, 0059+0060 active in both arms:
+
+| arm | TTFT | prefill tok/s | decode tok/s |
+|---|---:|---:|---:|
+| off | 0.13320 | 5396.6 | 156.31 |
+| on | 0.11795 | 6647.4 | 156.29 |
+| on | 0.11714 | 6664.8 | 156.35 |
+| off | 0.13238 | 5328.8 | 156.31 |
+| off | 0.13222 | 5419.5 | 156.41 |
+| on | 0.11540 | 6851.2 | 156.00 |
+
+Medians **ttft 0.13238 -> 0.11714 (x1.1301), prefill 5396.6 -> 6664.8 (x1.2350),
+decode x0.9999**; a = 15.2 ms, b = -0.7 ms, c = 15.1 ms. On the new frontier's
+algebra (`1.9943a + 0.8071c - 1.7329b`, from ttft 0.14037 s, prefill numerator
+0.11541 s, decode numerator 0.80537 s) that is **+4.38%**, i.e. ~2.042.
+
+Note how much the coefficients moved once ttft fell to 0.14 s: `a` is now worth
+**1.994 per second** against 1.333 at the old frontier. Re-derive the algebra
+after every frontier advance — the cheaper ttft gets, the more the remaining
+ttft milliseconds are worth.

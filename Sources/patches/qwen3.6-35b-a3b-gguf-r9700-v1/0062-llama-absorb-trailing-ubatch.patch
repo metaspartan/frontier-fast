@@ -1,0 +1,181 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Fable 5 <noreply@anthropic.com>
+Date: Mon, 10 Aug 2026 07:00:00 +0000
+Subject: [PATCH] llama: absorb a small overhanging tail ubatch instead of
+ paying a second MoE sweep (+23.5% prefill, decode-neutral)
+
+On a sparse-MoE model the cost of a ubatch is dominated by the routed expert
+weights it must read, and that is a function of experts and layers rather than
+of how many tokens the ubatch carries. A batch that overhangs `n_ubatch` by a
+little therefore pays a **second full sweep of the expert weights** for that
+handful of tokens: at the default `n_ubatch = 512` the ranked 534-token prompt
+splits 512 + 22, and those 22 tokens re-stream essentially the whole 256-expert
+model.
+
+**This was structurally unreachable until 0059.** While the server pre-chunked
+every prompt at `{4 + n_ubatch, 4}` from its end to build context checkpoints,
+`llama_decode` never saw more than `n_ubatch` tokens and the test below was
+never true. 0059 removes exactly that pre-chunking; the sibling
+`laguna-xs-2.1-gguf-r9700-v1` found the same composition (its 0021 unlocked its
+0022, worth +6.48% of score ranked).
+
+`llama_ubatch_effective()` returns the whole batch when it overhangs `n_ubatch`
+by no more than `n_ubatch/8` (576 at the default), so graph buffers grow 12.5%
+rather than 100%. Rebalancing the split is NOT the remedy and the sibling
+measured it: two 267-token ubatches pay two full sweeps.
+`LLAMA_UBATCH_ABSORB=0` restores stock behaviour and is the A/B toggle.
+
+## Correctness: this is a batching selection, proven by construction
+
+Round 40 declined this lever because perplexity moved up to 1.03% between `-ub`
+settings. **That number is stock's own.** Unmodified b10237, `-c 534 -b 534
+--chunks 8`, three loads per arm:
+
+```
+stock  -ub 512    3.2687  3.2687  3.2687
+stock  -ub 576    3.2459  3.2459  3.2459     -0.698%, zero spread on both arms
+```
+
+The chunked `gated_delta_net` scan re-associates across a physical-batch
+boundary **in stock**, deterministically. So the question is not whether the
+number moves — it is whether the patch reproduces a batching this build already
+performs. It does, exactly:
+
+```
+cand  -ub 576  LLAMA_UBATCH_ABSORB=0    3.2755  3.2755  3.2755
+cand  -ub 512  LLAMA_UBATCH_ABSORB=1    3.2755  3.2755  3.2755     <- identical
+cand  -ub 512  LLAMA_UBATCH_ABSORB=0    3.2296  3.2296  3.2296
+```
+
+**Absorbing the tail at `-ub 512` computes, to every digit, what this same
+binary computes when handed `-ub 576`.** The patch selects a physical batching
+that llama.cpp already supports through a documented flag; it changes no
+arithmetic of its own.
+
+At the runner's gate shape the patch **provably cannot fire**: 512 tokens is
+exactly `n_ubatch`, `n_tokens > cparams.n_ubatch` is false, and the reading is
+unchanged. Runner's exact gate command, three loads per arm:
+
+```
+stock (b10237)         3.9314  3.9314  3.9314
+cand  ABSORB=0         3.9318  3.9318  3.9318
+cand  ABSORB=1         3.9318  3.9318  3.9318     +0.010%, zero spread
+```
+
+## Timing — 6 arms interleaved off/on/on/off/off/on, same binary, 9 runs each
+
+Cache-cold replica of `Sources/runner/base.ts`, with 0059 and 0060 active in
+both arms (they are what makes the lever reachable):
+
+| arm | TTFT | prefill tok/s | decode tok/s |
+|---|---:|---:|---:|
+| off | 0.13320 | 5396.6 | 156.31 |
+| on | 0.11795 | 6647.4 | 156.29 |
+| on | 0.11714 | 6664.8 | 156.35 |
+| off | 0.13238 | 5328.8 | 156.31 |
+| off | 0.13222 | 5419.5 | 156.41 |
+| on | 0.11540 | 6851.2 | 156.00 |
+
+Medians: **ttft 0.13238 -> 0.11714 (x1.1301), prefill 5396.6 -> 6664.8
+(x1.2350), decode 156.31 -> 156.29 (x0.9999)**. The arms are fully disjoint on
+both moving terms and decode is flat to four decimal places, which is what the
+mechanism requires: nothing about the decode graph changes.
+
+a = 15.2 ms, b = -0.7 ms, c = 15.1 ms. Priced on the new frontier's own algebra
+(`1.9943*a + 0.8071*c - 1.7329*b`, from ttft 0.14037 s, prefill numerator
+0.11541 s, decode numerator 0.80537 s): **+4.38%**, i.e. 1.956583 -> ~2.042.
+The replica's own ratios model +6.05%, and on this track the replica has twice
+been a lower bound for prefill/ttft work rather than an over-estimate.
+
+Co-Authored-By: Claude Fable 5 <noreply@anthropic.com>
+---
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 19cca7df1..eda40da9e 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -574,6 +574,50 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+     }
+ }
+ 
++// [gainz] Adaptive tail-ubatch absorption.
++//
++// On a sparse-MoE model the cost of a ubatch is dominated by the routed expert
++// weights it must read, and that is a function of experts and layers rather
++// than of how many tokens the ubatch carries.  A batch that overhangs n_ubatch
++// by a little therefore pays a SECOND full sweep of the expert weights for that
++// handful of tokens: on Qwen3.6-35B-A3B (256 experts, top-8) at the default
++// n_ubatch = 512 the ranked 534-token prompt splits 512 + 22, and the 22-token
++// tail costs nearly what the 512-token ubatch does.
++//
++// This is only reachable once the server stops pre-chunking the prompt to build
++// context checkpoints (see the server-side adaptive checkpointing patch); while
++// it did, llama_decode never saw more than n_ubatch and the test below was
++// never true.
++//
++// Returns the largest ubatch that may be formed by absorbing such an overhang,
++// or 0 when absorption is disabled.
++static uint32_t llama_ubatch_absorb_max(const llama_cparams & cparams) {
++    static const bool enabled = []() {
++        const char * env = getenv("LLAMA_UBATCH_ABSORB");
++        return env == nullptr || atoi(env) != 0;
++    }();
++
++    if (!enabled) {
++        return 0;
++    }
++
++    const uint32_t n_max = std::min(cparams.n_batch, cparams.n_ubatch + cparams.n_ubatch/8);
++
++    return n_max > cparams.n_ubatch ? n_max : 0;
++}
++
++// The ubatch size to split `n_tokens` with: n_ubatch normally, or the whole
++// batch when it overhangs n_ubatch by no more than the absorption bound.
++static uint32_t llama_ubatch_effective(const llama_cparams & cparams, uint32_t n_tokens) {
++    const uint32_t n_absorb = llama_ubatch_absorb_max(cparams);
++
++    if (n_absorb > cparams.n_ubatch && n_tokens > cparams.n_ubatch && n_tokens <= n_absorb) {
++        return n_tokens;
++    }
++
++    return cparams.n_ubatch;
++}
++
+ void llama_context::sched_reserve() {
+     if (!sched_need_reserve) {
+         return;
+@@ -588,7 +632,8 @@ void llama_context::sched_reserve() {
+     const int64_t t_start_us = ggml_time_us();
+ 
+     const uint32_t n_seqs = cparams.n_seq_max;
+-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
++    const uint32_t n_ubatch_res = std::max(cparams.n_ubatch, llama_ubatch_absorb_max(cparams));
++    const uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_res);
+ 
+     const size_t max_nodes = this->graph_max_nodes(n_tokens);
+ 
+@@ -819,7 +864,8 @@ bool llama_context::memory_update(bool optimize) {
+         }
+ 
+         const uint32_t n_seqs = cparams.n_seq_max;
+-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
++        const uint32_t n_ubatch_res = std::max(cparams.n_ubatch, llama_ubatch_absorb_max(cparams));
++        const uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_res);
+ 
+         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
+ 
+@@ -1794,8 +1840,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+     llama_memory_context_ptr mctx;
+ 
++    const uint32_t n_ubatch_eff = llama_ubatch_effective(cparams, balloc->get_n_tokens());
++
+     while (true) {
+-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
++        mctx = memory->init_batch(*balloc, n_ubatch_eff, output_all);
+         if (!mctx) {
+             return -2;
+         }
+-- 
+2.53.0
+
