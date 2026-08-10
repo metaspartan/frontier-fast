@@ -5760,3 +5760,62 @@ Note how much the coefficients moved once ttft fell to 0.14 s: `a` is now worth
 **1.994 per second** against 1.333 at the old frontier. Re-derive the algebra
 after every frontier advance — the cheaper ttft gets, the more the remaining
 ttft milliseconds are worth.
+
+## Round 49c RANKED RESULT: VERIFIED, new frontier 2.038229 (+103.82%)
+
+`0062-absorb-the-tail-ubatch-...`, commit `3947510`, **verified**:
+
+```
+                     score      decode            prefill            ttft
+new frontier       2.038229   1.915171 (157.32)  2.044746 (4342.7)  2.658283 (0.12655)
+previous           1.956583   1.908895 (157.70)  1.833964 (3907.6)  2.373620 (0.14037)
+                   +4.17%     +0.33%             +11.49%            +11.99%
+
+accuracy gate passed on perplexity — 3.9314 -> 3.9318 (0.010% delta)
+```
+
+Projected +4.38%, measured +4.17% — the first projection this round that was not
+a 3x under-estimate, because the algebra was re-derived on the *new* frontier's
+numbers rather than the old ones.
+
+### Session total for this track
+
+```
+1.812930  ->  1.956583  ->  2.038229        +12.43% of score
+              0059+0060      0062
+```
+
+**Three patches, 182 lines, no kernel code, and the track crossed 2.0x.** Every
+point of it is prefill and ttft:
+
+```
+              start      end
+decode       1.9592    1.9152    (-2.2%, the parked pre-add fold)
+prefill      1.4858    2.0447    (+37.6%)
+ttft         1.6890    2.6583    (+57.4%,  0.19817 s -> 0.12655 s)
+```
+
+Nineteen kernel rounds moved decode from 1.0 to 1.96. Three host/engine patches
+moved the other two terms further than all of them moved decode, and the whole
+mechanism was one sentence: **`llama-server` performs speculative work betting
+that a later request will share a prefix with this one, and never checks whether
+one ever does.**
+
+### Open, in order
+
+1. **Unpark the pre-add fold** (revert 0061): worth ~+2.6% decode, ~+2% score,
+   at a measured ~50%-per-submission gate risk (4 of 10 recorded draws inside
+   the 0.1% band, worst +1.173% on the trusted runner). A rejection costs a slot
+   and leaves the frontier where it is, so the EV is positive — but it puts a
+   nondeterministic series back on the frontier tree, which taxes every
+   submission after it. Fixing the 0008 defect is worth more than shipping
+   around it.
+2. **The remaining ttft is now ~127 ms and essentially all prefill kernel** —
+   minflt per request is 5 and `AnonHugePages` retained is 0. The host-side
+   family is closed. What is left is `mul_mat_q`, still ~52% of the prefill
+   slope, at 94-99% of achievable on loads but 61-81% of a no-LDS/no-MMA probe
+   (round 48). That 19-39% has never been censused.
+3. **Re-derive the algebra before pricing anything.** At ttft 0.12655 s a second
+   saved on the ttft request is now worth ~2.2 of score, up from 1.333 at the
+   start of this round. The cheaper ttft gets, the more each remaining
+   millisecond of it is worth.
