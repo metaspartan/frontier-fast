@@ -1,0 +1,54 @@
+.: C:\Users\Carsen\Documents\PowerShell\Microsoft.PowerShell_profile.ps1:1
+Line |
+   1 |  . "C:\Users\Carsen\.codex\codex-model-toggle.ps1"
+     |    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     | The term 'C:\Users\Carsen\.codex\codex-model-toggle.ps1' is not recognized as a name of a cmdlet, function,
+     | script file, or executable program. Check the spelling of the name, or if a path was included, verify that the
+     | path is correct and try again.
+From c48eb81c7f4c4ce959d4973a8b2c661640b33b25 Mon Sep 17 00:00:00 2001
+From: Carsen <carsenk@gmail.com>
+Date: Wed, 12 Aug 2026 04:40:07 -0600
+Subject: [PATCH] cuda: allow exact in-place Nemotron activation co-launch
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 21 ++++++++++++++++++++-
+ 1 file changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f3b8b004b..71189a157 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3454,9 +3454,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             ggml_is_contiguous(shared_relu->src[0]) && ggml_is_contiguous(shared_sqr) &&
+             ggml_is_contiguous(routed_relu->src[0]) && ggml_is_contiguous(routed_sqr);
+ 
++        const auto disjoint_ranges = [](const ggml_tensor * a, const ggml_tensor * b) {
++            const uintptr_t a0 = (uintptr_t) a->data;
++            const uintptr_t b0 = (uintptr_t) b->data;
++            const uintptr_t a1 = a0 + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
++            const uintptr_t b1 = b0 + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
++            return a1 <= b0 || b1 <= a0;
++        };
++        // Both stock ReLU^2 chains are deliberately in-place: each output owns
++        // exactly the allocation of its input.  The general fusion-memory
++        // checker rejects that self-alias, so prove the narrower condition here:
++        // own-chain identity is allowed, cross-chain ranges must be disjoint.
++        const bool alias_ok = shared_sqr->data == shared_relu->src[0]->data &&
++                              routed_sqr->data == routed_relu->src[0]->data &&
++                              ggml_backend_buft_get_alloc_size(shared_sqr->buffer->buft, shared_sqr) ==
++                                  ggml_backend_buft_get_alloc_size(shared_relu->src[0]->buffer->buft, shared_relu->src[0]) &&
++                              ggml_backend_buft_get_alloc_size(routed_sqr->buffer->buft, routed_sqr) ==
++                                  ggml_backend_buft_get_alloc_size(routed_relu->src[0]->buffer->buft, routed_relu->src[0]) &&
++                              disjoint_ranges(shared_sqr, routed_sqr);
++
+         if (chain_ok && shape_ok &&
+                 ggml_can_fuse_subgraph(cgraph, i, 4, ops, out_nodes, 2) &&
+-                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, out_nodes, 2)) {
++                alias_ok) {
+             cudaStream_t stream = cuda_ctx->stream();
+             const int64_t ne10 = shared_sqr->ne[0];
+             const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+-- 
+2.49.0.windows.1
+
+
