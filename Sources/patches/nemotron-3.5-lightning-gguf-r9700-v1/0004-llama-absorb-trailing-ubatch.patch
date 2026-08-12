@@ -1,0 +1,96 @@
+From 14272980ec7e4000a44e3ebd9f735209524c8736 Mon Sep 17 00:00:00 2001
+From: Carsen <carsenk@gmail.com>
+Date: Wed, 12 Aug 2026 03:12:59 -0600
+Subject: [PATCH] llama: absorb a small trailing ubatch
+
+After adaptive checkpointing stops server pre-chunking, Nemotron full benchmark requests reach llama_context as 532 tokens. Stock splits that into 512 + 20, while the 82-token short slope arm is already one ubatch.
+
+Allow overhangs through n_ubatch + n_ubatch/8 to run as one ubatch and reserve graph buffers at the same bound. LLAMA_UBATCH_ABSORB=0 restores stock splitting for same-binary A/B.
+---
+ src/llama-context.cpp | 49 ++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 46 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0de3a68d1..90e381ed9 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -578,6 +578,45 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+     }
+ }
+ 
++// Adaptive tail-ubatch absorption.
++//
++// On a sparse-MoE model a small trailing ubatch launches a second graph and, in
++// every MoE block, reads another routed-expert working set for only a handful of
++// tokens. Nemotron's ranked full request has 532 tokens at the observed corpus
++// shape: the default n_ubatch = 512 splits it into 512 + 20, while the 82-token
++// short request used by the prefill slope is already one ubatch. Absorbing only
++// the full arm removes that tail graph without changing the short control.
++//
++// Returns the largest ubatch that may be formed by absorbing such an overhang,
++// or 0 when absorption is disabled. Rebalancing the split is not equivalent:
++// it still launches two graphs and pays two routed-expert working sets.
++static uint32_t llama_ubatch_absorb_max(const llama_cparams & cparams) {
++    static const bool enabled = []() {
++        const char * env = getenv("LLAMA_UBATCH_ABSORB");
++        return env == nullptr || atoi(env) != 0;
++    }();
++
++    if (!enabled) {
++        return 0;
++    }
++
++    const uint32_t n_max = std::min(cparams.n_batch, cparams.n_ubatch + cparams.n_ubatch/8);
++
++    return n_max > cparams.n_ubatch ? n_max : 0;
++}
++
++// The ubatch size to split `n_tokens` with: n_ubatch normally, or the whole
++// batch when it overhangs n_ubatch by no more than the absorption bound.
++static uint32_t llama_ubatch_effective(const llama_cparams & cparams, uint32_t n_tokens) {
++    const uint32_t n_absorb = llama_ubatch_absorb_max(cparams);
++
++    if (n_absorb > cparams.n_ubatch && n_tokens > cparams.n_ubatch && n_tokens <= n_absorb) {
++        return n_tokens;
++    }
++
++    return cparams.n_ubatch;
++}
++
+ void llama_context::sched_reserve() {
+     if (!sched_need_reserve) {
+         return;
+@@ -592,7 +631,8 @@ void llama_context::sched_reserve() {
+     const int64_t t_start_us = ggml_time_us();
+ 
+     const uint32_t n_seqs = cparams.n_seq_max;
+-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
++    const uint32_t n_ubatch_res = std::max(cparams.n_ubatch, llama_ubatch_absorb_max(cparams));
++    const uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_res);
+ 
+     const size_t max_nodes = this->graph_max_nodes(n_tokens);
+ 
+@@ -823,7 +863,8 @@ bool llama_context::memory_update(bool optimize) {
+         }
+ 
+         const uint32_t n_seqs = cparams.n_seq_max;
+-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
++        const uint32_t n_ubatch_res = std::max(cparams.n_ubatch, llama_ubatch_absorb_max(cparams));
++        const uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_res);
+ 
+         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
+ 
+@@ -1735,8 +1776,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+     llama_memory_context_ptr mctx;
+ 
++    const uint32_t n_ubatch_eff = llama_ubatch_effective(cparams, balloc->get_n_tokens());
++
+     while (true) {
+-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
++        mctx = memory->init_batch(*balloc, n_ubatch_eff, output_all);
+         if (!mctx) {
+             return -2;
+         }
+-- 
+2.49.0.windows.1
