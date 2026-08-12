@@ -74,7 +74,7 @@
     "reportedAs": "longContext on each verified record (the primary window) and longContextWindows (every window measured): decode, prefill, ttft, their paired speedups, and a score using the same formula",
     "ranking": "GET /api/leaderboard?contract=<track>&window=long",
     "blendedIntoRankedScore": false,
-    "canFailASubmission": false,
+    "canFailASubmission": "yes, when the runner has the long gate corpus. Perplexity is measured over held-out text at each window's own context length, on both arms, and a relative delta past the track's equivalence limit rejects the submission. Where the corpus is absent the windows come back correctness=unchecked and ranked=false: the measurement is still published, it just does not claim a score. Text divergence between the arms is still only reported — after one flipped knife-edge argmax every later token differs by construction.",
     "why": "At 512 tokens decode is weight-bandwidth bound; at 16k and 32k it is increasingly dominated by attention over the KV cache, so a kernel can win one and be neutral at the other. Both windows come from a single engine boot, so measuring the pair costs little over measuring one.",
     "notMeasuredOn": "vLLM tracks — the pinned engine is --max-model-len 8192 and the dedicated boot a long window needs costs GPU memory the largest track does not have; those runs record the reason."
   },

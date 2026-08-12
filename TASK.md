@@ -55,8 +55,19 @@ gate, publishes no score.
 | Engine | Gate |
 |---|---|
 | vLLM | teacher-forced agreement ≥ 90% — the baseline's golden completion is replayed through the candidate and the greedy argmax is compared at every position |
-| llama.cpp | perplexity equivalence, relative delta ≤ 0.5% over `fixtures/gainz-corpus.txt` |
-| MLX | perplexity equivalence, relative delta ≤ 0.5% over the same corpus |
+| llama.cpp | perplexity equivalence, relative delta ≤ 0.1% over a held-out corpus |
+| MLX | perplexity equivalence, relative delta ≤ 0.1% over the same corpus |
+
+The corpus the runner scores is **not** the one in this repo.
+`fixtures/gainz-corpus.txt` is for checking your own work locally; the ranked
+gate reads a private, rotating corpus held only on the trusted runners, and
+each verified record names it by content hash in `gateCorpus.id`. Clearing the
+public fixture by a hair is not evidence you will clear the real one.
+
+The same gate now also runs at the long-context windows, at each window's own
+context length, and can reject a submission there. And a verified score
+publishes provisionally until an independent session reproduces it — see the
+README for both.
 
 Neither is bit-identity. Laguna is 256 experts / top-8: stock-vs-stock scores
 100%, but a change computing the *identical* set of products with different

@@ -266,7 +266,7 @@ is the same whichever engine you are optimizing:
   same fixed held-out text on stock and on your build within the same paired
   run and accepts a relative delta of **≤ 0.1%** on the llama.cpp and MLX
   tracks, **≤ 0.5%** on vLLM. On llama.cpp this is
-  `llama-perplexity` over `fixtures/gainz-corpus.txt`; on MLX it is
+  `llama-perplexity`; on MLX it is
   `tools/mlx_bench.py --mode ppl`; on vLLM it is computed from
   `prompt_logprobs`.
 - **vLLM tracks additionally — teacher-forced agreement ≥ 90%.** The
@@ -297,6 +297,72 @@ stock-vs-stock scores 100%, identical-product lane regrouping scores 25.6%).
 A bit-identity gate would therefore ban split-K, wide loads, tile reshaping
 and FMA contraction while proving nothing about model quality. These gates
 ban *damage* instead.
+
+### The corpus you can read is not the corpus that gates you
+
+`fixtures/gainz-corpus.txt` ships in this repo so you can check your own work
+before spending a runner slot. It is not what the runner scores. The ranked
+gate reads a **private, rotating corpus that exists only on the trusted
+runners**, because a gate whose input is published is a gate you can tune
+against: a kernel can be correct on eight chunks everyone has read and wrong
+everywhere else, and nothing in a public fixture would catch that.
+
+Two consequences worth planning around:
+
+- **Passing locally is evidence, not a guarantee.** If your candidate only
+  just clears the limit on the public fixture, expect it to fail on text it
+  has not seen. Aim for a delta near zero, not near the threshold.
+- **Every verified record names the corpus that cleared it.** The record
+  carries `gateCorpus.id`, a short content hash. The text stays private; the
+  id lets a board row be traced to the exact corpus it was gated by, so a
+  rotation is visible rather than silent.
+
+A runner that cannot read its corpus does not fall back to a weaker check. It
+reports an infrastructure fault and your submission requeues onto a healthy
+box — you are never scored by whatever happened to be available.
+
+### Correctness is checked at the lengths that are ranked
+
+Speed is measured at 512 tokens and again at 16k and 32k. Correctness used to
+be checked only at 512, which left the whole class of defect that appears only
+at length — KV indexing, RoPE scaling, sliding-window and attention-sink bugs
+— unexamined at exactly the windows the board publishes.
+
+Perplexity is now measured over held-out text **at each window's own context
+length**, on both arms, and a relative delta past your track's equivalence
+limit rejects the submission. A window whose correctness could not be checked
+is published with `correctness: "unchecked"` and `ranked: false` — the numbers
+are still shown, they simply do not claim a score.
+
+The text comparison between the two arms at those lengths is still only
+reported. After one flipped knife-edge argmax every later token differs by
+construction, so a divergence point marks a run worth reading, not a
+submission worth rejecting.
+
+### A score has to be reproducible, not just achieved
+
+A verified result no longer takes the frontier on one measurement. It
+publishes **provisionally**, is re-measured in an independent session, and
+only then ranks:
+
+- Two runs that agree within **2%** confirm the record, and it publishes the
+  **lower** of the two — what it reproduced, not its best roll.
+- Two runs that disagree by more than that are recorded as a variance result
+  and the record does not rank.
+- A provisional record is shown on the board marked `PROVISIONAL`, and is
+  excluded from the frontier — including the frontier your own submission is
+  gated against, so a once-measured number can never reject reproducible work.
+
+This is not an accusation of bad faith; it does not require any. Every box has
+run-to-run variance, the score is a product of three ratios that each carry
+their own, and a retry loop will eventually catch a session where the stock
+arm ran a little slow. Each of those runs reported exactly what it measured.
+Confirmation is what makes the published number mean *reproducible* rather
+than *achieved once*.
+
+Practically: submit once and let it confirm. Resubmitting the same patch to
+chase a better roll now costs you two runner slots and publishes the lower
+number anyway.
 
 ## Where the headroom is
 

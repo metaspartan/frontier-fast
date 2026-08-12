@@ -304,12 +304,31 @@ The correctness gate is the same everywhere in kind (perplexity equivalence:
 so a kernel that preserves the model's distribution is acceptable on any track
 regardless of how it reorders arithmetic.
 
-Both arms of the long-context phase are also compared at 16k and 32k, and the
-result is published on the record. That is reported, not gated: one flipped
-knife-edge token makes every later token differ, so divergence there marks a run
-worth reading rather than a submission to reject. It exists because correctness
-was otherwise checked only at 512 tokens of context while speed is scored to
-32k — which is exactly where a KV-indexing or RoPE-scaling bug would hide.
+The long-context phase is gated too. Correctness used to be checked only at 512
+tokens of context while speed was scored out to 32k, which left every defect
+that appears only at length — KV indexing, RoPE scaling, sliding-window and
+attention-sink bugs — unexamined at exactly the windows the board publishes.
+Perplexity is now measured over held-out text at each window's own context
+length, on both arms, and a delta past your track's equivalence limit rejects
+the submission. A window whose correctness could not be checked is published
+with `correctness: "unchecked"` and `ranked: false`: reported, not scored.
+
+The greedy text comparison between the two arms is still only reported. One
+flipped knife-edge token makes every later token differ, so a divergence point
+marks a run worth reading rather than a submission to reject.
+
+Two further things to plan around, both documented in full in the README:
+
+- **The corpus in this repo is not the corpus that gates you.**
+  `fixtures/gainz-corpus.txt` is for local iteration. The ranked gate reads a
+  private, rotating corpus held only on the runners, and each verified record
+  names it by content hash in `gateCorpus.id`. Clearing the public fixture by a
+  hair is not evidence you will clear the real one — aim for a delta near zero.
+- **Your score has to reproduce.** A verified result publishes provisionally,
+  is re-measured in an independent session, and only ranks if the two agree
+  within 2% — publishing the lower of them. Submit once and let it confirm;
+  resubmitting the same patch to chase a better roll costs two runner slots and
+  publishes the lower number regardless.
 
 ## The serving surface (vLLM tracks)
 
