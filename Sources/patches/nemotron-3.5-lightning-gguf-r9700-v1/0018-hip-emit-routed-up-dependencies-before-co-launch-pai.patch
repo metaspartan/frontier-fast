@@ -1,0 +1,99 @@
+.: C:\Users\Carsen\Documents\PowerShell\Microsoft.PowerShell_profile.ps1:1
+Line |
+   1 |  . "C:\Users\Carsen\.codex\codex-model-toggle.ps1"
+     |    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     | The term 'C:\Users\Carsen\.codex\codex-model-toggle.ps1' is not recognized as a name of a cmdlet, function,
+     | script file, or executable program. Check the spelling of the name, or if a path was included, verify that the
+     | path is correct and try again.
+From 6ed49b369e19f2881d5cd5d0d2c76938a072d3f6 Mon Sep 17 00:00:00 2001
+From: Codex Scratch <noreply@openai.com>
+Date: Wed, 12 Aug 2026 07:03:19 -0600
+Subject: [PATCH 2/4] hip: emit routed-up dependencies before co-launch pair
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 38 +++++++++++++++++++++++++++++----
+ src/llama-graph.cpp             |  4 ++++
+ 2 files changed, 38 insertions(+), 4 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 191ae28cc..e3cc3aa6f 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4216,6 +4216,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         const char * value = std::getenv("GGML_CUDA_NEMO_SHEXP_UP_COLAUNCH");
+         return value == nullptr || std::atoi(value) != 0;
+     }();
++    static const bool nemo_shexp_up_diag = [] {
++        const char * value = std::getenv("GGML_CUDA_NEMO_SHEXP_UP_DIAG");
++        return value != nullptr && std::atoi(value) != 0;
++    }();
++    // Report graph-order misses too; the full matcher below cannot diagnose a
++    // routed node that was separated by an unexpanded dependency.
++    if (nemo_shexp_up_colaunch && nemo_shexp_up_diag && node->op == GGML_OP_MUL_MAT &&
++            node->src[0] != nullptr && node->src[0]->type == GGML_TYPE_Q5_0 &&
++            node->src[0]->ne[0] == 2688 && node->src[0]->ne[1] == 3712 &&
++            node->ne[0] == 3712 && node->ne[1] == 1 &&
++            (i + 1 >= cgraph->n_nodes || cgraph->nodes[i + 1]->op != GGML_OP_MUL_MAT_ID)) {
++        static std::atomic<uint64_t> n_adj_rejected{0};
++        const uint64_t count = n_adj_rejected.fetch_add(1, std::memory_order_relaxed) + 1;
++        if (count <= 23) {
++            GGML_LOG_INFO("%s: Nemotron shared/routed up reject=adjacency next_op=%d next=%s\n",
++                          __func__, i + 1 < cgraph->n_nodes ? (int) cgraph->nodes[i + 1]->op : -1,
++                          i + 1 < cgraph->n_nodes ? cgraph->nodes[i + 1]->name : "<end>");
++        }
++    }
+     if (nemo_shexp_up_colaunch && i + 1 < cgraph->n_nodes &&
+             node->op == GGML_OP_MUL_MAT && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID) {
+         ggml_tensor * shared = node;
+@@ -4247,10 +4266,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             return a1 <= b0 || b1 <= a0;
+         };
+ 
+-        if (shape_ok && ggml_cuda_should_fuse_mul_mat_vec_q(shared) &&
+-                ggml_cuda_should_fuse_mul_mat_vec_q(routed) && disjoint(shared, routed) &&
+-                ggml_can_fuse_subgraph(cgraph, i, 2, ops, out_nodes, 2) &&
+-                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 2)) {
++        const bool shared_mmvq = ggml_cuda_should_fuse_mul_mat_vec_q(shared);
++        const bool routed_mmvq = ggml_cuda_should_fuse_mul_mat_vec_q(routed);
++        const bool outputs_disjoint = disjoint(shared, routed);
++        const bool closure_ok = ggml_can_fuse_subgraph(cgraph, i, 2, ops, out_nodes, 2);
++        const bool ranges_ok = ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 2);
++        if (shape_ok && shared_mmvq && routed_mmvq && outputs_disjoint && closure_ok && ranges_ok) {
+             mmvq_nemo_routed_up_guest guest;
+             guest.src0 = routed->src[0];
+             guest.src1 = routed->src[1];
+@@ -4273,6 +4294,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 }
+             }
+             return 1;
++        } else if (nemo_shexp_up_diag) {
++            static std::atomic<uint64_t> n_guard_rejected{0};
++            const uint64_t count = n_guard_rejected.fetch_add(1, std::memory_order_relaxed) + 1;
++            if (count <= 23) {
++                GGML_LOG_INFO("%s: Nemotron shared/routed up reject=guard shape=%d shared_mmvq=%d "
++                              "routed_mmvq=%d disjoint=%d closure=%d ranges=%d\n",
++                              __func__, shape_ok, shared_mmvq, routed_mmvq,
++                              outputs_disjoint, closure_ok, ranges_ok);
++            }
+         }
+     }
+ 
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index a5c70e894..47f0dabee 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -2151,6 +2151,10 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+     // routed-up.  Both consume the same activation, so this dependency-neutral
+     // order lets the backend concatenate their MMVQ grids.
+     if (pin_pre_up != nullptr) {
++        // MUL_MAT_ID recursively owns the selected-expert/top-k branch. Emit
++        // that dependency first; otherwise it lands between shared-up and
++        // routed-up and defeats the adjacent backend matcher.
++        ggml_build_forward_expand(gf, selected_experts);
+         ggml_build_forward_expand(gf, pin_pre_up);
+         ggml_build_forward_expand(gf, cur);
+     }
+-- 
+2.49.0.windows.1
+
+
