@@ -16,6 +16,8 @@ const FIXTURE_PENDING = new Set([
   "maple-preview-mlx-apple-v1",
   "maple-preview-gguf-r9700-v1",
   "maple-preview-gguf-gb10cuda-v1",
+  "nemotron-3.5-lightning-gguf-r9700-v1",
+  "nemotron-3.5-lightning-gguf-gb10cuda-v1",
 ]);
 
 // Frozen tracks accept no submissions, so nobody can be iterating on one and
