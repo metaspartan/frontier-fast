@@ -1,0 +1,449 @@
+.: C:\Users\Carsen\Documents\PowerShell\Microsoft.PowerShell_profile.ps1:1
+Line |
+   1 |  . "C:\Users\Carsen\.codex\codex-model-toggle.ps1"
+     |    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     | The term 'C:\Users\Carsen\.codex\codex-model-toggle.ps1' is not recognized as a name of a cmdlet, function,
+     | script file, or executable program. Check the spelling of the name, or if a path was included, verify that the
+     | path is correct and try again.
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Carsen <carsenk@gmail.com>
+Date: Wed, 12 Aug 2026 08:47:28 -0600
+Subject: [PATCH] HIP: co-launch Nemotron attention QKV MMVQ
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu |  68 ++++++++++
+ ggml/src/ggml-cuda/mmvq.cu      | 216 +++++++++++++++++++++++++++++++-
+ ggml/src/ggml-cuda/mmvq.cuh     |  16 ++-
+ src/llama-graph.cpp             |  18 ++-
+ src/llama-graph.h               |   3 +-
+ src/models/nemotron-h.cpp       |   7 +-
+ 6 files changed, 323 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f508155c7..f56c46474 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4459,6 +4459,74 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    // Decode-only Nemotron attention: build_qkv explicitly relays the raw
++    // Q/K/V projections next to each other.  Their exact 2688-wide activation
++    // is shared, so append the K and V row grids to Q's launch.
++    static const bool disable_nemo_qkv_colaunch = [] {
++        const char * value = std::getenv("GGML_CUDA_DISABLE_NEMO_QKV_COLAUNCH");
++        return value != nullptr && std::atoi(value) != 0;
++    }();
++    if (!disable_nemo_qkv_colaunch && i + 2 < cgraph->n_nodes &&
++            node->op == GGML_OP_MUL_MAT &&
++            cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT &&
++            cgraph->nodes[i + 2]->op == GGML_OP_MUL_MAT) {
++        ggml_tensor * q = node;
++        ggml_tensor * k = cgraph->nodes[i + 1];
++        ggml_tensor * v = cgraph->nodes[i + 2];
++        const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_MUL_MAT };
++        const int out_nodes[] = { i, i + 1, i + 2 };
++
++        const bool shape_ok = q->src[0] != nullptr && q->src[1] != nullptr &&
++            k->src[0] != nullptr && k->src[1] != nullptr &&
++            v->src[0] != nullptr && v->src[1] != nullptr &&
++            q->src[0]->type == GGML_TYPE_Q5_0 && k->src[0]->type == GGML_TYPE_Q5_0 &&
++            (v->src[0]->type == GGML_TYPE_Q5_0 || v->src[0]->type == GGML_TYPE_Q8_0) &&
++            q->src[0]->ne[0] == 2688 && q->src[0]->ne[1] == 4096 &&
++            k->src[0]->ne[0] == 2688 && k->src[0]->ne[1] == 256 &&
++            v->src[0]->ne[0] == 2688 && v->src[0]->ne[1] == 256 &&
++            q->src[1]->type == GGML_TYPE_F32 && q->src[1]->ne[0] == 2688 && q->src[1]->ne[1] == 1 &&
++            k->src[1]->data == q->src[1]->data && v->src[1]->data == q->src[1]->data &&
++            k->src[1]->buffer == q->src[1]->buffer && v->src[1]->buffer == q->src[1]->buffer &&
++            q->type == GGML_TYPE_F32 && k->type == GGML_TYPE_F32 && v->type == GGML_TYPE_F32 &&
++            q->ne[0] == 4096 && q->ne[1] == 1 &&
++            k->ne[0] == 256 && k->ne[1] == 1 && v->ne[0] == 256 && v->ne[1] == 1;
++
++        if (shape_ok && ggml_cuda_should_fuse_mul_mat_vec_q(q) &&
++                ggml_cuda_should_fuse_mul_mat_vec_q(k) && ggml_cuda_should_fuse_mul_mat_vec_q(v) &&
++                ggml_can_fuse_subgraph(cgraph, i, 3, ops, out_nodes, 3) &&
++                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 3, out_nodes, 3)) {
++            mmvq_nemo_qkv_guests guests;
++            guests.k_src0 = k->src[0];
++            guests.k_src1 = k->src[1];
++            guests.k_dst  = k;
++            guests.v_src0 = v->src[0];
++            guests.v_src1 = v->src[1];
++            guests.v_dst  = v;
++            bool launched = false;
++            ggml_cuda_mul_mat_vec_q(*cuda_ctx, q->src[0], q->src[1], nullptr, q,
++                                    nullptr, nullptr, nullptr, nullptr, nullptr, &guests, &launched);
++            if (!launched) {
++                // Q has already taken the ordinary path; run only the guests.
++                ggml_cuda_mul_mat_vec_q(*cuda_ctx, k->src[0], k->src[1], nullptr, k);
++                ggml_cuda_mul_mat_vec_q(*cuda_ctx, v->src[0], v->src[1], nullptr, v);
++            } else {
++                static const bool print_stats = [] {
++                    const char * value = std::getenv("GGML_CUDA_NEMO_QKV_COLAUNCH_STATS");
++                    return value != nullptr && std::atoi(value) != 0;
++                }();
++                static std::atomic<uint64_t> n_fused{0};
++                const uint64_t count = n_fused.fetch_add(1, std::memory_order_relaxed) + 1;
++                if (print_stats && (count <= 6 || count % 6 == 0)) {
++                    GGML_LOG_INFO("%s: Nemotron Q/K/V MMVQ co-launch fire=%" PRIu64
++                                  ", v_type=%s, q=%s, k=%s, v=%s\n",
++                                  __func__, count, ggml_type_name(v->src[0]->type),
++                                  q->name, k->name, v->name);
++                }
++            }
++            return 2;
++        }
++    }
++
+     // Nemotron decode: the graph relay in nemotron-h.cpp places the independent
+     // shared and routed ReLU^2 chains next to one another. Evaluate both in a
+     // single dispatch and write the shared activation's q8_1 cache bytes in the
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index cc6e81d0e..b13de088c 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -997,6 +997,156 @@ static std::pair<dim3, dim3> calc_launch_params(
+     return {block_nums, block_dims};
+ }
+ 
++// Decode-shaped Nemotron attention uses three independent projections of the
++// same 2688-element activation: Q5_0 Q [4096], Q5_0 K [256], and Q5_0/Q8_0 V
++// [256].  The six trunk attention layers use this exact shape (the separate
++// NextN/MTP head is not part of this graph path). Concatenating their row grids
++// removes two dispatches without changing a single lane's K traversal or
++// reduction order.
++template <ggml_type type>
++static __device__ __forceinline__ float mul_mat_vec_q_nemo_qkv_partial(
++        const void * vx, const block_q8_1 * vy, const uint32_t row,
++        const uint32_t ncols_x, const uint32_t stride_row_x, const int local_warp) {
++    constexpr int qk       = ggml_cuda_type_traits<type>::qk;
++    constexpr int qi       = ggml_cuda_type_traits<type>::qi;
++    constexpr int vdr      = get_vdr_mmvq(type);
++    constexpr int nwarps   = 8;
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    constexpr vec_dot_q_cuda_t vec_dot_q_cuda = get_vec_dot_q_cuda(type);
++
++    const int tid = warp_size * local_warp + threadIdx.x;
++    const int blocks_per_row_x = ncols_x / qk;
++    constexpr int blocks_per_iter = vdr * nwarps * warp_size / qi;
++    const uint32_t row_offset = row * stride_row_x;
++    float tmp = 0.0f;
++    for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_x; kbx += blocks_per_iter) {
++        const int kby = kbx * (qk/QK8_1);
++        const int kqs = vdr * (tid % (qi/vdr));
++        tmp += vec_dot_q_cuda(vx, &vy[kby], row_offset + kbx, kqs);
++    }
++    return tmp;
++}
++
++template <ggml_type v_type>
++__launch_bounds__((v_type == GGML_TYPE_Q5_0 ? 6 : 12)*ggml_cuda_get_physical_warp_size(), 1)
++static __global__ void mul_mat_vec_q_nemo_qkv(
++        const void * qx, const void * kx, const void * vx,
++        const block_q8_1 * y, float * qdst, float * kdst, float * vdst,
++        const uint32_t ncols_x,
++        const uint32_t q_rows, const uint32_t k_rows, const uint32_t v_rows,
++        const uint32_t q_stride, const uint32_t k_stride, const uint32_t v_stride) {
++    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
++    static_assert(v_type == GGML_TYPE_Q5_0 || v_type == GGML_TYPE_Q8_0, "unsupported Nemotron V type");
++
++    constexpr int q_warps = 6;
++    constexpr int v_warps = v_type == GGML_TYPE_Q5_0 ? 6 : 8;
++    // Six waves are exact for Q5_0 at K=2688. When V is Q8_0, twelve
++    // launch waves pack two Q5_0 rows; V consumes its exact eight waves and
++    // leaves four idle waves only in the much smaller V grid.
++    constexpr int launch_warps = v_type == GGML_TYPE_Q5_0 ? 6 : 12;
++    constexpr int q_rows_per_block = launch_warps / q_warps;
++    constexpr int v_rows_per_block = launch_warps / v_warps;
++    const uint32_t q_blocks = (q_rows + q_rows_per_block - 1) / q_rows_per_block;
++    const uint32_t k_blocks = (k_rows + q_rows_per_block - 1) / q_rows_per_block;
++    const uint32_t block = blockIdx.x;
++    const bool is_q = block < q_blocks;
++    const bool is_k = !is_q && block < q_blocks + k_blocks;
++    const int local_warps = is_q || is_k ? q_warps : v_warps;
++    const int rows_per_block = is_q || is_k ? q_rows_per_block : v_rows_per_block;
++    const int row_in_block = threadIdx.y / local_warps;
++    const int local_warp = threadIdx.y - row_in_block * local_warps;
++    const uint32_t matrix_block = is_q ? block : (is_k ? block - q_blocks : block - q_blocks - k_blocks);
++    const uint32_t row = rows_per_block * matrix_block + row_in_block;
++    const uint32_t matrix_rows = is_q ? q_rows : (is_k ? k_rows : v_rows);
++    const bool row_valid = row < matrix_rows;
++
++    ggml_cuda_pdl_sync();
++    float tmp = 0.0f;
++    if (row_valid) {
++        if (is_q) {
++            tmp = mul_mat_vec_q_nemo_qkv_partial<GGML_TYPE_Q5_0>(qx, y, row, ncols_x, q_stride, local_warp);
++        } else if (is_k) {
++            tmp = mul_mat_vec_q_nemo_qkv_partial<GGML_TYPE_Q5_0>(kx, y, row, ncols_x, k_stride, local_warp);
++        } else {
++            tmp = mul_mat_vec_q_nemo_qkv_partial<v_type>(vx, y, row, ncols_x, v_stride, local_warp);
++        }
++    }
++
++    // Q5_0 needs six live wavefronts for K=2688 after 0001's trailing-warp
++    // trim; Q8_0 needs all eight. Pack two Q5_0 rows into one twelve-wavefront
++    // block only for a Q8_0 V projection, so Q and K retain exactly their
++    // standalone live-wavefront count.
++    // The group leader fills the remaining slots with +0.0f, matching the
++    // standalone eight-wavefront reduction structure byte for byte.
++    __shared__ float tmp_shared[2][7][warp_size];
++    if (local_warp == 0) {
++        for (int l = local_warps - 1; l < 7; ++l) {
++            tmp_shared[row_in_block][l][threadIdx.x] = 0.0f;
++        }
++    } else {
++        tmp_shared[row_in_block][local_warp - 1][threadIdx.x] = tmp;
++    }
++    __syncthreads();
++    if (local_warp > 0 || !row_valid) {
++        return;
++    }
++#pragma unroll
++    for (int l = 0; l < 7; ++l) {
++        tmp += tmp_shared[row_in_block][l][threadIdx.x];
++    }
++    tmp = warp_reduce_sum<warp_size>(tmp);
++    if (threadIdx.x == 0) {
++        if (is_q) {
++            qdst[row] = tmp;
++        } else if (is_k) {
++            kdst[row] = tmp;
++        } else {
++            vdst[row] = tmp;
++        }
++    }
++}
++
++template <ggml_type v_type>
++static bool mul_mat_vec_q_nemo_qkv_colaunch(
++        const void * qx, const void * kx, const void * vx, const void * y,
++        float * qdst, float * kdst, float * vdst,
++        const int ncols_x, const int q_rows, const int k_rows, const int v_rows,
++        const int q_stride, const int k_stride, const int v_stride,
++        const int warp_size, const mmvq_parameter_table_id table_id, cudaStream_t stream) {
++    if (table_id != MMVQ_PARAMETERS_RDNA4 || warp_size != 32) {
++        return false;
++    }
++    const auto q_dims = calc_launch_params<GGML_TYPE_Q5_0>(1, ncols_x, q_rows, 1, 1, warp_size, table_id);
++    const auto k_dims = calc_launch_params<GGML_TYPE_Q5_0>(1, ncols_x, k_rows, 1, 1, warp_size, table_id);
++    const auto v_dims = calc_launch_params<v_type>(1, ncols_x, v_rows, 1, 1, warp_size, table_id);
++    if (q_dims.first.y != 1 || q_dims.first.z != 1 ||
++            k_dims.first.y != 1 || k_dims.first.z != 1 ||
++            v_dims.first.y != 1 || v_dims.first.z != 1 ||
++            q_dims.first.x != (uint32_t) q_rows || k_dims.first.x != (uint32_t) k_rows ||
++            v_dims.first.x != (uint32_t) v_rows ||
++            q_dims.second.x != 32 || k_dims.second.x != 32 || v_dims.second.x != 32 ||
++            q_dims.second.y != 6 || k_dims.second.y != 6 ||
++            v_dims.second.y != (v_type == GGML_TYPE_Q5_0 ? 6u : 8u) ||
++            q_dims.second.z != 1 || k_dims.second.z != 1 || v_dims.second.z != 1) {
++        return false;
++    }
++
++    constexpr int launch_warps = v_type == GGML_TYPE_Q5_0 ? 6 : 12;
++    constexpr int q_rows_per_block = launch_warps / 6;
++    constexpr int v_rows_per_block = launch_warps / (v_type == GGML_TYPE_Q5_0 ? 6 : 8);
++    const int q_blocks = (q_rows + q_rows_per_block - 1) / q_rows_per_block;
++    const int k_blocks = (k_rows + q_rows_per_block - 1) / q_rows_per_block;
++    const int v_blocks = (v_rows + v_rows_per_block - 1) / v_rows_per_block;
++    const dim3 merged_grid(q_blocks + k_blocks + v_blocks, 1, 1);
++    const dim3 merged_block(warp_size, launch_warps, 1);
++    const ggml_cuda_kernel_launch_params launch_params(merged_grid, merged_block, 0, stream);
++    ggml_cuda_kernel_launch((mul_mat_vec_q_nemo_qkv<v_type>), launch_params,
++        qx, kx, vx, (const block_q8_1 *) y, qdst, kdst, vdst,
++        (uint32_t) ncols_x, (uint32_t) q_rows, (uint32_t) k_rows, (uint32_t) v_rows,
++        (uint32_t) q_stride, (uint32_t) k_stride, (uint32_t) v_stride);
++    return true;
++}
++
+ template <ggml_type type>
+ static bool mul_mat_vec_q_nemo_down_colaunch(
+         const void * vx, const void * vy, float * dst,
+@@ -1476,13 +1626,18 @@ void ggml_cuda_mul_mat_vec_q(
+         const mmvq_nemo_routed_down_guest * nemo_guest,
+         bool * nemo_guest_launched,
+         const mmvq_nemo_routed_up_guest * nemo_up_guest,
+-        bool * nemo_up_guest_launched) {
++        bool * nemo_up_guest_launched,
++        const mmvq_nemo_qkv_guests * nemo_qkv,
++        bool * nemo_qkv_launched) {
+     if (nemo_guest_launched != nullptr) {
+         *nemo_guest_launched = false;
+     }
+     if (nemo_up_guest_launched != nullptr) {
+         *nemo_up_guest_launched = false;
+     }
++    if (nemo_qkv_launched != nullptr) {
++        *nemo_qkv_launched = false;
++    }
+     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+@@ -1615,6 +1770,65 @@ void ggml_cuda_mul_mat_vec_q(
+ 
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
++    // The relay in build_qkv places raw Q/K/V projections next to one another.
++    // All three consume the exact same q8_1 activation, so a single flattened
++    // row grid preserves the standalone matrix-vector calculation byte for
++    // byte while removing the K and V dispatches.
++    if (nemo_qkv != nullptr && fusion == nullptr && ids == nullptr && src0->type == GGML_TYPE_Q5_0) {
++        const ggml_tensor * kw = nemo_qkv->k_src0;
++        const ggml_tensor * ka = nemo_qkv->k_src1;
++        ggml_tensor *       kd = nemo_qkv->k_dst;
++        const ggml_tensor * vw = nemo_qkv->v_src0;
++        const ggml_tensor * va = nemo_qkv->v_src1;
++        ggml_tensor *       vd = nemo_qkv->v_dst;
++        const bool same_activation = ka != nullptr && va != nullptr &&
++            ka->type == GGML_TYPE_F32 && va->type == GGML_TYPE_F32 &&
++            ka->data == src1->data && va->data == src1->data &&
++            ka->buffer == src1->buffer && va->buffer == src1->buffer &&
++            std::equal(std::begin(src1->ne), std::end(src1->ne), std::begin(ka->ne)) &&
++            std::equal(std::begin(src1->ne), std::end(src1->ne), std::begin(va->ne)) &&
++            std::equal(std::begin(src1->nb), std::end(src1->nb), std::begin(ka->nb)) &&
++            std::equal(std::begin(src1->nb), std::end(src1->nb), std::begin(va->nb));
++        const bool shapes_ok = kw != nullptr && kd != nullptr && vw != nullptr && vd != nullptr &&
++            kw->type == GGML_TYPE_Q5_0 && (vw->type == GGML_TYPE_Q5_0 || vw->type == GGML_TYPE_Q8_0) &&
++            kd->type == GGML_TYPE_F32 && vd->type == GGML_TYPE_F32 &&
++            src0->ne[0] == 2688 && src0->ne[1] == 4096 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
++            kw->ne[0] == 2688 && kw->ne[1] == 256 && kw->ne[2] == 1 && kw->ne[3] == 1 &&
++            vw->ne[0] == 2688 && vw->ne[1] == 256 && vw->ne[2] == 1 && vw->ne[3] == 1 &&
++            src1->ne[0] == 2688 && src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
++            dst->ne[0] == 4096 && dst->ne[1] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1 &&
++            kd->ne[0] == 256 && kd->ne[1] == 1 && kd->ne[2] == 1 && kd->ne[3] == 1 &&
++            vd->ne[0] == 256 && vd->ne[1] == 1 && vd->ne[2] == 1 && vd->ne[3] == 1 &&
++            ggml_is_contiguous(src0) && ggml_is_contiguous(kw) && ggml_is_contiguous(vw) &&
++            ggml_is_contiguous(dst) && ggml_is_contiguous(kd) && ggml_is_contiguous(vd);
++
++        if (same_activation && shapes_ok) {
++            const int device = ggml_cuda_get_device();
++            const int warp_size = ggml_cuda_info().devices[device].warp_size;
++            const mmvq_parameter_table_id table_id = get_device_table_id(ggml_cuda_info().devices[device].cc);
++            const int k_stride = kw->nb[1] / ggml_type_size(kw->type);
++            const int v_stride = vw->nb[1] / ggml_type_size(vw->type);
++            bool launched;
++            if (vw->type == GGML_TYPE_Q5_0) {
++                launched = mul_mat_vec_q_nemo_qkv_colaunch<GGML_TYPE_Q5_0>(
++                    src0->data, kw->data, vw->data, src1_q8_1, dst_d,
++                    (float *) kd->data, (float *) vd->data, ne00, ne01, kw->ne[1], vw->ne[1],
++                    s01, k_stride, v_stride, warp_size, table_id, stream);
++            } else {
++                launched = mul_mat_vec_q_nemo_qkv_colaunch<GGML_TYPE_Q8_0>(
++                    src0->data, kw->data, vw->data, src1_q8_1, dst_d,
++                    (float *) kd->data, (float *) vd->data, ne00, ne01, kw->ne[1], vw->ne[1],
++                    s01, k_stride, v_stride, warp_size, table_id, stream);
++            }
++            if (launched) {
++                if (nemo_qkv_launched != nullptr) {
++                    *nemo_qkv_launched = true;
++                }
++                return;
++            }
++        }
++    }
++
+     // Decode-only Nemotron shared/routed down co-launch.  The shared projection
+     // is the host and the routed MUL_MAT_ID occupies six guest channel slices
+     // at the front of the same grid.  If any condition is not exact, leave the
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index 2e896be5a..2dc1fa61b 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -28,13 +28,27 @@ struct mmvq_nemo_routed_up_guest {
+     ggml_tensor *       dst  = nullptr;
+ };
+ 
++// The two independent guests of a decode-shaped Nemotron attention Q/K/V
++// group.  Q is the ordinary host argument to ggml_cuda_mul_mat_vec_q; K and V
++// share its exact activation but retain their own weights and destinations.
++struct mmvq_nemo_qkv_guests {
++    const ggml_tensor * k_src0 = nullptr;
++    const ggml_tensor * k_src1 = nullptr;
++    ggml_tensor *       k_dst  = nullptr;
++    const ggml_tensor * v_src0 = nullptr;
++    const ggml_tensor * v_src1 = nullptr;
++    ggml_tensor *       v_dst  = nullptr;
++};
++
+ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+     const ggml_cuda_mm_fusion_args_host * fusion = nullptr,
+     const mmvq_nemo_routed_down_guest * nemo_guest = nullptr,
+     bool * nemo_guest_launched = nullptr,
+     const mmvq_nemo_routed_up_guest * nemo_up_guest = nullptr,
+-    bool * nemo_up_guest_launched = nullptr);
++    bool * nemo_up_guest_launched = nullptr,
++    const mmvq_nemo_qkv_guests * nemo_qkv = nullptr,
++    bool * nemo_qkv_launched = nullptr);
+ 
+ void ggml_cuda_op_mul_mat_vec_q(
+     ggml_backend_cuda_context & ctx,
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 55ff73842..aa1600fd3 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1595,7 +1595,8 @@ llm_graph_qkv llm_graph_context::build_qkv(
+                   int64_t   n_embd_head,
+                   int64_t   n_head,
+                   int64_t   n_head_kv,
+-                      int   il) const {
++                      int   il,
++                     bool   pin_projections) const {
+     const int64_t n_embd_q  = n_embd_head * n_head;
+     const int64_t n_embd_kv = n_embd_head * n_head_kv;
+ 
+@@ -1653,6 +1654,21 @@ llm_graph_qkv llm_graph_context::build_qkv(
+             Vcur = ggml_clamp(ctx0, Vcur, -hparams.f_clamp_kqv, hparams.f_clamp_kqv);
+             cb(Vcur, "Vcur_clamped", il);
+         }
++
++        // A backend may co-launch separate Q/K/V matrix-vector projections
++        // only while the raw MUL_MAT nodes are adjacent.  This opt-in relay is
++        // used by Nemotron decode; it does not change tensor creation or any
++        // arithmetic, only fixes the topological order before the reshapes and
++        // attention branches are expanded.
++        if (pin_projections && n_tokens == 1 &&
++                layer.wq_b == nullptr && layer.wk_b == nullptr && layer.wv_b == nullptr &&
++                layer.wq_s == nullptr && layer.wk_s == nullptr && layer.wv_s == nullptr &&
++                hparams.f_clamp_kqv <= 0.0f) {
++            ggml_build_forward_expand(gf, Qcur);
++            ggml_build_forward_expand(gf, Kcur);
++            ggml_build_forward_expand(gf, Vcur);
++        }
++
+         Qcur = ggml_reshape_3d(ctx0, Qcur, n_embd_head, n_head,    n_tokens);
+         Kcur = ggml_reshape_3d(ctx0, Kcur, n_embd_head, n_head_kv, n_tokens);
+         Vcur = ggml_reshape_3d(ctx0, Vcur, n_embd_head, n_head_kv, n_tokens);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index ec2c726b9..a71d85eb7 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1043,7 +1043,8 @@ struct llm_graph_context {
+                   int64_t   n_embd_head,
+                   int64_t   n_head,
+                   int64_t   n_head_kv,
+-                      int   il) const;
++                      int   il,
++                     bool   pin_projections = false) const;
+ 
+     ggml_tensor * build_ffn(
+              ggml_tensor * cur,
+diff --git a/src/models/nemotron-h.cpp b/src/models/nemotron-h.cpp
+index 1851f8cbd..3033c4ee0 100644
+--- a/src/models/nemotron-h.cpp
++++ b/src/models/nemotron-h.cpp
+@@ -248,7 +248,12 @@ ggml_tensor * llama_model_nemotron_h::graph::build_attention_layer(ggml_tensor *
+                                                           const llama_model &       model,
+                                                                 int64_t             n_embd_head,
+                                                                 int                 il) {
+-    auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur, n_embd_head, hparams.n_head(il), hparams.n_head_kv(il), il);
++    static const bool qkv_pin_enabled = [] {
++        const char * value = std::getenv("GGML_NEMO_QKV_PIN");
++        return value == nullptr || std::atoi(value) != 0;
++    }();
++    auto [Qcur, Kcur, Vcur] = build_qkv(model.layers[il], cur, n_embd_head,
++        hparams.n_head(il), hparams.n_head_kv(il), il, qkv_pin_enabled);
+ 
+     const float kq_scale =
+         hparams.f_attention_scale == 0.0f ? 1.0f / sqrtf(float(n_embd_head)) : hparams.f_attention_scale;
+
