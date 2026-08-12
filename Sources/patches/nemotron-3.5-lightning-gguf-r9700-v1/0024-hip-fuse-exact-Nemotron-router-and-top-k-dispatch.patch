@@ -1,0 +1,594 @@
+From ad54284048d771c9fddd5bd48685a4b72c7124ad Mon Sep 17 00:00:00 2001
+From: Carsen <carsenk@gmail.com>
+Date: Wed, 12 Aug 2026 09:46:06 -0600
+Subject: [PATCH 24/24] hip: fuse exact Nemotron router and top-k dispatch
+
+---
+ ggml/src/ggml-cuda/common.cuh           |  10 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu         | 157 +++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvf.cu              | 158 +++++++++++++++++++-----
+ ggml/src/ggml-cuda/mmvf.cuh             |   6 +
+ ggml/src/ggml-cuda/nemo-router-topk.cuh | 131 ++++++++++++++++++++
+ 5 files changed, 431 insertions(+), 31 deletions(-)
+ create mode 100644 ggml/src/ggml-cuda/nemo-router-topk.cuh
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index ffb0d226a..407399b14 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1518,6 +1518,11 @@ struct ggml_backend_cuda_context {
+ 
+     int curr_stream_no = 0;
+ 
++    // One completion word per backend stream for the exact Nemotron router
++    // producer/top-k last-block protocol.  Keeping the words per context and
++    // per stream prevents independent graph evaluations from sharing state.
++    uint32_t * nemo_router_topk_completion = nullptr;
++
+ #ifdef USE_CUDA_GRAPH
+     // Map from first_node_ptr to cuda_graph - allows multiple graphs per context
+     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
+@@ -1573,6 +1578,11 @@ struct ggml_backend_cuda_context {
+     explicit ggml_backend_cuda_context(int device) :
+         device(device),
+         name(GGML_CUDA_NAME + std::to_string(device)) {
++        ggml_cuda_set_device(device);
++        CUDA_CHECK(cudaMalloc((void **) &nemo_router_topk_completion,
++                              GGML_CUDA_MAX_STREAMS * sizeof(uint32_t)));
++        CUDA_CHECK(cudaMemset(nemo_router_topk_completion, 0,
++                             GGML_CUDA_MAX_STREAMS * sizeof(uint32_t)));
+     }
+ 
+     ggml_cuda_stream_context concurrent_stream_context;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 74282624e..fa77245cb 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -729,6 +729,11 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
+             CUBLAS_CHECK(cublasDestroy(cublas_handles[i]));
+         }
+     }
++    if (nemo_router_topk_completion != nullptr) {
++        ggml_cuda_set_device(device);
++        CUDA_CHECK(cudaFree(nemo_router_topk_completion));
++        nemo_router_topk_completion = nullptr;
++    }
+ }
+ 
+ 
+@@ -3325,6 +3330,102 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
+     return true;
+ }
+ 
++static bool ggml_cuda_check_fusion_memory_ranges(
++    const ggml_cgraph * cgraph, int node_idx, int node_count,
++    const int * out_nodes, int out_count, bool is_topk_moe);
++static cudaStream_t ggml_cuda_norm_quant_node_stream(
++    ggml_backend_cuda_context * ctx, const ggml_tensor * node);
++
++struct ggml_cuda_nemo_router_topk_info {
++    ggml_cuda_topk_moe_args args;
++    const ggml_tensor * bias    = nullptr;
++    const ggml_tensor * clamp   = nullptr;
++    const ggml_tensor * scale   = nullptr;
++    ggml_tensor *       weights = nullptr;
++    ggml_tensor *       ids     = nullptr;
++    int n_ops = 0;
++};
++
++// Match only the exact one-token Nemotron sigmoid+bias+top-6 chain following
++// its 2688x128 F32 router.  The generic standalone top-k fusion remains the
++// fallback for all other graphs.
++static bool ggml_cuda_find_nemo_router_topk(
++        ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph,
++        const int first, const ggml_tensor * router,
++        ggml_cuda_nemo_router_topk_info & out) {
++    if (first >= cgraph->n_nodes || cgraph->nodes[first]->op != GGML_OP_UNARY ||
++            ggml_get_unary_op(cgraph->nodes[first]) != GGML_UNARY_OP_SIGMOID ||
++            cgraph->nodes[first]->src[0] != router ||
++            !ggml_cuda_topk_moe_fusion(cgraph, first, out.args) ||
++            !out.args.sigmoid || !out.args.prob_bias || out.args.softmax ||
++            out.args.sqrt_softplus || out.args.delayed_softmax) {
++        return false;
++    }
++
++    std::vector<ggml_op> ops = { GGML_OP_UNARY };
++    const int i_probs = first;
++    out.bias = cgraph->nodes[i_probs + 2]->src[1];
++    ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_ARGSORT,
++                            GGML_OP_VIEW, GGML_OP_GET_ROWS });
++    int out_nodes[2] = { i_probs + 4, -1 };
++    out.ids = cgraph->nodes[out_nodes[0]];
++
++    if (out.args.norm) {
++        ops.insert(ops.end(), { GGML_OP_RESHAPE, GGML_OP_SUM_ROWS, GGML_OP_CLAMP,
++                                GGML_OP_DIV, GGML_OP_RESHAPE });
++        out.clamp = cgraph->nodes[first + (int) ops.size() - 3];
++    }
++    if (out.args.scale) {
++        ops.push_back(GGML_OP_SCALE);
++        out.scale = cgraph->nodes[first + (int) ops.size() - 1];
++    }
++    out_nodes[1] = first + (int) ops.size() - 1;
++    if (out_nodes[1] >= cgraph->n_nodes) {
++        return false;
++    }
++    out.weights = cgraph->nodes[out_nodes[1]];
++    out.n_ops = (int) ops.size();
++
++    if (!ggml_can_fuse_subgraph(cgraph, first, ops.size(), ops.data(), out_nodes, 2) ||
++            !ggml_cuda_should_use_topk_moe(cgraph->nodes[first], out.weights, router, out.ids)) {
++        return false;
++    }
++
++    const bool exact_shape = out.bias != nullptr &&
++        router->type == GGML_TYPE_F32 && out.bias->type == GGML_TYPE_F32 &&
++        out.weights->type == GGML_TYPE_F32 && out.ids->type == GGML_TYPE_I32 &&
++        router->ne[0] == 128 && router->ne[1] == 1 && router->ne[2] == 1 && router->ne[3] == 1 &&
++        out.bias->ne[0] == 128 && ggml_nelements(out.bias) == 128 && ggml_is_contiguous(out.bias) &&
++        out.weights->ne[0] == 1 && out.weights->ne[1] == 6 &&
++        out.weights->ne[2] == 1 && out.weights->ne[3] == 1 &&
++        out.ids->ne[0] == 6 && out.ids->ne[1] == 1 && out.ids->ne[2] == 1 && out.ids->ne[3] == 1 &&
++        out.ids->nb[0] != 0 && out.ids->nb[1] / out.ids->nb[0] == 128;
++    if (!exact_shape) {
++        return false;
++    }
++
++    // Skipping a node on another stream, or a fork/join boundary, would bypass
++    // scheduler event handling.  Require the entire router/selection group on
++    // the current stream.
++    const cudaStream_t stream = ctx->stream();
++    for (int j = first - 1; j < first + out.n_ops; ++j) {
++        if (ggml_cuda_norm_quant_node_stream(ctx, cgraph->nodes[j]) != stream) {
++            return false;
++        }
++    }
++    for (const auto & [fork_node, event] : ctx->stream_context().concurrent_events) {
++        for (int j = first - 1; j < first + out.n_ops; ++j) {
++            const ggml_tensor * member = cgraph->nodes[j];
++            if (member == fork_node || member == event.join_node) {
++                return false;
++            }
++        }
++    }
++
++    return ggml_cuda_check_fusion_memory_ranges(
++        cgraph, first, out.n_ops, out_nodes, 2, /*is_topk_moe=*/true);
++}
++
+ // returns whether the write (out) nodes overwrite the read nodes in operation
+ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
+                                                  const int           node_idx,
+@@ -4373,6 +4474,62 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    // Exact Nemotron decode router: retain the stock 224-thread F32 MMVF
++    // reduction and its global logits materialization, then let the last
++    // producer block execute the mechanically identical stock top-6 warp.
++    // This removes only the dependent top-k dispatch; it does not reorder the
++    // graph or rely on unsynchronized cross-block reads.
++    static const bool nemo_router_topk_enabled = [] {
++        const char * value = std::getenv("GGML_CUDA_NEMO_ROUTER_TOPK_FUSION");
++        const char * disable = std::getenv("GGML_CUDA_DISABLE_NEMO_ROUTER_TOPK_FUSION");
++        return (value == nullptr || std::atoi(value) != 0) &&
++               (disable == nullptr || std::atoi(disable) == 0);
++    }();
++    static const bool print_nemo_router_topk_stats = [] {
++        const char * value = std::getenv("GGML_CUDA_NEMO_ROUTER_TOPK_STATS");
++        return value != nullptr && std::atoi(value) != 0;
++    }();
++    if (nemo_router_topk_enabled && i + 1 < cgraph->n_nodes && node->op == GGML_OP_MUL_MAT &&
++            node->src[0] != nullptr && node->src[1] != nullptr &&
++            node->src[0]->type == GGML_TYPE_F32 && node->src[1]->type == GGML_TYPE_F32 &&
++            node->type == GGML_TYPE_F32 &&
++            node->src[0]->ne[0] == 2688 && node->src[0]->ne[1] == 128 &&
++            node->src[0]->ne[2] == 1 && node->src[0]->ne[3] == 1 &&
++            node->src[1]->ne[0] == 2688 && node->src[1]->ne[1] == 1 &&
++            node->src[1]->ne[2] == 1 && node->src[1]->ne[3] == 1 &&
++            node->ne[0] == 128 && node->ne[1] == 1 && node->ne[2] == 1 && node->ne[3] == 1) {
++        ggml_cuda_nemo_router_topk_info info;
++        if (ggml_cuda_find_nemo_router_topk(cuda_ctx, cgraph, i + 1, node, info)) {
++            const auto disjoint = [](const ggml_tensor * a, const ggml_tensor * b) {
++                const uintptr_t a0 = (uintptr_t) a->data;
++                const uintptr_t b0 = (uintptr_t) b->data;
++                const uintptr_t a1 = a0 + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
++                const uintptr_t b1 = b0 + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
++                return a1 <= b0 || b1 <= a0;
++            };
++            const bool alias_ok = disjoint(node, info.weights) && disjoint(node, info.ids) &&
++                disjoint(node->src[0], info.weights) && disjoint(node->src[0], info.ids) &&
++                disjoint(node->src[1], info.weights) && disjoint(node->src[1], info.ids) &&
++                disjoint(info.bias, info.weights) && disjoint(info.bias, info.ids) &&
++                disjoint(info.weights, info.ids);
++            const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
++            if (alias_ok && ggml_cuda_should_use_mmvf(
++                    node->src[0]->type, cc, node->src[0]->ne, node->src[0]->nb, node->src[1]->ne[1]) &&
++                    ggml_cuda_mul_mat_vec_f_nemo_router_topk(
++                        *cuda_ctx, node->src[0], node->src[1], node,
++                        info.bias, info.clamp, info.scale, info.weights, info.ids)) {
++                static std::atomic<uint64_t> n_fired{0};
++                const uint64_t count = n_fired.fetch_add(1, std::memory_order_relaxed) + 1;
++                if (print_nemo_router_topk_stats && (count <= 23 || count % 23 == 0)) {
++                    GGML_LOG_INFO("%s: Nemotron exact router+top-k fire=%" PRIu64
++                                  ", index=%d, skipped=%d, router=%s\n",
++                                  __func__, count, i, info.n_ops, node->name);
++                }
++                return info.n_ops;
++            }
++        }
++    }
++
+     // Mamba2 SSM_SCAN -> CPY: write the final recurrent state directly to the
+     // identity-mapped single cache row. This has its own toggle so the same
+     // binary can provide a strict A/B control while retaining other fusions.
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index d7dbc8b99..ec78f9768 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -3,14 +3,16 @@
+ #include "unary.cuh"
+ #include "mmvf.cuh"
+ #include "convert.cuh"
++#include "nemo-router-topk.cuh"
+ 
+-template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
++template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false,
++          bool is_multi_token_id = false, bool has_nemo_router_topk = false>
+ static __global__ void mul_mat_vec_f(
+         const T * x_ptr, const float * y_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+         const int ncols2, const uint3 nchannels_y, const int stride_row, const int stride_col_y2, const int stride_col_dst,
+         const uint3 channel_ratio, const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
+         const uint3 sample_ratio, const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
+-        const int ids_stride) {
++        const int ids_stride, const mmvf_nemo_router_topk nemo_topk = mmvf_nemo_router_topk()) {
+     const T       * GGML_CUDA_RESTRICT x   = x_ptr;
+     const float   * GGML_CUDA_RESTRICT y   = y_ptr;
+     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+@@ -338,43 +340,77 @@ static __global__ void mul_mat_vec_f(
+         }
+     }
+ 
+-    if (tid >= ncols_dst) {
+-        return;
+-    }
++    if constexpr (has_nemo_router_topk) {
++        static_assert(std::is_same_v<T, float> && std::is_same_v<type_acc, float> &&
++                      ncols_dst == 1 && block_size == 224 && !has_fusion && !is_multi_token_id);
+ 
+-    float value = sumf[tid];
++        // This store is the exact stock MMVF materialization boundary.  The
++        // same block size, float2 traversal, MAD sequence and two-stage warp
++        // reduction above are retained without reassociation.
++        if (tid == 0) {
++            dst[row] = sumf[0];
++        }
+ 
+-    if constexpr (has_fusion) {
+-        if (use_bias) {
+-            value += x_bias[tid*stride_col_dst + row];
++        __shared__ int last_router_block;
++        __syncthreads();
++        if (tid == 0) {
++            // CUDA's documented last-block reduction idiom: each producer
++            // publishes its logit before incrementing the stream-private
++            // completion word.  The block observing 127 is therefore the only
++            // block allowed to read the complete 128-value materialization.
++            __threadfence();
++            last_router_block = atomicAdd(nemo_topk.completion, 1u) == 127u;
+         }
++        __syncthreads();
+ 
+-        if (use_gate) {
+-            float gate_value = sumf_gate[tid];
+-            if (use_gate_bias) {
+-                gate_value += gate_bias[tid*stride_col_dst + row];
++        if (last_router_block && tid < WARP_SIZE) {
++            nemo_router_topk_128_sigmoid_bias(dst, nemo_topk);
++            __syncwarp();
++            if (tid == 0) {
++                atomicExch(nemo_topk.completion, 0u);
++            }
++        }
++        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, gate_x, x_bias, gate_bias, sumf_gate);
++    } else {
++        if (tid >= ncols_dst) {
++            return;
++        }
++
++        float value = sumf[tid];
++
++        if constexpr (has_fusion) {
++            if (use_bias) {
++                value += x_bias[tid*stride_col_dst + row];
+             }
+-            switch (glu_op) {
+-                case GGML_GLU_OP_SWIGLU:
+-                    value *= ggml_cuda_op_silu_single(gate_value);
+-                    break;
+-                case GGML_GLU_OP_GEGLU:
+-                    value *= ggml_cuda_op_gelu_single(gate_value);
+-                    break;
+-                case GGML_GLU_OP_SWIGLU_OAI: {
+-                    value = ggml_cuda_op_swiglu_oai_single(gate_value, value);
+-                    break;
++
++            if (use_gate) {
++                float gate_value = sumf_gate[tid];
++                if (use_gate_bias) {
++                    gate_value += gate_bias[tid*stride_col_dst + row];
++                }
++                switch (glu_op) {
++                    case GGML_GLU_OP_SWIGLU:
++                        value *= ggml_cuda_op_silu_single(gate_value);
++                        break;
++                    case GGML_GLU_OP_GEGLU:
++                        value *= ggml_cuda_op_gelu_single(gate_value);
++                        break;
++                    case GGML_GLU_OP_SWIGLU_OAI: {
++                        value = ggml_cuda_op_swiglu_oai_single(gate_value, value);
++                        break;
++                    }
++                    default:
++                        break;
+                 }
+-                default:
+-                    break;
+             }
+         }
+-    }
+ 
+-    dst[tid*stride_col_dst + row] = value;
++        dst[tid*stride_col_dst + row] = value;
+ 
+-    if constexpr (!has_fusion) {
+-        GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, gate_x, x_bias, gate_bias, sumf_gate);
++        if constexpr (!has_fusion) {
++            GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, glu_op, gate_x, x_bias, gate_bias, sumf_gate);
++        }
++        GGML_UNUSED(nemo_topk);
+     }
+ }
+ 
+@@ -395,7 +431,7 @@ static void mul_mat_vec_f_switch_fusion(
+             ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, true, is_multi_token_id>, launch_params,
+                 x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
++                sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvf_nemo_router_topk());
+             return;
+        }
+     }
+@@ -405,7 +441,7 @@ static void mul_mat_vec_f_switch_fusion(
+     ggml_cuda_kernel_launch(mul_mat_vec_f<T, type_acc, ncols_dst, block_size, false, is_multi_token_id>, launch_params,
+         x, y, ids, fusion, dst, ncols, nchannels_y, stride_row, stride_col_y, stride_col_dst,
+         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride);
++        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvf_nemo_router_topk());
+ 
+ }
+ 
+@@ -722,6 +758,66 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor
+     }
+ }
+ 
++bool ggml_cuda_mul_mat_vec_f_nemo_router_topk(
++        ggml_backend_cuda_context & ctx,
++        const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * logits,
++        const ggml_tensor * bias, const ggml_tensor * clamp, const ggml_tensor * scale,
++        ggml_tensor * weights, ggml_tensor * ids) {
++    if (src0 == nullptr || src1 == nullptr || logits == nullptr || bias == nullptr ||
++            weights == nullptr || ids == nullptr ||
++            src0->type != GGML_TYPE_F32 || src1->type != GGML_TYPE_F32 ||
++            logits->type != GGML_TYPE_F32 || bias->type != GGML_TYPE_F32 ||
++            weights->type != GGML_TYPE_F32 || ids->type != GGML_TYPE_I32 ||
++            src0->ne[0] != 2688 || src0->ne[1] != 128 || src0->ne[2] != 1 || src0->ne[3] != 1 ||
++            src1->ne[0] != 2688 || src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1 ||
++            logits->ne[0] != 128 || logits->ne[1] != 1 || logits->ne[2] != 1 || logits->ne[3] != 1 ||
++            bias->ne[0] != 128 || ggml_nelements(bias) != 128 ||
++            weights->ne[0] != 1 || weights->ne[1] != 6 || weights->ne[2] != 1 || weights->ne[3] != 1 ||
++            ids->ne[0] != 6 || ids->ne[1] != 1 || ids->ne[2] != 1 || ids->ne[3] != 1 ||
++            ids->nb[1] / ggml_type_size(ids->type) != 128 ||
++            !ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) ||
++            !ggml_is_contiguous(logits) || !ggml_is_contiguous(bias) || !ggml_is_contiguous(weights)) {
++        return false;
++    }
++
++    mmvf_nemo_router_topk guest;
++    guest.bias       = (const float *) bias->data;
++    guest.weights    = (float *) weights->data;
++    guest.ids        = (int32_t *) ids->data;
++    guest.completion = ctx.nemo_router_topk_completion + ctx.curr_stream_no;
++    guest.clamp_val  = clamp != nullptr ? ggml_get_op_params_f32(clamp, 0) : -INFINITY;
++    guest.scale_val  = scale != nullptr ? ggml_get_op_params_f32(scale, 0) : 1.0f;
++    guest.with_norm  = clamp != nullptr;
++
++    constexpr int ncols2    = 2688 / 2;
++    constexpr int nrows     = 128;
++    constexpr int block_size = 224;
++    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
++    if (warp_size != WARP_SIZE) {
++        return false;
++    }
++
++    ggml_cuda_mm_fusion_args_device empty{};
++    const uint3 one_fd  = init_fastdiv_values(1);
++    const uint3 zero_fd = make_uint3(0, 0, 0);
++    const dim3 block_nums(nrows, 1, 1);
++    const dim3 block_dims(block_size, 1, 1);
++    const ggml_cuda_kernel_launch_params launch_params(
++        block_nums, block_dims, warp_size * sizeof(float), ctx.stream());
++
++    ggml_cuda_kernel_launch(
++        (mul_mat_vec_f<float, float, 1, block_size, false, false, true>), launch_params,
++        (const float *) src0->data, (const float *) src1->data, (const int32_t *) nullptr,
++        empty, (float *) logits->data, ncols2, zero_fd,
++        (int) (src0->nb[1] / sizeof(float)), (int) (src1->nb[1] / sizeof(float) / 2),
++        (int) (logits->nb[1] / sizeof(float)), one_fd,
++        (int) (src0->nb[2] / sizeof(float)), (int) (src1->nb[2] / sizeof(float)),
++        (int) (logits->nb[2] / sizeof(float)), one_fd,
++        (int) (src0->nb[3] / sizeof(float)), (int) (src1->nb[3] / sizeof(float)),
++        (int) (logits->nb[3] / sizeof(float)), 0, guest);
++    return true;
++}
++
+ void ggml_cuda_op_mul_mat_vec_f(
+     ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
+diff --git a/ggml/src/ggml-cuda/mmvf.cuh b/ggml/src/ggml-cuda/mmvf.cuh
+index a50f7c021..b5976b729 100644
+--- a/ggml/src/ggml-cuda/mmvf.cuh
++++ b/ggml/src/ggml-cuda/mmvf.cuh
+@@ -5,6 +5,12 @@
+ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+     const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+ 
++bool ggml_cuda_mul_mat_vec_f_nemo_router_topk(
++    ggml_backend_cuda_context & ctx,
++    const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * logits,
++    const ggml_tensor * bias, const ggml_tensor * clamp, const ggml_tensor * scale,
++    ggml_tensor * weights, ggml_tensor * ids);
++
+ void ggml_cuda_op_mul_mat_vec_f(
+     ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, const char * src0_dd_i, const float * src1_ddf_i,
+diff --git a/ggml/src/ggml-cuda/nemo-router-topk.cuh b/ggml/src/ggml-cuda/nemo-router-topk.cuh
+new file mode 100644
+index 000000000..da12b2446
+--- /dev/null
++++ b/ggml/src/ggml-cuda/nemo-router-topk.cuh
+@@ -0,0 +1,131 @@
++#pragma once
++
++#include "ggml-cuda/common.cuh"
++
++#include <cmath>
++
++struct mmvf_nemo_router_topk {
++    const float * bias       = nullptr;
++    float *       weights    = nullptr;
++    int32_t *     ids        = nullptr;
++    uint32_t *    completion = nullptr;
++    float         clamp_val  = -INFINITY;
++    float         scale_val  = 1.0f;
++    bool          with_norm  = false;
++};
++
++// Exact one-row specialization of topk_moe_cuda<128, true> for Nemotron-H.
++// This is mechanically the stock iterative top-6 body.  The router producer
++// stores all 128 F32 logits before the standard last-block fence publishes
++// completion, so the separate-kernel F32 materialization boundary remains.
++static __device__ __forceinline__ void nemo_router_topk_128_sigmoid_bias(
++        const float * logits,
++        const mmvf_nemo_router_topk & guest) {
++    constexpr int n_experts          = 128;
++    constexpr int n_expert_used      = 6;
++    constexpr int experts_per_thread = n_experts / WARP_SIZE;
++
++    float wt[experts_per_thread];
++
++#pragma unroll
++    for (int i = 0; i < experts_per_thread; ++i) {
++        wt[i] = -INFINITY;
++    }
++
++    ggml_cuda_pdl_sync();
++#pragma unroll
++    for (int i = 0; i < n_experts; i += WARP_SIZE) {
++        const int expert = i + threadIdx.x;
++        wt[i / WARP_SIZE] = logits[expert];
++    }
++
++#pragma unroll
++    for (int i = 0; i < experts_per_thread; ++i) {
++        wt[i] = 1.f / (1.f + expf(-wt[i]));
++    }
++
++#pragma unroll
++    for (int i = 0; i < experts_per_thread; ++i) {
++        if (__isnanf(wt[i])) {
++            wt[i] = -FLT_MAX;
++        }
++    }
++
++    float selection_wt[experts_per_thread];
++#pragma unroll
++    for (int i = 0; i < experts_per_thread; ++i) {
++        selection_wt[i] = -INFINITY;
++    }
++#pragma unroll
++    for (int i = 0; i < n_experts; i += WARP_SIZE) {
++        const int expert = i + threadIdx.x;
++        selection_wt[i / WARP_SIZE] = wt[i / WARP_SIZE] + guest.bias[expert];
++    }
++
++    float wt_sum = 0.f;
++    float output_weights[experts_per_thread];
++#pragma unroll
++    for (int i = 0; i < experts_per_thread; ++i) {
++        output_weights[i] = 0.f;
++    }
++
++    ggml_cuda_pdl_lc();
++    for (int k = 0; k < n_expert_used; ++k) {
++        float max_val   = wt[0];
++        float max_val_s = selection_wt[0];
++        int max_expert  = threadIdx.x;
++
++#pragma unroll
++        for (int i = 1; i < experts_per_thread; ++i) {
++            const int expert = threadIdx.x + i * WARP_SIZE;
++            if (selection_wt[i] > max_val_s) {
++                max_val    = wt[i];
++                max_val_s  = selection_wt[i];
++                max_expert = expert;
++            }
++        }
++
++#pragma unroll
++        for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
++            const float val    = __shfl_xor_sync(0xFFFFFFFF, max_val, mask, WARP_SIZE);
++            const float val_s  = __shfl_xor_sync(0xFFFFFFFF, max_val_s, mask, WARP_SIZE);
++            const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
++            if (val_s > max_val_s || (val_s == max_val_s && expert < max_expert)) {
++                max_val    = val;
++                max_val_s  = val_s;
++                max_expert = expert;
++            }
++        }
++
++        if ((max_expert & (WARP_SIZE - 1)) == (int) threadIdx.x) {
++            selection_wt[max_expert / WARP_SIZE] = -INFINITY;
++        }
++        if ((k & (WARP_SIZE - 1)) == (int) threadIdx.x) {
++            output_weights[k / WARP_SIZE] = max_val;
++        }
++        if ((max_expert & (WARP_SIZE - 1)) == (int) threadIdx.x) {
++            guest.ids[k] = max_expert;
++            if (guest.with_norm) {
++                wt_sum += max_val;
++            }
++        }
++    }
++
++    if (guest.with_norm) {
++        wt_sum = warp_reduce_sum(wt_sum);
++        wt_sum = max(wt_sum, guest.clamp_val);
++        const float inv_sum = 1.0f / wt_sum;
++#pragma unroll
++        for (int i = 0; i < experts_per_thread; ++i) {
++            output_weights[i] *= inv_sum;
++        }
++    }
++
++#pragma unroll
++    for (int i = 0; i < experts_per_thread; ++i) {
++        const int idx = i * WARP_SIZE + threadIdx.x;
++        if (idx < n_expert_used) {
++            guest.weights[idx] = output_weights[i] * guest.scale_val;
++        }
++    }
++}
+-- 
+2.49.0.windows.1
+

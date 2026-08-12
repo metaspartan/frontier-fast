@@ -1,0 +1,224 @@
+From 283f963dda5763965959c0f725272bcf235340df Mon Sep 17 00:00:00 2001
+From: Codex Scratch <noreply@openai.com>
+Date: Wed, 12 Aug 2026 09:32:18 -0600
+Subject: [PATCH 23/24] hip: fuse Nemotron weighted expert reduction
+
+---
+ ggml/src/ggml-cuda/binbcast.cu  |  53 +++++++++++++++
+ ggml/src/ggml-cuda/binbcast.cuh |   6 ++
+ ggml/src/ggml-cuda/ggml-cuda.cu | 114 ++++++++++++++++++++++++++++++++
+ 3 files changed, 173 insertions(+)
+
+diff --git a/ggml/src/ggml-cuda/binbcast.cu b/ggml/src/ggml-cuda/binbcast.cu
+index 2e38077bf..c98f5e83d 100644
+--- a/ggml/src/ggml-cuda/binbcast.cu
++++ b/ggml/src/ggml-cuda/binbcast.cu
+@@ -542,6 +542,59 @@ void ggml_cuda_op_fused_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+     }
+ }
+ 
++// Exact batch-one Nemotron routed-expert tail. Stock first materializes six
++// rounded F32 products, then reduces the six expert views left-to-right in a
++// second launch. Explicit RN operations and AMD optimizer barriers preserve
++// those arithmetic boundaries while the single kernel avoids the product
++// tensor write/read and one dispatch.
++static __global__ void k_nemo_moe_weighted_reduce_f32(
++        const float * routed, const float * weights, float * dst) {
++    constexpr int n_embd = 2688;
++    __shared__ float staged_weights[6];
++    if (threadIdx.x < 6) {
++        staged_weights[threadIdx.x] = weights[threadIdx.x];
++    }
++    __syncthreads();
++
++    // A single block makes the weight staging a grid-wide boundary. The graph
++    // allocator may reuse the tiny routing-weight allocation for dst; every
++    // thread has copied those six values before any destination store occurs.
++    for (int i = threadIdx.x; i < n_embd; i += blockDim.x) {
++        float p0 = __fmul_rn(routed[0*n_embd + i], staged_weights[0]);
++        float p1 = __fmul_rn(routed[1*n_embd + i], staged_weights[1]);
++        float p2 = __fmul_rn(routed[2*n_embd + i], staged_weights[2]);
++        float p3 = __fmul_rn(routed[3*n_embd + i], staged_weights[3]);
++        float p4 = __fmul_rn(routed[4*n_embd + i], staged_weights[4]);
++        float p5 = __fmul_rn(routed[5*n_embd + i], staged_weights[5]);
++#if defined(__HIP_PLATFORM_AMD__)
++        asm volatile("" : "+v"(p0), "+v"(p1), "+v"(p2), "+v"(p3), "+v"(p4), "+v"(p5));
++#endif
++        float sum = __fadd_rn(p0, p1);
++        sum = __fadd_rn(sum, p2);
++        sum = __fadd_rn(sum, p3);
++        sum = __fadd_rn(sum, p4);
++        sum = __fadd_rn(sum, p5);
++        dst[i] = sum;
++    }
++}
++
++void ggml_cuda_op_nemo_moe_weighted_reduce(
++        ggml_backend_cuda_context & ctx,
++        const ggml_tensor * routed,
++        const ggml_tensor * weights,
++        ggml_tensor * dst) {
++    GGML_ASSERT(routed->type == GGML_TYPE_F32 && weights->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
++    GGML_ASSERT(routed->ne[0] == 2688 && routed->ne[1] == 6 && ggml_is_contiguous(routed));
++    GGML_ASSERT(weights->ne[0] == 1 && weights->ne[1] == 6 && ggml_is_contiguous(weights));
++    GGML_ASSERT(dst->ne[0] == 2688 && dst->ne[1] == 1 && ggml_is_contiguous(dst));
++
++    constexpr int block_size = 256;
++    const dim3 blocks(1, 1, 1);
++    const ggml_cuda_kernel_launch_params launch_params(blocks, block_size, 0, ctx.stream());
++    ggml_cuda_kernel_launch(k_nemo_moe_weighted_reduce_f32, launch_params,
++        (const float *) routed->data, (const float *) weights->data, (float *) dst->data);
++}
++
+ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+ 
+diff --git a/ggml/src/ggml-cuda/binbcast.cuh b/ggml/src/ggml-cuda/binbcast.cuh
+index 12624785b..e929a34e4 100644
+--- a/ggml/src/ggml-cuda/binbcast.cuh
++++ b/ggml/src/ggml-cuda/binbcast.cuh
+@@ -10,3 +10,9 @@ void ggml_cuda_op_repeat_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+ 
+ void ggml_cuda_op_fused_add(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int n_fuse);
+ void ggml_cuda_op_fused_mul(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int n_fuse);
++
++void ggml_cuda_op_nemo_moe_weighted_reduce(
++    ggml_backend_cuda_context & ctx,
++    const ggml_tensor * routed,
++    const ggml_tensor * weights,
++    ggml_tensor * dst);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f508155c7..74282624e 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4249,6 +4249,99 @@ static bool ggml_cuda_nemo_mamba_ssm_out_ok(
+         mm->ne[2] == 1 && mm->ne[3] == 1;
+ }
+ 
++struct ggml_cuda_nemo_moe_weighted_reduce_tail {
++    const ggml_tensor * routed  = nullptr;
++    const ggml_tensor * weights = nullptr;
++    ggml_tensor * dst           = nullptr;
++};
++
++// Match MUL(routed[2688,6], weights[1,6]), six ordered views, and the five
++// left-associated ADDs emitted by build_moe_ffn. The routed MMID remains a
++// separate, fully completed launch; only the two elementwise launches become
++// one, avoiding the cross-block race of an MMVQ-epilogue implementation.
++static bool ggml_cuda_nemo_moe_weighted_reduce_detect(
++        const ggml_cgraph * cgraph, const int i,
++        ggml_cuda_nemo_moe_weighted_reduce_tail & tail) {
++    constexpr int n_experts = 6;
++    constexpr int n_nodes   = 1 + n_experts + (n_experts - 1);
++    if (i + n_nodes > cgraph->n_nodes) {
++        return false;
++    }
++
++    ggml_tensor * weighted = cgraph->nodes[i];
++    if (weighted->op != GGML_OP_MUL || weighted->type != GGML_TYPE_F32 ||
++            weighted->ne[0] != 2688 || weighted->ne[1] != n_experts ||
++            weighted->ne[2] != 1 || weighted->ne[3] != 1 || !ggml_is_contiguous(weighted)) {
++        return false;
++    }
++    const ggml_tensor * routed = weighted->src[0] != nullptr && weighted->src[0]->op == GGML_OP_MUL_MAT_ID ?
++        weighted->src[0] : weighted->src[1];
++    const ggml_tensor * weights = routed == weighted->src[0] ? weighted->src[1] : weighted->src[0];
++    if (routed == nullptr || weights == nullptr || routed->op != GGML_OP_MUL_MAT_ID ||
++            routed->type != GGML_TYPE_F32 || !ggml_are_same_shape(routed, weighted) ||
++            !ggml_is_contiguous(routed) || weights->type != GGML_TYPE_F32 ||
++            weights->ne[0] != 1 || weights->ne[1] != n_experts ||
++            weights->ne[2] != 1 || weights->ne[3] != 1 || !ggml_is_contiguous(weights)) {
++        return false;
++    }
++
++    ggml_tensor * views[n_experts];
++    for (int expert = 0; expert < n_experts; ++expert) {
++        views[expert] = cgraph->nodes[i + 1 + expert];
++        if (views[expert]->op != GGML_OP_VIEW || views[expert]->src[0] != weighted ||
++                views[expert]->type != GGML_TYPE_F32 || views[expert]->ne[0] != 2688 ||
++                views[expert]->ne[1] != 1 || views[expert]->ne[2] != 1 || views[expert]->ne[3] != 1 ||
++                views[expert]->data != (char *) weighted->data + expert*weighted->nb[1]) {
++            return false;
++        }
++    }
++
++    ggml_tensor * previous = nullptr;
++    for (int add = 0; add < n_experts - 1; ++add) {
++        ggml_tensor * current = cgraph->nodes[i + 1 + n_experts + add];
++        const ggml_tensor * lhs = add == 0 ? views[0] : previous;
++        const ggml_tensor * rhs = views[add + 1];
++        if (current->op != GGML_OP_ADD || current->src[0] != lhs || current->src[1] != rhs ||
++                current->type != GGML_TYPE_F32 || current->ne[0] != 2688 || current->ne[1] != 1 ||
++                current->ne[2] != 1 || current->ne[3] != 1 || !ggml_is_contiguous(current)) {
++            return false;
++        }
++        previous = current;
++    }
++
++    const ggml_op ops[n_nodes] = {
++        GGML_OP_MUL,
++        GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW, GGML_OP_VIEW,
++        GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD, GGML_OP_ADD,
++    };
++    const int out_nodes[] = { i + n_nodes - 1 };
++    if (!ggml_can_fuse_subgraph(cgraph, i, n_nodes, ops, out_nodes, 1)) {
++        return false;
++    }
++
++    const auto disjoint = [](const ggml_tensor * a, const ggml_tensor * b) {
++        if (a == nullptr || b == nullptr || a->buffer == nullptr || b->buffer == nullptr) {
++            return false;
++        }
++        const uintptr_t a0 = (uintptr_t) a->data;
++        const uintptr_t b0 = (uintptr_t) b->data;
++        const uintptr_t a1 = a0 + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
++        const uintptr_t b1 = b0 + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
++        return a1 <= b0 || b1 <= a0;
++    };
++    // dst must not overwrite routed expert values. An overlap with the six
++    // routing weights is allowed: the specialized single-block kernel stages
++    // all of them before its first destination store.
++    if (!disjoint(previous, routed)) {
++        return false;
++    }
++
++    tail.routed  = routed;
++    tail.weights = weights;
++    tail.dst     = previous;
++    return true;
++}
++
+ // try and fuse nodes and return the number of nodes to skip
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+@@ -4259,6 +4352,27 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ 
+     ggml_tensor * node = cgraph->nodes[i];
+ 
++    static const bool disable_nemo_moe_weighted_reduce = [] {
++        const char * value = std::getenv("GGML_CUDA_DISABLE_NEMO_MOE_WEIGHTED_REDUCE");
++        return value != nullptr && std::atoi(value) != 0;
++    }();
++    if (!disable_nemo_moe_weighted_reduce && node->op == GGML_OP_MUL) {
++        ggml_cuda_nemo_moe_weighted_reduce_tail tail;
++        if (ggml_cuda_nemo_moe_weighted_reduce_detect(cgraph, i, tail)) {
++            ggml_cuda_op_nemo_moe_weighted_reduce(*cuda_ctx, tail.routed, tail.weights, tail.dst);
++            static const bool print_stats = [] {
++                const char * value = std::getenv("GGML_CUDA_NEMO_MOE_WEIGHTED_REDUCE_STATS");
++                return value != nullptr && std::atoi(value) != 0;
++            }();
++            static std::atomic<uint64_t> n_fused{0};
++            const uint64_t count = n_fused.fetch_add(1, std::memory_order_relaxed) + 1;
++            if (print_stats && (count <= 23 || count % 23 == 0)) {
++                GGML_LOG_INFO("%s: Nemotron weighted expert reduction fire=%" PRIu64 "\n", __func__, count);
++            }
++            return 11;
++        }
++    }
++
+     // Mamba2 SSM_SCAN -> CPY: write the final recurrent state directly to the
+     // identity-mapped single cache row. This has its own toggle so the same
+     // binary can provide a strict A/B control while retaining other fusions.
+-- 
+2.49.0.windows.1
+
