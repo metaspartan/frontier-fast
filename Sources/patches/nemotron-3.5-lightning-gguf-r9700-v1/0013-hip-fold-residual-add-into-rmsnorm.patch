@@ -1,0 +1,431 @@
+From f36a94406672097292b4cf3e24492763730a1b15 Mon Sep 17 00:00:00 2001
+From: Codex Scratch <noreply@openai.com>
+Date: Wed, 12 Aug 2026 05:49:10 -0600
+Subject: [PATCH] hip: fold Nemotron residual add into RMS norm
+
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f0aa9df67..bdad47000 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3526,6 +3526,114 @@ static bool ggml_cuda_norm_quant_plain_ok(const ggml_cgraph * cgraph, const int
+     return ggml_is_contiguous(mul) && ggml_are_same_shape(mul, x);
+ }
+ 
++// Return the exact ADD chain length that stock's multi-ADD path would fuse.
++// The chain value is src0 of the first ADD followed, left-to-right, by src1 of
++// each ADD node.
++static int ggml_cuda_nemo_pre_add_chain_len(const ggml_cgraph * cgraph, const int i) {
++    int n_fuse = 0;
++    ggml_op ops[RMS_NORM_ADD_MAX_OPERANDS];
++    std::fill(ops, ops + RMS_NORM_ADD_MAX_OPERANDS, GGML_OP_ADD);
++
++    for (; n_fuse <= RMS_NORM_ADD_MAX_OPERANDS - 2; ++n_fuse) {
++        if (!ggml_can_fuse(cgraph, i + n_fuse, ops + n_fuse, 2)) {
++            break;
++        }
++        if (cgraph->nodes[i + n_fuse] != cgraph->nodes[i + n_fuse + 1]->src[0]) {
++            break;
++        }
++        if (!ggml_are_same_layout(cgraph->nodes[i + n_fuse]->src[1],
++                                  cgraph->nodes[i + n_fuse + 1]->src[1])) {
++            break;
++        }
++    }
++    return n_fuse + 1;
++}
++
++static bool ggml_cuda_nemo_pre_add_shape_ok(const ggml_tensor * t) {
++    return t != nullptr && t->type == GGML_TYPE_F32 &&
++        t->ne[0] == 2688 && t->ne[1] == 1 && t->ne[2] == 1 && t->ne[3] == 1 &&
++        t->nb[0] == ggml_type_size(t->type) && ggml_is_contiguous(t);
++}
++
++static bool ggml_cuda_nemo_same_allocation_or_disjoint(const ggml_tensor * a, const ggml_tensor * b) {
++    if (a == nullptr || b == nullptr || a->data == nullptr || b->data == nullptr ||
++            a->buffer == nullptr || b->buffer == nullptr) {
++        return false;
++    }
++    const uintptr_t a0 = (uintptr_t) a->data;
++    const uintptr_t b0 = (uintptr_t) b->data;
++    const size_t as = ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
++    const size_t bs = ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
++    if (a0 == b0) {
++        return as == bs;
++    }
++    return a0 + as <= b0 || b0 + bs <= a0;
++}
++
++// Match only Nemotron's batch-one outer block residual, never Mamba's internal
++// [4096,1] y + x*D operation.  Returns the number of ADD nodes, or zero.
++static int ggml_cuda_nemo_pre_add_norm_detect(const ggml_cgraph * cgraph, const int i) {
++    if (i >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_ADD) {
++        return 0;
++    }
++
++    const int n_adds = ggml_cuda_nemo_pre_add_chain_len(cgraph, i);
++    const int inorm  = i + n_adds;
++    if (n_adds < 1 || n_adds >= RMS_NORM_ADD_MAX_OPERANDS || inorm + 1 >= cgraph->n_nodes) {
++        return 0;
++    }
++
++    ggml_tensor * add_last = cgraph->nodes[inorm - 1];
++    ggml_tensor * norm     = cgraph->nodes[inorm];
++    ggml_tensor * mul      = cgraph->nodes[inorm + 1];
++    if (!ggml_cuda_nemo_pre_add_shape_ok(add_last) ||
++            norm->op != GGML_OP_RMS_NORM || norm->src[0] != add_last ||
++            !ggml_cuda_nemo_pre_add_shape_ok(mul) || !ggml_are_same_shape(mul, add_last)) {
++        return 0;
++    }
++
++    // Retain the exact stock RMS_NORM+MUL eligibility and leave the separate
++    // RMS_NORM+MUL+ADD epilogue alone.
++    if (ggml_cuda_can_fuse(cgraph, inorm, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {}) ||
++            !ggml_cuda_can_fuse(cgraph, inorm, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
++        return 0;
++    }
++
++    const ggml_tensor * mul_src = mul->src[0] == norm ? mul->src[1] :
++                                  mul->src[1] == norm ? mul->src[0] : nullptr;
++    if (!ggml_cuda_nemo_pre_add_shape_ok(mul_src)) {
++        return 0;
++    }
++
++    if (!ggml_cuda_nemo_pre_add_shape_ok(cgraph->nodes[i]->src[0])) {
++        return 0;
++    }
++    for (int k = 0; k < n_adds; ++k) {
++        const ggml_tensor * add = cgraph->nodes[i + k];
++        if (add->op != GGML_OP_ADD || !ggml_are_same_shape(add, add_last) ||
++                !ggml_cuda_nemo_pre_add_shape_ok(add->src[1])) {
++            return 0;
++        }
++    }
++
++    // Exact in-place ADD aliases are elementwise-safe; partial aliases are not.
++    if (!ggml_cuda_nemo_same_allocation_or_disjoint(cgraph->nodes[i]->src[0], add_last)) {
++        return 0;
++    }
++    for (int k = 0; k < n_adds; ++k) {
++        if (!ggml_cuda_nemo_same_allocation_or_disjoint(cgraph->nodes[i + k]->src[1], add_last)) {
++            return 0;
++        }
++    }
++    // The output loop reads the stored residual while writing the norm result.
++    // Require those allocations to be fully disjoint.
++    if (mul->data == add_last->data ||
++            !ggml_cuda_nemo_same_allocation_or_disjoint(mul, add_last)) {
++        return 0;
++    }
++    return n_adds;
++}
++
+ // try and fuse nodes and return the number of nodes to skip
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+@@ -3568,6 +3676,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return value == nullptr || std::atoi(value) != 0;
+     }();
+     static const bool q8_1_cache_disabled = std::getenv("GGML_CUDA_MMVQ_NO_Q8_1_CACHE") != nullptr;
++    static const bool disable_rms_norm_q8 = [] {
++        const char * value = std::getenv("GGML_CUDA_DISABLE_RMS_NORM_Q8_FUSION");
++        return value != nullptr && std::atoi(value) != 0;
++    }();
+     if (nemo_shexp_act_colaunch && !q8_1_cache_disabled && i + 3 < cgraph->n_nodes &&
+             node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_RELU) {
+         ggml_tensor * shared_relu = node;
+@@ -3828,6 +3940,46 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    // Nemotron batch-one outer residual ADD -> following RMS norm.  This sits
++    // before the generic multi-ADD path so the same left-associated chain is
++    // consumed as part of the norm launch.  Disabling it leaves the verified
++    // standalone RMS norm -> q8_1 producer fold completely unchanged.
++    static const bool disable_nemo_pre_add_norm = [] {
++        const char * value = std::getenv("GGML_CUDA_DISABLE_NEMO_PRE_ADD_NORM");
++        return value != nullptr && std::atoi(value) != 0;
++    }();
++    if (!disable_nemo_pre_add_norm && node->op == GGML_OP_ADD) {
++        const int n_adds = ggml_cuda_nemo_pre_add_norm_detect(cgraph, i);
++        if (n_adds > 0) {
++            ggml_tensor * adds[RMS_NORM_ADD_MAX_OPERANDS] = {};
++            for (int k = 0; k < n_adds; ++k) {
++                adds[k] = cgraph->nodes[i + k];
++            }
++            ggml_tensor * norm_node = cgraph->nodes[i + n_adds];
++            ggml_tensor * mul_node  = cgraph->nodes[i + n_adds + 1];
++            char * q8_1_dst = nullptr;
++            if (!disable_rms_norm_q8 && !q8_1_cache_disabled) {
++                q8_1_dst = ggml_cuda_norm_quant_register(cuda_ctx, cgraph, i + n_adds + 2, mul_node);
++            }
++
++            static const bool print_stats = [] {
++                const char * value = std::getenv("GGML_CUDA_NEMO_PRE_ADD_NORM_STATS");
++                return value != nullptr && std::atoi(value) != 0;
++            }();
++            static std::atomic<uint64_t> n_fused{0};
++            const uint64_t count = n_fused.fetch_add(1, std::memory_order_relaxed) + 1;
++            if (print_stats && (count <= 46 || count % 46 == 0)) {
++                GGML_LOG_INFO("%s: Nemotron residual RMS norm fold fire=%" PRIu64
++                              ", adds=%d, q8=%d, node=%s\n",
++                              __func__, count, n_adds, q8_1_dst != nullptr, mul_node->name);
++            }
++
++            ggml_cuda_op_rms_norm_fused_pre_add(
++                *cuda_ctx, adds, n_adds, norm_node, mul_node, q8_1_dst);
++            return n_adds + 1;
++        }
++    }
++
+     // multi-(add or mul)
+     if (node->op == GGML_OP_ADD || node->op == GGML_OP_MUL) {
+         int     n_fuse = 0;
+@@ -4373,10 +4525,6 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 2;
+     }
+ 
+-    static const bool disable_rms_norm_q8 = [] {
+-        const char * value = std::getenv("GGML_CUDA_DISABLE_RMS_NORM_Q8_FUSION");
+-        return value != nullptr && std::atoi(value) != 0;
+-    }();
+     if (!disable_rms_norm_q8 && !q8_1_cache_disabled && ggml_cuda_norm_quant_plain_ok(cgraph, i)) {
+         ggml_tensor * mul_node = cgraph->nodes[i + 1];
+         char * q8_1_dst = ggml_cuda_norm_quant_register(cuda_ctx, cgraph, i + 2, mul_node);
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index a9e8434ee..a1f995f19 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -240,6 +240,205 @@ static __global__ void rms_norm_mul_quant_f32(const float * x,
+     }
+ }
+ 
++// ----- Nemotron residual ADD -> RMS norm (+ q8_1) ---------------------------
++//
++// Nemotron's batch-one block boundary is:
++//
++//   ADD [2688,1] -> RMS_NORM -> MUL -> quantize_q8_1 -> MMVQ
++//
++// The ADD destination remains materialized because it is the next block's
++// residual.  The same block then runs the stock RMS reduction/output expression
++// and, when requested, the exact padded q8_1 epilogue above.  ADD operands are
++// visited as src0 followed by every chained ADD src1, matching k_bin_bcast's
++// comma-fold order and preserving a distinct rounded F32 addition per step.
++
++struct rms_norm_pre_add_args {
++    const float * src[RMS_NORM_ADD_MAX_OPERANDS];
++    int64_t       stride_row[RMS_NORM_ADD_MAX_OPERANDS];
++};
++
++template <int block_size, int n_op, bool do_quant>
++static __global__ void rms_norm_pre_add_f32(const rms_norm_pre_add_args args,
++                                            float *       add_dst,
++                                            const int64_t add_stride_row,
++                                            float *       dst,
++                                            const int     ncols,
++                                            const int     q8_ncols,
++                                            const float   eps,
++                                            const float * mul,
++                                            const int64_t mul_stride_row,
++                                            const uint3   mul_ncols_packed,
++                                            const uint3   mul_nrows_packed,
++                                            void *        q8_1_dst) {
++    ggml_cuda_pdl_lc();
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++
++    add_dst += (int64_t) row * add_stride_row;
++    dst     += (int64_t) row * ncols;
++
++    const uint32_t mul_row = fastmodulo((uint32_t) row, mul_nrows_packed);
++    mul += (int64_t) mul_row * mul_stride_row;
++
++    float tmp = 0.0f;
++
++    ggml_cuda_pdl_sync();
++    for (int col = tid; col < ncols; col += block_size) {
++        float acc = args.src[0][(int64_t) row * args.stride_row[0] + col];
++#pragma unroll
++        for (int k = 1; k < n_op; ++k) {
++            acc = acc + args.src[k][(int64_t) row * args.stride_row[k] + col];
++        }
++        add_dst[col] = acc;
++        tmp += acc * acc;
++    }
++
++    extern __shared__ float s_sum[];
++    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++
++    const float mean  = tmp / ncols;
++    const float scale = rsqrtf(mean + eps);
++    const int64_t row_cont = row;
++    block_q8_1 * y = (block_q8_1 *) q8_1_dst;
++
++    const int output_cols = do_quant ? q8_ncols : ncols;
++    for (int col = tid; col < output_cols; col += block_size) {
++        float val = 0.0f;
++        if (col < ncols) {
++            const int mul_col = fastmodulo(col, mul_ncols_packed);
++            val      = scale * add_dst[col] * mul[mul_col];
++            dst[col] = val;
++        }
++
++        if constexpr (do_quant) {
++            const int64_t i_cont = row_cont*q8_ncols + col;
++            const int64_t ib     = i_cont / QK8_1;
++            const int64_t iqs    = i_cont % QK8_1;
++
++            const float xq = val;
++            float amax = fabsf(xq);
++            float sum  = xq;
++
++            amax = warp_reduce_max<QK8_1>(amax);
++            sum  = warp_reduce_sum<QK8_1>(sum);
++
++            const float  d = amax / 127.0f;
++            const int8_t q = amax == 0.0f ? 0 : roundf(xq / d);
++
++            y[ib].qs[iqs] = q;
++            if (iqs == 0) {
++                y[ib].ds = make_half2(d, sum);
++            }
++        }
++    }
++}
++
++template <int n_op, bool do_quant>
++static void rms_norm_pre_add_launch(const rms_norm_pre_add_args & args,
++                                    float * add_dst, int64_t add_stride_row,
++                                    float * dst, int ncols, int q8_ncols,
++                                    int nrows, float eps,
++                                    const float * mul, int64_t mul_stride_row,
++                                    uint32_t mul_ncols, uint32_t mul_nrows,
++                                    void * q8_1_dst, cudaStream_t stream) {
++    const dim3 blocks_num(nrows, 1, 1);
++    const uint3 mul_ncols_packed = init_fastdiv_values(mul_ncols);
++    const uint3 mul_nrows_packed = init_fastdiv_values(mul_nrows);
++
++    if (ncols < 1024) {
++        const dim3 block_dims(256, 1, 1);
++        const ggml_cuda_kernel_launch_params launch_params =
++            ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, stream};
++        ggml_cuda_kernel_launch((rms_norm_pre_add_f32<256, n_op, do_quant>), launch_params,
++            args, add_dst, add_stride_row, dst, ncols, q8_ncols, eps, mul, mul_stride_row,
++            mul_ncols_packed, mul_nrows_packed, q8_1_dst);
++    } else {
++        const dim3 block_dims(1024, 1, 1);
++        const ggml_cuda_kernel_launch_params launch_params =
++            ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float) : 0, stream};
++        ggml_cuda_kernel_launch((rms_norm_pre_add_f32<1024, n_op, do_quant>), launch_params,
++            args, add_dst, add_stride_row, dst, ncols, q8_ncols, eps, mul, mul_stride_row,
++            mul_ncols_packed, mul_nrows_packed, q8_1_dst);
++    }
++}
++
++void ggml_cuda_op_rms_norm_fused_pre_add(ggml_backend_cuda_context & ctx,
++                                         ggml_tensor * const * adds, int n_adds,
++                                         ggml_tensor * norm, ggml_tensor * mul_tensor,
++                                         char * q8_1_dst) {
++    GGML_ASSERT(n_adds >= 1 && n_adds <= RMS_NORM_ADD_MAX_OPERANDS - 1);
++
++    ggml_tensor * add_last = adds[n_adds - 1];
++    const ggml_tensor * mul_src = nullptr;
++    if (mul_tensor->src[0] == norm) {
++        mul_src = mul_tensor->src[1];
++    } else if (mul_tensor->src[1] == norm) {
++        mul_src = mul_tensor->src[0];
++    } else {
++        GGML_ABORT("RMS norm MUL does not consume norm");
++    }
++
++    GGML_ASSERT(add_last->type == GGML_TYPE_F32);
++    GGML_ASSERT(norm->type == GGML_TYPE_F32);
++    GGML_ASSERT(mul_tensor->type == GGML_TYPE_F32);
++    GGML_ASSERT(add_last->ne[0] == 2688 && add_last->ne[1] == 1 &&
++                add_last->ne[2] == 1 && add_last->ne[3] == 1);
++
++    float eps = 0.0f;
++    memcpy(&eps, norm->op_params, sizeof(float));
++    GGML_ASSERT(eps >= 0.0f);
++
++    rms_norm_pre_add_args args = {};
++    int n_op = 0;
++    const ggml_tensor * s0 = adds[0]->src[0];
++    args.src[n_op]        = (const float *) s0->data;
++    args.stride_row[n_op] = s0->nb[1] / sizeof(float);
++    ++n_op;
++    for (int k = 0; k < n_adds; ++k) {
++        const ggml_tensor * s1 = adds[k]->src[1];
++        args.src[n_op]        = (const float *) s1->data;
++        args.stride_row[n_op] = s1->nb[1] / sizeof(float);
++        ++n_op;
++    }
++    for (int k = n_op; k < RMS_NORM_ADD_MAX_OPERANDS; ++k) {
++        args.src[k]        = args.src[0];
++        args.stride_row[k] = args.stride_row[0];
++    }
++
++    const int ncols      = (int) add_last->ne[0];
++    const int nrows      = (int) add_last->ne[1];
++    const int q8_ncols   = (int) GGML_PAD(add_last->ne[0], MATRIX_ROW_PADDING);
++    float * add_dst      = (float *) add_last->data;
++    float * dst          = (float *) mul_tensor->data;
++    const int64_t add_stride_row = add_last->nb[1] / sizeof(float);
++    const int64_t mul_stride_row = mul_src->nb[1] / sizeof(float);
++    const bool do_quant = q8_1_dst != nullptr;
++
++#define RMS_NORM_PRE_ADD_LAUNCH_CASE(N) \
++        case N: \
++            if (do_quant) { \
++                rms_norm_pre_add_launch<N, true>(args, add_dst, add_stride_row, dst, ncols, q8_ncols, nrows, eps, \
++                    (const float *) mul_src->data, mul_stride_row, (uint32_t) mul_src->ne[0], \
++                    (uint32_t) mul_src->ne[1], q8_1_dst, ctx.stream()); \
++            } else { \
++                rms_norm_pre_add_launch<N, false>(args, add_dst, add_stride_row, dst, ncols, q8_ncols, nrows, eps, \
++                    (const float *) mul_src->data, mul_stride_row, (uint32_t) mul_src->ne[0], \
++                    (uint32_t) mul_src->ne[1], nullptr, ctx.stream()); \
++            } \
++            break
++    switch (n_op) {
++        RMS_NORM_PRE_ADD_LAUNCH_CASE(2);
++        RMS_NORM_PRE_ADD_LAUNCH_CASE(3);
++        RMS_NORM_PRE_ADD_LAUNCH_CASE(4);
++        RMS_NORM_PRE_ADD_LAUNCH_CASE(5);
++        RMS_NORM_PRE_ADD_LAUNCH_CASE(6);
++        RMS_NORM_PRE_ADD_LAUNCH_CASE(7);
++        RMS_NORM_PRE_ADD_LAUNCH_CASE(8);
++        default: GGML_ABORT("unsupported RMS norm pre-add operand count");
++    }
++#undef RMS_NORM_PRE_ADD_LAUNCH_CASE
++}
++
+ template <int block_size>
+ static __global__ void rms_norm_back_f32(
+         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+index 2acd71607..a5a6dcf56 100644
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -13,6 +13,18 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+ void ggml_cuda_op_rms_norm_fused_quant(ggml_backend_cuda_context & ctx,
+                                        ggml_tensor * dst, ggml_tensor * mul_tensor, char * q8_1_dst);
+ 
++// Maximum number of operands in the exact left-associated residual chain that
++// may be folded into the following RMS norm.
++#define RMS_NORM_ADD_MAX_OPERANDS 8
++
++// Produce the residual ADD destination and the following RMS norm + scale in
++// one launch.  When q8_1_dst is non-null, also materialize the exact padded
++// q8_1 cache bytes consumed by the following MMVQ.
++void ggml_cuda_op_rms_norm_fused_pre_add(ggml_backend_cuda_context & ctx,
++                                         ggml_tensor * const * adds, int n_adds,
++                                         ggml_tensor * norm, ggml_tensor * mul_tensor,
++                                         char * q8_1_dst);
++
+ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+                                      ggml_tensor *               dst,
+                                      ggml_tensor *               mul_tensor,
+-- 
+2.49.0.windows.1
+
+

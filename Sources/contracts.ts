@@ -1,7 +1,7 @@
 import type { Contract } from "./types";
 
 /**
- * The eight live tracks, mirroring https://frontier.fast/api/tracks.
+ * The active tracks, mirroring https://frontier.fast/api/tracks.
  *
  * The live registry is authoritative — this file is a local copy so the CLI
  * and the tests can run offline. If the two disagree, the API wins; fetch it
@@ -137,6 +137,30 @@ export const TRACKS: Record<string, Contract> = {
     model: "deepgrove/maple-preview-GGUF",
     revision: "bc977a71db00936b152b7252b49096309a7a6022",
     quantization: "gguf-tq2_0",
+    machine: "gb10-cuda-sm121",
+    promptTokens: 512,
+    decodeTokens: 128,
+    warmupRuns: 2,
+    measuredRuns: 9,
+  },
+  "nemotron-3.5-lightning-gguf-r9700-v1": {
+    id: "nemotron-3.5-lightning-gguf-r9700-v1",
+    family: "nemotron-3.5-lightning",
+    model: "ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
+    revision: "main",
+    quantization: "gguf-q4_k_m",
+    machine: "r9700-rdna4-gfx1201",
+    promptTokens: 512,
+    decodeTokens: 128,
+    warmupRuns: 2,
+    measuredRuns: 9,
+  },
+  "nemotron-3.5-lightning-gguf-gb10cuda-v1": {
+    id: "nemotron-3.5-lightning-gguf-gb10cuda-v1",
+    family: "nemotron-3.5-lightning",
+    model: "ggml-org/NVIDIA-Nemotron-3.5-Lightning-30B-A3B-GGUF",
+    revision: "main",
+    quantization: "gguf-q4_k_m",
     machine: "gb10-cuda-sm121",
     promptTokens: 512,
     decodeTokens: 128,

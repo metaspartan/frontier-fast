@@ -1,0 +1,163 @@
+.: C:\Users\Carsen\Documents\PowerShell\Microsoft.PowerShell_profile.ps1:1
+Line |
+   1 |  . "C:\Users\Carsen\.codex\codex-model-toggle.ps1"
+     |    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     | The term 'C:\Users\Carsen\.codex\codex-model-toggle.ps1' is not recognized as a name of a cmdlet, function,
+     | script file, or executable program. Check the spelling of the name, or if a path was included, verify that the
+     | path is correct and try again.
+From 00d9f10eba988e726d42b23f64af883b3705349e Mon Sep 17 00:00:00 2001
+From: Codex Scratch <noreply@openai.com>
+Date: Wed, 12 Aug 2026 07:39:35 -0600
+Subject: [PATCH 17/18] hip: elide Nemotron Mamba z materialization
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 93 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/norm.cu      |  5 +-
+ ggml/src/ggml-cuda/norm.cuh     |  3 +-
+ 3 files changed, 98 insertions(+), 3 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7cc1071cc..912259237 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4124,6 +4124,61 @@ static bool ggml_cuda_nemo_mamba_swiglu_norm_q8_ok(
+     return ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, out_nodes, 1);
+ }
+ 
++// Decode-only extension of the exact SwiGLU/RMS/q8 producer above.  The first
++// SwiGLU input is an ordinary CONT of Nemotron's {64,64} z view.  For one token
++// that view is already linear F32, so the fused producer can read it directly
++// and elide the otherwise redundant 16 KiB device copy and its launch.
++static const ggml_tensor * ggml_cuda_nemo_mamba_direct_z_ok(
++        ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, const int i) {
++    if (i + 4 >= cgraph->n_nodes || cgraph->nodes[i]->op != GGML_OP_CONT ||
++            (cgraph->nodes[i]->flags & GGML_TENSOR_FLAG_OUTPUT) ||
++            !ggml_cuda_nemo_mamba_swiglu_norm_q8_ok(ctx, cgraph, i + 1)) {
++        return nullptr;
++    }
++
++    const ggml_tensor * cont = cgraph->nodes[i];
++    const ggml_tensor * glu  = cgraph->nodes[i + 1];
++    const ggml_tensor * mul  = cgraph->nodes[i + 4];
++    const ggml_tensor * z    = cont->src[0];
++    if (z == nullptr || glu->src[0] != cont || z->data == nullptr ||
++            z->type != GGML_TYPE_F32 || cont->type != GGML_TYPE_F32 ||
++            !ggml_are_same_shape(z, cont) ||
++            z->ne[0] != 64 || z->ne[1] != 64 || z->ne[2] != 1 || z->ne[3] != 1 ||
++            !ggml_is_contiguous(z) || !ggml_is_contiguous(cont) ||
++            ggml_cuda_norm_quant_node_stream(ctx, cont) != ctx->stream()) {
++        return nullptr;
++    }
++
++    // The skipped CONT must feed only this GLU.  A hidden view or second user
++    // would still require its materialized destination.
++    int cont_users = 0;
++    for (int j = i + 1; j < cgraph->n_nodes; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        if (n->view_src == cont) {
++            return nullptr;
++        }
++        for (int k = 0; k < GGML_MAX_SRC; ++k) {
++            if (n->src[k] == cont) {
++                if (n != glu) {
++                    return nullptr;
++                }
++                ++cont_users;
++            }
++        }
++    }
++    if (cont_users != 1) {
++        return nullptr;
++    }
++
++    // 0015 checked the final producer write against the CONT allocation.  The
++    // direct path reads z's original allocation instead, so prove that range
++    // disjoint as well rather than relying on allocator history.
++    if (mul->data == z->data || !ggml_cuda_nemo_same_allocation_or_disjoint(mul, z)) {
++        return nullptr;
++    }
++    return z;
++}
++
+ static bool ggml_cuda_nemo_mamba_ssm_out_ok(
+         const ggml_tensor * mm, const ggml_tensor * activation) {
+     if (mm == nullptr || activation == nullptr || mm->op != GGML_OP_MUL_MAT ||
+@@ -5057,6 +5112,44 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         const char * value = std::getenv("GGML_CUDA_DISABLE_NEMO_MAMBA_SWIGLU_NORM_Q8_FUSION");
+         return value != nullptr && std::atoi(value) != 0;
+     }();
++    // Extend 0015 backward across the decode-only z CONT.  Disabling only this
++    // extension restores 0015 exactly in the same binary.
++    static const bool disable_nemo_mamba_z_cont = [] {
++        const char * value = std::getenv("GGML_CUDA_DISABLE_NEMO_MAMBA_Z_CONT_FUSION");
++        return value != nullptr && std::atoi(value) != 0;
++    }();
++    if (!disable_nemo_mamba_z_cont && !disable_nemo_mamba_swiglu_norm_q8 &&
++            !disable_rms_norm_q8 && !q8_1_cache_disabled) {
++        const ggml_tensor * direct_z = ggml_cuda_nemo_mamba_direct_z_ok(cuda_ctx, cgraph, i);
++        if (direct_z != nullptr) {
++            ggml_tensor * glu_node = cgraph->nodes[i + 1];
++            ggml_tensor * mul_node = cgraph->nodes[i + 4];
++            const ggml_tensor * mm_node = nullptr;
++            const ggml_tensor * activation = ggml_cuda_norm_quant_find_mmvq_consumer(
++                cuda_ctx, cgraph, i + 5, mul_node, &mm_node);
++            if (ggml_cuda_nemo_mamba_ssm_out_ok(mm_node, activation)) {
++                char * q8_1_dst = ggml_cuda_norm_quant_register(cuda_ctx, cgraph, i + 5, mul_node);
++                if (q8_1_dst != nullptr) {
++                    static const bool print_stats = [] {
++                        const char * value = std::getenv("GGML_CUDA_NEMO_MAMBA_Z_CONT_STATS");
++                        const char * parent = std::getenv("GGML_CUDA_NEMO_MAMBA_SWIGLU_NORM_Q8_STATS");
++                        return (value != nullptr && std::atoi(value) != 0) ||
++                               (parent != nullptr && std::atoi(parent) != 0);
++                    }();
++                    static std::atomic<uint64_t> n_fused{0};
++                    const uint64_t count = n_fused.fetch_add(1, std::memory_order_relaxed) + 1;
++                    if (print_stats && (count <= 23 || count % 23 == 0)) {
++                        GGML_LOG_INFO("%s: Nemotron Mamba direct-z SwiGLU+RMS+q8_1 fire=%" PRIu64
++                                      ", bytes=%zu, activation=%s, output=%s\n",
++                                      __func__, count, ggml_nbytes(direct_z), activation->name, mm_node->name);
++                    }
++                    ggml_cuda_op_nemo_mamba_swiglu_rms_norm_fused_quant(
++                        *cuda_ctx, glu_node, cgraph->nodes[i + 3], mul_node, q8_1_dst, direct_z);
++                    return 4;
++                }
++            }
++        }
++    }
+     if (!disable_nemo_mamba_swiglu_norm_q8 && !disable_rms_norm_q8 && !q8_1_cache_disabled &&
+             ggml_cuda_nemo_mamba_swiglu_norm_q8_ok(cuda_ctx, cgraph, i)) {
+         ggml_tensor * mul_node = cgraph->nodes[i + 3];
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index ee56a0f18..68530525f 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -1009,8 +1009,9 @@ void ggml_cuda_op_rms_norm_fused_quant(ggml_backend_cuda_context & ctx,
+ 
+ void ggml_cuda_op_nemo_mamba_swiglu_rms_norm_fused_quant(
+         ggml_backend_cuda_context & ctx, ggml_tensor * glu, ggml_tensor * rms_norm,
+-        ggml_tensor * mul_tensor, char * q8_1_dst) {
+-    const ggml_tensor * x = glu->src[0];
++        ggml_tensor * mul_tensor, char * q8_1_dst,
++        const ggml_tensor * swiglu_x_override) {
++    const ggml_tensor * x = swiglu_x_override != nullptr ? swiglu_x_override : glu->src[0];
+     const ggml_tensor * g = glu->src[1];
+     const ggml_tensor * mul_src = mul_tensor->src[0] == rms_norm ?
+         mul_tensor->src[1] : mul_tensor->src[0];
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+index f2c1db6f5..de4edb05d 100644
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -28,7 +28,8 @@ void ggml_cuda_op_rms_norm_fused_pre_add(ggml_backend_cuda_context & ctx,
+ // Exact decode-shaped Nemotron Mamba SwiGLU + grouped RMS norm + scale + q8_1.
+ void ggml_cuda_op_nemo_mamba_swiglu_rms_norm_fused_quant(
+         ggml_backend_cuda_context & ctx, ggml_tensor * glu, ggml_tensor * rms_norm,
+-        ggml_tensor * mul_tensor, char * q8_1_dst);
++        ggml_tensor * mul_tensor, char * q8_1_dst,
++        const ggml_tensor * swiglu_x_override = nullptr);
+ 
+ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+                                      ggml_tensor *               dst,
+-- 
+2.49.0.windows.1
+
+

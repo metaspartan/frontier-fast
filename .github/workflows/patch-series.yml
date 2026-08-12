@@ -46,10 +46,10 @@ jobs:
           done
           exit $status
 
-      - name: Clone the pinned llama.cpp tree
+      - name: Clone the llama.cpp source caches
         run: |
-          git clone --filter=blob:none https://github.com/ggml-org/llama.cpp.git /tmp/llama
-          git -C /tmp/llama checkout 2b63e0610bbc2be990ae1360d5256efcdc3f9efb
+          git clone --filter=blob:none --no-checkout https://github.com/ggml-org/llama.cpp.git /tmp/llama-upstream
+          git clone --filter=blob:none --no-checkout https://github.com/deepgrove-ai/llama.cpp.git /tmp/llama-maple
 
       # Only the GGUF tracks patch llama.cpp. The MLX track also keeps its
       # series under Sources/patches/, but those apply to the installed
@@ -67,8 +67,27 @@ jobs:
             series=$(ls "$dir"*.patch 2>/dev/null | sort) || continue
             [ -z "$series" ] && continue
             echo "::group::$dir"
-            rm -rf /tmp/tree && cp -r /tmp/llama /tmp/tree
-            git -C /tmp/tree checkout -q .
+            case "$id" in
+              nemotron-3.5-lightning-gguf-*)
+                base=/tmp/llama-upstream
+                pin=0b1bad14ff204627636aeb1de22ddcd5acb859d4
+                ;;
+              maple-preview-gguf-*)
+                base=/tmp/llama-maple
+                pin=8ce8ca6c6d370b6235dfa8e2a0611a9adb6d77d1
+                ;;
+              *)
+                base=/tmp/llama-upstream
+                pin=2b63e0610bbc2be990ae1360d5256efcdc3f9efb
+                ;;
+            esac
+            rm -rf /tmp/tree && cp -r "$base" /tmp/tree
+            if ! git -C /tmp/tree checkout -q "$pin"; then
+              echo "FAIL $id could not check out pinned engine $pin"
+              status=1
+              echo "::endgroup::"
+              continue
+            fi
             for p in $series; do
               if git -C /tmp/tree apply --index "$GITHUB_WORKSPACE/$p" 2>/dev/null; then
                 echo "  ok   $(basename $p)"
