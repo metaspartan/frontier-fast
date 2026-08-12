@@ -1,0 +1,102 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Codex Scratch <noreply@openai.com>
+Date: Wed, 12 Aug 2026 04:57:20 -0600
+Subject: [PATCH] server: adapt prompt-cache admission to observed hits
+
+---
+ tools/server/server-context.cpp |  6 +++++-
+ tools/server/server-task.cpp    |  3 +++
+ tools/server/server-task.h      | 47 +++++++++++++++++++++++++++++++++
+ 3 files changed, 55 insertions(+), 1 deletion(-)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index dc730121e..cff44562d 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -1717,7 +1717,11 @@ private:
+ 
+                 const int64_t t_start = ggml_time_us();
+ 
+-                ret->prompt_save(*prompt_cache);
++                // [gainz] adaptive admission: skip the state copy while this cache
++                // is not producing hits.  The load below is unaffected.
++                if (prompt_cache->admit()) {
++                    ret->prompt_save(*prompt_cache);
++                }
+ 
+                 if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                     ret->prompt_clear();
+diff --git a/tools/server/server-task.cpp b/tools/server/server-task.cpp
+index 1ee677553..187bbb3ee 100644
+--- a/tools/server/server-task.cpp
++++ b/tools/server/server-task.cpp
+@@ -1815,6 +1815,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
+         prompt = std::move(it_best->prompt);
+ 
+         states.erase(it_best);
++
++        // [gainz] this cache just paid for itself -- see admit()
++        last_hit = true;
+     }
+ 
+     return true;
+diff --git a/tools/server/server-task.h b/tools/server/server-task.h
+index 6275ec760..4e0c0bafd 100644
+--- a/tools/server/server-task.h
++++ b/tools/server/server-task.h
+@@ -655,6 +655,53 @@ struct server_prompt_cache {
+ 
+     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
+ 
++    // [gainz] adaptive admission.
++    //
++    // Filling this cache costs a full llama_state_seq_get_data_ext of the slot's
++    // sequence state on every slot reuse -- tens to hundreds of MiB per request
++    // on a large-context model, all of it first-touch host memory.  It only pays
++    // for itself if a later request finds a cached entry that shares enough of a
++    // prefix (`load()` picking an `it_best`).  On traffic where prompts do not
++    // overlap the hit rate is exactly zero and the fill cost is pure loss.
++    //
++    // A cache with a zero hit rate should stop paying to fill itself: `admit()`
++    // suspends the store after a run of misses, any hit restores it in full, and
++    // a probe entry is admitted periodically so a workload that starts sharing
++    // prefixes recovers on its own.  The LOAD path is untouched -- entries
++    // already held stay searchable, and a slot's own prompt continuity does not
++    // go through this cache at all.
++    bool adaptive = [] {
++        const char * e = getenv("LLAMA_ADAPTIVE_PROMPT_CACHE");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    int  credit    = 2;
++    int  idle      = 0;
++    bool last_hit  = false;
++
++    static const int CREDIT_MAX  = 4;
++    static const int PROBE_EVERY = 64;
++
++    bool admit() {
++        if (!adaptive) {
++            return true;
++        }
++
++        if (last_hit) {
++            credit   = CREDIT_MAX;
++            idle     = 0;
++            last_hit = false;
++        } else if (credit > 0) {
++            credit--;
++        }
++
++        if (credit == 0 && ++idle >= PROBE_EVERY) {
++            credit = 1;
++            idle   = 0;
++        }
++
++        return credit > 0;
++    }
++
+     bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+ 
+     void update();
+-- 
+2.49.0.windows.1
