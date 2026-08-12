@@ -319,6 +319,12 @@ marks a run worth reading rather than a submission to reject.
 
 Two further things to plan around, both documented in full in the README:
 
+- **Check long context locally with `--mode ppl-long`.** `tools/mlx_bench.py`
+  now walks one full long context through a shared KV cache and scores it in
+  segments, which is how the MLX runner gates the 16k and 32k windows:
+  `python tools/mlx_bench.py --model <m> --corpus <text> --mode ppl-long --window 32768`.
+  The segmenting matters — evaluating a 32k window in one pass asks for roughly
+  20 GB of float32 logits over a ~150k vocab, which will not fit on a 16 GB Mac.
 - **The corpus in this repo is not the corpus that gates you.**
   `fixtures/gainz-corpus.txt` is for local iteration. The ranked gate reads a
   private, rotating corpus held only on the runners, and each verified record

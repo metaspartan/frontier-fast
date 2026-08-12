@@ -30,9 +30,10 @@ genuine independent measurement rather than something derived from TTFT —
 deriving it from TTFT would make prefillSpeedup identical to ttftSpeedup and
 spend 0.35 of the score on one number.
 
-Two modes:
-  bench  -> {decodeTokensPerSecond, prefillTokensPerSecond, ttftSeconds, text}
-  ppl    -> {perplexity}
+Three modes:
+  bench    -> {decodeTokensPerSecond, prefillTokensPerSecond, ttftSeconds, text}
+  ppl      -> {perplexity}                  short gate, independent 512-tok windows
+  ppl-long -> {perplexity, window, tokens}  one full long context, segmented
 """
 import argparse
 import json
@@ -43,6 +44,7 @@ import time
 import mlx.core as mx
 import mlx.nn as nn
 from mlx_lm import load, stream_generate
+from mlx_lm.models.cache import make_prompt_cache
 
 
 def corpus_text(path):
@@ -149,11 +151,56 @@ def perplexity(model, tok, corpus, window=512, chunks=8):
     return {"perplexity": math.exp(total_nll / total_tokens), "tokens": total_tokens}
 
 
+
+def perplexity_long(model, tok, corpus, window, segment=512):
+    """Teacher-forced perplexity across ONE context of `window` tokens.
+
+    The short gate above scores eight independent 512-token windows, so no
+    token it ever evaluates sits more than 512 positions from the start of a
+    fresh cache. That cannot see the class of defect the long-context columns
+    are ranked on — KV indexing, RoPE scaling, sliding-window and attention-sink
+    bugs all live at depth. This walks a single long context instead, so the
+    last token attends over the full 32k of cache the board publishes numbers
+    for.
+
+    Evaluated in segments through one shared cache. The model still sees the
+    whole growing context, but the logits tensor stays [1, segment, vocab]
+    rather than [1, window, vocab], and on this box that is the difference
+    between running and dying: at 32k over a ~150k vocab the single-shot form
+    would ask for roughly 20 GB of float32 logits on a 16 GB machine.
+    """
+    ids = tok.encode(corpus)
+    need = window + 1
+    if len(ids) < need:
+        raise SystemExit(f"corpus too short for a {window}-token window: need {need} tokens, have {len(ids)}")
+    ids = ids[:need]
+    cache = make_prompt_cache(model)
+    total_nll, total_tokens = 0.0, 0
+    for start in range(0, window, segment):
+        end = min(start + segment, window)
+        inputs = mx.array(ids[start:end])[None]
+        targets = mx.array(ids[start + 1:end + 1])[None]
+        logits = model(inputs, cache=cache).astype(mx.float32)
+        nll = nn.losses.cross_entropy(logits, targets, reduction="sum")
+        mx.eval(nll)
+        total_nll += float(nll.item())
+        total_tokens += targets.size
+        # Release the segment's logits before allocating the next one; without
+        # this the peak is the sum over segments rather than one segment.
+        del logits, nll
+        mx.clear_cache()
+    if not total_tokens:
+        raise SystemExit("corpus too short for a perplexity window")
+    return {"perplexity": math.exp(total_nll / total_tokens), "tokens": total_tokens, "window": window}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--model", required=True, help="local path or HF repo id")
     ap.add_argument("--corpus", required=True)
-    ap.add_argument("--mode", choices=["bench", "ppl"], default="bench")
+    ap.add_argument("--mode", choices=["bench", "ppl", "ppl-long"], default="bench")
+    ap.add_argument("--window", type=int, default=32768, help="context length for ppl-long")
+    ap.add_argument("--segment", type=int, default=512, help="tokens scored per forward pass in ppl-long; bounds peak logits memory")
     ap.add_argument("--prompt-tokens", type=int, default=512)
     ap.add_argument("--decode-tokens", type=int, default=128)
     ap.add_argument("--runs", type=int, default=5)
@@ -165,6 +212,10 @@ def main():
 
     if args.mode == "ppl":
         print(json.dumps(perplexity(model, tok, text)))
+        return
+
+    if args.mode == "ppl-long":
+        print(json.dumps(perplexity_long(model, tok, text, args.window, args.segment)))
         return
 
     warm = tok.encode(text)[:args.prompt_tokens]
