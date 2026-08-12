@@ -1,0 +1,156 @@
+.: C:\Users\Carsen\Documents\PowerShell\Microsoft.PowerShell_profile.ps1:1
+Line |
+   1 |  . "C:\Users\Carsen\.codex\codex-model-toggle.ps1"
+     |    ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+     | The term 'C:\Users\Carsen\.codex\codex-model-toggle.ps1' is not recognized as a name of a cmdlet, function,
+     | script file, or executable program. Check the spelling of the name, or if a path was included, verify that the
+     | path is correct and try again.
+From d77ac67787e9762ddd3b4f25f1556a3acdd223fb Mon Sep 17 00:00:00 2001
+From: Carsen <carsenk@gmail.com>
+Date: Wed, 12 Aug 2026 02:59:07 -0600
+Subject: [PATCH] llama: view identity-mapped Mamba conv state
+
+---
+ src/llama-graph.cpp            | 23 +++++++++++++++++++----
+ src/llama-graph.h              |  6 ++++--
+ src/llama-memory-recurrent.cpp | 16 ++++++++++++++++
+ src/llama-memory-recurrent.h   |  4 ++++
+ src/models/mamba-base.cpp      |  3 ++-
+ 5 files changed, 45 insertions(+), 7 deletions(-)
+
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index 55d858024..9bc33c592 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -3351,7 +3351,8 @@ ggml_tensor * llm_graph_context::build_rs(
+            uint32_t   rs_head,
+            uint32_t   rs_size,
+             int32_t   rs_zero,
+-        const llm_graph_get_rows_fn & get_state_rows) const {
++        const llm_graph_get_rows_fn & get_state_rows,
++              bool   state_is_identity) const {
+ 
+     GGML_UNUSED(rs_size);
+     ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
+@@ -3364,7 +3365,12 @@ ggml_tensor * llm_graph_context::build_rs(
+     // copy states
+     // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
+     // {state_size, rs_size} -> {state_size, n_seqs}
+-    ggml_tensor * output_states = get_state_rows(ctx0, states, state_copy_main);
++    ggml_tensor * output_states;
++    if (state_is_identity) {
++        output_states = ggml_view_2d(ctx0, states, state_size, n_seqs, states->nb[1], rs_head*states->nb[1]);
++    } else {
++        output_states = get_state_rows(ctx0, states, state_copy_main);
++    }
+     ggml_build_forward_expand(gf, output_states);
+ 
+     // copy extra states which won't be changed further (between n_seqs and n_rs)
+@@ -3412,12 +3418,21 @@ ggml_tensor * llm_graph_context::build_rs(
+         ggml_tensor * s,
+             int32_t   state_size,
+             int32_t   n_seqs,
+-        const llm_graph_get_rows_fn & get_state_rows) const {
++        const llm_graph_get_rows_fn & get_state_rows,
++              bool   allow_state_view) const {
+     const auto * kv_state = inp->mctx;
+ 
++    // A graph may be reused across decode steps, so a view is safe only for
++    // the single fixed cache slot at offset zero. Also decline while a copied
++    // sequence or rollback snapshot would make s_copy() select another row.
++    static const bool disable_state_view = getenv("LLAMA_DISABLE_RS_STATE_VIEW") != nullptr;
++    const bool state_is_identity = allow_state_view && !disable_state_view &&
++        n_seqs == 1 && kv_state->get_head() == 0 && kv_state->get_n_rs() == 1 &&
++        kv_state->s_copy_main_is_identity(n_seqs);
++
+     return build_rs(s, inp->s_copy_main, inp->s_copy_extra, state_size, n_seqs,
+                     kv_state->get_n_rs(), kv_state->get_head(), kv_state->get_size(), kv_state->get_rs_z(),
+-                    get_state_rows);
++                    get_state_rows, state_is_identity);
+ }
+ 
+ ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 75bc0fe80..5db52ee9d 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1279,7 +1279,8 @@ struct llm_graph_context {
+                uint32_t   rs_head,
+                uint32_t   rs_size,
+                 int32_t   rs_zero,
+-            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
++            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows,
++                   bool   state_is_identity = false) const;
+ 
+     llm_graph_input_rs * build_rs_inp() const;
+ 
+@@ -1288,7 +1289,8 @@ struct llm_graph_context {
+             ggml_tensor * s,
+                 int32_t   state_size,
+                 int32_t   n_seqs,
+-            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows) const;
++            const llm_graph_get_rows_fn & get_state_rows = ggml_get_rows,
++                   bool   allow_state_view = false) const;
+ 
+     ggml_tensor * build_rwkv_token_shift_load(
+         llm_graph_input_rs * inp,
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index ef82eb976..348bfdafd 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -1243,6 +1243,22 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
+     return mem->s_l[il];
+ }
+ 
++bool llama_memory_recurrent_context::s_copy_main_is_identity(int32_t n_seqs) const {
++    for (int32_t i = 0; i < n_seqs; ++i) {
++        const uint32_t cell_idx = i + mem->head;
++        if (mem->cells[cell_idx].src0 != (int32_t) cell_idx) {
++            return false;
++        }
++        if (mem->n_rs_seq != 0 && !mem->cells[cell_idx].seq_id.empty()) {
++            const llama_seq_id seq = *mem->cells[cell_idx].seq_id.begin();
++            if (seq >= 0 && (size_t) seq < mem->rs_idx.size() && mem->rs_idx[seq] != 0) {
++                return false;
++            }
++        }
++    }
++    return true;
++}
++
+ int32_t llama_memory_recurrent_context::s_copy(int i) const {
+     const uint32_t cell_idx = i + mem->head;
+     const int32_t  src0     = mem->cells[cell_idx].src0;
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index b13b7b748..3558807fb 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -173,6 +173,10 @@ public:
+ 
+     int32_t s_copy(int i) const;
+ 
++    // Side-effect-free counterpart to s_copy() for deciding whether a graph
++    // can consume the current cache rows directly.
++    bool s_copy_main_is_identity(int32_t n_seqs) const;
++
+ private:
+     const llama_memory_status status;
+ 
+diff --git a/src/models/mamba-base.cpp b/src/models/mamba-base.cpp
+index fd3fe3f03..3f3b256fc 100644
+--- a/src/models/mamba-base.cpp
++++ b/src/models/mamba-base.cpp
+@@ -174,7 +174,8 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
+     ggml_tensor * conv_states_all = mctx_cur->get_r_l(il);
+     ggml_tensor * ssm_states_all  = mctx_cur->get_s_l(il);
+ 
+-    ggml_tensor * conv = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
++    ggml_tensor * conv = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs,
++                                  ggml_get_rows, /*allow_state_view=*/true);
+     conv               = ggml_reshape_3d(ctx0, conv, d_conv - 1, d_inner + 2 * n_group * d_state, n_seqs);
+ 
+     // {n_embd, n_tokens} => {n_embd, n_seq_tokens, n_seqs}
+-- 
+2.49.0.windows.1
+
+
