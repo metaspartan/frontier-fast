@@ -1,688 +1,20 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Carsen <carsenk@gmail.com>
-Date: Thu, 13 Aug 2026 10:30:00 -0600
+Date: Thu, 13 Aug 2026 11:00:00 -0600
 Subject: [PATCH 10/10] hip: group decode KV-cache set_rows stores into one launch
 
-A decode step stores the new K row and the new V row into the KV cache with
-two independent set_rows launches over disjoint tensors. Merging adjacent
-single-row F32->F16 set_rows stores into one launch removes dispatches
-without touching any value: each element keeps its source, its cast and its
-destination address. GGML_CUDA_DISABLE_SET_ROWS_GROUP=1 restores stock.
-
-Ported from laguna-xs-2.1-gguf-r9700-v1 0007.
-
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
-index 561ab7ac5..8b7bcd68d 100644
+index eb501d20b..2393a17c3 100644
 --- a/ggml/src/ggml-cuda/ggml-cuda.cu
 +++ b/ggml/src/ggml-cuda/ggml-cuda.cu
-@@ -88,6 +88,7 @@
- #include <cstdlib>
- #include <string>
- #include <vector>
-+#include <unordered_set>
- 
- static_assert(sizeof(half) == sizeof(ggml_fp16_t), "wrong fp16 size");
- 
-@@ -3078,6 +3079,28 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
-         return true;
-     }
- 
-+
-+    // LFM shortconv: ssm_conv then elementwise mul by the c-gate (no silu).
-+    if (ops.size() == 2 && ops.begin()[0] == GGML_OP_SSM_CONV && ops.begin()[1] == GGML_OP_MUL) {
-+        const ggml_tensor * ssm_conv = cgraph->nodes[node_idx];
-+        const ggml_tensor * mul      = cgraph->nodes[node_idx+1];
-+
-+        if (ssm_conv->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32) {
-+            return false;
-+        }
-+        if (!ggml_are_same_shape(ssm_conv, mul)) {
-+            return false;
-+        }
-+        if (mul->src[0] != ssm_conv && mul->src[1] != ssm_conv) {
-+            return false;
-+        }
-+        const ggml_tensor * gate = (mul->src[0] == ssm_conv) ? mul->src[1] : mul->src[0];
-+        if (gate->type != GGML_TYPE_F32 || !ggml_are_same_shape(gate, mul)) {
-+            return false;
-+        }
-+        return true;
-+    }
-+
-     if (ops.size() == 2 && ops.begin()[0] == GGML_OP_UNARY && ops.begin()[1] == GGML_OP_MUL
-      && unary_ops.size() == 1 && (unary_ops.begin()[0] == GGML_UNARY_OP_SILU || unary_ops.begin()[0] == GGML_UNARY_OP_SIGMOID || unary_ops.begin()[0] == GGML_UNARY_OP_SOFTPLUS)) {
-         const ggml_tensor * unary = cgraph->nodes[node_idx];
-@@ -3154,6 +3177,664 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
-     return false;
+@@ -3794,6 +3794,39 @@ static bool ggml_cuda_norm_quant_plain_ok(const ggml_cgraph * cgraph, const int
+     return true;
  }
  
-+// ----- grouped mmvq (QKV-class) launch detection --------------------------------
-+//
-+// During decode, attention computes several quantized matvecs over the SAME
-+// activation vector (the Q/K/V projections, and gate projections in
-+// gated-attention models). After q8_1 dedupe each is still its own kernel
-+// launch. On launch-bound configurations merging them into one launch removes
-+// dispatch overhead without touching arithmetic: the grouped kernel gives every
-+// row exactly the thread geometry, k-loop and reduction sequence it has in the
-+// individual launch (see mul_mat_vec_q_grouped in mmvq.cu), so the outputs are
-+// byte-identical by construction.
-+//
-+// Group members are usually NOT adjacent in the graph (Q's norm/rope chain sits
-+// between the Q and K matvecs), so later members are hoisted to the position of
-+// the first. That is legal only when
-+//   (a) every input of a hoisted member is already fully written at the hoist
-+//       point - true here: the shared src1 is produced before the first member
-+//       and the weights are immutable - and
-+//   (b) the hoisted write cannot touch memory any skipped-over node still reads
-+//       or writes. Graph-allocator blocks are reused across disjoint lifetimes,
-+//       so this is checked against actual data ranges below.
-+
-+static bool ggml_cuda_mmvq_can_group(const ggml_tensor * node) {
-+    if (node->op != GGML_OP_MUL_MAT) {
-+        return false;
-+    }
-+    const ggml_tensor * src0 = node->src[0];
-+    const ggml_tensor * src1 = node->src[1];
-+    if (src0 == nullptr || src1 == nullptr || node->src[2] != nullptr) {
-+        return false;
-+    }
-+    if ((node->flags & GGML_TENSOR_FLAG_COMPUTE) == 0) {
-+        return false;
-+    }
-+    // must be exactly the ggml_cuda_mul_mat_vec_q route of ggml_cuda_mul_mat:
-+    // not FWHT, not the compute-buffer padding-clear case, quantized src0
-+    // (which statically rejects the earlier mmvf/mmf routes), single dense
-+    // column, and accepted by the mmvq batch-size gate.
-+    if (ggml_get_op_params_i32(node, 1) == GGML_HINT_SRC0_IS_HADAMARD) {
-+        return false;
-+    }
-+    if (!ggml_is_quantized(src0->type)) {
-+        return false;
-+    }
-+    if (src1->type != GGML_TYPE_F32 || node->type != GGML_TYPE_F32) {
-+        return false;
-+    }
-+    if (src0->ne[2] != 1 || src0->ne[3] != 1) {
-+        return false;
-+    }
-+    if (src1->ne[1] != 1 || src1->ne[2] != 1 || src1->ne[3] != 1) {
-+        return false;
-+    }
-+    if (node->ne[1] != 1 || node->ne[2] != 1 || node->ne[3] != 1) {
-+        return false;
-+    }
-+    if (!ggml_is_contiguous(src0) || !ggml_is_contiguous(src1) || !ggml_is_contiguous(node)) {
-+        return false;
-+    }
-+    if (src0->buffer == nullptr ||
-+            ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE) {
-+        return false;
-+    }
-+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-+    if (!ggml_cuda_should_use_mmvq(src0->type, cc, 1)) {
-+        return false;
-+    }
-+    return true;
-+}
-+
-+static bool ggml_cuda_mmvq_ranges_disjoint(const ggml_tensor * a, const ggml_tensor * b) {
-+    const int64_t a0 = (int64_t) a->data;
-+    const int64_t a1 = a0 + (int64_t) ggml_nbytes(a);
-+    const int64_t b0 = (int64_t) b->data;
-+    const int64_t b1 = b0 + (int64_t) ggml_nbytes(b);
-+    return a1 <= b0 || b1 <= a0;
-+}
-+
-+static bool ggml_cuda_mmvq_hoist_legal(const ggml_cgraph * cgraph, const int start, const int j) {
-+    const ggml_tensor * cand = cgraph->nodes[j];
-+    for (int k = start + 1; k < j; ++k) {
-+        const ggml_tensor * mid = cgraph->nodes[k];
-+        if (ggml_cuda_is_view_or_noop(mid)) {
-+            continue;
-+        }
-+        // hoisted write vs. everything the intermediate reads
-+        for (int si = 0; si < GGML_MAX_SRC; ++si) {
-+            if (mid->src[si] != nullptr && !ggml_cuda_mmvq_ranges_disjoint(cand, mid->src[si])) {
-+                return false;
-+            }
-+        }
-+        // hoisted write vs. the intermediate's own write
-+        if (!ggml_cuda_mmvq_ranges_disjoint(cand, mid)) {
-+            return false;
-+        }
-+        // the intermediate's write vs. the hoisted member's inputs
-+        if (!ggml_cuda_mmvq_ranges_disjoint(mid, cand->src[0]) ||
-+                !ggml_cuda_mmvq_ranges_disjoint(mid, cand->src[1])) {
-+            return false;
-+        }
-+    }
-+    return true;
-+}
-+
-+// A candidate must not be pulled out of a mul_mat+glu fusion that stock would
-+// actually perform. That decision is exactly ggml_cuda_can_fuse on the GLU
-+// patterns - INCLUDING its allocation-dependent memory-range check, which in
-+// practice blocks the fusion for most shared-expert gate/up pairs (their glu
-+// output tends to reuse the activation's block). Ranges-blocked pairs run as
-+// two plain matvec launches in stock, and grouping those changes no arithmetic.
-+// Anything whose result reaches a GLU through a shape not tested here (e.g.
-+// the scale/bias fusion variants) is rejected conservatively.
-+static bool ggml_cuda_mmvq_would_glu_fuse(const ggml_cgraph * cgraph, const int j) {
-+    const auto fires = [&](const int p, std::initializer_list<enum ggml_op> ops) {
-+        return p >= 0 && ggml_cuda_can_fuse(cgraph, p, ops, {});
-+    };
-+    // as the first (gate) or second (up) matvec of the 3-node pattern
-+    if (fires(j,     { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU })) return true;
-+    if (fires(j - 1, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU })) return true;
-+    // bias variants
-+    if (fires(j,     { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_GLU })) return true;
-+    if (fires(j - 2, { GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_MUL_MAT, GGML_OP_ADD, GGML_OP_GLU })) return true;
-+
-+    const ggml_tensor * cand = cgraph->nodes[j];
-+    const int end = std::min(cgraph->n_nodes, j + 6);
-+    for (int k = j + 1; k < end; ++k) {
-+        const ggml_tensor * n = cgraph->nodes[k];
-+        if (n->op != GGML_OP_GLU) {
-+            continue;
-+        }
-+        for (int si = 0; si < GGML_MAX_SRC; ++si) {
-+            const ggml_tensor * src = n->src[si];
-+            if (src == nullptr) {
-+                continue;
-+            }
-+            const bool direct = src == cand;
-+            const bool via_add = src->op == GGML_OP_ADD && (src->src[0] == cand || src->src[1] == cand);
-+            if (direct || via_add) {
-+                // reaches a GLU outside the exact patterns above: check whether the
-+                // simple pattern is present but merely range-blocked (stock runs it
-+                // unfused, safe to group); otherwise reject conservatively
-+                const bool blocked_pair =
-+                    (ggml_can_fuse_subgraph(cgraph, j, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, { j + 2 }) &&
-+                     ggml_cuda_should_fuse_mul_mat(cgraph->nodes[j + 1], cgraph->nodes[j], cgraph->nodes[j + 2])) ||
-+                    (j >= 1 &&
-+                     ggml_can_fuse_subgraph(cgraph, j - 1, { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU }, { j + 1 }) &&
-+                     ggml_cuda_should_fuse_mul_mat(cgraph->nodes[j], cgraph->nodes[j - 1], cgraph->nodes[j + 1]));
-+                if (!blocked_pair) {
-+                    return true;
-+                }
-+            }
-+        }
-+    }
-+    return false;
-+}
-+
-+static int ggml_cuda_mmvq_collect_group(const ggml_cgraph * cgraph, const int start, ggml_tensor ** members) {
-+    ggml_tensor * first = cgraph->nodes[start];
-+    const ggml_tensor * src1 = first->src[1];
-+    members[0] = first;
-+    int n = 1;
-+
-+    constexpr int scan_window = 40;
-+    const int end = std::min(cgraph->n_nodes, start + 1 + scan_window);
-+
-+    for (int j = start + 1; j < end && n < MMVQ_MAX_GROUP_SIZE; ++j) {
-+        ggml_tensor * cand = cgraph->nodes[j];
-+        if (ggml_cuda_is_view_or_noop(cand)) {
-+            continue;
-+        }
-+        if (cand->op == GGML_OP_MUL_MAT && cand->src[1] == src1 &&
-+                cand->src[0]->type  == first->src[0]->type  &&
-+                cand->src[0]->ne[0] == first->src[0]->ne[0] &&
-+                cand->src[0]->nb[1] == first->src[0]->nb[1] &&
-+                ggml_cuda_mmvq_can_group(cand) &&
-+                !ggml_cuda_mmvq_would_glu_fuse(cgraph, j) &&
-+                ggml_cuda_mmvq_hoist_legal(cgraph, start, j)) {
-+            members[n++] = cand;
-+        }
-+    }
-+    return n;
-+}
-+
-+
-+
-+// ----- grouped rms_norm (QK-norm class) launch detection ----------------------
-+//
-+// A decoder layer normalises Q and K with two independent rms_norm+mul pairs of
-+// the same ncols/eps over disjoint tensors. Merging them into one launch removes
-+// a dispatch without touching arithmetic: the grouped kernel gives every row
-+// exactly the thread geometry, reduction and output expression it has in the
-+// individual launch (see rms_norm_f32_grouped in norm.cu), so the outputs are
-+// byte-identical by construction.
-+//
-+// The two pairs are separated by the ops that consume the first one (Q's rope),
-+// so later members are hoisted to the position of the first. As for the grouped
-+// mmvq launch that is legal only when the hoisted writes cannot touch memory any
-+// skipped-over node still reads or writes, and the hoisted inputs cannot be
-+// written in between; graph-allocator blocks are reused across disjoint
-+// lifetimes, so this is checked against actual data ranges.
-+
-+static bool ggml_cuda_rms_norm_pair_groupable(const ggml_cgraph * cgraph, const int i) {
-+    if (i + 1 >= cgraph->n_nodes) {
-+        return false;
-+    }
-+    // stock must run exactly the rms_norm+mul fused path here: the +add variant
-+    // is checked first in ggml_cuda_try_fuse and is left alone
-+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
-+        return false;
-+    }
-+    if (!ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-+        return false;
-+    }
-+
-+    const ggml_tensor * norm = cgraph->nodes[i];
-+    const ggml_tensor * mul  = cgraph->nodes[i + 1];
-+    const ggml_tensor * src0 = norm->src[0];
-+
-+    const ggml_tensor * mul_src = nullptr;
-+    if (mul->src[0] == norm) {
-+        mul_src = mul->src[1];
-+    } else if (mul->src[1] == norm) {
-+        mul_src = mul->src[0];
-+    } else {
-+        return false;
-+    }
-+
-+    if (src0 == nullptr || mul_src == nullptr) {
-+        return false;
-+    }
-+    if (src0->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 ||
-+            mul->type != GGML_TYPE_F32 || mul_src->type != GGML_TYPE_F32) {
-+        return false;
-+    }
-+    // 2D only: the grouped kernel constant-folds the channel/sample offsets
-+    if (src0->ne[2] != 1 || src0->ne[3] != 1 || mul_src->ne[2] != 1 || mul_src->ne[3] != 1) {
-+        return false;
-+    }
-+    if (norm->ne[2] != 1 || norm->ne[3] != 1 || mul->ne[2] != 1 || mul->ne[3] != 1) {
-+        return false;
-+    }
-+    if (src0->nb[0] != ggml_type_size(src0->type) || mul_src->nb[0] != ggml_type_size(mul_src->type)) {
-+        return false;
-+    }
-+    // dst is written as dst[row*ncols + col]
-+    if (!ggml_is_contiguous(mul) || mul->ne[0] != src0->ne[0] || mul->ne[1] != src0->ne[1]) {
-+        return false;
-+    }
-+    float eps = 0.0f;
-+    memcpy(&eps, norm->op_params, sizeof(float));
-+    if (!(eps >= 0.0f)) {
-+        return false;
-+    }
-+    return true;
-+}
-+
-+static bool ggml_cuda_rms_norm_hoist_legal(const ggml_cgraph * cgraph, const int start, const int j,
-+                                           const std::unordered_set<const ggml_tensor *> & done,
-+                                           const std::unordered_set<const ggml_tensor *> & done2) {
-+    const ggml_tensor * norm = cgraph->nodes[j];
-+    const ggml_tensor * mul  = cgraph->nodes[j + 1];
-+    const ggml_tensor * in0  = norm->src[0];
-+    const ggml_tensor * in1  = (mul->src[0] == norm) ? mul->src[1] : mul->src[0];
-+
-+    for (int k = start + 2; k < j; ++k) {
-+        const ggml_tensor * mid = cgraph->nodes[k];
-+        // Nodes already issued earlier in this pass (e.g. the K/V matvecs that a
-+        // grouped mmvq launch hoisted) have finished before this launch point, so
-+        // neither their reads nor their writes can race the hoisted write.
-+        if (ggml_cuda_is_view_or_noop(mid) || done.count(mid) != 0 || done2.count(mid) != 0) {
-+            continue;
-+        }
-+        // hoisted write vs. everything the intermediate reads / writes
-+        for (int si = 0; si < GGML_MAX_SRC; ++si) {
-+            if (mid->src[si] != nullptr && !ggml_cuda_mmvq_ranges_disjoint(mul, mid->src[si])) {
-+                return false;
-+            }
-+        }
-+        if (!ggml_cuda_mmvq_ranges_disjoint(mul, mid)) {
-+            return false;
-+        }
-+        // the intermediate's write vs. the hoisted members' inputs
-+        if (!ggml_cuda_mmvq_ranges_disjoint(mid, in0) || !ggml_cuda_mmvq_ranges_disjoint(mid, in1)) {
-+            return false;
-+        }
-+        // the hoisted rms_norm intermediate is never materialised, but a
-+        // skipped-over node must not depend on the pair's result either
-+        for (int si = 0; si < GGML_MAX_SRC; ++si) {
-+            if (mid->src[si] == norm || mid->src[si] == mul) {
-+                return false;
-+            }
-+        }
-+    }
-+    return true;
-+}
-+
-+static int ggml_cuda_rms_norm_collect_group(const ggml_cgraph * cgraph, const int start,
-+                                            ggml_tensor ** norms, ggml_tensor ** muls,
-+                                            const std::unordered_set<const ggml_tensor *> & done,
-+                                            const std::unordered_set<const ggml_tensor *> & done2) {
-+    ggml_tensor * first      = cgraph->nodes[start];
-+    const int64_t ncols      = first->src[0]->ne[0];
-+    float         eps_first  = 0.0f;
-+    memcpy(&eps_first, first->op_params, sizeof(float));
-+
-+    norms[0] = first;
-+    muls[0]  = cgraph->nodes[start + 1];
-+    int n    = 1;
-+
-+    constexpr int scan_window = 12;
-+    const int end = std::min(cgraph->n_nodes - 1, start + 2 + scan_window);
-+
-+    for (int j = start + 2; j < end && n < RMS_NORM_MAX_GROUP_SIZE; ++j) {
-+        ggml_tensor * cand = cgraph->nodes[j];
-+        if (ggml_cuda_is_view_or_noop(cand) || done.count(cand) != 0 || done2.count(cand) != 0) {
-+            continue;
-+        }
-+        if (cand->op != GGML_OP_RMS_NORM) {
-+            continue;
-+        }
-+        if (cand->src[0]->ne[0] != ncols) {
-+            continue;
-+        }
-+        float eps_cand = 0.0f;
-+        memcpy(&eps_cand, cand->op_params, sizeof(float));
-+        if (eps_cand != eps_first) {
-+            continue;
-+        }
-+        if (!ggml_cuda_rms_norm_pair_groupable(cgraph, j)) {
-+            continue;
-+        }
-+        if (!ggml_cuda_rms_norm_hoist_legal(cgraph, start, j, done, done2)) {
-+            continue;
-+        }
-+        // members must write disjoint destinations
-+        bool overlap = false;
-+        for (int m = 0; m < n; ++m) {
-+            if (!ggml_cuda_mmvq_ranges_disjoint(muls[m], cgraph->nodes[j + 1])) {
-+                overlap = true;
-+                break;
-+            }
-+        }
-+        if (overlap) {
-+            continue;
-+        }
-+        norms[n] = cand;
-+        muls[n]  = cgraph->nodes[j + 1];
-+        ++n;
-+    }
-+    return n;
-+}
-+
-+
-+// ----- add chain folded into the following rms_norm+mul ----------------------
-+//
-+// The residual add that feeds a pre-norm is a separate dispatch in stock even
-+// though the rms_norm block already covers the whole row. This detects
-+//   [ADD (chain)] -> RMS_NORM -> MUL
-+// and runs it as one kernel. The add chain is exactly the one the upstream
-+// multi-(add|mul) fusion would build - same operands, same order, same single
-+// destination - so the stored result is unchanged, and the norm then consumes
-+// the same float values it would have read back from that store.
-+
-+static int ggml_cuda_rms_norm_pre_add_chain_len(const ggml_cgraph * cgraph, const int i) {
-+    // mirrors the multi-add fusion loop in ggml_cuda_try_fuse
-+    int     n_fuse = 0;
-+    ggml_op ops[8];
-+    std::fill(ops, ops + 8, GGML_OP_ADD);
-+
-+    for (; n_fuse <= 6; ++n_fuse) {
-+        if (!ggml_can_fuse(cgraph, i + n_fuse, ops + n_fuse, 2)) {
-+            break;
-+        }
-+        if (cgraph->nodes[i + n_fuse] != cgraph->nodes[i + n_fuse + 1]->src[0]) {
-+            break;
-+        }
-+        if (!ggml_are_same_layout(cgraph->nodes[i + n_fuse]->src[1], cgraph->nodes[i + n_fuse + 1]->src[1])) {
-+            break;
-+        }
-+    }
-+    return n_fuse + 1;
-+}
-+
-+static bool ggml_cuda_rms_norm_pre_add_operand_ok(const ggml_tensor * t, const ggml_tensor * ref) {
-+    return t != nullptr && t->type == GGML_TYPE_F32 && ggml_are_same_shape(t, ref) &&
-+           ggml_is_contiguous(t) && t->nb[0] == ggml_type_size(t->type);
-+}
-+
-+// returns the number of chained ADD nodes to fold, or 0
-+static int ggml_cuda_rms_norm_pre_add_detect(const ggml_cgraph * cgraph, const int i) {
-+    if (cgraph->nodes[i]->op != GGML_OP_ADD) {
-+        return 0;
-+    }
-+
-+    const int n_adds = ggml_cuda_rms_norm_pre_add_chain_len(cgraph, i);
-+    const int inorm  = i + n_adds;
-+    if (inorm + 1 >= cgraph->n_nodes) {
-+        return 0;
-+    }
-+    if (n_adds < 1 || n_adds > RMS_NORM_ADD_MAX_OPERANDS - 1) {
-+        return 0;
-+    }
-+
-+    ggml_tensor * add_last = cgraph->nodes[inorm - 1];
-+    ggml_tensor * norm     = cgraph->nodes[inorm];
-+    ggml_tensor * mul      = cgraph->nodes[inorm + 1];
-+
-+    if (norm->op != GGML_OP_RMS_NORM || norm->src[0] != add_last) {
-+        return 0;
-+    }
-+    // the norm+mul pair must be exactly what stock would fuse, and the +add
-+    // variant is left alone
-+    if (ggml_cuda_can_fuse(cgraph, inorm, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
-+        return 0;
-+    }
-+    if (!ggml_cuda_can_fuse(cgraph, inorm, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-+        return 0;
-+    }
-+
-+    const ggml_tensor * mul_src = nullptr;
-+    if (mul->src[0] == norm) {
-+        mul_src = mul->src[1];
-+    } else if (mul->src[1] == norm) {
-+        mul_src = mul->src[0];
-+    } else {
-+        return 0;
-+    }
-+    if (mul_src == nullptr || mul_src->type != GGML_TYPE_F32 ||
-+            mul_src->nb[0] != ggml_type_size(mul_src->type)) {
-+        return 0;
-+    }
-+    if (mul_src->ne[2] != 1 || mul_src->ne[3] != 1) {
-+        return 0;
-+    }
-+
-+    // 2D, non-broadcast add operands only
-+    if (add_last->type != GGML_TYPE_F32 || add_last->ne[2] != 1 || add_last->ne[3] != 1) {
-+        return 0;
-+    }
-+    if (!ggml_is_contiguous(add_last) || add_last->nb[0] != ggml_type_size(add_last->type)) {
-+        return 0;
-+    }
-+    if (!ggml_cuda_rms_norm_pre_add_operand_ok(cgraph->nodes[i]->src[0], add_last)) {
-+        return 0;
-+    }
-+    for (int k = 0; k < n_adds; ++k) {
-+        const ggml_tensor * a = cgraph->nodes[i + k];
-+        if (a->op != GGML_OP_ADD || !ggml_are_same_shape(a, add_last)) {
-+            return 0;
-+        }
-+        if (!ggml_cuda_rms_norm_pre_add_operand_ok(a->src[1], add_last)) {
-+            return 0;
-+        }
-+    }
-+    // the norm output must not alias the stored add result: the kernel reads the
-+    // add result back after writing it
-+    if (!ggml_cuda_mmvq_ranges_disjoint(mul, add_last)) {
-+        return 0;
-+    }
-+    if (!ggml_is_contiguous(mul) || !ggml_are_same_shape(mul, add_last)) {
-+        return 0;
-+    }
-+    // and the intermediate norm result is never materialised, so nothing else
-+    // may read it (guaranteed by ggml_cuda_can_fuse's single-use check)
-+    return n_adds;
-+}
-+
-+
-+// ----- folding the q8_1 quantization into the norm that produces it ----------
-+//
-+// The activation a decoder layer feeds to its projections is produced by an
-+// rms_norm+mul and then quantized to q8_1 by the first mul_mat_vec_q that
-+// consumes it (patch 0003 makes the later consumers reuse that result). The
-+// norm kernel already has the value in a register the instant before the
-+// quantize kernel would load it back, and its blocks already cover whole rows,
-+// so the quantization can be produced by the norm itself - one dispatch fewer
-+// per activation.
-+//
-+// The buffer is registered in the same per-graph cache the consumers look in,
-+// under exactly the parameter tuple ggml_cuda_mul_mat_vec_q would use. A
-+// mismatch can therefore only cost a cache miss (the consumer re-quantizes as
-+// before), never a wrong result.
-+
-+// does `t` feed a mul_mat / mul_mat_id that routes through mul_mat_vec_q?
-+static bool ggml_cuda_norm_quant_has_mmvq_consumer(const ggml_cgraph * cgraph, const int from, const ggml_tensor * t) {
-+    const int cc  = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-+    // The consumer can sit well past the producer (the MoE router, top-k cluster
-+    // and expert matvecs all run between the ffn norm and the shared-expert
-+    // projections), so the window is generous. Distance is irrelevant to
-+    // correctness: the cache entry describes the value written here, and the
-+    // cache's own lifetime rules (patch 0003) govern when it may be reused.
-+    const int end = std::min(cgraph->n_nodes, from + 64);
-+
-+    for (int j = from; j < end; ++j) {
-+        const ggml_tensor * n = cgraph->nodes[j];
-+        if (n->op != GGML_OP_MUL_MAT && n->op != GGML_OP_MUL_MAT_ID) {
-+            continue;
-+        }
-+        // match the cache's identity rule: a reshape/view of the producer's
-+        // result is the same data and hits the same entry
-+        const ggml_tensor * s1 = n->src[1];
-+        if (s1 == nullptr) {
-+            continue;
-+        }
-+        const ggml_tensor * s1_origin = s1->view_src != nullptr ? s1->view_src : s1;
-+        if (s1_origin != t || s1->data != t->data) {
-+            continue;
-+        }
-+        if (s1->ne[0] != t->ne[0] || s1->nb[1] != t->nb[1] ||
-+                s1->ne[1] != t->ne[1] || s1->ne[2] != t->ne[2] || s1->ne[3] != t->ne[3]) {
-+            continue;
-+        }
-+        const ggml_tensor * w = n->src[0];
-+        if (w == nullptr || !ggml_is_quantized(w->type)) {
-+            continue;
-+        }
-+        if (t->type != GGML_TYPE_F32 || n->type != GGML_TYPE_F32) {
-+            continue;
-+        }
-+        if (!ggml_cuda_should_use_mmvq(w->type, cc, s1->ne[1])) {
-+            continue;
-+        }
-+        return true;
-+    }
-+    return false;
-+}
-+
-+// Shape requirements of the folded epilogue: every warp of the norm block must
-+// cover exactly one 32-element q8_1 block of one row, and the q8_1 row length
-+// must equal the tensor row length (no padding tail to zero-fill).
-+static bool ggml_cuda_norm_quant_shape_ok(const ggml_tensor * t) {
-+    const int64_t ncols = t->ne[0];
-+    if (ncols % QK8_1 != 0) {
-+        return false;
-+    }
-+    if (GGML_PAD(ncols, MATRIX_ROW_PADDING) != ncols) {
-+        return false;
-+    }
-+    const int block_size = ncols < 1024 ? 256 : 1024;
-+    if (ncols % block_size != 0 || block_size % QK8_1 != 0) {
-+        return false;
-+    }
-+    if (!ggml_is_contiguous(t)) {
-+        return false;
-+    }
-+    if (t->ne[2] != 1 || t->ne[3] != 1) {
-+        return false;
-+    }
-+    return true;
-+}
-+
-+// Registers the q8_1 buffer for `t` in the per-graph cache and returns it, or
-+// nullptr when the fold should not be done (already cached, wrong shape, no
-+// consumer).
-+static char * ggml_cuda_norm_quant_register(ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph,
-+                                            const int from, ggml_tensor * t) {
-+    if (!ggml_cuda_norm_quant_shape_ok(t)) {
-+        return nullptr;
-+    }
-+    if (!ggml_cuda_norm_quant_has_mmvq_consumer(cgraph, from, t)) {
-+        return nullptr;
-+    }
-+
-+    cudaStream_t stream = ctx->stream();
-+
-+    const size_t  ts          = ggml_type_size(t->type);
-+    const int64_t ne10        = t->ne[0];
-+    const int64_t s11         = t->nb[1] / ts;
-+    const int64_t s12         = t->nb[2] / ts;
-+    const int64_t s13         = t->nb[3] / ts;
-+    const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-+
-+    if (ctx->quantized_src1_cache.find(t, stream, ne10, s11, s12, s13,
-+            ne10_padded, t->ne[1], t->ne[2], t->ne[3]) != nullptr) {
-+        return nullptr; // already quantized in this evaluation
-+    }
-+
-+    const size_t size_q8_1 = t->ne[3]*t->ne[2] * t->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
-+    return ctx->quantized_src1_cache.insert(ctx->pool(), t, stream, ne10, s11, s12, s13,
-+        ne10_padded, t->ne[1], t->ne[2], t->ne[3], size_q8_1);
-+}
-+
-+// A plain rms_norm+mul (no residual add to fold) that stock would run through
-+// ggml_cuda_op_rms_norm_fused.
-+static bool ggml_cuda_norm_quant_plain_ok(const ggml_cgraph * cgraph, const int i) {
-+    if (cgraph->nodes[i]->op != GGML_OP_RMS_NORM) {
-+        return false;
-+    }
-+    if (i + 1 >= cgraph->n_nodes) {
-+        return false;
-+    }
-+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
-+        return false;
-+    }
-+    if (!ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL }, {})) {
-+        return false;
-+    }
-+
-+    const ggml_tensor * norm = cgraph->nodes[i];
-+    const ggml_tensor * mul  = cgraph->nodes[i + 1];
-+    const ggml_tensor * x    = norm->src[0];
-+
-+    const ggml_tensor * mul_src = (mul->src[0] == norm) ? mul->src[1] : mul->src[0];
-+    if (mul_src == nullptr || mul_src->type != GGML_TYPE_F32 ||
-+            mul_src->nb[0] != ggml_type_size(mul_src->type) ||
-+            mul_src->ne[2] != 1 || mul_src->ne[3] != 1) {
-+        return false;
-+    }
-+    if (x->type != GGML_TYPE_F32 || x->ne[2] != 1 || x->ne[3] != 1 ||
-+            x->nb[0] != ggml_type_size(x->type)) {
-+        return false;
-+    }
-+    if (!ggml_is_contiguous(mul) || !ggml_are_same_shape(mul, x)) {
-+        return false;
-+    }
-+    return true;
-+}
-+
-+
-+// ----- grouped set_rows (KV-cache K/V store) launch detection -----------------
 +static bool ggml_cuda_set_rows_groupable(const ggml_cgraph * cgraph, const int i) {
 +    const ggml_tensor * node = cgraph->nodes[i];
-+    if (node->op != GGML_OP_SET_ROWS) {
-+        return false;
-+    }
-+    if (i >= 2 && ggml_cuda_can_fuse(cgraph, i - 2, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
-+        return false;
-+    }
++    if (node->op != GGML_OP_SET_ROWS) { return false; }
++    if (i >= 2 && ggml_cuda_can_fuse(cgraph, i - 2, { GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) { return false; }
 +    const ggml_tensor * src0 = node->src[0];
 +    const ggml_tensor * src1 = node->src[1];
 +    if (src0 == nullptr || src1 == nullptr) { return false; }
@@ -693,7 +25,6 @@ index 561ab7ac5..8b7bcd68d 100644
 +    if (!ggml_is_contiguous(src0)) { return false; }
 +    return true;
 +}
-+
 +static int ggml_cuda_set_rows_collect_group(const ggml_cgraph * cgraph, const int start, ggml_tensor ** members) {
 +    members[0] = cgraph->nodes[start];
 +    int n = 1;
@@ -713,226 +44,55 @@ index 561ab7ac5..8b7bcd68d 100644
 +    }
 +    return n;
 +}
-+
  // try and fuse nodes and return the number of nodes to skip
  static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
  
-@@ -3855,6 +4536,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
-         return 2;
-     }
- 
-+    if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_MUL }, {})) {
-+        static const bool disable_ssm_mul = getenv("GGML_CUDA_DISABLE_SSM_MUL") != nullptr &&
-+                                            std::atoi(getenv("GGML_CUDA_DISABLE_SSM_MUL"));
-+        if (!disable_ssm_mul) {
-+            ggml_cuda_op_ssm_conv(*cuda_ctx, node, /*bias_add_node=*/ nullptr, /*silu_dst=*/ nullptr, cgraph->nodes[i + 1]);
-+            return 1;
-+        }
-+    }
-+
-     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
-         ggml_cuda_op_ssm_conv(*cuda_ctx, node, /*bias_add_node=*/ nullptr, cgraph->nodes[i + 1]);
-         return 1;
-@@ -3978,8 +4668,35 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
-                 stream_ctx.concurrent_events.clear();
-             }
- 
-+            // Members of grouped mmvq launches already issued earlier in this pass.
-+            std::unordered_set<const ggml_tensor *> mmvq_grouped_done;
-+            // Members of grouped rms_norm launches already issued earlier in this pass.
-+            std::unordered_set<const ggml_tensor *> norm_grouped_done;
+@@ -4631,6 +4664,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+             std::unordered_set<const ggml_tensor *> mmvq_grouped_done;
+             // Members of grouped rms_norm launches already issued earlier in this pass.
+             std::unordered_set<const ggml_tensor *> norm_grouped_done;
 +            std::unordered_set<const ggml_tensor *> set_rows_grouped_done;
 +            static const bool disable_set_rows_group = getenv("GGML_CUDA_DISABLE_SET_ROWS_GROUP") != nullptr &&
 +                                                       std::atoi(getenv("GGML_CUDA_DISABLE_SET_ROWS_GROUP"));
-+            static const bool disable_norm_group = getenv("GGML_CUDA_DISABLE_NORM_GROUP") != nullptr &&
-+                                                   std::atoi(getenv("GGML_CUDA_DISABLE_NORM_GROUP"));
-+            static const bool disable_pre_add_norm = getenv("GGML_CUDA_DISABLE_PRE_ADD_NORM") != nullptr &&
-+                                                   std::atoi(getenv("GGML_CUDA_DISABLE_PRE_ADD_NORM"));
-+            static const bool disable_norm_quant = getenv("GGML_CUDA_DISABLE_NORM_QUANT") != nullptr &&
-+                                                   std::atoi(getenv("GGML_CUDA_DISABLE_NORM_QUANT"));
-+            static const bool disable_mmvq_group = getenv("GGML_CUDA_DISABLE_MMVQ_GROUP") != nullptr &&
-+                                                   std::atoi(getenv("GGML_CUDA_DISABLE_MMVQ_GROUP"));
-+            const bool mmvq_group_enabled = !disable_mmvq_group && stream_ctx.concurrent_events.empty();
-+            static const bool log_mmvq_group_stats = getenv("GGML_MMVQ_GROUP_STATS") != nullptr;
-+            int64_t mmvq_group_stats_buf[2] = {0, 0};
-+            int64_t * mmvq_group_stats = log_mmvq_group_stats ? mmvq_group_stats_buf : nullptr;
-+
-             for (int i = 0; i < cgraph->n_nodes; i++) {
-                 ggml_tensor * node = cgraph->nodes[i];
-+
-+                // An op that writes through a view modifies a pre-existing tensor:
-+                // drop any cached q8_1 quantization of that tensor.
-+                if (node->view_src != nullptr && !ggml_cuda_is_view_or_noop(node)) {
-+                    cuda_ctx->quantized_src1_cache.invalidate_views_of(node);
-+                }
-+
-                 if (is_concurrent_event_active) {
-                     GGML_ASSERT(concurrent_event);
- 
-@@ -4020,6 +4737,75 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
-                     continue;
+             static const bool disable_norm_group = getenv("GGML_CUDA_DISABLE_NORM_GROUP") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_NORM_GROUP"));
+             static const bool disable_pre_add_norm = getenv("GGML_CUDA_DISABLE_PRE_ADD_NORM") != nullptr &&
+@@ -4698,6 +4734,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                  }
  
-+                if (mmvq_grouped_done.count(node) != 0) {
-+                    continue; // already computed as part of a grouped mmvq launch
-+                }
-+
-+                if (norm_grouped_done.count(node) != 0) {
+                 if (norm_grouped_done.count(node) != 0) {
 +                    continue;
 +                }
 +                if (set_rows_grouped_done.count(node) != 0) {
-+                    continue; // already computed as part of a grouped rms_norm launch
-+                }
-+
-+                if (!disable_norm_group && stream_ctx.concurrent_events.empty() &&
-+                        node->op == GGML_OP_RMS_NORM && ggml_cuda_rms_norm_pair_groupable(cgraph, i)) {
-+                    ggml_tensor * norms[RMS_NORM_MAX_GROUP_SIZE];
-+                    ggml_tensor * muls [RMS_NORM_MAX_GROUP_SIZE];
-+                    const int n_members = ggml_cuda_rms_norm_collect_group(cgraph, i, norms, muls, norm_grouped_done, mmvq_grouped_done);
-+                    if (n_members >= 2) {
-+                        ggml_cuda_op_rms_norm_grouped(*cuda_ctx, norms, muls, n_members);
-+                        for (int m = 1; m < n_members; ++m) {
-+                            norm_grouped_done.insert(norms[m]);
-+                            norm_grouped_done.insert(muls[m]);
-+                        }
-+                        i += 1; // the first pair's mul is consumed by the grouped launch
-+                        continue;
-+                    }
-+                }
-+
-+                if (!disable_norm_quant && stream_ctx.concurrent_events.empty() && node->op == GGML_OP_GLU &&
-+                        node->type == GGML_TYPE_F32 && ggml_is_contiguous(node) &&
-+                        ggml_nelements(node) % QK8_1 == 0) {
-+                    char * q8_1_dst = ggml_cuda_norm_quant_register(cuda_ctx, cgraph, i + 1, node);
-+                    if (q8_1_dst != nullptr && ggml_cuda_op_glu_quant(*cuda_ctx, node, q8_1_dst)) {
-+                        continue;
-+                    }
-+                }
-+
-+                if (!disable_norm_quant && stream_ctx.concurrent_events.empty() &&
-+                        node->op == GGML_OP_RMS_NORM && ggml_cuda_norm_quant_plain_ok(cgraph, i)) {
-+                    ggml_tensor * mul_node  = cgraph->nodes[i + 1];
-+                    char *        q8_1_dst  = ggml_cuda_norm_quant_register(cuda_ctx, cgraph, i + 2, mul_node);
-+                    if (q8_1_dst != nullptr) {
-+                        ggml_cuda_op_rms_norm_fused_pre_add_quant(*cuda_ctx, nullptr, 0, node, mul_node, q8_1_dst);
-+                        i += 1; // the rms_norm and its mul
-+                        continue;
-+                    }
-+                }
-+
-+                if (!disable_pre_add_norm && stream_ctx.concurrent_events.empty() && node->op == GGML_OP_ADD) {
-+                    const int n_adds = ggml_cuda_rms_norm_pre_add_detect(cgraph, i);
-+                    if (n_adds > 0) {
-+                        ggml_tensor * adds[RMS_NORM_ADD_MAX_OPERANDS];
-+                        for (int k = 0; k < n_adds; ++k) {
-+                            adds[k] = cgraph->nodes[i + k];
-+                        }
-+                        ggml_tensor * norm_node = cgraph->nodes[i + n_adds];
-+                        ggml_tensor * mul_node   = cgraph->nodes[i + n_adds + 1];
-+                        char * q8_1_dst = disable_norm_quant ? nullptr :
-+                            ggml_cuda_norm_quant_register(cuda_ctx, cgraph, i + n_adds + 2, mul_node);
-+                        if (q8_1_dst != nullptr) {
-+                            ggml_cuda_op_rms_norm_fused_pre_add_quant(*cuda_ctx, adds, n_adds,
-+                                norm_node, mul_node, q8_1_dst);
-+                        } else {
-+                            ggml_cuda_op_rms_norm_fused_pre_add(*cuda_ctx, adds, n_adds, norm_node, mul_node);
-+                        }
-+                        i += n_adds + 1; // the chain, the rms_norm and its mul
-+                        continue;
-+                    }
-+                }
-+
-                 int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);
- 
-                 if (nodes_to_skip != 0) {
-@@ -4029,9 +4815,48 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
-                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
-                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
- #endif
-+                    // Nodes consumed by the fused op bypass the loop head: run the
-+                    // view-write invalidation for them here (after the fused compute,
-+                    // which is when their writes are issued).
-+                    for (int k = 1; k <= nodes_to_skip; ++k) {
-+                        const ggml_tensor * fused_node = cgraph->nodes[i + k];
-+                        if (fused_node->view_src != nullptr && !ggml_cuda_is_view_or_noop(fused_node)) {
-+                            cuda_ctx->quantized_src1_cache.invalidate_views_of(fused_node);
-+                        }
-+                    }
-+
-                     i += nodes_to_skip;
-                     continue;
+                     continue; // already computed as part of a grouped rms_norm launch
                  }
-+
-+                if (mmvq_group_enabled && ggml_cuda_mmvq_can_group(node)) {
-+                    ggml_tensor * members[MMVQ_MAX_GROUP_SIZE];
-+                    const int n_members = ggml_cuda_mmvq_collect_group(cgraph, i, members);
-+                    if (n_members >= 2) {
-+                        ggml_cuda_mul_mat_vec_q_grouped(*cuda_ctx, members, n_members);
-+                        for (int m = 1; m < n_members; ++m) {
-+                            mmvq_grouped_done.insert(members[m]);
-+                        }
-+                        if (mmvq_group_stats != nullptr) {
-+                            mmvq_group_stats[0] += 1;          // groups launched
-+                            mmvq_group_stats[1] += n_members;  // members covered
-+                        }
-+                        continue;
-+                    }
-+                }
-+
+ 
+@@ -4797,6 +4836,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                         continue;
+                     }
+                 }
 +                if (!disable_set_rows_group && stream_ctx.concurrent_events.empty() &&
 +                        node->op == GGML_OP_SET_ROWS && ggml_cuda_set_rows_groupable(cgraph, i)) {
 +                    ggml_tensor * members[SET_ROWS_MAX_GROUP_SIZE];
 +                    const int n_members = ggml_cuda_set_rows_collect_group(cgraph, i, members);
 +                    if (n_members >= 2) {
 +                        ggml_cuda_op_set_rows_grouped(*cuda_ctx, members, n_members);
-+                        for (int m = 1; m < n_members; ++m) {
-+                            set_rows_grouped_done.insert(members[m]);
-+                        }
++                        for (int m = 1; m < n_members; ++m) { set_rows_grouped_done.insert(members[m]); }
 +                        continue;
 +                    }
 +                }
  #ifndef NDEBUG
                  assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device));
                  for (int j = 0; j < GGML_MAX_SRC; j++) {
-@@ -4055,6 +4880,15 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
-                     try_launch_concurrent_event(node);
-                }
-             }
-+
-+            if (mmvq_group_stats != nullptr && mmvq_group_stats[0] > 0) {
-+                static int stats_prints_left = 8;
-+                if (stats_prints_left > 0) {
-+                    stats_prints_left--;
-+                    GGML_LOG_INFO("mmvq-group: %lld groups covering %lld matvecs in this pass (n_nodes=%d)\n",
-+                        (long long) mmvq_group_stats[0], (long long) mmvq_group_stats[1], cgraph->n_nodes);
-+                }
-+            }
-         }
- 
- #ifdef USE_CUDA_GRAPH
-@@ -4116,6 +4950,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
- 
-     ggml_cuda_set_device(cuda_ctx->device);
- 
-+    // Quantized-src1 reuse is only valid within a single graph evaluation: start
-+    // empty so nothing computed before this call (another graph split, CPU ops,
-+    // a previous token) can alias a cached entry.
-+    cuda_ctx->quantized_src1_cache.clear();
-+
-     bool use_cuda_graph             = false;
-     bool cuda_graph_update_required = false;
-     const void * graph_key = nullptr;
 diff --git a/ggml/src/ggml-cuda/set-rows.cu b/ggml/src/ggml-cuda/set-rows.cu
-index 465997065..2b8ca8a70 100644
+index 465997065..d2eb0ddbd 100644
 --- a/ggml/src/ggml-cuda/set-rows.cu
 +++ b/ggml/src/ggml-cuda/set-rows.cu
-@@ -373,6 +373,69 @@ void set_rows_cuda<half, int64_t>(ggml_backend_cuda_context & ctx, const ggml_te
+@@ -373,6 +373,53 @@ void set_rows_cuda<half, int64_t>(ggml_backend_cuda_context & ctx, const ggml_te
  }
  
  
 +
-+// Single-row F32->F16 grouped set_rows kernel.
-+// Each thread copies one element, routing to its segment's source/dest.
 +struct set_rows_grouped_args {
 +    const float   * src0[SET_ROWS_MAX_GROUP_SIZE];
 +    const int64_t * src1[SET_ROWS_MAX_GROUP_SIZE];
@@ -941,31 +101,21 @@ index 465997065..2b8ca8a70 100644
 +    int64_t         ne00[SET_ROWS_MAX_GROUP_SIZE];
 +    uint32_t        seg_end[SET_ROWS_MAX_GROUP_SIZE];
 +};
-+
 +static __global__ void k_set_rows_grouped_f32_f16(const set_rows_grouped_args args, const int64_t ne_total) {
 +    const int64_t i = int64_t(blockDim.x) * blockIdx.x + threadIdx.x;
-+    if (i >= ne_total) {
-+        return;
-+    }
-+    uint32_t seg = 0;
-+    uint32_t seg_start = 0;
++    if (i >= ne_total) { return; }
++    uint32_t seg = 0, seg_start = 0;
 +    #pragma unroll
 +    for (int s = 0; s < SET_ROWS_MAX_GROUP_SIZE - 1; ++s) {
-+        if ((uint32_t) i >= args.seg_end[s]) {
-+            seg = s + 1;
-+            seg_start = args.seg_end[s];
-+        }
++        if ((uint32_t) i >= args.seg_end[s]) { seg = s + 1; seg_start = args.seg_end[s]; }
 +    }
 +    const int64_t local = i - (int64_t) seg_start;
-+    if (local >= args.ne00[seg]) {
-+        return;
-+    }
++    if (local >= args.ne00[seg]) { return; }
 +    ggml_cuda_pdl_sync();
 +    const int64_t dst_row = args.src1[seg][0];
 +    ggml_cuda_pdl_lc();
 +    args.dst[seg][dst_row * args.s1[seg] + local] = ggml_cuda_cast<half>(args.src0[seg][local]);
 +}
-+
 +void ggml_cuda_op_set_rows_grouped(ggml_backend_cuda_context & ctx, ggml_tensor * const * nodes, int n_nodes) {
 +    GGML_ASSERT(n_nodes >= 2 && n_nodes <= SET_ROWS_MAX_GROUP_SIZE);
 +    set_rows_grouped_args args = {};
@@ -984,15 +134,11 @@ index 465997065..2b8ca8a70 100644
 +        total += (uint32_t) src0->ne[0];
 +        args.seg_end[m] = total;
 +    }
-+    for (int m = n_nodes; m < SET_ROWS_MAX_GROUP_SIZE; ++m) {
-+        args.seg_end[m] = total;
-+    }
++    for (int m = n_nodes; m < SET_ROWS_MAX_GROUP_SIZE; ++m) { args.seg_end[m] = total; }
 +    const int num_blocks = (int((total + CUDA_SET_ROWS_BLOCK_SIZE - 1) / CUDA_SET_ROWS_BLOCK_SIZE));
-+    const ggml_cuda_kernel_launch_params launch_params(
-+        dim3(num_blocks), dim3(CUDA_SET_ROWS_BLOCK_SIZE), 0, ctx.stream());
++    const ggml_cuda_kernel_launch_params launch_params(dim3(num_blocks), dim3(CUDA_SET_ROWS_BLOCK_SIZE), 0, ctx.stream());
 +    ggml_cuda_kernel_launch(k_set_rows_grouped_f32_f16, launch_params, args, (int64_t) total);
 +}
-+
  void ggml_cuda_op_set_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
      const ggml_tensor * src0 = dst->src[0];
      const ggml_tensor * src1 = dst->src[1];
