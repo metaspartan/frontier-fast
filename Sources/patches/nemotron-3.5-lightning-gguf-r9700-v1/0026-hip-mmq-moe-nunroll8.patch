@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Carsen <carsenk@gmail.com>
-Date: Thu, 13 Aug 2026 08:20:00 -0600
+Date: Thu, 13 Aug 2026 09:00:00 -0600
 Subject: [PATCH 26/26] hip: lengthen MoE J96/J128 k-loop unroll to 8
 
 The decode-only MoE prefill (6 of 128 experts) runs the Q4_K J96/J128 tile
@@ -9,3 +9,24 @@ shortens the dominant Q4_K down-projection inner loop. Arithmetic order is
 unchanged; masked lanes remain padded and masked exactly.
 GGML_CUDA_MMQ_MOE_NUNROLL restores the stock factor for a same-binary A/B.
 
+diff --git a/ggml/src/ggml-cuda/mmq.cu b/ggml/src/ggml-cuda/mmq.cu
+index 707437ea3..117375fd7 100644
+--- a/ggml/src/ggml-cuda/mmq.cu
++++ b/ggml/src/ggml-cuda/mmq.cu
+@@ -202,8 +202,15 @@ void ggml_cuda_mul_mat_q(
+         CUDA_CHECK(cudaGetLastError());
+     }
+ 
++    // mul_mat_id flattens the n_expert_used slots of all ne12 tokens and then
++    // groups those rows by expert. MMQ always loads a complete J-row tile,
++    // including the masked lanes of the final expert. Size the guard region
++    // from the same logical column bound used by mmq_args::ncols_max below.
++    // Using ne11 here is wrong for MoE: it is normally 1 (broadcast gate/up)
++    // or n_expert_used and rounds to a zero J_max, leaving the last tile to
++    // read beyond the pool allocation.
+     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
+-        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
++        ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne12) * sizeof(block_q8_1_mmq);
+     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
+     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
+     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
