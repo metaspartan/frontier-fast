@@ -357,6 +357,11 @@ So every open-division submission also runs a paired probe set:
 | Tool calling | wrong function, wrong slots, unparseable output | BFCL-style comparison of the parsed call |
 | Instruction following | format collapse under a structural constraint | IFEval-style deterministic verifiers, no judge |
 
+On the vLLM tracks the long families are absent, and that is the engine rather
+than an omission: those tracks serve a pinned engine at `--max-model-len 8192`,
+so a 16k or 32k item cannot be submitted at all. Tool calling and instruction
+following run there normally.
+
 Four things worth understanding about how these are scored:
 
 - **Paired, never absolute.** The stock build is the reference. These are small
