@@ -1,0 +1,138 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Opus 5 <noreply@anthropic.com>
+Date: Thu, 13 Aug 2026 21:00:00 +0000
+Subject: [PATCH] mmq: round the MoE J-tile cap to the nearest valid tile, not
+ the next one up (+6.1% prefill, +3.3% ttft, decode-neutral)
+
+0023 caps the `mul_mat_id` MMQ column tile near the expected expert segment
+width: `target = 2 * ceil(ncols_dst / n_expert)`, then takes the first valid J
+at or above it. The valid J grid on RDNA4 is coarse - 16, 32, 48, 64, ... - so
+"first at or above" is only faithful to that 2x when the target happens to land
+on a grid point. At the 512-token ubatch the cap was tuned against it does:
+512*8/256 = 16, target 32, J = 32.
+
+0062 changed the shape. The ranked 534-token prompt now arrives as ONE ubatch
+instead of 512 + 22, so `cols_per_expert` is 17, target is 34, and the same
+rule steps past 40 (not a valid config for Q4_K/Q5_K/Q6_K) all the way to
+**J = 48** - 2.9x the mean segment rather than 2x. Nothing re-tuned the cap
+when the ubatch it reads changed underneath it.
+
+Rounding to the nearest valid J (ties to the smaller) restores J = 32 at 534
+and is a no-op everywhere the target already lands on a grid point.
+`GGML_CUDA_MMQ_MOE_J_FIRST_GE=1` restores the old rule and is the A/B toggle;
+`GGML_CUDA_MMQ_MOE_J_TARGET=<n>` overrides the target for sweeping.
+
+## Measured (R9700 gfx1201, 62-patch parent, same binary, env-toggled)
+
+Kernel census at pp534 proves it fires and prices it - `mul_mat_q` over two
+passes, J = 48 -> J = 32:
+
+    mul_mat_q<Q4_K> 54.14 -> 49.25 ms      mul_mat_q<Q5_K> 35.97 -> 34.92 ms
+    mul_mat_q<Q6_K>  4.10 ->  3.86 ms      total          100.79 -> 94.64 ms
+
+llama-bench pp534, 5 interleaved rounds, alternating order, 5/5 separated:
+new 4754.1 / 4747.9 / 4709.2 / 4705.5 / 4722.2, old 4585.0 / 4555.8 / 4542.5 /
+4563.8 / 4539.7 -> +3.65% on the whole pass. tg128 160.09 vs 160.03, flat.
+
+J is a sharp optimum at this shape, swept on the same binary at pp534:
+J = 16 4318.7, **J = 32 4679.1**, J = 48 4506.8 (the shipped choice), J = 64
+4399.3.
+
+Ranked-harness replica (llama-server, 9 runs/arm, 6 interleaved arms/side),
+medians, every arm separated 6/6 on both prefill and ttft:
+
+    prefill  6723.4 -> 7132.9 tok/s   1.0609
+    ttft     0.11639 -> 0.112675 s    1.0330
+    decode   156.55 -> 156.47 tok/s   0.9995   (mmq is not on the decode path)
+
+    score    0.9995^0.65 * 1.0609^0.20 * 1.0330^0.15 = 1.0165
+
+## Correctness
+
+The runner gate is `-c 512 --chunks 8`: one 512-token ubatch, target exactly
+32, so both rules pick J = 32 and the arms are the same binary path. Measured,
+3 loads each, zero spread: stock b10237 3.9314, candidate 3.9318 either way -
+the series delta stays +0.010% against a 0.1% budget.
+
+Both long windows are exact multiples of 512 and equally untouched: 16384 reads
+6.0307 on both arms (2 loads each), 32768 reads 6.3312 on both.
+
+Where it does fire it is not bit-identical - 0040 folds the routed weight
+multiply and 0037/0038 the expert-slot reduction into the MMQ epilogue, so the
+tiling also orders how expert contributions combine - and it moves TOWARD
+stock. At `-c 534 -b 534 --chunks 8`, against stock's own single-ubatch reading
+of that shape (b10237, `-ub 576`) at 3.2459: J = 32 reads 3.2521 (+0.19%),
+the shipped J = 48 reads 3.2755 (+0.91%).
+---
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -1585,20 +1585,62 @@
+         getenv("GGML_CUDA_DISABLE_MMQ_MOE_J") == nullptr) {
+         const int64_t cols_per_expert = (args.ncols_dst + args.nchannels_y - 1) / args.nchannels_y;
+         int64_t target = 2*cols_per_expert;
++        {
++            const char * e = getenv("GGML_CUDA_MMQ_MOE_J_TARGET");
++            if (e != nullptr) {
++                target = atoi(e);
++            }
++        }
+         if (target < 16) {
+             target = 16;
+         }
++        // The valid J grid is coarse (16, 32, 48, 64, ... on RDNA4), so
++        // "first valid J >= target" can land far above the target. At the
++        // 512-token ubatch this cap was tuned for, target is exactly 32 and
++        // the rounding is invisible; once 0062 lets a 534-token prompt through
++        // as one ubatch, target becomes 34 and the same rule jumps to J = 48 -
++        // 2.9x the mean expert segment instead of the 2x it means to express,
++        // and a measured 3.7% of the pass. Round to the NEAREST valid J
++        // instead (ties to the smaller), which restores J = 32 there.
++        //
++        // This is a tile decomposition, not a change of arithmetic per output
++        // element, but it is NOT bit-identical in this series: 0040 folds the
++        // routed weight multiply and 0037/0038 the expert-slot reduction into
++        // the MMQ epilogue, so the tiling also orders how expert contributions
++        // are combined. Measured at -c 534 -b 534 --chunks 8, the new choice
++        // moves TOWARD stock's own answer for that shape rather than away:
++        // stock (single 534 ubatch) 3.2459, J = 32 3.2521 (+0.19%),
++        // J = 48 3.2755 (+0.91%). The runner gate (-c 512 --chunks 8) and both
++        // long windows (16384, 32768) are exact multiples of 512, where target
++        // is 32 and both rules pick J = 32 - all three are unchanged to every
++        // digit, verified by kernel census and by perplexity on both arms.
++        const bool first_ge = getenv("GGML_CUDA_MMQ_MOE_J_FIRST_GE") != nullptr;
+         if (target < J_best) {
++            int     pick = 0;
++            int64_t best_dist = INT64_MAX;
+             for (int J = 8; J <= 128; J += 8) {
+                 const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
+-                if (config.type == GGML_TYPE_COUNT || J < target) {
++                if (config.type == GGML_TYPE_COUNT) {
+                     continue;
+                 }
+                 if (mmq_get_nbytes_shared(config, cc) > smpbo) {
+                     continue;
+                 }
+-                J_best = J;
+-                break;
++                if (first_ge) {
++                    if (J < target) {
++                        continue;
++                    }
++                    pick = J;
++                    break;
++                }
++                const int64_t dist = J >= target ? J - target : target - J;
++                if (dist < best_dist) {
++                    best_dist = dist;
++                    pick = J;
++                }
++            }
++            if (pick > 0 && pick < J_best) {
++                J_best = pick;
+             }
+         }
+     }
+-- 
+2.43.0
+
