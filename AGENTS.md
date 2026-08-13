@@ -325,6 +325,13 @@ Two further things to plan around, both documented in full in the README:
   `python tools/mlx_bench.py --model <m> --corpus <text> --mode ppl-long --window 32768`.
   The segmenting matters — evaluating a 32k window in one pass asks for roughly
   20 GB of float32 logits over a ~150k vocab, which will not fit on a 16 GB Mac.
+- **Capability probes run on every open-division submission.** RULER-style
+  needle retrieval and variable tracking at 16k and 32k, BFCL-style tool-call
+  scoring, and IFEval-style verifiable instructions — all paired against the
+  stock build, all generated from a private rotating seed. A kernel that holds
+  perplexity and loses needles at 32k is a kernel that broke something, and
+  this is what sees it. Scored per item, so gaining one probe never offsets
+  losing another. See the README for how the threshold is set.
 - **The corpus in this repo is not the corpus that gates you.**
   `fixtures/gainz-corpus.txt` is for local iteration. The ranked gate reads a
   private, rotating corpus held only on the runners, and each verified record

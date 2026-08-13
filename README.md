@@ -339,6 +339,51 @@ reported. After one flipped knife-edge argmax every later token differs by
 construction, so a divergence point marks a run worth reading, not a
 submission worth rejecting.
 
+### Capability probes: what perplexity cannot see
+
+Perplexity equivalence is necessary and it is not sufficient. The clearest
+demonstration comes from quantisation work: on Gemma-2-2B, INT7 *improved*
+perplexity while degrading 18.7% of active SAE features. "Perplexity moved
+0.04%" is a claim about the average next token over natural prose. It is not a
+claim that the model can still retrieve from depth, follow a reference chain,
+emit a parseable tool call, or hold a structural constraint.
+
+So every open-division submission also runs a paired probe set:
+
+| Family | What it catches | Method |
+|---|---|---|
+| Needle retrieval | KV indexing, attention sinks, sliding-window bugs | RULER-style multi-key NIAH at 16k and 32k |
+| Variable tracking | degraded long-range attention, not merely noisy | RULER-style multi-hop chains at 16k and 32k |
+| Tool calling | wrong function, wrong slots, unparseable output | BFCL-style comparison of the parsed call |
+| Instruction following | format collapse under a structural constraint | IFEval-style deterministic verifiers, no judge |
+
+Four things worth understanding about how these are scored:
+
+- **Paired, never absolute.** The stock build is the reference. These are small
+  quantised models and many probes sit near their floor — that is expected and
+  fine. What gates is an item the stock build passed that yours then failed.
+  Your absolute score is not the measurement.
+- **Per item, not per total.** A candidate that breaks one probe and happens to
+  pass another is not unchanged. Comparing totals would hide exactly that, so
+  the comparison is item by item, and items you gained are reported but never
+  offset items you lost.
+- **Generated, not downloaded.** The items are built from a private rotating
+  seed on the runner, and the long ones bury their needles in the held-out
+  corpus. A published probe set is one you can special-case — the same reason
+  the gate corpus is not the fixture in this repo. The record names the seed by
+  hash so a rotation stays visible.
+- **The threshold is measured, not assumed.** Task-level pass/fail is coarse:
+  one flipped knife-edge argmax can flip a whole item. The limit for a track
+  comes from running the identical build against itself across independent
+  sessions and observing how much it disagrees with itself. Until that floor
+  exists for a runner, the probes are reported on the record and do not gate.
+
+Every verified record carries the full per-family breakdown — stock passed,
+your build passed, items lost, items gained, and how many items the stock build
+itself failed. That last number bounds how much signal the set carried at all,
+and it is published because a family where stock scored 0/6 proves nothing
+either way.
+
 ### A score has to be reproducible, not just achieved
 
 A verified result no longer takes the frontier on one measurement. It
