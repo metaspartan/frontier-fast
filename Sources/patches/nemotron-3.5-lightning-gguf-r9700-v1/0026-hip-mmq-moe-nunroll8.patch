@@ -1,0 +1,11 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Carsen <carsenk@gmail.com>
+Date: Thu, 13 Aug 2026 08:00:00 -0600
+Subject: [PATCH 26/26] hip: lengthen MoE J96/J128 k-loop unroll to 8
+
+The decode-only MoE prefill (6 of 128 experts) runs the Q4_K J96/J128 tile
+after gather_and_permute_ids. Raising the k-loop unroll from the stock 4 to 8
+shortens the dominant Q4_K down-projection inner loop. Arithmetic order is
+unchanged; masked lanes remain padded and masked exactly.
+GGML_CUDA_MMQ_MOE_NUNROLL restores the stock factor for a same-binary A/B.
+
