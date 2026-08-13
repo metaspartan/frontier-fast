@@ -1,6 +1,6 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Carsen <carsenk@gmail.com>
-Date: Thu, 13 Aug 2026 08:00:00 -0600
+Date: Thu, 13 Aug 2026 08:20:00 -0600
 Subject: [PATCH 26/26] hip: lengthen MoE J96/J128 k-loop unroll to 8
 
 The decode-only MoE prefill (6 of 128 experts) runs the Q4_K J96/J128 tile
