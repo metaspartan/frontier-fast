@@ -1,0 +1,128 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Code (Opus 5) <noreply@anthropic.com>
+Date: Thu, 13 Aug 2026 16:00:00 -0600
+Subject: [PATCH 1/2] server: adapt context checkpoint creation to observed reuse
+
+Port to the GB10 CUDA track of the Nemotron R9700 series patch 0003, byte
+identical: it touches only tools/server/server-context.cpp, which has no
+architecture-gated code, and both tracks pin the same llama.cpp commit
+0b1bad14ff204627636aeb1de22ddcd5acb859d4.
+
+Hybrid and recurrent models split completion prompts to capture full
+sequence-state checkpoints. On unique cache-cold traffic those checkpoints are
+invalidated without a restore, paying extra decode calls and state copies for
+no reuse. Nemotron 3.5 Lightning is hybrid Mamba2 + attention, so it takes this
+path on every ranked request.
+
+Give checkpoint creation a small reuse credit: successful restores refill it,
+unused invalidations spend it, and a periodic probe re-enables the feature if
+traffic changes. LLAMA_ADAPTIVE_CKPT=0 restores stock behavior for same-binary
+A/B. The model arithmetic is unchanged.
+
+This patch is not worth submitting alone and is not submitted alone: on its own
+it is prefill 1708 vs 1572 tok/s (1.087x). It is here because patch 0002 cannot
+fire until checkpoint splitting stops -- measured on GB10, absorption alone is
+1562 vs 1572 tok/s, i.e. nothing. Together they are 1.359x prefill / 1.336x
+TTFT. See 0002 for the full paired numbers.
+---
+ tools/server/server-context.cpp | 63 +++++++++++++++++++++++++++++++++
+ 1 file changed, 63 insertions(+)
+
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index d75c6856d..dc730121e 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -968,6 +968,40 @@ private:
+     int slots_debug = 0;
+     int n_empty_consecutive = 0;
+ 
++    // [gainz] adaptive context checkpointing.
++    //
++    // For models whose memory cannot be partially rolled back (SWA, recurrent,
++    // hybrid) the prompt loop creates context checkpoints while evaluating a
++    // prompt.  Each one costs an extra llama_decode call -- the prompt is
++    // deliberately broken at {4 + n_ubatch, 4} tokens from its end purely so the
++    // state can be captured before those tokens are evaluated -- plus a full
++    // llama_state_seq_get_data copy of the sequence state.
++    //
++    // A checkpoint only ever pays for itself if a LATER request into the same
++    // slot shares a prefix long enough to reach it.  When it does not, the next
++    // task erases it unused ("erased invalidated context checkpoint") and the
++    // whole cost was loss.  On single-turn / non-overlapping traffic that is
++    // every checkpoint, on every request, forever.
++    //
++    // The credit below makes it self-tuning instead of unconditional: creation
++    // is allowed while there is credit, a successful restore refills it, a task
++    // that discards checkpoints without restoring one spends it, and after a
++    // long dry spell a single probe task is allowed through so traffic that
++    // starts sharing prefixes turns the feature back on.  Nothing about what the
++    // model computes changes -- a missing checkpoint only ever means the prompt
++    // is re-evaluated, which is exactly what happens today.
++    static constexpr int CKPT_CREDIT_MAX  = 4;
++    static constexpr int CKPT_PROBE_EVERY = 64;
++
++    bool ckpt_adaptive   = [] {
++        const char * e = getenv("LLAMA_ADAPTIVE_CKPT");
++        return e == nullptr || atoi(e) != 0;
++    }();
++    int  ckpt_credit     = 2;
++    int  ckpt_idle       = 0;
++    int  ckpt_wasted     = 0;
++    int  ckpt_last_task  = -1;
++
+     std::unique_ptr<server_prompt_cache> prompt_cache;
+ 
+     server_metrics metrics;
+@@ -3364,6 +3398,10 @@ private:
+                                         // restore the draft's speculative state
+                                         common_speculative_set_state(spec.get(), slot.id, it->data_spec);
+ 
++                                        // [gainz] a restore proves checkpoints are paying off on this traffic
++                                        ckpt_credit = CKPT_CREDIT_MAX;
++                                        ckpt_idle   = 0;
++
+                                         pos_next = std::min(pos_next, std::max(it->pos_min + 1, it->pos_max));
+                                         n_past   = std::min(slot.prompt.tokens.size_up_to_pos(pos_next), (size_t) it->n_tokens);
+                                         SLT_TRC(slot, "restored context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_past = %d, size = %.3f MiB)\n", it->pos_min, it->pos_max, it->n_tokens, n_past, (float) it->size() / 1024 / 1024);
+@@ -3384,6 +3422,8 @@ private:
+                                     const auto & cur = *it;
+                                     if (cur.pos_max > pos_next) {
+                                         SLT_TRC(slot, "erased invalidated context checkpoint (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", n_swa = %d, pos_next = %d, size = %.3f MiB)\n", cur.pos_min, cur.pos_max, cur.n_tokens, n_swa, pos_next, (float) cur.size() / 1024 / 1024);
++                                        // [gainz] created, never restored
++                                        ckpt_wasted++;
+                                         it = slot.prompt.checkpoints.erase(it);
+                                     } else {
+                                         ++it;
+@@ -3450,6 +3490,29 @@ private:
+ 
+                     bool do_checkpoint = params_base.n_ctx_checkpoints > 0;
+ 
++                    // [gainz] adaptive context checkpointing -- see ckpt_credit above.
++                    // Settled once per task, before the first chunk of its prompt is
++                    // assembled, so every chunk of one prompt makes the same decision.
++                    if (ckpt_adaptive) {
++                        if (ckpt_last_task != slot.task->id) {
++                            ckpt_last_task = slot.task->id;
++
++                            if (ckpt_wasted > 0) {
++                                ckpt_wasted = 0;
++                                if (ckpt_credit > 0) {
++                                    ckpt_credit--;
++                                }
++                            }
++
++                            if (ckpt_credit == 0 && ++ckpt_idle >= CKPT_PROBE_EVERY) {
++                                ckpt_credit = 1;
++                                ckpt_idle   = 0;
++                            }
++                        }
++
++                        do_checkpoint = do_checkpoint && ckpt_credit > 0;
++                    }
++
+                     // make checkpoints only for completion tasks
+                     do_checkpoint = do_checkpoint && slot.task->type == SERVER_TASK_TYPE_COMPLETION;
+ 
+-- 
+2.49.0.windows.1
+

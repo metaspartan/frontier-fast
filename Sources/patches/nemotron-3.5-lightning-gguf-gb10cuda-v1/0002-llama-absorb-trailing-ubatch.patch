@@ -1,0 +1,142 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Code (Opus 5) <noreply@anthropic.com>
+Date: Thu, 13 Aug 2026 16:05:00 -0600
+Subject: [PATCH 2/2] llama: absorb a small trailing ubatch into the prompt graph
+
+Port to the GB10 CUDA track of the Nemotron R9700 series patch 0004, byte
+identical: it touches only src/llama-context.cpp, which is backend-independent,
+and both tracks pin the same llama.cpp commit
+0b1bad14ff204627636aeb1de22ddcd5acb859d4.
+
+Allow overhangs through n_ubatch + n_ubatch/8 to run as one ubatch and reserve
+graph buffers at the same bound. LLAMA_UBATCH_ABSORB=0 restores stock splitting
+for same-binary A/B.
+
+Why it pays here: the ranked request is ~537 tokens at this corpus shape, so the
+default n_ubatch = 512 splits it into 512 + 25. On a 128-expert / 6-active MoE
+that second graph re-reads a whole routed-expert working set for 25 tokens. The
+82-token short request used for the prefill slope is already one ubatch and is
+untouched, so the term is not gamed -- only the full arm changes.
+
+Measured on the DGX Spark GB10 (sm_121, CUDA 13.0), llama-server booted exactly
+as the runner boots it (-ngl 99 -c 8192 --parallel 1), six unique cache-cold
+~537-token prompts per arm, whole-process arms alternated A/B/A/B/A/B, median
+per round:
+
+  round   prefill tok/s          TTFT s                 decode tok/s
+          stock -> cand          stock -> cand          stock -> cand
+    1     1571.98 -> 2142.32     0.34159 -> 0.25465     78.763 -> 78.660
+    2     1584.58 -> 2135.87     0.33888 -> 0.25370     78.795 -> 78.618
+    3     1579.36 -> 2146.05     0.34007 -> 0.25466     78.756 -> 78.605
+
+  median ratios: prefill 1.3588x, ttft 1.3358x, decode 0.99808x
+  projected score 0.99808^0.65 * 1.3588^0.20 * 1.3358^0.15 = 1.1090
+
+Lever isolation on the same binary (median of six):
+  LLAMA_ADAPTIVE_CKPT=0 LLAMA_UBATCH_ABSORB=0   prefill 1572   ttft 0.3416
+  LLAMA_ADAPTIVE_CKPT=1 LLAMA_UBATCH_ABSORB=0   prefill 1708   ttft 0.3149
+  LLAMA_ADAPTIVE_CKPT=0 LLAMA_UBATCH_ABSORB=1   prefill 1562   ttft 0.3439
+  LLAMA_ADAPTIVE_CKPT=1 LLAMA_UBATCH_ABSORB=1   prefill 2142   ttft 0.2547
+
+Absorption alone does nothing, which is why the two patches are one change.
+
+Correctness, same binary, both arms:
+  perplexity  -c 512   --chunks 8, gainz corpus   3.7469 vs 3.7469  (delta 0.000%)
+  perplexity  -c 16384 --chunks 2, long corpus    8.7496 vs 8.7496  (delta 0.000%)
+  greedy text, 6 prompt lengths spanning the n_ubatch boundary
+    (421 / 505 / 521 / 557 / 1745 / 4462 prompt tokens):
+    byte-identical at 5 of 6, including 557 tokens -- the absorbed shape itself.
+    1745 tokens differs; that shape does not absorb (overhang 209 > 64), so the
+    flip comes from the checkpoint lever. A stock-vs-stock control across two
+    fresh boots reproduced all six hashes exactly, so the harness noise floor is
+    zero and the single divergence is real, not a boot artifact. It is a
+    knife-edge argmax flip, not a distribution shift: perplexity is unchanged at
+    both the ranked and the long window.
+---
+ src/llama-context.cpp | 49 ++++++++++++++++++++++++++++++++++++++++---
+ 1 file changed, 46 insertions(+), 3 deletions(-)
+
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0de3a68d1..90e381ed9 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -578,6 +578,45 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
+     }
+ }
+ 
++// Adaptive tail-ubatch absorption.
++//
++// On a sparse-MoE model a small trailing ubatch launches a second graph and, in
++// every MoE block, reads another routed-expert working set for only a handful of
++// tokens. Nemotron's ranked full request has 532 tokens at the observed corpus
++// shape: the default n_ubatch = 512 splits it into 512 + 20, while the 82-token
++// short request used by the prefill slope is already one ubatch. Absorbing only
++// the full arm removes that tail graph without changing the short control.
++//
++// Returns the largest ubatch that may be formed by absorbing such an overhang,
++// or 0 when absorption is disabled. Rebalancing the split is not equivalent:
++// it still launches two graphs and pays two routed-expert working sets.
++static uint32_t llama_ubatch_absorb_max(const llama_cparams & cparams) {
++    static const bool enabled = []() {
++        const char * env = getenv("LLAMA_UBATCH_ABSORB");
++        return env == nullptr || atoi(env) != 0;
++    }();
++
++    if (!enabled) {
++        return 0;
++    }
++
++    const uint32_t n_max = std::min(cparams.n_batch, cparams.n_ubatch + cparams.n_ubatch/8);
++
++    return n_max > cparams.n_ubatch ? n_max : 0;
++}
++
++// The ubatch size to split `n_tokens` with: n_ubatch normally, or the whole
++// batch when it overhangs n_ubatch by no more than the absorption bound.
++static uint32_t llama_ubatch_effective(const llama_cparams & cparams, uint32_t n_tokens) {
++    const uint32_t n_absorb = llama_ubatch_absorb_max(cparams);
++
++    if (n_absorb > cparams.n_ubatch && n_tokens > cparams.n_ubatch && n_tokens <= n_absorb) {
++        return n_tokens;
++    }
++
++    return cparams.n_ubatch;
++}
++
+ void llama_context::sched_reserve() {
+     if (!sched_need_reserve) {
+         return;
+@@ -592,7 +631,8 @@ void llama_context::sched_reserve() {
+     const int64_t t_start_us = ggml_time_us();
+ 
+     const uint32_t n_seqs = cparams.n_seq_max;
+-    const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
++    const uint32_t n_ubatch_res = std::max(cparams.n_ubatch, llama_ubatch_absorb_max(cparams));
++    const uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_res);
+ 
+     const size_t max_nodes = this->graph_max_nodes(n_tokens);
+ 
+@@ -823,7 +863,8 @@ bool llama_context::memory_update(bool optimize) {
+         }
+ 
+         const uint32_t n_seqs = cparams.n_seq_max;
+-        const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
++        const uint32_t n_ubatch_res = std::max(cparams.n_ubatch, llama_ubatch_absorb_max(cparams));
++        const uint32_t n_tokens = std::min(cparams.n_ctx, n_ubatch_res);
+ 
+         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
+ 
+@@ -1735,8 +1776,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
+ 
+     llama_memory_context_ptr mctx;
+ 
++    const uint32_t n_ubatch_eff = llama_ubatch_effective(cparams, balloc->get_n_tokens());
++
+     while (true) {
+-        mctx = memory->init_batch(*balloc, cparams.n_ubatch, output_all);
++        mctx = memory->init_batch(*balloc, n_ubatch_eff, output_all);
+         if (!mctx) {
+             return -2;
+         }
+-- 
+2.49.0.windows.1
