@@ -307,10 +307,15 @@ so the consumer can read them from there.
 `llama_memory_recurrent_context::s_copy_main_is_identity()` detects that at
 graph-build time without `s_copy()`'s side effects, and `build_rs` hands the
 consumer a contiguous `ggml_view_2d` of the cache rows instead. The view is
-restricted to `n_seqs == 1 && head == 0 && n_rs == 1` because llama.cpp reuses
-built graphs across decode steps and a view bakes its offset at build time; at
-row 0 a reused graph can never go stale, and that is the `--parallel 1` ranked
-shape. `LLAMA_DISABLE_RS_STATE_VIEW=1` restores stock.
+restricted to `n_tokens == 1 && n_seqs == 1 && head == 0 && n_rs == 1`. The
+`n_seqs`/`head`/`n_rs` part is the sibling track's: llama.cpp reuses built graphs
+across decode steps and a view bakes its offset at build time, so at row 0 a
+reused graph can never go stale, and that is the `--parallel 1` ranked shape. The
+`n_tokens == 1` clause is added here so the view is taken only on the
+decode-shape build it was derived for and is provably inert at every
+prompt-shaped build, including the long-context evaluation windows. It costs
+nothing: the gain is a decode gain and decode is `n_tokens == 1`, at short and
+long context alike. `LLAMA_DISABLE_RS_STATE_VIEW=1` restores stock.
 
 **Why this one ports when the launch-structure family did not.** This README
 already records grouped-mmvq as off by default, grouped-mmvf as measured dead
@@ -328,22 +333,30 @@ build:
 
 | round | on tg128 | off tg128 | on pp512 | off pp512 |
 | --- | --- | --- | --- | --- |
-| 1 | 75.78 | 72.78 | 2350.33 | 2339.71 |
-| 2 | 75.65 | 72.85 | 2358.05 | 2342.07 |
-| 3 | 75.61 | 72.93 | 2364.08 | 2338.71 |
-| 4 | 75.63 | 72.91 | 2350.22 | 2353.82 |
-| 5 | 75.56 | 72.74 | 2353.37 | 2342.66 |
+| 1 | 75.74 | 72.97 | 2355.60 | 2356.87 |
+| 2 | 75.57 | 73.09 | 2355.79 | 2338.26 |
+| 3 | 75.78 | 72.86 | 2351.35 | 2371.15 |
+| 4 | 75.78 | 73.00 | 2351.90 | 2336.70 |
+| 5 | 75.57 | 72.91 | 2319.05 | 2358.87 |
 
-decode median per-round ratio **1.0382**, 5/5 rounds disjoint (min-on 75.56 >
-max-off 72.93); pp512 overlaps in both directions, i.e. neutral — the identity
-check declines during prompt-phase builds by construction.
+decode median per-round ratio **1.0380**, 5/5 rounds disjoint (min-on 75.57 >
+max-off 73.09); pp512 overlaps in both directions, i.e. neutral — the view is
+not taken on any prompt-shaped build by construction.
 
-Perplexity is **bit-identical on both shapes**: gate `-c 512 --chunks 8`
-**3.9306** on and off (equal to the parent frontier's recorded value), decode
-shape `-c 512 -b 512 -ub 1 --chunks 8` **3.9237** on and off. The view and the
-gather deliver the same bytes to the same consumer, so this is expected rather
-than lucky, and it means the whole 0.1%/0.5% perplexity budget is still unspent
-after this patch.
+Perplexity is **identical to four decimal places at every measured shape**, view
+on and view off: gate `-c 512 --chunks 8` **3.9306** (equal to the parent
+frontier's recorded value), decode shape `-c 512 -b 512 -ub 1 --chunks 8`
+**3.9237**, the 16384-token window of the held-out long corpus **5.9375**, and
+the 32768-token window **6.9450**. The view and the gather deliver the same bytes
+to the same consumer, so this is structural rather than a lucky draw, and this
+patch spends none of the long-context budget.
+
+For the next reader: this series' own 32k reading of **6.9450** against stock's
+**6.9341** (+0.157%) is entirely patch **0013**'s load-time requant —
+`GGML_LOAD_REQUANT=0` on the same binary returns exactly 6.9341, while disabling
+the MMQ J-cap instead leaves 6.9450 unchanged. It is a byte-level weight change,
+so no kernel rewrite recovers it, and it is the accuracy side of a trade that
+buys +5.7% decode. Neither 0020 nor 0021 moves it.
 
 ## 0021: the q8_1 quantize folded into the fused unary+mul (+0.44% decode)
 
