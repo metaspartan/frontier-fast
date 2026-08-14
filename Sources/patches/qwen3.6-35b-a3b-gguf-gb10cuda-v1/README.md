@@ -288,3 +288,113 @@ restores the rolled loop.
   exactly eaten by the target types' lower dense-shape kernel efficiency
   (Q6_K dense mmvq runs near the LPDDR5 ceiling; Q5_K/Q5_1 dense do not).
   Byte cuts only pay when the destination kernel is at least as efficient.
+
+## 0020: the recurrent state served as a cache view, not a gather (+3.82% decode)
+
+Cross-port of the r9700 track's 0030, and the first patch in this series that
+came from that track's *core* work rather than its backend work. It touches no
+backend code at all — `src/llama-graph.*`, `src/llama-memory-recurrent.*`,
+`src/models/delta-net-base.cpp`, `src/models/qwen35moe.cpp` — which is why it
+transfers between HIP and CUDA unchanged.
+
+Thirty of this model's forty layers are gated-delta-net. Each one materialises
+its recurrent state before `gated_delta_net` runs: `build_rs` gathers the ssm
+state and `build_conv_state` gathers the conv window, two `get_rows` launches
+per layer per decoded token. That gather exists so seq-copy migration and
+rollback-snapshot restore can redirect a slot. In steady single-slot decode its
+index vector is the identity, and the copy moves bytes to a new address purely
+so the consumer can read them from there.
+`llama_memory_recurrent_context::s_copy_main_is_identity()` detects that at
+graph-build time without `s_copy()`'s side effects, and `build_rs` hands the
+consumer a contiguous `ggml_view_2d` of the cache rows instead. The view is
+restricted to `n_seqs == 1 && head == 0 && n_rs == 1` because llama.cpp reuses
+built graphs across decode steps and a view bakes its offset at build time; at
+row 0 a reused graph can never go stale, and that is the `--parallel 1` ranked
+shape. `LLAMA_DISABLE_RS_STATE_VIEW=1` restores stock.
+
+**Why this one ports when the launch-structure family did not.** This README
+already records grouped-mmvq as off by default, grouped-mmvf as measured dead
+(+0.5% for ~90 launches removed), and CUDA graph capture as live at decode with
+no launch-overhead pool behind it. All three say the same thing: on sm_121 a
+removed dispatch is worth almost nothing, because the replay gap the HIP track
+recovers is not there to recover. 0020 is not a launch-count patch. It removes
+a **read plus a write of the entire recurrent state on 30 layers of every
+token** — bytes, on a 121.6 GiB LPDDR5 part whose cold DRAM rate is 200-205
+GB/s. That is the property to test a candidate port against on this device: not
+how many dispatches it deletes, but how many bytes.
+
+Same-binary toggle, 5 interleaved whole-process rounds against the 19-patch
+build:
+
+| round | on tg128 | off tg128 | on pp512 | off pp512 |
+| --- | --- | --- | --- | --- |
+| 1 | 75.78 | 72.78 | 2350.33 | 2339.71 |
+| 2 | 75.65 | 72.85 | 2358.05 | 2342.07 |
+| 3 | 75.61 | 72.93 | 2364.08 | 2338.71 |
+| 4 | 75.63 | 72.91 | 2350.22 | 2353.82 |
+| 5 | 75.56 | 72.74 | 2353.37 | 2342.66 |
+
+decode median per-round ratio **1.0382**, 5/5 rounds disjoint (min-on 75.56 >
+max-off 72.93); pp512 overlaps in both directions, i.e. neutral — the identity
+check declines during prompt-phase builds by construction.
+
+Perplexity is **bit-identical on both shapes**: gate `-c 512 --chunks 8`
+**3.9306** on and off (equal to the parent frontier's recorded value), decode
+shape `-c 512 -b 512 -ub 1 --chunks 8` **3.9237** on and off. The view and the
+gather deliver the same bytes to the same consumer, so this is expected rather
+than lucky, and it means the whole 0.1%/0.5% perplexity budget is still unspent
+after this patch.
+
+## 0021: the q8_1 quantize folded into the fused unary+mul (+0.44% decode)
+
+Cross-port of the r9700 track's 0036, unmodified — the patch carries no arch
+guard, and 0009 already provides the mul-fold hook it extends. Same-binary
+toggle (`GGML_CUDA_DISABLE_UNARY_MUL_QUANT=1`), 5 interleaved rounds on top of
+0020: tg128 75.79/75.83/75.85/75.85/75.96 -> control 75.41/75.49/75.52/
+75.57/75.67, median ratio **1.0044**, 5/5 disjoint (min-on 75.79 > max-off
+75.67); pp512 neutral. Gate ppl **3.9306** both arms.
+
+It is small here for the same reason the rest of the launch-structure family is
+small: an nsys decode census of the 0020 build puts only 108 us/token in
+`k_bin_bcast op_mul` (82 launches) and 225 us/token in `quantize_q8_1` (125
+launches) out of a ~14 ms token, so the entire pool this patch can reach is
+about 2.4%. It is banked because it is byte-exact and toggleable, not because
+it is a lever.
+
+### Decode census of the 0020 build (nsys, share of kernel time)
+
+| share | n/token | kernel |
+| --- | --- | --- |
+| 48.3% | 107 | `mul_mat_vec_q` Q6_K dense (qkv/z, ssm_out, attn_out, lm head) |
+| 14.1% | 41 | `mul_mat_vec_q` Q4_K MoE gate+up (ids) |
+| 8.7% | 38 | `mul_mat_vec_q` Q5_K expert down (one-warp, 0018) |
+| 5.3% | 144 | `mul_mat_vec_f` F32 — the GDN alpha/beta/router/shexp-gate swarm |
+| 3.5% | 41 | `mul_mat_vec_q` Q8_0 (ids) |
+| 2.0% | 31 | `gated_delta_net_cuda` |
+| 1.5% | 125 | `quantize_q8_1` |
+| 0.7% | 82 | `k_bin_bcast op_mul` |
+
+Half the decode token is still dense Q6_K matvec, which 0014-0019 have already
+worked over; the F32 swarm is the largest remaining *count*, and grouping it is
+the lever this README records as measured dead here.
+
+### Prefill census of the same build (nsys, share of kernel time)
+
+| share | n/pass | kernel |
+| --- | --- | --- |
+| 26.6% | 160 | `mul_mat_q` Q4_K experts |
+| 17.0% | 74 | `mul_mat_q` Q5_K expert down |
+| 12.4% | 220 | `mul_mat_q` Q6_K (J=128 path) |
+| 12.3% | 60 | `gated_delta_net_cuda` |
+| 4.6% | 220 | `k_bin_bcast op_mul` |
+| 2.3% | 60 | `concat_non_cont` |
+| 1.8% | 60 | `ssm_conv_long_token_f32` |
+
+The two GDN prefill items the r9700 track attacked are both live here and both
+unported: its 0043 (multi-column waves in `gated_delta_net`, +5.7% prefill
+there) addresses the 12.3% row, and its 0033 (conv-chain fold at prefill shape,
+which deletes `concat_non_cont`, +3.6% prefill there) addresses the 2.3% + 1.8%
+pair. Neither applies cleanly on top of this series — both need their
+`ggml-cuda.cu` hunks rebased — and 0043 is explicitly not bit-exact on the HIP
+track, so it spends perplexity budget that 0020 and 0021 leave untouched. They
+are the scoped next levers for prefill.

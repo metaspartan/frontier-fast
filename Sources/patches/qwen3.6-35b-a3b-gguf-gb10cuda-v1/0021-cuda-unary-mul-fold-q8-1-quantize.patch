@@ -1,0 +1,142 @@
+From: Claude Opus 5 (Claude Code) <noreply@anthropic.com>
+Subject: [PATCH 21/21] cuda: fold the q8_1 quantize into the fused unary+mul
+ (+0.44% decode on sm_121)
+
+Cross-port of the qwen3.6-35b-a3b-gguf-r9700-v1 series' 0036, unmodified. The
+patch carries no architecture guard and 0009 already provides the mul-fold hook
+it extends, so it applies and fires on sm_121 as written.
+
+Same-binary toggle (GGML_CUDA_DISABLE_UNARY_MUL_QUANT=1), 5 interleaved
+whole-process rounds on top of 0020:
+
+| round | fold on tg128 | fold off tg128 |
+| --- | --- | --- |
+| 1 | 75.85 | 75.67 |
+| 2 | 75.79 | 75.57 |
+| 3 | 75.96 | 75.52 |
+| 4 | 75.85 | 75.41 |
+| 5 | 75.83 | 75.49 |
+
+median per-round ratio 1.0044, 5/5 rounds disjoint (min-on 75.79 > max-off
+75.67); pp512 neutral in both directions.
+
+Perplexity is bit-identical with the fold on and off, at both shapes:
+gate -c 512 --chunks 8 gives 3.9306 either way, decode shape
+-c 512 -b 512 -ub 1 --chunks 8 gives 3.9237 either way. Both equal the readings
+taken for 0020, so the 21-patch series as a whole is numerically identical to
+the 19-patch frontier it extends.
+
+The gain is small here, and the census says why rather than leaving it to
+guesswork: on the 0020 build this device spends 108 us/token in k_bin_bcast
+op_mul across 82 launches and 225 us/token in quantize_q8_1 across 125 launches,
+out of a ~14 ms token, so the entire pool this patch can reach is about 2.4%.
+It is banked because it is byte-exact and toggleable.
+
+---
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 50c313aa7..7442e20a7 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5548,7 +5548,25 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SILU }) ||
+         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SIGMOID }) ||
+         ggml_cuda_can_fuse(cgraph, i, { GGML_OP_UNARY, GGML_OP_MUL }, { GGML_UNARY_OP_SOFTPLUS })) {
+-        ggml_cuda_op_unary_mul(*cuda_ctx, node, cgraph->nodes[i + 1]);
++        ggml_tensor * mul = cgraph->nodes[i + 1];
++
++        // Same-shape gated product feeding a mul_mat_vec_q: fold that consumer's
++        // q8_1 quantization into this kernel instead of letting it launch
++        // quantize_q8_1 over the bytes we are about to write. Two populations on
++        // qwen35moe, 40 launches per decode token in total: the GDN gated norm
++        // (silu, 30/token, consumed by ssm_out) and the attention gate product
++        // (sigmoid, 10/token, consumed by attn_output). The register call keys
++        // the cache entry on the CONSUMER's view because both consumers read a
++        // RESHAPE of the product rather than the product itself.
++        static const bool disable_unary_mul_quant = getenv("GGML_CUDA_DISABLE_UNARY_MUL_QUANT") != nullptr &&
++                                                    std::atoi(getenv("GGML_CUDA_DISABLE_UNARY_MUL_QUANT"));
++        char * q8_1_dst = nullptr;
++        if (!disable_unary_mul_quant && mul->type == GGML_TYPE_F32 &&
++                cuda_ctx->stream_context().concurrent_events.empty()) {
++            q8_1_dst = ggml_cuda_quant_register_for_consumer(cuda_ctx, cgraph, i + 2, mul);
++        }
++
++        ggml_cuda_op_unary_mul(*cuda_ctx, node, mul, q8_1_dst);
+         return 1;
+     }
+ 
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index e1b16b83f..fc2c0c7cd 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -630,7 +630,8 @@ void ggml_cuda_op_leaky_relu(ggml_backend_cuda_context & ctx, ggml_tensor * dst)
+ /* fused unary + mul */
+ 
+ template <float (*op)(float)>
+-static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
++static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node,
++                                        char * q8_1_dst = nullptr) {
+     // unary_node: UNARY op applied to unary_node->src[0]
+     // mul_node:   MUL(a, b) where one of a/b is unary_node
+     // Output goes to mul_node->data
+@@ -655,6 +656,18 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
+     const int64_t unary_stride = unary_src->nb[1];
+     const int64_t other_stride = other_src->nb[1];
+ 
++    if (q8_1_dst != nullptr) {
++        // F32 only, and the caller has checked contiguity / QK8_1 divisibility.
++        GGML_ASSERT(unary_src->type == GGML_TYPE_F32);
++        GGML_ASSERT(ggml_is_contiguous(mul_node));
++        GGML_ASSERT(k % QK8_1 == 0);
++        unary_gated_quant_cuda<op>((const float *) unary_src->data, (const float *) other_src->data,
++                                   (float *) mul_node->data, k, nc,
++                                   unary_stride / sizeof(float), other_stride / sizeof(float),
++                                   q8_1_dst, stream);
++        return;
++    }
++
+     if (unary_src->type == GGML_TYPE_F16) {
+         unary_gated_cuda<op>((const half *) unary_src->data, (const half *) other_src->data,
+                              (half *) mul_node->data, k, nc,
+@@ -666,16 +679,17 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
+     }
+ }
+ 
+-void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node) {
++void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node,
++                            char * q8_1_dst) {
+     switch (ggml_get_unary_op(unary_node)) {
+         case GGML_UNARY_OP_SILU:
+-            ggml_cuda_op_unary_mul_impl<op_silu>(ctx, unary_node, mul_node);
++            ggml_cuda_op_unary_mul_impl<op_silu>(ctx, unary_node, mul_node, q8_1_dst);
+             break;
+         case GGML_UNARY_OP_SIGMOID:
+-            ggml_cuda_op_unary_mul_impl<op_sigmoid>(ctx, unary_node, mul_node);
++            ggml_cuda_op_unary_mul_impl<op_sigmoid>(ctx, unary_node, mul_node, q8_1_dst);
+             break;
+         case GGML_UNARY_OP_SOFTPLUS:
+-            ggml_cuda_op_unary_mul_impl<op_softplus>(ctx, unary_node, mul_node);
++            ggml_cuda_op_unary_mul_impl<op_softplus>(ctx, unary_node, mul_node, q8_1_dst);
+             break;
+         default:
+             GGML_ABORT("Unsupported unary op for fused unary+mul");
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+index b8df5532d..d83c77a58 100644
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -103,7 +103,14 @@ void ggml_cuda_op_geglu_quick(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+ 
+ void ggml_cuda_op_xielu(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+-void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node);
++// Fused unary+mul. When q8_1_dst != nullptr the kernel additionally writes the
++// q8_1 quantization of the product into that buffer, for the case where the
++// product feeds a mul_mat_vec_q that would otherwise launch quantize_q8_1 over
++// the values this kernel just wrote (the GDN gated norm and the attention gate
++// product both do). F32 only; the caller must have checked that mul_node is
++// contiguous and that its element count is a multiple of QK8_1.
++void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary_node, ggml_tensor * mul_node,
++                            char * q8_1_dst = nullptr);
+ 
+ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
+ 
