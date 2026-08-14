@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude Code (Opus 5) <noreply@anthropic.com>
 Date: Fri, 14 Aug 2026 03:30:00 -0600
-Subject: [PATCH 08/27] cuda: allow the exact in-place Nemotron activation co-launch
+Subject: [PATCH 08/26] cuda: allow the exact in-place Nemotron activation co-launch
 
 Ported from the Nemotron R9700 HIP series to the GB10 CUDA track. Both tracks
 pin llama.cpp 0b1bad14ff20 and llama.cpp's HIP backend is the CUDA backend

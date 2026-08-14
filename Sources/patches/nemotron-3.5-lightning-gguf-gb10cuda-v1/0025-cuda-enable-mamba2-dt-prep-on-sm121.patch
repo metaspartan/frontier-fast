@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude Code (Opus 5) <noreply@anthropic.com>
 Date: Fri, 14 Aug 2026 03:30:00 -0600
-Subject: [PATCH 26/27] cuda: enable the Mamba2 dt decay preparation on sm_121
+Subject: [PATCH 25/26] cuda: enable the Mamba2 dt decay preparation on sm_121
 
 Patch 0013 arrives from the R9700 series with a hard architecture gate --
 `if (!GGML_CUDA_CC_IS_RDNA4(cc)) return 0;` -- so on GB10 it compiles,

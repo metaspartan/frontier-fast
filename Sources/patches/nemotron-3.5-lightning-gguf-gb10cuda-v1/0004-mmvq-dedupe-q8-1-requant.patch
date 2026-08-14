@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude Code (Opus 5) <noreply@anthropic.com>
 Date: Fri, 14 Aug 2026 03:30:00 -0600
-Subject: [PATCH 04/27] cuda: reuse q8_1 activations across Nemotron MMVQ consumers
+Subject: [PATCH 04/26] cuda: reuse q8_1 activations across Nemotron MMVQ consumers
 
 Ported from the Nemotron R9700 HIP series to the GB10 CUDA track. Both tracks
 pin llama.cpp 0b1bad14ff20 and llama.cpp's HIP backend is the CUDA backend
@@ -20,7 +20,7 @@ This is also the substrate the producer-side q8_1 folds in later patches
 write into. GB10 leave-one-out: GGML_CUDA_MMVQ_NO_Q8_1_CACHE=1 costs 0.73%
 of decode.
 
-NOTE: on CUDA this patch needs patch 0027, which makes the cache's frees
+NOTE: on CUDA this patch needs patch 0026, which makes the cache's frees
 LIFO-ordered. See that patch for why the HIP build never hit it.
 ---
 diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh

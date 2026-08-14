@@ -4,16 +4,28 @@ Patch series for Nemotron 3.5 Lightning 30B-A3B (Q4_K_M) on the DGX Spark GB10,
 via llama.cpp CUDA.
 
 The series is 0001-0002 (server/graph prompt-side, measured on this box) plus
-0003-0027, a port of the Nemotron R9700 HIP series. llama.cpp's HIP backend is
-the CUDA backend source-translated and both tracks pin the same engine commit,
-so those diffs apply to `ggml/src/ggml-cuda` unchanged; the two CUDA-specific
-patches the port needed are 0026 (an RDNA4-only gate that made one fusion dead
-code on sm_121) and 0027 (the q8_1 reuse cache frees out of order, which the
-CUDA VMM pool asserts on and the HIP leg pool tolerates).
+0003-0024, a port of the Nemotron R9700 HIP series, plus 0025-0026, the two
+CUDA-specific patches the port needed. llama.cpp's HIP backend is the CUDA
+backend source-translated and both tracks pin the same engine commit, so those
+diffs apply to `ggml/src/ggml-cuda` unchanged.
 
-R9700 patch 0009, adaptive prompt-cache admission, is deliberately NOT ported:
-the llama.cpp bench harness sends `cache_prompt: false` on every request, so
-the lever cannot fire and there is nothing to measure.
+0025 opens an RDNA4-only gate that made one fusion dead code on sm_121. 0026
+makes the q8_1 reuse cache free in LIFO order, which the CUDA VMM pool requires
+and the HIP leg pool does not.
+
+Three R9700 patches are deliberately NOT ported:
+
+- **0009** (adaptive prompt-cache admission) cannot fire — the bench harness
+  sends `cache_prompt: false` on every request it times.
+- **0026** (dt decay prepared per prompt token) is actively wrong on CUDA. It
+  repoints the scan's `dt` at a prepared softplus buffer, but `ssm-scan.cu`
+  routes long sequences to the SSD matmul kernel instead, inside a
+  `#if !defined(GGML_USE_HIP)` block that does not exist in the HIP build. That
+  kernel reads raw `dt` and softplusses it a second time, so every ranked
+  prompt decodes garbage. Perplexity and `llama-bench` cannot see it: both feed
+  one continuous sequence that is an exact multiple of `n_ubatch`.
+- 0001 (MMVQ idle-warp trim) IS ported but is worth 0.06% here; it is carried
+  only because two co-launch patches build on the helpers it introduces.
 
 **This track does not build the platform default engine.** It pins llama.cpp at
 `0b1bad14ff20` rather than `b10237`, for the same reason its R9700 twin does:

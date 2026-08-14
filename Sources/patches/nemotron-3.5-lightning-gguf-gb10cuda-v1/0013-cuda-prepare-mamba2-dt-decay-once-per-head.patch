@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude Code (Opus 5) <noreply@anthropic.com>
 Date: Fri, 14 Aug 2026 03:30:00 -0600
-Subject: [PATCH 13/27] cuda: prepare the Mamba2 dt decay once per head
+Subject: [PATCH 13/26] cuda: prepare the Mamba2 dt decay once per head
 
 Ported from the Nemotron R9700 HIP series to the GB10 CUDA track. Both tracks
 pin llama.cpp 0b1bad14ff20 and llama.cpp's HIP backend is the CUDA backend
@@ -12,8 +12,19 @@ recomputes both in every warp that shares that head. Compute them once in a
 small preparation kernel that also absorbs the dt bias ADD.
 
 This patch is architecture-gated in the source it was ported from; see patch
-0026, which opens the gate for sm_121. GB10 leave-one-out with the gate open:
+0025, which opens the gate for sm_121. GB10 leave-one-out with the gate open:
 GGML_CUDA_DISABLE_SSM_DT_PREP_FUSION=1 costs 0.32% of decode.
+
+Only the DECODE half of the R9700 pair is ported. Its prompt-graph half
+(R9700 0026) is not, and must not be: it repoints the scan's dt source at a
+prepared softplus(dt)/dA buffer, but ggml-cuda/ssm-scan.cu selects the SSD
+matmul kernel instead of the scan for long sequences on NVIDIA Turing+,
+inside a block the HIP build compiles out entirely. That kernel reads raw dt,
+so it softplusses an already-softplussed value and every ranked prompt comes
+back as fluent garbage. Measured: with it in, all 11 of the runner's
+deterministic ranked prompts degenerate against a coherent stock arm and
+three of them 500 the server; with it out, the series is byte-identical to
+the parent frontier on all 11 at both 128 and 728 generated tokens.
 ---
 diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
 index dd1233a5d..2afa35d74 100644

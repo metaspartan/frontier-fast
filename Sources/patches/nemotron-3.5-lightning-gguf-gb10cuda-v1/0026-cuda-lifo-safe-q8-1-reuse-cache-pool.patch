@@ -1,7 +1,7 @@
 From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Claude Code (Opus 5) <noreply@anthropic.com>
 Date: Fri, 14 Aug 2026 03:30:00 -0600
-Subject: [PATCH 27/27] cuda: give the q8_1 reuse cache a pool it can free in LIFO order
+Subject: [PATCH 26/26] cuda: give the q8_1 reuse cache a pool it can free in LIFO order
 
 Patch 0004's cache holds pool suballocations across many graph nodes and
 releases them from the middle of the vector: the oldest entry on capacity
