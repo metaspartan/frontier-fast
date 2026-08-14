@@ -1,5 +1,15 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Carsen <carsenk@gmail.com>
+Date: Thu, 13 Aug 2026 12:00:00 -0600
+Subject: [PATCH 26/26] hip: raise Q4_K J96 MMQ occupancy to 3
+
+The decode-only MoE prefill (6 of 128 experts) runs the Q4_K J=96 tile
+selected by patch 0010. The RDNA4 config sets occupancy=2 for all Q4_K
+tiles. Raising to 3 for J=96 lets the compiler target 3 resident blocks
+per CU, which can hide memory latency better when the MoE tile's working
+set is small. Arithmetic is unchanged; hash 29b53026dd77caf1.
+
 diff --git a/ggml/src/ggml-cuda/mmq-config-rdna4.cuh b/ggml/src/ggml-cuda/mmq-config-rdna4.cuh
-index 9293d9d55..ba6af33a8 100644
 --- a/ggml/src/ggml-cuda/mmq-config-rdna4.cuh
 +++ b/ggml/src/ggml-cuda/mmq-config-rdna4.cuh
 @@ -122,7 +122,7 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
@@ -10,4 +20,3 @@ index 9293d9d55..ba6af33a8 100644
 +    CASE(GGML_TYPE_Q4_K, 256, 3, 128,  96, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
      CASE(GGML_TYPE_Q4_K, 256, 2, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
      CASE(GGML_TYPE_Q4_K, 256, 2, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, false, false);
- 
