@@ -411,3 +411,174 @@ pair. Neither applies cleanly on top of this series — both need their
 `ggml-cuda.cu` hunks rebased — and 0043 is explicitly not bit-exact on the HIP
 track, so it spends perplexity budget that 0020 and 0021 leave untouched. They
 are the scoped next levers for prefill.
+
+## The roofline, measured rather than assumed (2026-08-14)
+
+Every headroom claim on this track has been computed against **273 GB/s**,
+which is the DGX Spark datasheet number, and against a bytes/token figure the
+board itself labels `estimated-from-architecture`. Both were measured on the
+box before 0022 was designed, because 0022's whole argument is the size of the
+gap between what a kernel gets and what the DRAM will give.
+
+### What the DRAM actually delivers
+
+A standalone CUDA program, cudaEvent-timed, no profiler, pseudo-random
+contents, one block per row exactly as `mul_mat_vec_q` launches:
+
+| working set | geometry | 64 thr/blk | 128 thr/blk | 256 thr/blk |
+| --- | --- | --- | --- | --- |
+| 417 MB (the output head, exact) | 248320 x 1680 B | **231.8** | 242.7 | 244.1 |
+| 5.28 GB | 3145728 x 1680 B | 238-239 | 250-253 | — |
+| 13.8 MB (L2-resident control) | 8192 x 1680 B | 1306-1363 | — | — |
+
+The last row is the residency check that replaces a miss counter (this box
+denies GPU performance counters to non-root, so `ncu` cannot run): a working
+set inside the 24 MB L2 reads 5.6x faster, so the 417 MB and 5.28 GB rows are
+DRAM. Zeroed and pseudo-random buffers read the same, so there is no
+compression artefact either way.
+
+**Sustained streaming read on this GB10 is 232-252 GB/s, not 273.**
+
+### What the token actually reads
+
+Byte census from the GGUF tensor table, matched launch-for-launch against an
+nsys decode trace of the 21-patch frontier build (103 decoded tokens, every
+kernel group's launch count divides exactly):
+
+| MB/token | us/token | GB/s | matvec group |
+| --- | --- | --- | --- |
+| 550.5 | 2565 | 214.6 | Q6_K attn_qkv x30 + attn_q x10 `[2048 x 8192]` |
+| 417.2 | 2053 | 203.2 | Q6_K output head `[2048 x 248320]` |
+| 377.5 | 2008 | 188.0 | Q4_K ffn_gate+up_exps x40 (fused) `[2048 x 512] x8` |
+| 275.3 | 1423 | 193.5 | Q6_K ssm_out x30 + attn_output x10 `[4096 x 2048]` |
+| 213.4 | 1237 | 172.5 | Q5_K ffn_down_exps x37 `[512 x 2048] x8` |
+| 206.4 | 981 | 210.4 | Q6_K attn_gate x30 `[2048 x 4096]` |
+| 111.4 | 589 | 189.3 | Q8_0 shexp gate+up x40 (fused) + attn_k/v x20 |
+| 83.9 | 369 | 227.1 | F32 ffn_gate_inp router x40 `[2048 x 256]` |
+| 44.6 | 267 | 166.9 | Q8_0 ffn_down_shexp x40 `[512 x 2048]` |
+| 20.6 | 120 | 172.3 | Q6_K ffn_down_exps x3 `[512 x 2048] x8` |
+| 15.7 | 111 | 142.3 | F32 ssm_alpha/ssm_beta x60 `[2048 x 32]` |
+| 0.3 | 49 | 6.7 | F32 ffn_gate_inp_shexp x40 |
+| **2316.8** | **11772** | **196.8** | **aggregate matvec** (431 launches/token) |
+
+Add the recurrent state (30 GDN layers x 2.097 MB, read and written: 125.8 MB),
+the conv state (2.9 MB), the KV cache of the 10 attention layers at 512 context
+(10.5 MB), the logits write (1.0 MB) and the norm weights (17.7 MB), and the
+token reads **2474.8 MB**, against the board's estimate of 2777.9 MB. The
+estimate is close to the *stock* byte count; 0013 already removed about 290 MB
+of it.
+
+Matvec is **88.6%** of GPU-busy time (11772 of 13277 us/token, where GPU-busy
+is the union of kernel intervals and lands within 0.7% of the unprofiled wall
+clock).
+
+### The ceiling those two numbers imply
+
+At 2474.8 MB/token the frontier's 74.59 tok/s is **184.6 GB/s** end to end:
+
+| against | GB/s | ceiling | headroom over 74.59 |
+| --- | --- | --- | --- |
+| datasheet (what the board uses) | 273.0 | 110.3 | +47.9% |
+| best sustained streaming read | 250.0 | 101.0 | +35.4% |
+| head geometry at 64 thr/blk (the kernel's own block) | 231.8 | 93.7 | +25.6% |
+| the best rate any real matvec here reaches | 214.6 | 86.7 | +16.3% |
+| the current aggregate matvec rate | 196.8 | 79.5 | +6.6% |
+
+The published 98.27 tok/s ceiling survives this, but by cancellation rather
+than by being right: 273 GB/s overstates the bandwidth by about 9% and
+2777.9 MB overstates the bytes by about 12%. Recomputed honestly the ceiling is
+99-101 tok/s.
+
+The reachable part is the narrow band. Every large matvec is already within
+5-15% of what its own access pattern sustains, so the difference between the
+top and bottom rows of that table is not engineering headroom - it is the cost
+of reading a 210-byte Q6_K block with 4-byte loads, which this track has
+measured dead twice. 0022 takes the one part of the gap that is a launch
+parameter rather than a load width.
+
+### Correction to an earlier entry
+
+The dead end recorded as "the 149 GB/s profile figure was measured under nsys
+overhead" is wrong about the mechanism. Node-level graph tracing costs 5.2% of
+wall clock (74.79 -> 70.91 tok/s) but **does not inflate kernel durations**:
+run with `GGML_CUDA_DISABLE_GRAPHS=1` under a plain kernel trace, which costs
+0.96%, the same kernels report the same medians to within 1% - the output head
+reads 2045.63 us one way and 2044.29 us the other. The overhead lands in the
+gaps between nodes. Kernel times from an nsys census may be used directly; what
+must not be used directly is the *sum* of them, which overcounts by about 8%
+because adjacent CUPTI ranges overlap by roughly 1 us of drain.
+
+## 0022: sm_121 wide row block for the dense Q6_K matvecs (+1.2% decode)
+
+Dense Q6_K is 1449 of the 2317 MB of matvec weights a token reads. The table
+above says the group runs at 202-215 GB/s and the probe says its own geometry
+sustains 232 GB/s at 64 threads per block and 243 at 128. Q6_K's 210-byte block
+forbids a wider load, so the remaining way to get more narrow loads in flight
+against one row is more lanes on the row: the SM121 mmvq table gives K-quants
+two warps, and this gives Q6_K four.
+
+`rows_per_block` does not move - `calc_rows_per_block` returns 1 for every
+`ncols_dst == 1` shape that is not `small_k`, and Q6_K never takes `small_k` on
+this model - so the grid is unchanged and only the block grows. That is the
+difference from the whole-table nwarps sweep recorded as neutral in the dead
+ends above: raising nwarps for the entire K-quant row also raised the expert
+shapes to `rows_per_block = 2*nwarps = 8`, which the same section separately
+measures at -0.4%, so the two were being netted against each other.
+
+Firing proof (nsys, grids identical, blocks doubled): head 2044 -> 1977 us,
+ssm_out 36.99 -> 35.26 us, qkv 66.50 -> 66.61 us, attn_gate 33.54 -> 33.73 us,
+and every Q4_K/Q5_K/Q8_0/F32 launch unchanged.
+
+Three sessions, two independently built shared libraries with distinct md5
+selected by `LD_LIBRARY_PATH`, counterbalanced order, whole-process launches,
+`llama-bench tg128 -r 2`:
+
+| session | control | wide | median ratio |
+| --- | --- | --- | --- |
+| A, 6 rounds | 75.92-76.13 | 76.64-77.10 | 1.0123 |
+| B, 6 rounds | 75.91-76.15 | 76.93-77.14 | 1.0131 |
+| C, 5 rounds | 75.90-76.09 | 76.76-76.92 | 1.0120 |
+
+17 of 17 rounds disjoint. pp512 overlaps in both directions over 6 rounds
+(2339-2355 control, 2347-2358 wide): decode-shape mmvq is not on the prefill
+path, which runs MMQ. Gate ppl `-c 512 --chunks 8` reads **3.9306** on five
+consecutive loads of each arm, equal to the parent frontier's recorded value.
+
+Eight warps was swept in the same harness and is an occupancy cliff:
+72.73-72.93 against 75.91-76.15, **-4.2%**. Four is the setting.
+`GGML_CUDA_DISABLE_SM121_WIDE_ROW_BLOCK` restores two warps.
+
+## 0023: guard the folded add chain against a cross-block overlap
+
+A correctness guard, credited to the round-51 work on the sibling track
+`qwen3.6-35b-a3b-gguf-r9700-v1`, carried here because this series ships the
+same 0006 fold unguarded. It carries no performance claim.
+
+0006's `rms_norm_pre_add` issues one block per row: block r writes `add_dst`
+row r in loop 1 and `dst` row r in loop 2, with only a block-scope
+`__syncthreads()` between them, and reads the add operand rows in loop 1.
+Nothing orders one block's loop 2 against another block's loop 1, so a write
+range belonging to block r must not intersect a read range belonging to a
+different block. The existing check tests `dst` against the stored add result
+only. Since every writer and reader is contiguous and the same shape, their row
+grids are congruent, and an overlap is safe only when the two tensors start at
+exactly the same address - the in-place residual add the kernel already
+assumes. On the sibling track 9 of 79 folds per graph overlap with bases 128
+bytes apart, and the fold there produces a 0.107% spread over six distinct
+perplexity values.
+
+**On this track the guard declines nothing.** `GGML_RMS_PRE_ADD_AUDIT=1` dumps
+each candidate's ranges and the verdict:
+
+| shape | folds seen | declined |
+| --- | --- | --- |
+| `-c 512 --chunks 8` | 79 at nrows 2, 632 at nrows 512 | 0 |
+| `-c 2048 --chunks 2` | 79 at nrows 2, 632 at nrows 512 | 0 |
+| `-c 16384` long window | 79 at nrows 2, 2528 at nrows 512 | 0 |
+| `-c 512 -b 512 -ub 1` | 828 at nrows 1 | 0 |
+
+and the gate reads 3.9306 on five loads guarded and 3.9306 on five unguarded.
+This track's allocator does not produce the sibling's offset pair, so the fold
+is correct here by accident of layout rather than by construction; the guard
+makes it correct by construction at zero declined folds and therefore zero
+cost. `GGML_CUDA_PRE_ADD_NORM_UNSAFE=1` drops it.

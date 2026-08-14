@@ -1,0 +1,122 @@
+From: Claude Opus 5 <noreply@anthropic.com>
+Subject: [PATCH] CUDA: sm_121 wide row block for the dense Q6_K matvecs
+
+Half of this model's decode token is dense Q6_K matvec. A byte census of the
+21-patch frontier build, taken from the GGUF tensor table and matched launch
+for launch against an nsys decode trace, reads 2317 MB of matvec weights per
+token, of which the Q6_K dense group is 1449 MB: attn_qkv x30 and attn_q x10
+at [2048 x 8192] (550 MB), the [2048 x 248320] output head (417 MB), ssm_out
+x30 and attn_output x10 at [4096 x 2048] (275 MB) and attn_gate x30 at
+[2048 x 4096] (206 MB).
+
+That group runs at 202-214 GB/s. The question this patch answers is what the
+number would be if nothing were wrong, and the answer comes from a
+profiler-free probe rather than from the datasheet. A CUDA program that
+reproduces the output head's exact launch geometry - 248320 blocks, one
+1680-byte row of DRAM each, cudaEvent timing, pseudo-random contents - reads
+
+    64 threads/block   227.2 232.5 231.1 232.2 232.3  GB/s   (median 231.8)
+   128 threads/block   240.3 242.5 243.0 242.7 243.0  GB/s   (median 242.7)
+   256 threads/block   243.7 244.1 244.1 244.3 244.7  GB/s   (median 244.1)
+
+with an L2-residency control at the same geometry (13.8 MB, inside the 24 MB
+L2) reading 1306-1363 GB/s, i.e. 5.6x, so the 417 MB figures are DRAM and not
+cache. The kernel runs the 64-thread column and the DRAM will serve the
+128-thread one. Q6_K has vdr = 1 and a 210-byte block, so a lane can only
+issue narrow loads and no wider load exists (measured dead twice on this
+track); the remaining way to get more of them in flight against one row is
+more lanes on the row.
+
+The SM121 mmvq table gives K-quants two warps. This gives Q6_K four, and only
+Q6_K:
+
+    if (sm121_wide_row_block(type, ncols_dst, table_id)) return 4;
+
+rows_per_block does not move. calc_rows_per_block returns 1 for every
+ncols_dst == 1 shape that is not small_k, and Q6_K never takes the small_k
+path on this model, so the grid is unchanged and only the block grows. That is
+what separates this from the whole-table nwarps sweep this track recorded as
+neutral: raising nwarps for the entire K-quant row also raised the expert
+shapes to rows_per_block = 2*nwarps = 8, which the same ledger separately
+measured at -0.4%, so the two effects were being netted against each other in
+one number.
+
+Firing proof, nsys node-graph census, grids identical and blocks doubled:
+
+    [2048 x 248320] head      grid 248320x1x1  blk 32x2 -> 32x4   2044 -> 1977 us
+    [4096 x 2048] ssm_out     grid   2048x1x1  blk 32x2 -> 32x4     36.99 -> 35.26 us
+    [2048 x 8192] qkv/q       grid   8192x1x1  blk 32x2 -> 32x4     66.50 -> 66.61 us
+    [2048 x 4096] attn_gate   grid   4096x1x1  blk 32x2 -> 32x4     33.54 -> 33.73 us
+
+and every Q4_K, Q5_K, Q8_0 and F32 launch unchanged in grid and block.
+
+Measurement. Two independently built shared libraries, distinct md5, selected
+by LD_LIBRARY_PATH; counterbalanced arm order; whole-process launches;
+llama-bench tg128 -r 2.
+
+    session A, 6 rounds   ctl 75.92-76.13   wide 76.64-77.10   median ratio 1.0123
+    session B, 6 rounds   ctl 75.91-76.15   wide 76.93-77.14   median ratio 1.0131
+    session C, 5 rounds   ctl 75.90-76.09   wide 76.76-76.92   median ratio 1.0120
+
+17 of 17 rounds disjoint. pp512 overlaps in both directions across 6 rounds
+(2339-2355 against 2347-2358), so prefill is neutral - decode-shape mmvq is
+not on the prefill path, which runs MMQ.
+
+Eight warps was swept in the same harness and is an occupancy cliff: 72.73-72.93
+against the control's 75.91-76.15, -4.2%. Four is the setting.
+
+Perplexity is unchanged at the gate shape: -c 512 --chunks 8 on the held-out
+corpus reads 3.9306 on five consecutive loads of the wide build and 3.9306 on
+five of the control, equal to the parent frontier's recorded value.
+
+GGML_CUDA_DISABLE_SM121_WIDE_ROW_BLOCK restores the two-warp block.
+---
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 0291459..1ed84a9 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -155,6 +155,34 @@ static constexpr __host__ __device__ bool sm121_one_warp_row(
+ #endif
+ }
+ 
++// sm_121 wide row block. The dense Q6_K matvecs are half of this model's decode
++// token: attn_qkv/attn_q [2048 x 8192], attn_gate [2048 x 4096], ssm_out and
++// attn_output [4096 x 2048] and the [2048 x 248320] output head, 1449 MB of the
++// 2317 MB of weights a token reads. Q6_K has vdr = 1 and a 210-byte block, so a
++// lane can only issue narrow loads; the way to get more of them in flight per
++// row is more lanes on the row, not wider ones. A profiler-free probe of the
++// output head's exact geometry - 248320 blocks, one 1680-byte row each - reads
++// 231 GB/s at 64 threads per block and 243 GB/s at 128, while the kernel itself
++// runs at 203 GB/s, so the block is the narrower of the two constraints. The
++// K-quant entry of the SM121 table gives two warps; Q6_K takes four. Eight was
++// swept and is an occupancy cliff (-4.2% decode).
++//
++// rows_per_block is unaffected: calc_rows_per_block returns 1 for every
++// ncols_dst == 1 shape that is not small_k, and Q6_K never takes the small_k
++// path on this model, so the grid is unchanged and only the block grows. That
++// is what separates this from the earlier whole-table nwarps sweep, which moved
++// the expert shapes to rows_per_block = 2*nwarps = 8 at the same time and paid
++// that back against itself.
++static constexpr __host__ __device__ bool sm121_wide_row_block(
++        ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id) {
++#ifdef GGML_CUDA_DISABLE_SM121_WIDE_ROW_BLOCK
++    (void) type; (void) ncols_dst; (void) table_id;
++    return false;
++#else
++    return table_id == MMVQ_PARAMETERS_SM121 && ncols_dst == 1 && type == GGML_TYPE_Q6_K;
++#endif
++}
++
+ // sm_121 mmvq k-loop unroll factor. On this device the dominant decode kernels
+ // are the Q6_K dense matvecs (~50% of decode kernel time in an nsys census):
+ // Q6_K has vdr = 1 and its 210-byte block forbids any wider load, so a lane
+@@ -498,6 +526,9 @@ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_d
+             if (sm121_one_warp_row(type, ncols_dst, table_id)) {
+                 return 1;
+             }
++            if (sm121_wide_row_block(type, ncols_dst, table_id)) {
++                return 4;
++            }
+             switch (type) {
+                 case GGML_TYPE_Q2_K:
+                 case GGML_TYPE_Q3_K:
