@@ -1,19 +1,25 @@
 # laguna-xs-2.1-gguf-r9700-v1 — patch series
 
-The platform's most-worked track. Nineteen patches applied to llama.cpp
+The platform's most-worked track. Twenty-four patches applied to llama.cpp
 `b10237`, built `GGML_HIP=ON, AMDGPU_TARGETS=gfx1201, Release`. Frontier
-**+37.13%** (154.87 tok/s decode against a 95.43 tok/s baseline); the current
-top entry is `MoE shared expert gate/up as ninth channel`.
+**+60.26%** (158.16 tok/s decode against a 95.43 tok/s baseline) at 0023; the
+top entry is `Adaptive prompt-cache admission`. 0020–0023 are the graph-order
+pin and the three server/llama host patches, and they are where the last
++20 points of score came from — not from kernels.
 
 Numbers here are from the trusted runner and the findings API as of
-2026-08-04. `curl -s "https://frontier.fast/api/findings?track=laguna-xs-2.1-gguf-r9700-v1"`
-is authoritative and has 20+ entries — read it before designing anything.
+2026-08-14. `curl -s "https://frontier.fast/api/findings?track=laguna-xs-2.1-gguf-r9700-v1&limit=500"`
+is authoritative and has 25+ entries — read it before designing anything.
+**Pass `limit`**: the default page is global and the qwen track's volume will
+push every laguna finding off it.
 
 ## The one thing to know: this box is launch-bound
 
-1331 dispatches per token, and kernel time is only ~74% of decode wall. That
-means **removing a launch pays 2–3× its kernel-time share**, because you
-remove its inter-dispatch gap too.
+Re-censused at 0023: **778 dispatches per token, 4.96 ms of kernel inside a
+6.07 ms wall token** — kernel is now 82% of decode wall and the average
+inter-dispatch gap is ~1.43 us. Removing a launch still pays its own kernel
+time *plus* that gap, which is the arithmetic every win on this track has
+been made of.
 
 The q8_1 re-quantization dedupe is the proof: it was projected at +2.7% from
 its 4% share of decode and landed at **+8.69%** (decode 1.1397, 109.08
@@ -40,6 +46,8 @@ of kernels already near the memory ceiling.
 | 0017-0018 | MoE shared expert as a ninth channel | The shared-expert down projection is **latency**-bound, not bandwidth-bound: standalone it moves 0.86 MB in 8.43 us (102 GB/s) from only 2048 workgroups, while the routed projection doing identical per-row work at 8× the channel count sustains 601 GB/s. Bandwidth here scales with wave count, so the fix is more concurrent work in the same launch. |
 | 0019 | release the q8_1 cache before pool teardown | Fixes an abort, not a speed win — see below. |
 | 0020 | attention gate projection joins the Q/K grouped launch | **won** — score **1.3872 (+38.72%)**, decode 1.6474x / **156.8 tok/s**. A one-line graph-order change, bit-identical. Took the track from Cybara's 1.3731. Open lever 1 below is now partly closed. |
+| 0021-0023 | the three host-side patches: adaptive context checkpoints, trailing-ubatch absorption, adaptive prompt-cache admission | **+5.61%, +6.48%, +2.73% of score** — 1.3872 → **1.6026**, from ~229 lines and no kernel code. All three are the same pattern: `llama-server` doing speculative work betting a later request shares a prefix, never checking whether one ever does. Check all three on any llama.cpp server track *before* writing a kernel. |
+| 0024 | MoE routing-weight multiply folded into the routed down projection | **+1.69% decode**, pp neutral, bit-exact (decode-shape PPL identical to every digit). −39.0 dispatches/token; the `k_bin_bcast` y=8 population is gone. Composes with 0017 — the ninth channel is not routed, so it is predicated off the scale and both folds ride one launch. |
 
 ## Dead ends — do not spend a slot re-deriving these
 
@@ -76,13 +84,32 @@ of kernels already near the memory ceiling.
 
 ## Open levers, in order
 
-1. **Merge Q/K/V matvecs into one grouped launch; fold `k_bin_bcast`.**
-   Post-dedupe, `mul_mat_vec_q` is 69.2% of decode across 13,134 dispatches
-   at 12.24 us. Q/K/V are three dispatches over the *same* quantized input
-   with different weights — groupable into one launch with byte-identical
-   per-row work. A launch-count play on a launch-bound box, which is the
-   class that pays here. Needs graph-level fusion detection; budget a full
-   session. HIP graphs are already on, so that is not a lever.
+Census at 0024 (748 dispatches/token) for sizing anything below: `mul_mat_vec_q`
+162 @ 17.31 us, `quantize_q8_1` 78 @ 1.41, `rms_norm_pre_add<1024,1>` 42,
+`mul_mat_vec_q_grouped` 41 @ 21.98, then four families at exactly 40 —
+`k_set_rows_grouped`, `flash_attn_combine_results`, `k_mul_bcast0_quant`,
+`k_bin_bcast` — and `mul_mat_vec_f` 39 @ 4.84 (the f32 router at decode),
+`topk_moe` 39, `rms_norm_f32_grouped` 38, `rms_norm_pre_add<1024,3>` 38,
+`rope_neox_grouped` 38.
+
+0. **The last `k_bin_bcast`: 40/token @ 2.04 us, the shared-expert add**
+   (`cur = ggml_add(moe_out, ffn_shexp)`). 0024 removed the other bin_bcast
+   family and this is the twin, worth ~139 us/token including its gap
+   (~+2.3% decode) if it folds. The shared expert's output is already produced
+   by the ninth channel of the same launch that produces the routed result, so
+   the two candidates are an accumulating store on that channel, or absorbing
+   the add as a fourth input to the `rms_norm_pre_add` fold that already sums
+   three. **Start here** — it is the cheapest remaining launch-count play and
+   the machinery for both routes already exists in the series.
+1. **Merge Q/K/V matvecs into one grouped launch.** Q/K and the attention gate
+   are grouped (0004, 0020); V is left out because it is Q6_K and the grouped
+   kernel is single-type. Do **not** try to fix that by reordering — that is
+   measured dead (`reordering-more-breaks-other-groupings`, and it moves
+   decode-shape PPL by 0.5%). The legitimate route is a cross-quant-type guest
+   inside `mul_mat_vec_q_grouped`, which qwen3.6 0052 already implements and
+   measured at +0.6% decode there for 10 dispatches; here it is worth ~19-38.
+   `k_bin_bcast` is no longer part of this lever — 0024 took half of it and
+   lever 0 is the other half.
 2. **A graph arrangement that keeps the shared-expert fold's +3.62%.** The
    fold itself is correct and worth +3.62% same-binary over 5 interleaved
    rounds, PPL bit-identical at 5.2611, -39 dispatches/token, -4.86% kernel
@@ -93,6 +120,28 @@ of kernels already near the memory ceiling.
    but pinning the routed chain needs an early `ggml_build_forward_expand`
    inside `build_moe_ffn`, which reorders the attention subgraph and costs
    patch 0004's Q/K grouped launch. A third arrangement is the open problem.
+
+- **The rocBLAS router GEMM lever was worth +0.9% before 0022 and is worth
+  ~+0.2% after it.** The finding `laguna-router-rocblas-four-workgroups` priced
+  it off a census where the 534-token prompt ran as 512 + 22 and the router
+  cost *doubled* at 534 while staying flat at 84 — which is what made it a
+  prefill-slope play. 0022 absorbs the tail, so 534 is now ONE ubatch, the
+  router costs the same at 84 and at 534, and the saving cancels in the
+  `(a-b)` prefill term. Re-run the score algebra
+  (`ranked-score-sensitivity-algebra`) against the *current* series before
+  building it: a token-invariant saving is worth 1.631a + 0.853c − 1.876b per
+  second, and when a ≈ b ≈ c it collapses to the ttft term alone. Porting
+  qwen3.6 0044+0056 here is still correct work, just not a percent of score.
+- **Hardware memory counters do not work on this part.** `rocprofv3 --pmc
+  FETCH_SIZE WRITE_SIZE` returns **0.00 for every dispatch**: `FETCH_SIZE` is
+  defined over `TCC_*`, which does not exist on RDNA4 (the L2 is `GL2C`), and
+  the native `GL2C_EA_RDREQ_*_sum` counters read zero too without privileged
+  counter access. So the "byte census" figures quoted above and in
+  `r9700-decode-roofline` are **architectural estimates, not measurements** —
+  treat the 78-94%-of-roofline claim accordingly, and note the Nemotron
+  sibling found its estimate 29% high once actually measured. Do not spend a
+  session trying to get bytes out of rocprofv3 here; `--kernel-trace` dispatch
+  counts and durations do work and are deterministic.
 
 ## Known defect in the merged series
 

@@ -1,0 +1,361 @@
+From 88d921ec5021d7109e9bfc21525c9f60d07f9942 Mon Sep 17 00:00:00 2001
+From: Claude Opus 5 <opus5@local>
+Date: Fri, 14 Aug 2026 00:50:32 +0000
+Subject: [PATCH] cuda/hip: fold the MoE routing-weight multiply into the
+ routed down projection (+1.69% decode, bit-exact)
+
+Decode census on the 23-patch frontier build: 778 dispatches per token for
+4.96 ms of kernel inside a 6.07 ms wall token, so kernel is 82% of decode and
+every removed node is worth its own kernel time plus ~1.43 us of gap. Exactly
+two `k_bin_bcast` families survive in that census, and the larger one is one
+launch per layer applying the MoE routing weights:
+
+    experts = ggml_mul(experts[n_embd, n_expert_used], weights[1, n_expert_used])
+
+39 launches per token, 1.63 us each, moving the whole expert output through
+memory to apply EIGHT scalars. The matvec that produced those bytes already
+holds the finished value in a register and already knows which destination
+channel - i.e. which expert slot, i.e. which weight - it is writing.
+
+`dst_scale` is added to the mm-fusion argument struct: one f32 per destination
+channel, applied to `result` immediately before the store, with the store
+redirected to the MUL's destination. One scalar load per block.
+
+Two things make this a different patch here than on the qwen3.6 sibling:
+
+- **It has to compose with the shared expert riding as a ninth channel**
+  (0017). That channel is not routed and must not be scaled, so the multiply is
+  predicated on `!is_extra` and the extra channel keeps its stock store. Both
+  folds therefore ride the same launch: the census below shows the down
+  projection still at `gy=9`.
+- **The MUL is not adjacent to the matvec.** `build_moe_ffn` pins the shared
+  expert's down projection between them so the backend can pair the two
+  matvecs, so detection accepts the MUL at i+1 *or* i+2 and, in the second
+  case, requires the intervening node to be that MUL_MAT and lists it as an
+  output of the span. `ggml_can_fuse_subgraph` still proves nothing else reads
+  the unscaled result.
+
+`has_dst_scale` is deliberately NOT routed through the existing `has_fusion`
+template flag: that flag also instantiates the gate path, whose
+`tmp_shared_gate` doubles the block's LDS footprint on exactly this launch.
+
+Bit-exact by construction - the multiplicand is the same rounded f32 the stock
+kernel would have written and the MUL would have read back - and measurably so.
+
+Detection is gated on `ne[2] == 1` (the decode shape), a contiguous f32 factor
+of shape [1, n_expert_used], identical layout between the MUL's destination and
+the matvec's, and `ggml_cuda_should_fuse_mul_mat_vec_q` so the node was taking
+mmvq anyway. Prefill takes MMQ and is untouched, and measured neutral.
+`GGML_CUDA_DISABLE_MOE_WEIGHT_FUSE=1` restores the stock pair.
+
+Measured on the runner box (HIP_VISIBLE_DEVICES=0), same binary via the env
+toggle, whole-process launches, arm order alternated per round, 5 rounds:
+
+| round | order | tg128 off | tg128 on | ratio |
+|---|---|---:|---:|---:|
+| 1 | off,on | 164.48 | 167.26 | 1.0169 |
+| 2 | on,off | 164.02 | 166.81 | 1.0170 |
+| 3 | off,on | 163.77 | 166.21 | 1.0149 |
+| 4 | on,off | 163.20 | 166.31 | 1.0191 |
+| 5 | off,on | 162.98 | 165.58 | 1.0160 |
+
+Median per-round ratio **1.0169**, 5/5 rounds positive and the two arms are
+fully disjoint: min(on) 165.58 > max(off) 164.48. Both arms drift down together
+across rounds (thermal), which is why the statistic is the per-round ratio.
+pp534 median ratio 1.0041, i.e. neutral as designed.
+
+- census, same binary, fold on vs off: **786.9 -> 747.9 dispatches/token,
+  exactly -39.0**, and the entire `k_bin_bcast` y=8 population (39/token,
+  68.8 us/token) is gone. Nothing else moved; the down projection keeps its
+  `gy=9` shared-expert channel.
+- perplexity, `fixtures/gainz-corpus.txt`, 8 chunks: BIT-IDENTICAL on both
+  arms at both shapes - **19.5388** at the decode shape `-b 512 -ub 1`, which
+  is the shape the fold actually fires at, and 19.6616 at the `-c 512` gate
+  shape, where it correctly does not fire.
+
+Do not read a kernel-time delta off two separately profiled processes here:
+the first-profiled arm shows `topk_moe` and `rope_neox_grouped` - kernels
+neither arm modifies - inflated 2.6x by cold clocks. Dispatch counts are
+deterministic; wall time needs the interleaved A/B.
+---
+ ggml/src/ggml-cuda/common.cuh   |   4 +
+ ggml/src/ggml-cuda/ggml-cuda.cu | 125 +++++++++++++++++++++++++++++---
+ ggml/src/ggml-cuda/mmvq.cu      |  47 +++++++++++-
+ 3 files changed, 165 insertions(+), 11 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 3c86cb8aa..a98b1a724 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1630,6 +1630,9 @@ struct ggml_cuda_mm_fusion_args_host {
+     const ggml_tensor * gate_bias = nullptr;
+     const ggml_tensor * x_scale = nullptr;
+     const ggml_tensor * gate_scale = nullptr;
++    // One f32 factor per destination channel, applied to the finished result:
++    // the MoE routing weight of the expert slot this launch is writing.
++    const ggml_tensor * dst_scale = nullptr;
+     ggml_glu_op glu_op;
+ };
+ struct ggml_cuda_mm_fusion_args_device {
+@@ -1638,6 +1641,7 @@ struct ggml_cuda_mm_fusion_args_device {
+     const void * gate_bias = nullptr;
+     const void * x_scale = nullptr;
+     const void * gate_scale = nullptr;
++    const void * dst_scale = nullptr;
+     ggml_glu_op glu_op;
+ };
+ 
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 075ea889b..731bb2331 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3377,6 +3377,81 @@ static bool ggml_cuda_mmvq_would_glu_fuse(const ggml_cgraph * cgraph, const int
+ //
+ // Returns the graph index of the shared-expert matvec that may be issued as an
+ // extra channel of the routed launch, or -1.
++// MoE routing-weight fold: MUL_MAT_ID(down_exps) -> MUL(result, weights).
++//
++// The multiply is an elementwise pass over [n_embd, n_expert_used] applying ONE
++// scalar per expert slot - 39 launches per decoded token, each moving the whole
++// expert output through memory to apply eight floats. The matvec that produced
++// those bytes already holds the finished value in a register and already knows
++// which destination channel - i.e. which expert slot, i.e. which weight - it is
++// writing, so the factor costs one scalar load per block and the store lands
++// directly in the MUL's destination.
++//
++// Bit-exact: the multiplicand is the same rounded f32 the stock kernel would
++// have written and the MUL would have read back.
++static const ggml_tensor * ggml_cuda_moe_weight_fuse_detect(const ggml_cgraph * cgraph, const int i, int * out_mul_idx) {
++    const ggml_tensor * mm = cgraph->nodes[i];
++    if (mm->op != GGML_OP_MUL_MAT_ID || mm->src[2] == nullptr) {
++        return nullptr;
++    }
++    // decode shape only: one token, one destination column per expert slot.
++    // At prefill ne[2] is the token count and the node takes MMQ instead.
++    if (mm->ne[2] != 1 || mm->ne[3] != 1) {
++        return nullptr;
++    }
++    if (!ggml_cuda_should_fuse_mul_mat_vec_q(mm)) {
++        return nullptr;
++    }
++    // never steal the gate/up pair out of the gate+up+GLU fusion
++    if (ggml_cuda_mmvq_would_glu_fuse(cgraph, i)) {
++        return nullptr;
++    }
++
++    // The MUL is the next node, or the one after it when the shared expert down
++    // projection has been emitted adjacent (build_moe_ffn pins it there so the
++    // backend can issue both as one launch).
++    for (int span = 1; span <= 2; ++span) {
++        const int m = i + span;
++        if (m >= cgraph->n_nodes) {
++            break;
++        }
++        const ggml_tensor * mul = cgraph->nodes[m];
++        if (mul->op != GGML_OP_MUL) {
++            continue;
++        }
++        if (mul->src[0] != mm && mul->src[1] != mm) {
++            continue;
++        }
++        const ggml_tensor * w = mul->src[0] == mm ? mul->src[1] : mul->src[0];
++        // one contiguous f32 factor per expert slot, broadcast over the embedding
++        if (w == nullptr || w->type != GGML_TYPE_F32 || !ggml_is_contiguous(w) ||
++                w->ne[0] != 1 || w->ne[1] != mm->ne[1] || w->ne[2] != 1 || w->ne[3] != 1) {
++            return nullptr;
++        }
++        // the fused store writes the MUL destination at the matvec position,
++        // which is only legal if the two are laid out identically
++        if (mul->type != GGML_TYPE_F32 || !ggml_are_same_shape(mul, mm) || !ggml_is_contiguous(mul) ||
++                mul->nb[0] != sizeof(float) || mul->nb[1] != mm->nb[1] || mul->nb[2] != mm->nb[2]) {
++            return nullptr;
++        }
++        bool ok;
++        if (span == 1) {
++            ok = ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL }, { m });
++        } else {
++            // the intervening node is the shared expert down projection; its
++            // output is read by the later add, so it stays an output of the span
++            ok = cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT &&
++                 ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT, GGML_OP_MUL }, { i + 1, m });
++        }
++        if (!ok) {
++            return nullptr;
++        }
++        *out_mul_idx = m;
++        return w;
++    }
++    return nullptr;
++}
++
+ static int ggml_cuda_moe_shexp_find_down(const ggml_cgraph * cgraph, const int i, const int cc) {
+     const ggml_tensor * routed = cgraph->nodes[i];
+     if (routed->op != GGML_OP_MUL_MAT_ID || routed->src[2] == nullptr) {
+@@ -5317,6 +5392,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 return e != nullptr && atoi(e) == 0;
+             }();
+             const bool moe_shexp_fuse_enabled = !disable_moe_shexp_fuse && stream_ctx.concurrent_events.empty();
++            // Fold the MoE routing-weight multiply into the routed down projection.
++            static const bool disable_moe_weight_fuse = getenv("GGML_CUDA_DISABLE_MOE_WEIGHT_FUSE") != nullptr &&
++                                                   std::atoi(getenv("GGML_CUDA_DISABLE_MOE_WEIGHT_FUSE"));
+             // Fold the shared expert's gate/up into the routed gate+up+GLU launch.
+             // Separate toggle from the down fold so either can be A/B'd alone.
+             static const bool disable_moe_shexp_gu_fuse = [] {
+@@ -5586,17 +5664,44 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
+-                if (moe_shexp_fuse_enabled && node->op == GGML_OP_MUL_MAT_ID) {
+-                    const int j = ggml_cuda_moe_shexp_find_down(cgraph, i, cc_for_shexp);
+-                    if (j > 0) {
+-                        ggml_tensor * shexp_node = cgraph->nodes[j];
++                if (node->op == GGML_OP_MUL_MAT_ID) {
++                    const int j = moe_shexp_fuse_enabled ? ggml_cuda_moe_shexp_find_down(cgraph, i, cc_for_shexp) : -1;
++
++                    // The routing-weight fold composes with the shared-expert
++                    // pairing: the extra channel is not routed and keeps its
++                    // unscaled store, so both ride the same launch.
++                    int mul_idx = -1;
++                    const ggml_tensor * w = nullptr;
++                    if (!disable_moe_weight_fuse && stream_ctx.concurrent_events.empty()) {
++                        w = ggml_cuda_moe_weight_fuse_detect(cgraph, i, &mul_idx);
++                        if (w != nullptr && j > 0 && j >= mul_idx) {
++                            w = nullptr;  // pairing reaches past the fold; keep stock
++                        }
++                    }
++
++                    if (w != nullptr || j > 0) {
++                        ggml_cuda_mm_fusion_args_host fusion_data{};
++                        ggml_tensor * out = node;
++                        if (w != nullptr) {
++                            fusion_data.dst_scale = w;
++                            out = cgraph->nodes[mul_idx];
++                        }
+                         ggml_cuda_mmvq_shexp shexp_args;
+-                        shexp_args.src0 = shexp_node->src[0];
+-                        shexp_args.src1 = shexp_node->src[1];
+-                        shexp_args.dst  = shexp_node;
+-                        ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], node->src[2], node,
+-                                                /*fusion=*/nullptr, &shexp_args);
+-                        mmvq_grouped_done.insert(shexp_node);
++                        if (j > 0) {
++                            ggml_tensor * shexp_node = cgraph->nodes[j];
++                            shexp_args.src0 = shexp_node->src[0];
++                            shexp_args.src1 = shexp_node->src[1];
++                            shexp_args.dst  = shexp_node;
++                        }
++                        ggml_cuda_mul_mat_vec_q(*cuda_ctx, node->src[0], node->src[1], node->src[2], out,
++                                                w != nullptr ? &fusion_data : nullptr,
++                                                j > 0 ? &shexp_args : nullptr);
++                        if (j > 0) {
++                            mmvq_grouped_done.insert(cgraph->nodes[j]);
++                        }
++                        if (w != nullptr) {
++                            mmvq_grouped_done.insert(out);
++                        }
+                         continue;
+                     }
+                 }
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index d345e6d6a..d32cc1d27 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -481,7 +481,11 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
+     return 1;
+ }
+ 
+-template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool has_extra = false>
++// has_dst_scale is deliberately NOT routed through has_fusion: that flag also
++// instantiates the gate path, whose tmp_shared_gate doubles the block's LDS
++// footprint and halves the LDS-limited occupancy of exactly this launch.
++template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false, bool has_extra = false,
++          bool has_dst_scale = false>
+ __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+@@ -523,6 +527,15 @@ static __global__ void mul_mat_vec_q(
+ 
+     const uint32_t channel_dst = blockIdx.y;
+ 
++    // One scalar load per block: every row this block writes shares the factor.
++    // The extra (shared-expert) channel is not routed and keeps its stock value.
++    float dst_scale_v = 1.0f;
++    if constexpr (has_dst_scale) {
++        if (!is_extra) {
++            dst_scale_v = ((const float *) fusion.dst_scale)[channel_dst];
++        }
++    }
++
+     uint32_t channel_x;
+     uint32_t channel_y;
+     uint32_t sample_dst;
+@@ -732,6 +745,11 @@ static __global__ void mul_mat_vec_q(
+                         }
+                     }
+                 }
++                if constexpr (has_dst_scale) {
++                    if (!is_extra) {
++                        result *= dst_scale_v;
++                    }
++                }
+                 dst[j*stride_col_dst + i] = result;
+             }
+         }
+@@ -740,6 +758,9 @@ static __global__ void mul_mat_vec_q(
+     if constexpr (!has_fusion) {
+         GGML_UNUSED_VARS(use_gate, use_bias, use_gate_bias, use_scale, use_gate_scale, active_glu, gate_bias, x_bias, x_scale, gate_scale, tmp_gate);
+     }
++    if constexpr (!has_dst_scale) {
++        GGML_UNUSED_VARS(dst_scale_v);
++    }
+     if constexpr (type != GGML_TYPE_NVFP4) {
+         GGML_UNUSED_VARS(use_scale, use_gate_scale, x_scale, gate_scale, x_scales, gate_scales);
+     }
+@@ -1104,6 +1125,14 @@ static void mul_mat_vec_q_switch_fusion(
+     const bool has_fusion = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                             fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+     if constexpr (c_ncols_dst == 1) {
++        if (!has_fusion && fusion.dst_scale != nullptr) {
++            const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
++            ggml_cuda_kernel_launch((mul_mat_vec_q<type, c_ncols_dst, false, small_k, false, true>), launch_params,
++                 vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
++                 channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
++                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_extra_channel{});
++            return;
++        }
+         if (has_fusion) {
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(block_nums, block_dims, nbytes_shared, stream);
+             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k>, launch_params,
+@@ -1247,6 +1276,13 @@ static void mul_mat_vec_q_switch_ncols_dst(
+                         vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+                         channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
+                         sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, *extra);
++                } else if (fusion.dst_scale != nullptr) {
++                    // Routed down projection with the MoE routing weight folded into
++                    // its store, the shared expert still riding as the last channel.
++                    ggml_cuda_kernel_launch((mul_mat_vec_q<type, c_ncols_dst, false, false, true, true>), launch_params,
++                        vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
++                        channel_ratio_fd, stride_channel_x, stride_channel_y, stride_channel_dst,
++                        sample_ratio_fd, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, *extra);
+                 } else {
+                     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, false, true>, launch_params,
+                         vx, vy, ids, fusion, dst, ncols_x, nchannels_y_fd, stride_row_x, stride_col_y, stride_col_dst,
+@@ -1525,6 +1561,15 @@ void ggml_cuda_mul_mat_vec_q(
+         // non-negligible for some models such as gpt-oss-20b
+         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
+ 
++        if (fusion->dst_scale) {
++            // one f32 per destination channel: the routing weight vector
++            GGML_ASSERT(fusion->dst_scale->type == GGML_TYPE_F32);
++            GGML_ASSERT(ggml_is_contiguous(fusion->dst_scale));
++            GGML_ASSERT(ids != nullptr);
++            GGML_ASSERT(ggml_nelements(fusion->dst_scale) == dst->ne[1]);
++            fusion_local.dst_scale = fusion->dst_scale->data;
++        }
++
+         if (fusion->x_bias) {
+             GGML_ASSERT(fusion->x_bias->type == GGML_TYPE_F32);
+             GGML_ASSERT(fusion->x_bias->ne[0] == dst->ne[0]);
+-- 
+2.53.0
+
