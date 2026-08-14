@@ -1,0 +1,133 @@
+From: Claude Opus 5 <noreply@anthropic.com>
+Subject: [PATCH 64/64] cuda/hip: unpark the rms_norm pre-add fold at one row
+
+The residual-add fold (0008) has been parked since round 49 because it makes
+the perplexity gate nondeterministic - the same binary, the same command and
+the same allocation read up to nine distinct values across loads, and one
+trusted-runner draw at +1.173% threw away an otherwise verified 1.9443 score.
+Six mechanisms were proposed and measured dead across rounds 43b-47c.
+
+The defect needs more than one row in flight, and that is measurable without
+writing any code. The fold's launch is `blocks_num(nrows, 1, 1)`, so nrows is
+the block count; `-b 512 -ub 1` runs the identical graph at one row per eval.
+Same binary, the runner's exact gate command, fold forced on:
+
+    -ub 512 (nrows 512)   3.9364 3.9318 3.9274 3.9418 3.9318 3.9347
+                          five distinct values, spread 0.366%
+    -ub 1   (nrows 1)     3.9382 x6, spread 0.000%
+    -ub 1   fold OFF      3.9382 x3            <- the SAME value
+    -ub 512 fold OFF      3.9318 x3
+
+Two things follow. The hazard is between blocks: at one block it is gone. And
+at one block the fold is not merely deterministic, it is bit-identical to the
+add chain it replaces, which is what it was written to be - so every reading
+that has ever been attributed to "the fold reassociates" was the race, not
+arithmetic.
+
+The kernel makes the cross-block reading structural. `rms_norm_pre_add_f32`
+writes the residual sum to `add_dst` in its first loop and, after only the
+block-scope `__syncthreads()` inside `block_reduce`, writes `dst` in its
+second. Both buffers legitimately alias operands of the add chain (in-place
+residual adds; the host guard only covers the `dst`/`add_dst` pair itself), so
+one block's second-loop store is unordered against another block's first-loop
+load. Nothing in the kernel orders those two loops across blocks. That also
+explains why round 44's register fix did not help: it removed the read-back,
+not the write.
+
+This patch takes the half of the fold that is sound. `ggml_cuda_rms_norm_pre_add_detect`
+declines above one row, so:
+
+  - decode is always one row - the fold fires and the launch saving is kept;
+  - every prefill shape is more than one row, including the gate's 512-row
+    ubatch and every 512-token chunk of the long-context windows, so the
+    perplexity path runs the parked graph and cannot reach the fold at all.
+
+Measured on the R9700 box, one binary, `GGML_CUDA_DISABLE_PRE_ADD_NORM=1` for
+the control, 10 arms interleaved cand/ctl/ctl/cand/cand/ctl/ctl/cand/cand/ctl,
+5 llama-bench repetitions each:
+
+    cand tg128  163.78 163.46 164.42 164.74 164.52   mean 164.18
+    ctl  tg128  158.58 157.85 159.97 160.13 159.84   mean 159.27   -> +3.08%
+
+5/5 separated (candidate minimum 163.46 above control maximum 160.13).
+
+    cand pp512  4872.6 4791.9 4790.9 4790.2 4809.4   mean 4811.0
+    ctl  pp512  4818.1 4824.2 4813.9 4807.2 4803.6   mean 4813.4   -> -0.05%
+
+Prefill is flat by construction: the fold declines at every prefill shape, so
+the prefill graph is the parent's.
+
+Correctness, runner's exact gate command (`-c 512 --chunks 8`), candidate at
+its shipped default, 4 loads: 3.9318 / 3.9318 / 3.9318 / 3.9318 - the parked
+frontier's own value to four decimals with zero spread, against stock 3.9314
+(+0.010%). At the decode shape (`-b 512 -ub 1`) candidate reads 3.9382 x3 and
+the control 3.9382 x2, i.e. the fold changes nothing it computes.
+
+`GGML_CUDA_DISABLE_PRE_ADD_NORM=1` restores the parked build.
+`GGML_CUDA_PRE_ADD_NORM_ALL_ROWS=1` restores the multi-row fold for anyone
+continuing the hunt for the residual defect - which is now localised to a
+cross-block interaction in a kernel whose only synchronisation is
+block-scoped.
+---
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5247,6 +5247,22 @@
+     ggml_tensor * norm     = cgraph->nodes[inorm];
+     ggml_tensor * mul      = cgraph->nodes[inorm + 1];
+ 
++    // One row only.  rms_norm_pre_add_launch issues blocks_num(nrows, 1, 1) and
++    // the kernel writes the residual sum to add_dst in its first loop, then -
++    // after only a block-scope __syncthreads() inside block_reduce - writes dst
++    // in its second.  add_dst and dst legitimately alias operands of the add
++    // chain (in-place residual adds), so with more than one block in flight one
++    // block's second-loop store is unordered against another block's first-loop
++    // load and the result depends on block scheduling.  Nothing in the kernel
++    // orders those two loops across blocks.  At nrows == 1 there is exactly one
++    // block and the hazard cannot exist; see the measurement above the
++    // disable_pre_add_norm gate.
++    static const bool pre_add_all_rows = getenv("GGML_CUDA_PRE_ADD_NORM_ALL_ROWS") != nullptr &&
++                                         std::atoi(getenv("GGML_CUDA_PRE_ADD_NORM_ALL_ROWS"));
++    if (!pre_add_all_rows && ggml_nrows(add_last) != 1) {
++        return 0;
++    }
++
+     if (norm->op != GGML_OP_RMS_NORM || norm->src[0] != add_last) {
+         return 0;
+     }
+@@ -6769,17 +6785,25 @@
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_ROPE_GROUP"));
+             static const bool disable_set_rows_group = getenv("GGML_CUDA_DISABLE_SET_ROWS_GROUP") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_SET_ROWS_GROUP"));
+-            // PARKED AGAIN (round 49).  This fold is nondeterministic at the runner
+-            // gate shape and the defect is still unidentified after six excluded
+-            // mechanisms (README rounds 43b-47c).  Recorded draws of |cand-stock|
+-            // on the runner's exact gate command: +0.226, +0.010, -0.018, +0.211,
+-            // +0.046, +0.534, +0.112, +0.025, -0.043 percent locally and **+1.173
+-            // percent on the trusted runner**, which rejected an otherwise verified
+-            // 1.9443 measurement.  Parked reads 3.9318 on 10 of 10 loads.  The fold
+-            // is worth ~1.97% of score; a coin flip on the whole submission is worth
+-            // more than that.  GGML_CUDA_PRE_ADD_NORM=1 re-enables it.
+-            static const bool disable_pre_add_norm = !(getenv("GGML_CUDA_PRE_ADD_NORM") != nullptr &&
+-                                                       std::atoi(getenv("GGML_CUDA_PRE_ADD_NORM")));
++            // Unparked at one row (round 50).  The defect this fold was parked for
++            // needs more than one row in flight.  Same binary, the runner's exact
++            // gate command, fold forced on:
++            //
++            //   -ub 512 (nrows 512)  3.9364 3.9318 3.9274 3.9418 3.9318 3.9347
++            //                        five distinct values, spread 0.366%
++            //   -ub 1   (nrows 1)    3.9382 x6, spread 0.000%
++            //   -ub 1   fold off     3.9382 x3   <- the SAME value
++            //
++            // At one row the fold is not merely deterministic, it is bit-identical
++            // to the add chain it replaces, which is what it was written to be.
++            // ggml_cuda_rms_norm_pre_add_detect now declines above one row: every
++            // prefill shape, including the gate's 512-row ubatch, therefore runs
++            // the parked graph, and decode - which is always one row - keeps the
++            // fold.  GGML_CUDA_DISABLE_PRE_ADD_NORM=1 restores the parked build;
++            // GGML_CUDA_PRE_ADD_NORM_ALL_ROWS=1 restores the multi-row fold for
++            // further investigation of the residual defect.
++            static const bool disable_pre_add_norm = getenv("GGML_CUDA_DISABLE_PRE_ADD_NORM") != nullptr &&
++                                                     std::atoi(getenv("GGML_CUDA_DISABLE_PRE_ADD_NORM"));
+             static const bool disable_norm_quant = getenv("GGML_CUDA_DISABLE_NORM_QUANT") != nullptr &&
+                                                    std::atoi(getenv("GGML_CUDA_DISABLE_NORM_QUANT"));
+             static const bool disable_l2_norm_group = getenv("GGML_CUDA_DISABLE_L2_NORM_GROUP") != nullptr &&

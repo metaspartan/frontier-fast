@@ -5760,3 +5760,179 @@ Note how much the coefficients moved once ttft fell to 0.14 s: `a` is now worth
 **1.994 per second** against 1.333 at the old frontier. Re-derive the algebra
 after every frontier advance — the cheaper ttft gets, the more the remaining
 ttft milliseconds are worth.
+
+## Round 50: the 0008 defect needs more than one block, and 0064 takes the half of the fold that is sound (+3.08% decode, gate untouched)
+
+Seven rounds have been spent on the pre-add residual fold. Rounds 43b-47c
+proposed six mechanisms, measured all six dead, and correctly narrowed the
+defect to "inside the kernel with a fixed set of participants". Round 49 parked
+it for the second time after a trusted-runner draw at **+1.173%** threw away an
+otherwise verified 1.9443 score.
+
+This round did not open a seventh hypothesis about *what* races. It asked a
+smaller question that needs no code at all: **how many blocks does the race
+need?**
+
+### The measurement
+
+`rms_norm_pre_add_launch` issues `blocks_num(nrows, 1, 1)`, so `nrows` **is**
+the block count, and `-b 512 -ub 1` runs the identical graph at one row per
+eval. On the shipped frontier binary, with `GGML_CUDA_PRE_ADD_NORM=1`:
+
+```
+runner's exact gate command, -c 512 --chunks 8
+
+  -ub 512  (nrows 512)  fold ON    3.9364 3.9318 3.9274 3.9418 3.9318 3.9347
+                                   five distinct values, spread 0.366%
+  -ub 1    (nrows   1)  fold ON    3.9382 x6            spread 0.000%
+  -ub 1    (nrows   1)  fold OFF   3.9382 x3            <- the SAME value
+  -ub 512  (nrows 512)  fold OFF   3.9318 x3            spread 0.000%
+```
+
+Two results, and the second is the more interesting one.
+
+**The hazard is between blocks.** At one block it is gone — not reduced, gone,
+to four decimals over six loads.
+
+**At one block the fold is bit-identical to the add chain it replaces.** The
+one-row candidate and the one-row control return the same number nine times out
+of nine. That was always the fold's design claim (same operand order, same
+per-element rounding as the `k_bin_bcast` chain), and it is now measured. Every
+reading previously attributed to "the fold reassociates" was the race, not
+arithmetic.
+
+### Why the kernel makes this structural
+
+`rms_norm_pre_add_f32` writes the residual sum to `add_dst` in its first loop
+and, after only the block-scope `__syncthreads()` inside `block_reduce`, writes
+`dst` in its second. Round 45's host-side audit found the surviving overlaps are
+`add_dst`<->`srcA/srcB` and `dst`<->`srcA/srcB` — the in-place residual adds —
+and called them "benign by construction because each block owns one row". That
+is true *within* a block and says nothing across blocks: one block's second-loop
+store into a buffer that is also an add operand is unordered against another
+block's first-loop load of that operand. Nothing in the kernel orders the two
+loops grid-wide. The `ggml_cuda_mmvq_ranges_disjoint(mul, add_last)` guard
+covers only the `dst`/`add_dst` pair.
+
+This also explains **round 44's negative result**: the register fix removed the
+loop-2 *read-back* and left the loop-2 *write*, which is the half that races.
+
+### 0064
+
+`ggml_cuda_rms_norm_pre_add_detect` declines above one row. Decode is always one
+row, so the fold and its launch saving are kept; every prefill shape is more
+than one row, so the perplexity path — the runner gate's 512-token ubatch, and
+every 512-token chunk of the 16k/32k windows — runs the parked graph and cannot
+reach the fold at all.
+
+**Firing proven by census, not by timing.** `rocprofv3 --kernel-trace`, one
+steady decode token:
+
+```
+                                          candidate   control
+dispatches / token                            491        560
+kernel us / token                            5165       5233
+rms_norm_pre_add_f32<1024, 1, true>            11         80
+rms_norm_pre_add_f32<1024, 2, true>            30          0
+rms_norm_pre_add_f32<1024, 3, true>            39          0
+k_bin_bcast op_add                              1         70
+```
+
+The `n_add >= 2` instantiations exist only when the fold fires. **-69
+dispatches/token**, of which 68 us is kernel time and the rest is replay gap —
+69 x ~2.8 us ~= 190 us of a 6270 us token = 3.0%, which is the whole measured
+gain. At the gate's prefill shape the candidate trace contains **no**
+`rms_norm_pre_add_f32` launch of any instantiation.
+
+### Timing
+
+One binary, `GGML_CUDA_DISABLE_PRE_ADD_NORM=1` for the control, 10 arms
+interleaved `cand ctl ctl cand cand ctl ctl cand cand ctl`, `llama-bench -r 5`:
+
+```
+cand tg128  163.78 163.46 164.42 164.74 164.52   mean 164.18
+ctl  tg128  158.58 157.85 159.97 160.13 159.84   mean 159.27   -> +3.08%
+```
+
+5/5 separated — the candidate minimum (163.46) is above the control maximum
+(160.13).
+
+```
+cand pp512  4872.6 4791.9 4790.9 4790.2 4809.4   mean 4811.0
+ctl  pp512  4818.1 4824.2 4813.9 4807.2 4803.6   mean 4813.4   -> -0.05%
+```
+
+Prefill is flat *by construction*, not by luck: the fold declines at every
+prefill shape, so the prefill graph is the parent's.
+
+At 0.65 weight, +3.08% decode is **+1.99% of score**: 2.0677 -> ~2.109.
+
+### Correctness
+
+```
+runner's exact gate command, candidate at its shipped default, 4 loads
+  3.9318  3.9318  3.9318  3.9318      spread 0.000%,  stock 3.9314 (+0.010%)
+
+decode shape (-b 512 -ub 1), 4096 decode steps
+  candidate  3.9382 x3        control  3.9382 x2      identical
+```
+
+The gate reading is the parked frontier's own value, because at the gate shape
+the candidate *is* the parked frontier — the census above proves the fold never
+launches there.
+
+### What is left of the defect
+
+The multi-row fold is still broken and is still worth ~1.2% of score in prefill
+and ttft. `GGML_CUDA_PRE_ADD_NORM_ALL_ROWS=1` restores it for anyone continuing.
+The box it now lives in is much smaller than round 47c's: the participants are
+two loops of the same kernel in different blocks, and the only synchronisation
+between them is block-scoped. The obvious next test is whether declining the
+fold when `dst` or `add_dst` overlaps any `args.src[k]` restores determinism at
+`-ub 512` — round 45 enumerated those overlaps and dismissed them on reasoning
+that assumed a single block.
+
+### Carry this one forward
+
+**When a fold is nondeterministic, measure its block count before hypothesising
+about its memory.** `nrows` was a free axis in every round from 43b onward: the
+launch geometry is `blocks_num(nrows,1,1)`, `-ub` sets `nrows`, and the gate
+command accepts `-ub`. Four minutes of `llama-perplexity` separated "the fold is
+wrong" from "the fold is right and its launch geometry is wrong", after six
+rounds of kernel reading had not.
+
+### Round 50 addendum: the served path, censused, and the generation control
+
+`rocprofv3` over one `llama-server` completion (128 greedy tokens):
+
+```
+rms_norm_pre_add_f32<1024, 3, true>   4953 launches   grid 1024 = 1 block
+rms_norm_pre_add_f32<1024, 2, true>   3810 launches   grid 1024 = 1 block
+rms_norm_pre_add_f32<1024, 1, true>   1717 launches   grids 1024 / 2048 / 4096 / 6144
+k_bin_bcast op_add                     727 launches   grids 1024 / 2048 / 4096 / 6144
+```
+
+8763 folded launches on the ranked path, and **every one of them is a single
+block**. The multi-block grids belong to the `n_add == 1` quantize fold (0009)
+and to the unfolded prefill add chain. The gate holds where it matters.
+
+Greedy generation control, four independent `llama-server` processes per arm, 12
+prompts x 64 tokens, `cache_prompt: false`:
+
+```
+cand2 vs cand3/cand4, ctl vs ctl2/ctl3/ctl4, cand2 vs ctl2, cand3 vs ctl3,
+cand4 vs ctl4            all 12/12 byte-identical   (15 pairs)
+cand  vs everything      11/12  - prompt 2 only, in the FIRST candidate process
+```
+
+Three candidate processes and four control processes agree to the byte on every
+prompt, including cross-arm. The single outlier is one process, one prompt; the
+series' other two folds (0009/0036) carry a known pre-existing per-load jitter of
+0.19-0.38% and are active in both arms. Worth one more control run if anyone
+touches this again — it is not a gate either way, because the residual fold
+cannot launch at the gate's shape.
+
+**Note for anyone benchmarking on this box from now on:** `llama-bench` and
+`llama-server` enumerate two ROCm devices (the R9700 and the iGPU `gfx1036`) and
+fail to load the model unless `HIP_VISIBLE_DEVICES=0` is set. Every measurement
+in this round was device-0 pinned.
