@@ -552,3 +552,131 @@ never checks whether one ever does.**
 ```
 
 Look for the third one on every llama.cpp server track before writing a kernel.
+
+---
+
+## 0027 — the norm and the rope that consumes it, and a precondition for the pairs rule
+
+Two rounds on this track have been won by the same rule: find two kernel
+launches with no GPU work between them and issue them as one. This round found
+the rule's precondition by violating it first.
+
+### The population, and which pair merges
+
+Decode at the 26-patch frontier is a clean 16-dispatch loop per layer, 658
+dispatches and 4.73 ms of kernel in a 6.05 ms token. Kernel is 78% of the wall,
+so the residue is ~1.2 ms of inter-dispatch gap. Three adjacent pairs looked
+equivalent on a dispatch trace:
+
+```
+ 6,7   flash_attn_tile          -> flash_attn_combine_results   40/token
+ 2,3   rms_norm_f32_grouped     -> rope_neox_grouped            38/token
+11,12  mul_mat_vec_f (router)   -> topk_moe                     39/token
+```
+
+They are not equivalent, and the distinguishing question is not adjacency at
+all. It is **what the second kernel's block decomposition is for.** A second
+dispatch that exists because the first one's blocks must all finish — a
+reduction over a split — cannot be absorbed without reproducing that barrier
+inside the first kernel, and the barrier is not the expensive part.
+
+### The pair that does not merge: flash attention's KV-split reduction
+
+`launch_fattn` issues the attention kernel and then `flash_attn_combine_results`
+from one host function with nothing in between, which is the textbook shape of
+the rule. It was built: a counter in global memory, every block of a tile
+announcing completion with one `__hip_atomic_fetch_add`, the block that observes
+itself last running the reduction. It works, it is bit-exact, and the census
+confirms it fires — `flash_attn_combine_results` disappears and the census drops
+39.7 dispatches per token.
+
+It is **1.4% slower**, and a three-arm build says why. The arms are one binary,
+selected by env, and the middle one performs the barrier and then returns,
+leaving the stock reduction kernel in place:
+
+| arm | flash_attn_tile | combine kernel | dispatches/token |
+|---|---|---|---|
+| stock | 4.92 us | 1.89 us | 658.0 |
+| barrier only | 5.43 us | 1.86 us | 658.0 |
+| barrier + fold | 9.64 us | — | 618.3 |
+
+The device-wide barrier costs **0.51 us per launch** — cheap, and roughly the
+price of the dispatch it removes. The reduction costs **4.2 us**, against 1.89
+us as its own kernel, because the standalone kernel runs 64 blocks (one output
+row each) and the fold runs 8 (one tile each, `ncols2` rows each). Two effects,
+both from that 8x:
+
+- `expf(meta[l].x - kqmax)` is recomputed per thread per row. At one row per
+  thread that is 4 exponentials; at `ncols2 = 8` it is 64, i.e. **8192 per block
+  against the reference's 512**. Hoisting the `ncols2 x parallel_blocks = 32`
+  distinct scales into shared memory took the fold from 11.76 us to 9.64 us.
+- The rest is the parallelism itself, and no amount of restructuring recovers
+  it: the same work now has one eighth of the threads.
+
+**The precondition, stated for the next agent:** the pairs rule holds when the
+two kernels share a block decomposition. When the second kernel's blocks are a
+*different* partition of the same data — which is exactly what a reduction over
+a split is — folding it costs a barrier plus the parallelism ratio between the
+two grids, and on this box that is a loss. Price `grid1/grid2` before building.
+
+### The pair that does merge
+
+`rms_norm_f32_grouped` and `rope_neox_grouped` both run **one block per row over
+the same 72 rows** (Q's 64 heads and K's 8, at head dim 128), and row r's rope
+reads only row r's norm. Same partition, so the dependency is inside the block
+and there is no barrier at all — `__syncthreads()` is the whole synchronisation.
+
+The kernel runs the body of `rms_norm_f32_grouped`, stores the normalised row
+exactly as the norm would, keeps a copy in shared memory, and then runs the body
+of `rope_neox_grouped` reading that copy instead of reading the store back. Both
+groups already carry a segment table; the host asserts the two tables are equal
+so one segment scan serves both. Since ncols <= block_size on this model, each
+thread also holds its element across the reduction instead of reading the row
+twice.
+
+Detection pairs the two existing collectors: after the norm group is collected,
+each `muls[m]` must be the `src[0]` of exactly one ROPE, the ropes must satisfy
+the existing groupable and hoist-legality checks (with the norm group counted as
+already issued, since the fused kernel runs it first), and the row counts must
+match member for member. Anything else declines to the two separate launches.
+
+```
+                    dispatches/token   kernel us/token   the two kernels
+frontier                     658.0            4727.3     1.88 + 1.47 us
++0027                        620.2            4688.1     2.33 us
+```
+
+Same binary, arms by env toggle, six whole-process `llama-bench` launches with
+rotating arm order, median of per-round ratios:
+
+| | decode | prefill |
+|---|---|---|
+| 0027 | **1.01402** (rounds 1.00976–1.01451) | 1.00004 |
+
+6/6 rounds positive and the arms are fully separated: min(on) 171.73 t/s >
+max(off) 170.21 t/s. Perplexity is bit-identical on every shape measured —
+decode-shape 5.2682 to every chunk, gate-shape 5.2611, 16k 12.7619, 32k
+11.8711.
+
+Kill switch: `GGML_CUDA_DISABLE_NORM_ROPE_FUSE=1`.
+
+### Bundled: the pre-add cross-block hazard guard
+
+Diagnosed on the qwen3.6 r9700 track in round 51 (patch 0065) — **not this
+round's discovery**, carried here because this track ships the same fold
+unguarded. `rms_norm_pre_add_launch` issues one block per row; block r writes
+`add_dst` row r in loop 1 and `dst` row r in loop 2 with only a block-scope
+barrier between, and reads every add operand in loop 1. Nothing orders one
+block's loop 2 against another block's loop 1, so a write range must never
+intersect a read range belonging to a different block. This track already tested
+`add_dst` against the operands; the missing edge is `dst` against the same read
+set. On qwen3.6, 9 of 79 folds placed `dst` over an operand 128 bytes apart —
+not a whole multiple of the row stride — and the unguarded build returned six
+distinct perplexities spanning 0.107%, right on the 0.1% short-gate limit.
+
+On Laguna-XS the guard declines **zero** folds: a prefill-shape census with the
+guard on and off is identical (160 `rms_norm_pre_add`, 162 plain norms, 3607
+dispatches), and both readings are bit-identical at every shape. It costs
+nothing here and closes a latent hazard.
+
+Toggle: `GGML_CUDA_PRE_ADD_NORM_UNSAFE=1` drops the guard.
