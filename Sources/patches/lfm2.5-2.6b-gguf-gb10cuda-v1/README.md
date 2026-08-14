@@ -7,6 +7,7 @@ Applied in order against pinned llama.cpp **b10237**.
 | 0001–0011 | laguna-xs gb10cuda engine family, unchanged | **+0.9% decode, +0.8% prefill** (see "the 11-patch family" below) |
 | 0012 | `cuda-sm121-wide-q4k-mmvq-vecdot` | **+7.76% decode** (5/5 interleaved rounds disjoint; prefill neutral) |
 | 0013 | `cuda-rms-norm-register-cached-row` | **+0.65% prefill** (5/5 disjoint), decode +0.19% (overlapping); **bit-exact** |
+| 0014–0016 | the LFM shortconv decode chain, ported from the r9700 track | **+1.73% decode** (5/5 disjoint; prefill neutral); **bit-identical** on all four perplexity shapes |
 
 ## 0012: the sm_121 wide Q4_K mmvq vec_dot (+7.76% decode)
 
@@ -234,6 +235,70 @@ memory-contended conditions noted above.
    *mmvq*-layout quantize into the glu; extending
    `ggml_cuda_norm_quant_register` to the MMQ layout would delete ~44 MB of
    round-trip per layer. Worth ~6–8% prefill.
-3. The conv-block bookkeeping (`k_get_rows_float` 86 µs, `k_bin_bcast` 82 µs,
-   `concat_cont` 44 µs, `cpy_scalar` 37 µs per token) — the R9700 0030
-   recurrent-state identity view is the model, but the whole pool is ~2.5%.
+3. ~~The conv-block bookkeeping (`k_get_rows_float` 86 µs, `k_bin_bcast` 82 µs,
+   `concat_cont` 44 µs, `cpy_scalar` 37 µs per token)~~ — **done, +1.73% decode,
+   shipped as 0014–0016.** The estimate of "the whole pool is ~2.5%" was close:
+   the pool is 2.90% of summed kernel time and 1.73% of it came back as wall.
+
+## 0014–0016: the LFM shortconv decode chain (+1.73% decode)
+
+A port of the r9700 track's 0011 / 0010 / 0014. The kernel and detector live in
+`ggml/src/ggml-cuda`, which the HIP backend shares, so the bodies transferred
+unchanged; 0014 is core C++ with no backend code at all. The single
+CUDA-specific edit in the whole port is the arithmetic fence's inline-asm
+constraint, `"v"` (an AMDGPU VGPR constraint) becoming `"f"` under `__CUDA_ARCH__`.
+
+Per decoded token the census goes **448.7 → 321.7 dispatches**:
+
+| kernel | series | with 0014–0016 |
+| --- | --- | --- |
+| `shortconv_fold_f32` | 0 | **21** |
+| `ssm_conv_f32` | 22 | 1 |
+| `concat_cont` | 22 | 1 |
+| `cpy_scalar` | 22 | 1 |
+| `k_bin_bcast<op_mul>` | 44 | 2 |
+| `k_get_rows_float` | 24 | 2 |
+| `quantize_q8_1` | 60 | 39 |
+
+**Why this is worth +1.73% here and +5.4% on RDNA4.** The marginal cost of one
+dispatch inside a replayed CUDA graph on GB10 measures **0.88 µs** — empty
+kernels appended to the tail of the captured decode graph, N = 0/500/2000,
+tg128 120.74 / 114.13 / 99.59, slope linear at 0.85–0.96 µs across segments.
+The R9700 figure is 2.08 µs. So 127 removed dispatches predict 112 µs of an
+8283 µs token, or **+1.35%**; the measured +1.73% is that plus the staging
+round trips the fold also deletes. This is the general rule on this box
+restated with a number: rank a candidate port by bytes removed, and price its
+dispatch savings at 0.88 µs each, not at the RDNA4 rate.
+
+**The two halves are superadditive and must ship together.** Isolated on one
+binary against both kill switches: 0014 alone +0.41%, 0015 alone +0.66%, the
+pair +1.64%. 0014 moves the conv window into the persistent recurrent cache, and
+only then does the fold's aliasing check pass on 21 of 22 layers instead of a
+minority. 0016 is **neutral** on this box and is kept only because the 21
+dispatches it removes are real: the 8 KB each of those quantizes moved had just
+been written by the fold, so they were L2-served and the prize is 21 × 0.88 µs =
+0.22%, under the 0.86% noise floor.
+
+Correctness is bit-identity, not equivalence: perplexity is identical to the
+parent series on all four shapes — 22.7466 at the gate shape, 22.6048 on the
+decode path (3 fresh loads per arm each), 15.6640 at 16k and 14.3499 at 32k —
+and llama-server greedy completions are byte-identical. The fold fires on the
+serving path too (6300 `shortconv_fold_f32` launches under `llama-server`), so
+it is not a bench-only fusion.
+
+### What did NOT port from the r9700 series
+
+Triaged and rejected before building, for reasons that generalise:
+
+- **0001 `mmvq-narrow-starved-blocks`** and **0009 `mmvq-narrow-q6k-output-head`**
+  — both repurpose the `small_k` template slot to halve `nwarps`, which is only
+  free because `calc_rows_per_block()` returns 1 on every RDNA table and the
+  small_k path is vetoed for RDNA. On sm_121 the GENERIC table already gives
+  `nwarps = 4`, and narrowing to 2 measured **−4.4% decode** on this track.
+- **0003 `mmvq-grouped-launch`** — already carried here as 0002 but forced
+  **off** by 0010, at −2.5%. A pure launch-count win is the shape most likely to
+  evaporate on this box.
+- **0008 `ssm-conv-fuse-mul`** — subsumed at decode by 0015, and prefill takes
+  MMQ rather than this path.
+- **0012 / 0013 (server checkpointing and prompt-cache admission)** — not kernel
+  work.

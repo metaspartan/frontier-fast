@@ -1,0 +1,188 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: x <x@y>
+Date: Fri, 14 Aug 2026 01:59:45 -0600
+Subject: [PATCH] CUDA: the LFM shortconv fold emits its own q8_1 quantization
+
+Port of the R9700/HIP track patch 0014 to the GB10 CUDA series.
+
+The preceding patch collapsed the shortconv decode chain into one kernel whose
+last statement is `dst = sumf * g`. The very next thing that happens to that
+value is that the shortconv out_proj matvec quantizes it to q8_1 in a separate
+launch that reads back 8 KB the fold wrote a moment earlier. 22 of LFM2.5's 30
+layers are shortconv layers, so that is 22 dispatches per decoded token spent
+re-reading a value that was already in a register.
+
+This has the fold write the q8_1 blocks itself, into a buffer registered in the
+per-graph activation cache. out_proj then finds the quantization already present
+and skips its own quantize_q8_1 launch.
+
+Bit-identity is by construction and was verified, not assumed:
+
+  - the quantized value is the float the fold has just stored to dst, and the
+    amax/sum warp reductions, d = amax/127.0f, q = roundf(val/d) and the (d, sum)
+    ds write are copied verbatim from quantize_q8_1;
+  - the launch geometry makes every warp cover exactly one whole 32-element q8_1
+    block of the single output row. The host gate requires dst_stride == 1,
+    n_ch % 32 == 0, blockDim.x % 32 == 0 and n_ch % blockDim.x == 0, so no warp
+    is ever partially retired inside the reduction;
+  - the buffer is registered under exactly the parameter tuple
+    ggml_cuda_mul_mat_vec_q would have used, so a mismatch can only cost a cache
+    miss and the stock requantize, never a wrong result.
+
+Measured on GB10 (sm_121, CUDA 13.0, LFM2.5-2.6B-Q4_K_M):
+
+  - census, per decoded token: quantize_q8_1 falls from 60 launches to 39, and
+    total dispatches from 342.7 to 321.7.
+  - perplexity bit-identical on both shapes, 3 fresh loads per arm (22.7466
+    gate, 22.6048 decode path).
+  - decode tg128, isolated on one binary with GGML_CUDA_DISABLE_SHORTCONV_QUANT:
+    NEUTRAL, below the noise floor of this box.
+
+The neutral result is expected here and is reported rather than hidden. The 21
+launches this removes each move 8 KB that the fold has just written, so they were
+served out of GB10's 24 MB L2 rather than from DRAM; the only prize is the
+dispatch latency, 21 x 0.88 us = 18.5 us against an 8283 us token, or 0.22%,
+which this box cannot resolve against a 0.86% run-to-run spread. It is kept
+because the dispatch removal is real and measured in the census, and because it
+costs nothing: the epilogue runs in registers the kernel already holds.
+
+GGML_CUDA_DISABLE_SHORTCONV_QUANT=1 restores the separate launch.
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 12 ++++++++
+ ggml/src/ggml-cuda/ssm-conv.cu  | 53 +++++++++++++++++++++++++++++----
+ ggml/src/ggml-cuda/ssm-conv.cuh |  4 +++
+ 3 files changed, 64 insertions(+), 5 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 6def7814..177610a2 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5204,6 +5204,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+             std::unordered_set<const ggml_tensor *> shortconv_fold_done;
+             static const bool disable_shortconv_fold = getenv("GGML_CUDA_DISABLE_SHORTCONV_FOLD") != nullptr &&
+                                                        std::atoi(getenv("GGML_CUDA_DISABLE_SHORTCONV_FOLD"));
++            static const bool disable_shortconv_quant = getenv("GGML_CUDA_DISABLE_SHORTCONV_QUANT") != nullptr &&
++                                                        std::atoi(getenv("GGML_CUDA_DISABLE_SHORTCONV_QUANT"));
+             // Members of grouped rms_norm / rope launches already issued earlier in this pass.
+             std::unordered_set<const ggml_tensor *> grouped_done;
+             static const bool disable_norm_group = getenv("GGML_CUDA_DISABLE_NORM_GROUP") != nullptr &&
+@@ -5294,6 +5296,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 if (!disable_shortconv_fold && stream_ctx.concurrent_events.empty() && node->op == GGML_OP_MUL) {
+                     ggml_shortconv_fold_plan plan;
+                     if (ggml_cuda_shortconv_fold_collect(cgraph, i, plan)) {
++                        // The fold's output is the activation the shortconv
++                        // out_proj matvec consumes, so the fold emits its own
++                        // q8_1 quantization from the register it already holds
++                        // and out_proj hits the cache instead of launching
++                        // quantize_q8_1. Registration failing (wrong shape, no
++                        // mmvq consumer, already cached) only costs the fold
++                        // its epilogue; the separate launch happens as before.
++                        if (!disable_shortconv_quant && !disable_norm_quant) {
++                            plan.q8_1_dst = ggml_cuda_norm_quant_register(cuda_ctx, cgraph, i, plan.folded[3]);
++                        }
+                         ggml_cuda_op_shortconv_fold(*cuda_ctx, plan);
+                         for (int m = 0; m < 4; ++m) {
+                             shortconv_fold_done.insert(plan.folded[m]);
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index 6dd6e3b3..eff70695 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -244,7 +244,7 @@ static __device__ __forceinline__ float ggml_cuda_assoc_fence(float v) {
+     return v;
+ }
+ 
+-template <int nc>
++template <int nc, bool do_quant = false>
+ static __global__ void shortconv_fold_f32(
+         const float * __restrict__ b_ptr,     const float * __restrict__ x_ptr,
+         const float * __restrict__ g_ptr,     const float * __restrict__ state_ptr,
+@@ -253,7 +253,7 @@ static __global__ void shortconv_fold_f32(
+         const int b_stride,   const int x_stride, const int g_stride,
+         const int state_stride, const int w_stride,
+         const int dst_stride, const int cache_stride,
+-        const int n_ch) {
++        const int n_ch,       void * __restrict__ q8_1_dst) {
+     ggml_cuda_pdl_lc();
+     const int c = blockIdx.x * blockDim.x + threadIdx.x;
+     ggml_cuda_pdl_sync();
+@@ -288,7 +288,34 @@ static __global__ void shortconv_fold_f32(
+         cache_ptr[c * cache_stride + j] = x[j + 1];
+     }
+ 
+-    dst_ptr[c * dst_stride] = sumf * g_ptr[c * g_stride];
++    const float val = sumf * g_ptr[c * g_stride];
++    dst_ptr[c * dst_stride] = val;
++
++    if constexpr (do_quant) {
++        // stock quantize_q8_1 body, on the value just written. The caller
++        // guarantees dst is contiguous with a single row, n_ch % QK8_1 == 0 and
++        // blockDim.x % QK8_1 == 0, so lane c of this warp is quant index
++        // c % QK8_1 of q8_1 block c / QK8_1 and every lane of the warp is live.
++        block_q8_1 * y = (block_q8_1 *) q8_1_dst;
++
++        const int ib  = c / QK8_1;
++        const int iqs = c % QK8_1;
++
++        float amax = fabsf(val);
++        float sum  = val;
++
++        amax = warp_reduce_max<QK8_1>(amax);
++        sum  = warp_reduce_sum<QK8_1>(sum);
++
++        const float  d = amax / 127.0f;
++        const int8_t q = amax == 0.0f ? 0 : roundf(val / d);
++
++        y[ib].qs[iqs] = q;
++
++        if (iqs == 0) {
++            y[ib].ds = make_half2(d, sum);
++        }
++    }
+ }
+ 
+ void ggml_cuda_op_shortconv_fold(ggml_backend_cuda_context & ctx, const ggml_shortconv_fold_plan & p) {
+@@ -303,11 +330,27 @@ void ggml_cuda_op_shortconv_fold(ggml_backend_cuda_context & ctx, const ggml_sho
+ 
+     const ggml_cuda_kernel_launch_params lp = ggml_cuda_kernel_launch_params(blocks, fold_threads, 0, stream);
+ 
++    // The quantizing variant requires every warp of the launch to cover exactly
++    // one whole 32-element q8_1 block of the single output row.
++    const bool do_quant = p.q8_1_dst != nullptr &&
++                          p.dst_stride == 1 &&
++                          p.n_ch % QK8_1 == 0 &&
++                          fold_threads % QK8_1 == 0 &&
++                          p.n_ch % fold_threads == 0;
++
+ #define GGML_SHORTCONV_FOLD_CASE(NC)                                                                      \
+     case NC:                                                                                              \
+-        ggml_cuda_kernel_launch(shortconv_fold_f32<NC>, lp, p.b, p.x, p.g, p.state, p.w, p.dst, p.cache,   \
++        if (do_quant) {                                                                                   \
++            ggml_cuda_kernel_launch(shortconv_fold_f32<NC, true>, lp,                                     \
++                                p.b, p.x, p.g, p.state, p.w, p.dst, p.cache,                              \
++                                p.b_stride, p.x_stride, p.g_stride, p.state_stride, p.w_stride,           \
++                                p.dst_stride, p.cache_stride, p.n_ch, p.q8_1_dst);                        \
++        } else {                                                                                          \
++            ggml_cuda_kernel_launch(shortconv_fold_f32<NC, false>, lp,                                    \
++                                p.b, p.x, p.g, p.state, p.w, p.dst, p.cache,                              \
+                                 p.b_stride, p.x_stride, p.g_stride, p.state_stride, p.w_stride,           \
+-                                p.dst_stride, p.cache_stride, p.n_ch);                                    \
++                                p.dst_stride, p.cache_stride, p.n_ch, (void *) nullptr);                  \
++        }                                                                                                 \
+         break;
+ 
+     switch (p.nc) {
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cuh b/ggml/src/ggml-cuda/ssm-conv.cuh
+index 6fdb35af..bbd11fee 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cuh
++++ b/ggml/src/ggml-cuda/ssm-conv.cuh
+@@ -26,6 +26,10 @@ struct ggml_shortconv_fold_plan {
+     int n_ch = 0;
+     int nc   = 0;
+ 
++    // q8_1 quantization of the fold's own output, written by the fold kernel
++    // instead of by a separate quantize_q8_1 launch. nullptr disables it.
++    void * q8_1_dst = nullptr;
++
+     ggml_tensor * folded[4] = { nullptr, nullptr, nullptr, nullptr };  // concat, cpy, conv, mul_gate
+ };
+ 
