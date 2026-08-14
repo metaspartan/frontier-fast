@@ -5936,3 +5936,101 @@ cannot launch at the gate's shape.
 `llama-server` enumerate two ROCm devices (the R9700 and the iGPU `gfx1036`) and
 fail to load the model unless `HIP_VISIBLE_DEVICES=0` is set. Every measurement
 in this round was device-0 pinned.
+
+## Round 51: the pre-add defect, named — a 128-byte misaligned overlap, and a guard that closes it (banked, +0.31%)
+
+Round 50 shipped the fold at one row and left the multi-row path declined with
+the defect localised to "a cross-block interaction". This round names it.
+
+### 1. The nrows ladder: not "more than one block", more than one WAVE
+
+Round 50's framing was right in direction and wrong in degree. Same binary, the
+runner's gate command, fold forced on, 5 loads per rung:
+
+| nrows | readings | spread |
+|---|---|---|
+| 1 | 3.9382 x6 | 0.000% |
+| 2 | 3.9137 x5 | 0.000% |
+| 8 | 3.9184 x5 | 0.000% |
+| 64 | 3.9619 x5 | 0.000% |
+| **512** | 3.9368 3.9353 3.9353 3.9353 3.9350 | **0.046%, 3 distinct** |
+
+64 blocks on 64 CUs are all resident at once and issue every loop-1 load before
+any loop-2 store, so the window never opens. 512 blocks run in several dispatch
+waves and it does. **The hazard needs blocks in different waves.** Any future
+claim about this fold has to survive the ladder, not just an nrows > 1 test.
+
+### 2. The overlap, read off the ranges instead of argued about
+
+`GGML_RMS_PRE_ADD_AUDIT=1` dumps every fold's writers and readers. Of 79 folds
+in the graph, **9 are hazardous, at both nrows 2 and nrows 512**:
+
+```
+dst     = 0x...204600 +16384   ->  [0x204600, 0x208600)
+add_dst = 0x...200000 +16384   ->  [0x200000, 0x204000)
+src0    = 0x...200000 +16384   ==  add_dst        (in-place, safe)
+src1    = 0x...204680 +16384   ->  [0x204680, 0x208680)
+```
+
+`dst` overlaps `src1`, and the bases are **128 bytes apart** — not a whole
+number of the 8192-byte row stride. Block r's loop-2 store into `dst` row r
+therefore lands on the **last 32 floats of `src1` row r-1**, which block r-1
+reads in its loop 1. 32 of 2048 floats, on 9 of 79 folds, only when the two
+blocks are in different waves — which is exactly the size and the rarity of the
+jitter this fold has always shown.
+
+**This is the overlap round 45 enumerated and dismissed.** Its reasoning was
+"benign by construction because each block owns one row". A block owns one row
+*of its own tensors*; it does not own the row of a differently-based tensor it
+happens to overlap. The dismissal was the single-block frame, and round 50
+disproved that frame.
+
+### 3. The guard
+
+`ggml_cuda_pre_add_write_safe`: for each writer (`dst`, `add_dst`) against each
+reader (every add operand), an overlap is safe **only** when the two tensors
+start at exactly the same address — the in-place residual add the kernel already
+assumes. Every other overlap declines the fold, including one a whole number of
+rows apart. Applied only above one row, so round 50's decode path is untouched
+by construction.
+
+```
+gate command, guard ON (shipped default), 8 loads
+  3.9318 x8                                        spread 0.000%
+gate command, guard OFF (GGML_CUDA_PRE_ADD_NORM_UNSAFE=1), 8 loads
+  3.9301 3.9339 3.9318 3.9322 3.9318 3.9318 3.9321 3.9297
+  six distinct values                              spread 0.107%
+```
+
+3.9318 is the parent's own reading, so the 70 surviving folds are bit-identical
+to the add chain they replace. **The five-round defect is closed.**
+
+### 4. Timing, and why this is banked rather than submitted
+
+ABBA over 10 arms, one binary, `GGML_CUDA_PRE_ADD_NORM_ONE_ROW=1` as the
+round-50 control:
+
+```
+multi pp512  4967.3 4923.1 4893.2 4894.8 4877.3   mean 4911.1
+one   pp512  4924.5 4884.9 4856.9 4826.8 4835.5   mean 4865.7   -> +0.93%
+multi tg128  mean 164.80    one tg128  mean 164.87              -> -0.04%
+```
+
+5/5 adjacent arm pairs positive on prefill; decode flat by construction.
+
+Score value: `0.20 x 0.93% + 0.15 x 0.84% = **+0.31%**`. That is below this
+track's practical bar and below the 0.75% kernel confirmation tolerance, so a
+standalone submission would publish at the lower of two runs and be rejected on
+the frontier rule. **It is banked to ship with the next decode lever.** The
+declined 9 folds are the ceiling of this approach: making them safe would need a
+grid-wide barrier between the two loops, which costs more than the fold saves.
+
+### 5. Carry this forward
+
+- The same fold is shipped on `laguna-xs` (r9700 + gb10), `lfm2.5` (r9700 +
+  gb10), `maple-preview` and `qwen3.6 gb10`. All six have this latent defect.
+  The guard is 12 lines and portable.
+- **A per-row kernel is not automatically per-row safe.** Whenever a kernel
+  writes one buffer and reads another that ggml-alloc may have placed on top of
+  it, "one block per row" only protects you if the two bases are equal. Check
+  the base delta against the row stride, not just for overlap.

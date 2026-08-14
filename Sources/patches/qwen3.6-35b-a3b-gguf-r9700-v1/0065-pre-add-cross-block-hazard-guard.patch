@@ -1,0 +1,212 @@
+From: Claude Opus 5 <noreply@anthropic.com>
+Subject: [PATCH 65/65] cuda/hip: name the pre-add cross-block hazard and guard it
+
+Round 50 shipped the residual fold at one row and left the multi-row path
+declined, with the defect localised to "a cross-block interaction". This
+identifies it exactly and re-enables the multi-row fold behind a host-side
+guard.
+
+### The nrows ladder: it is not "more than one block", it is more than one WAVE
+
+Same binary, the runner's gate command, fold forced on, 5 loads per rung:
+
+    nrows    1     3.9382 x6                                        0.000%
+    nrows    2     3.9137 x5                                        0.000%
+    nrows    8     3.9184 x5                                        0.000%
+    nrows   64     3.9619 x5                                        0.000%
+    nrows  512     3.9368 3.9353 3.9353 3.9353 3.9350   3 distinct  0.046%
+
+64 blocks on 64 CUs are co-resident and issue every loop-1 load before any
+loop-2 store, so the window never opens. 512 blocks run in several dispatch
+waves and it does.
+
+### The hazard, from the ranges rather than from reasoning
+
+`GGML_RMS_PRE_ADD_AUDIT=1` dumps every fold's write and read ranges. **9 of 79
+folds per graph** look like this:
+
+    dst     = 0x...204600 +16384   ->  [0x204600, 0x208600)
+    add_dst = 0x...200000 +16384   ->  [0x200000, 0x204000)
+    src0    = 0x...200000 +16384   ==  add_dst   (in-place, safe)
+    src1    = 0x...204680 +16384   ->  [0x204680, 0x208680)
+
+`dst` overlaps `src1` with the bases **128 bytes apart** - not a whole number of
+the 8192-byte row stride. So block r's loop-2 store into `dst` row r lands on
+the last 32 floats of `src1` row **r-1**, which block r-1 reads in its loop 1.
+Nothing orders those two, and 32 of 2048 floats is exactly the size of
+perturbation the perplexity jitter has always shown.
+
+This is the overlap round 45 enumerated and dismissed as "benign by
+construction because each block owns one row". Each block does own one row -
+of its own tensors. It does not own the row of a differently-based tensor it
+happens to overlap.
+
+### The guard
+
+`ggml_cuda_pre_add_write_safe`: for each writer (`dst`, `add_dst`) against each
+reader (every add operand), an overlap is only safe when the two tensors start
+at exactly the same address - the in-place residual add the kernel already
+assumes. Any other overlap, including one a whole number of rows apart,
+declines the fold. Applied only above one row, so the round-50 decode path is
+untouched by construction.
+
+    gate command, guard ON (shipped default), 8 loads
+      3.9318 x8                                      spread 0.000%
+    gate command, guard OFF (GGML_CUDA_PRE_ADD_NORM_UNSAFE=1), 8 loads
+      3.9301 3.9339 3.9318 3.9322 3.9318 3.9318 3.9321 3.9297
+      six distinct values                            spread 0.107%
+
+3.9318 is the parent's own reading, so the 70 folds that survive the guard are
+bit-identical to the add chain they replace, as designed.
+
+### Timing
+
+One binary, ABBA over 10 arms, `llama-bench -r 5`, `GGML_CUDA_PRE_ADD_NORM_ONE_ROW=1`
+for the round-50 control:
+
+    multi pp512  4967.3 4923.1 4893.2 4894.8 4877.3   mean 4911.1
+    one   pp512  4924.5 4884.9 4856.9 4826.8 4835.5   mean 4865.7   -> +0.93%
+    multi tg128  mean 164.80    one tg128  mean 164.87              -> -0.04%
+
+5/5 adjacent arm pairs positive on prefill. Decode is flat by construction: the
+guard only runs above one row, and decode is always one row.
+
+**This is worth about +0.31% of score** (0.20 x 0.93% on prefill, 0.15 x 0.84%
+on ttft) - below this track's practical bar and below the 0.75% confirmation
+tolerance, so it is not submitted on its own. It ships with the next decode
+lever, and it closes a defect that has cost five rounds and is latent in the
+six sibling tracks that carry the same fold.
+
+Toggles: `GGML_CUDA_DISABLE_PRE_ADD_NORM=1` parks the fold entirely;
+`GGML_CUDA_PRE_ADD_NORM_ONE_ROW=1` is the round-50 build;
+`GGML_CUDA_PRE_ADD_NORM_UNSAFE=1` drops the guard and reproduces the defect;
+`GGML_RMS_PRE_ADD_AUDIT=1` dumps the ranges the guard tests.
+---
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -5228,6 +5228,47 @@
+            ggml_is_contiguous(t) && t->nb[0] == ggml_type_size(t->type);
+ }
+ 
++// ---- cross-block write/read hazard on the folded add chain ----------------
++//
++// rms_norm_pre_add_launch issues one block per row.  Block r writes add_dst
++// row r in loop 1 and dst row r in loop 2, with only the block-scope
++// __syncthreads() inside block_reduce between them, and reads operand row r in
++// loop 1.  Nothing orders one block's loop 2 against another block's loop 1,
++// so a WRITE range belonging to block r must never intersect a READ range
++// belonging to block r' != r.
++//
++// Every writer and reader here is contiguous and the same shape, so their row
++// grids are congruent.  An overlapping pair is therefore safe only when the two
++// tensors start at exactly the same address - block r then writes precisely the
++// row block r reads, which is the in-place residual add and is what the kernel
++// already assumes.  Any other overlap, INCLUDING one that is a whole number of
++// rows apart, puts block r's store on top of block r+k's load.
++static bool ggml_cuda_pre_add_write_safe(const ggml_tensor * w, const ggml_tensor * r) {
++    if (r == nullptr) {
++        return true;
++    }
++    if (w->data == r->data) {
++        return true;
++    }
++    return ggml_cuda_mmvq_ranges_disjoint(w, r);
++}
++
++static void ggml_cuda_pre_add_audit(const ggml_cgraph * cgraph, int i, int n_adds,
++                                    const ggml_tensor * add_last, const ggml_tensor * mul,
++                                    int64_t nrows, bool hazard) {
++    static int calls = 0;
++    fprintf(stderr, "[PREADD] call=%d nrows=%lld n_adds=%d hazard=%d dst=%p+%zu add_dst=%p+%zu",
++            calls++, (long long) nrows, n_adds, (int) hazard,
++            mul->data, ggml_nbytes(mul), add_last->data, ggml_nbytes(add_last));
++    const ggml_tensor * r0 = cgraph->nodes[i]->src[0];
++    fprintf(stderr, " src0=%p+%zu", r0 ? r0->data : nullptr, r0 ? ggml_nbytes(r0) : 0);
++    for (int k = 0; k < n_adds; ++k) {
++        const ggml_tensor * rk = cgraph->nodes[i + k]->src[1];
++        fprintf(stderr, " src%d=%p+%zu", k + 1, rk ? rk->data : nullptr, rk ? ggml_nbytes(rk) : 0);
++    }
++    fprintf(stderr, "\n");
++}
++
+ // returns the number of chained ADD nodes to fold, or 0
+ static int ggml_cuda_rms_norm_pre_add_detect(const ggml_cgraph * cgraph, const int i) {
+     if (cgraph->nodes[i]->op != GGML_OP_ADD) {
+@@ -5257,9 +5298,14 @@
+     // orders those two loops across blocks.  At nrows == 1 there is exactly one
+     // block and the hazard cannot exist; see the measurement above the
+     // disable_pre_add_norm gate.
+-    static const bool pre_add_all_rows = getenv("GGML_CUDA_PRE_ADD_NORM_ALL_ROWS") != nullptr &&
+-                                         std::atoi(getenv("GGML_CUDA_PRE_ADD_NORM_ALL_ROWS"));
+-    if (!pre_add_all_rows && ggml_nrows(add_last) != 1) {
++    static const bool pre_add_one_row = getenv("GGML_CUDA_PRE_ADD_NORM_ONE_ROW") != nullptr &&
++                                        std::atoi(getenv("GGML_CUDA_PRE_ADD_NORM_ONE_ROW"));
++    static const bool pre_add_unsafe = getenv("GGML_CUDA_PRE_ADD_NORM_UNSAFE") != nullptr &&
++                                       std::atoi(getenv("GGML_CUDA_PRE_ADD_NORM_UNSAFE"));
++    static const bool pre_add_audit = getenv("GGML_RMS_PRE_ADD_AUDIT") != nullptr &&
++                                      std::atoi(getenv("GGML_RMS_PRE_ADD_AUDIT"));
++    const int64_t pre_add_nrows = ggml_nrows(add_last);
++    if (pre_add_one_row && pre_add_nrows != 1) {
+         return 0;
+     }
+ 
+@@ -5320,6 +5366,31 @@
+     }
+     // and the intermediate norm result is never materialised, so nothing else
+     // may read it (guaranteed by ggml_cuda_can_fuse's single-use check)
++    // Above one row the cross-block hazard is live: audit the write set against
++    // the read set and decline any fold that is not provably per-row.
++    bool pre_add_hazard = false;
++    if (pre_add_nrows > 1) {
++        const ggml_tensor * writers[2] = { mul, add_last };
++        for (int wi = 0; wi < 2 && !pre_add_hazard; ++wi) {
++            if (!ggml_cuda_pre_add_write_safe(writers[wi], cgraph->nodes[i]->src[0])) {
++                pre_add_hazard = true;
++                break;
++            }
++            for (int k = 0; k < n_adds; ++k) {
++                if (!ggml_cuda_pre_add_write_safe(writers[wi], cgraph->nodes[i + k]->src[1])) {
++                    pre_add_hazard = true;
++                    break;
++                }
++            }
++        }
++    }
++    if (pre_add_audit) {
++        ggml_cuda_pre_add_audit(cgraph, i, n_adds, add_last, mul, pre_add_nrows, pre_add_hazard);
++    }
++    if (pre_add_hazard && !pre_add_unsafe) {
++        return 0;
++    }
++
+     return n_adds;
+ }
+ 
+@@ -6799,9 +6870,24 @@
+             // ggml_cuda_rms_norm_pre_add_detect now declines above one row: every
+             // prefill shape, including the gate's 512-row ubatch, therefore runs
+             // the parked graph, and decode - which is always one row - keeps the
+-            // fold.  GGML_CUDA_DISABLE_PRE_ADD_NORM=1 restores the parked build;
+-            // GGML_CUDA_PRE_ADD_NORM_ALL_ROWS=1 restores the multi-row fold for
+-            // further investigation of the residual defect.
++            // fold.
++            //
++            // Round 51 re-enables the multi-row fold behind a host-side hazard
++            // guard.  An nrows ladder localised the defect further: nrows 1, 2, 8
++            // and 64 are all deterministic to four decimals over five loads, and
++            // only 512 jitters - the hazard needs blocks in DIFFERENT dispatch
++            // waves, not merely more than one.  Dumping the write and read ranges
++            // then names it: 9 of 79 folds per graph place the norm output over an
++            // add operand with the bases 128 bytes apart, i.e. NOT a whole number
++            // of rows, so block r's loop-2 store lands on the last 32 floats of
++            // block r-1's loop-1 operand row.  Declining exactly those folds
++            // (ggml_cuda_pre_add_write_safe) returns 3.9318 on 8 of 8 loads where
++            // the unguarded build returns six distinct values spanning 0.107%.
++            //
++            // GGML_CUDA_DISABLE_PRE_ADD_NORM=1 restores the parked build;
++            // GGML_CUDA_PRE_ADD_NORM_ONE_ROW=1 restores the round-50 decode-only
++            // fold; GGML_CUDA_PRE_ADD_NORM_UNSAFE=1 drops the guard and
++            // reproduces the defect; GGML_RMS_PRE_ADD_AUDIT=1 dumps the ranges.
+             static const bool disable_pre_add_norm = getenv("GGML_CUDA_DISABLE_PRE_ADD_NORM") != nullptr &&
+                                                      std::atoi(getenv("GGML_CUDA_DISABLE_PRE_ADD_NORM"));
+             static const bool disable_norm_quant = getenv("GGML_CUDA_DISABLE_NORM_QUANT") != nullptr &&
