@@ -1,11 +1,12 @@
 From: Claude Opus 5 (Claude Code) <noreply@anthropic.com>
 Subject: [PATCH 20/20] llama: serve the recurrent state as a cache view when the
- slot mapping is identity (+3.8% decode on sm_121)
+ slot mapping is identity (+3.80% decode on sm_121)
 
-Cross-port of the qwen3.6-35b-a3b-gguf-r9700-v1 series' 0030. The patch is
-entirely in llama.cpp core (src/llama-graph.*, src/llama-memory-recurrent.*,
-src/models/*.cpp) and contains no backend code, so it transfers between the HIP
-and CUDA tracks unchanged; only the measurement below is new.
+Cross-port of the qwen3.6-35b-a3b-gguf-r9700-v1 series' 0030, with one added
+restriction (see below). The patch is entirely in llama.cpp core
+(src/llama-graph.*, src/llama-memory-recurrent.*, src/models/*.cpp) and contains
+no backend code, so it transfers between the HIP and CUDA tracks unchanged; the
+measurements are new.
 
 Qwen3.6-35B-A3B runs gated-delta-net linear attention in 30 of its 40 layers.
 Each of those layers materialises its recurrent state before gated_delta_net
@@ -18,50 +19,63 @@ bytes to a new address purely so the consumer can read them from there.
 llama_memory_recurrent_context::s_copy_main_is_identity() detects that case at
 graph-build time without the side effects of s_copy(), and build_rs then hands
 the consumer a contiguous ggml_view_2d of the cache rows instead of a gather.
-The view is restricted to the single-slot serving shape (n_seqs == 1, head == 0,
-n_rs == 1) because llama.cpp reuses built graphs across decode steps and a view
-bakes its offset at build time; at row 0 a reused graph can never go stale, and
-that is the ranked configuration (--parallel 1). Prompt-phase builds, where
-cells[].src0 is still unset, take the stock gather.
 LLAMA_DISABLE_RS_STATE_VIEW=1 restores stock everywhere.
 
-Why it is worth more here than its dispatch count suggests: GB10 is a 121.6 GiB
-LPDDR5 part whose cold DRAM rate is 200-205 GB/s, and the eliminated gathers are
-a read plus a write of the entire recurrent state on 30 layers of every token.
-Removing them removes bytes, not merely launches - which matters on a device
-where this series has repeatedly measured launch-count reduction (grouped mmvq,
-grouped mmvf) to be worth almost nothing, because CUDA graph capture is already
-live at decode and the replay gap the HIP track pays is not there to recover.
+The view is restricted to n_tokens == 1 && n_seqs == 1 && head == 0 &&
+n_rs == 1. The n_seqs/head/n_rs part is the sibling track's: llama.cpp reuses
+built graphs across decode steps and a view bakes its offset at build time, so
+at row 0 a reused graph can never go stale, and that is the ranked --parallel 1
+shape. The n_tokens == 1 clause is added here so the view is taken only on the
+decode-shape build it was derived for and is provably inert at every
+prompt-shaped build, including the long-context evaluation windows. It costs
+nothing: the gain is a decode gain and decode is n_tokens == 1, at short and
+long context alike.
+
+Why this is worth more here than its dispatch count suggests: GB10 is a
+121.6 GiB LPDDR5 part whose cold DRAM rate is 200-205 GB/s, and the eliminated
+gathers are a read plus a write of the entire recurrent state on 30 layers of
+every token. Removing them removes bytes, not merely launches - which matters on
+a device where this series has repeatedly measured launch-count reduction
+(grouped mmvq, grouped mmvf) to be worth almost nothing, because CUDA graph
+capture is already live at decode and the replay gap the HIP track pays is not
+there to recover.
 
 Measured on the runner box gx10-838f, same-binary toggle, 5 interleaved
 whole-process rounds against the 19-patch frontier build:
 
 | round | view on tg128 | view off tg128 | on pp512 | off pp512 |
 | --- | --- | --- | --- | --- |
-| 1 | 75.78 | 72.78 | 2350.33 | 2339.71 |
-| 2 | 75.65 | 72.85 | 2358.05 | 2342.07 |
-| 3 | 75.61 | 72.93 | 2364.08 | 2338.71 |
-| 4 | 75.63 | 72.91 | 2350.22 | 2353.82 |
-| 5 | 75.56 | 72.74 | 2353.37 | 2342.66 |
+| 1 | 75.74 | 72.97 | 2355.60 | 2356.87 |
+| 2 | 75.57 | 73.09 | 2355.79 | 2338.26 |
+| 3 | 75.78 | 72.86 | 2351.35 | 2371.15 |
+| 4 | 75.78 | 73.00 | 2351.90 | 2336.70 |
+| 5 | 75.57 | 72.91 | 2319.05 | 2358.87 |
 
-decode median per-round ratio 1.0382, 5/5 rounds disjoint (min-on 75.56 >
-max-off 72.93). Prefill overlaps in both directions, i.e. neutral - the identity
-check declines during prompt-phase builds by construction.
+decode median per-round ratio 1.0380, 5/5 rounds disjoint (min-on 75.57 >
+max-off 73.09). Prefill overlaps in both directions, i.e. neutral.
 
 Correctness: the view and the gather deliver the same bytes to the same
-consumer, and both perplexity shapes confirm it exactly.
+consumer, and every measured shape confirms it to four decimal places.
 
-- gate shape (-c 512 --chunks 8, held-out corpus): 3.9306 on, 3.9306 off,
-  bit-identical, and equal to the parent frontier's recorded value
-- decode shape (-c 512 -b 512 -ub 1 --chunks 8): 3.9237 on, 3.9237 off,
-  bit-identical
+- gate shape (-c 512 --chunks 8, held-out corpus): 3.9306 on and off, equal to
+  the parent frontier's recorded value
+- decode shape (-c 512 -b 512 -ub 1 --chunks 8): 3.9237 on and off
+- 16384-token window of the held-out long corpus: 5.9375 on and off
+- 32768-token window: 6.9450 on and off
+
+The two long windows are bit-identical because the n_tokens == 1 clause keeps
+the view out of every prompt-shaped build; they are quoted here so the next
+reader can see that this patch spends none of the long-context budget. (The
+parent series' own 32k reading is 6.9450 against stock's 6.9341, and that
++0.157% is patch 0013's requant, recoverable with GGML_LOAD_REQUANT=0 - it is
+not this patch's and cannot be fixed here.)
 
 ---
+
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index e12a8cdc2..dd50a0eb1 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -3287,7 +3287,8 @@ ggml_tensor * llm_graph_context::build_rs(
+@@ -3287,7 +3287,8 @@
             uint32_t   rs_head,
             uint32_t   rs_size,
              int32_t   rs_zero,
@@ -71,7 +85,7 @@ index e12a8cdc2..dd50a0eb1 100644
  
      GGML_UNUSED(rs_size);
      ggml_tensor * states = ggml_reshape_2d(ctx0, s, state_size, s->ne[1]);
-@@ -3300,7 +3301,19 @@ ggml_tensor * llm_graph_context::build_rs(
+@@ -3300,7 +3301,19 @@
      // copy states
      // NOTE: assuming the copy destinations are ALL contained between rs_head and rs_head + n_rs
      // {state_size, rs_size} -> {state_size, n_seqs}
@@ -92,7 +106,7 @@ index e12a8cdc2..dd50a0eb1 100644
      ggml_build_forward_expand(gf, output_states);
  
      // copy extra states which won't be changed further (between n_seqs and n_rs)
-@@ -3348,12 +3361,25 @@ ggml_tensor * llm_graph_context::build_rs(
+@@ -3348,12 +3361,26 @@
          ggml_tensor * s,
              int32_t   state_size,
              int32_t   n_seqs,
@@ -110,6 +124,7 @@ index e12a8cdc2..dd50a0eb1 100644
 +    // kept. Multi-slot or migrated states fall back to the stock gather.
 +    static const bool disable_state_view = getenv("LLAMA_DISABLE_RS_STATE_VIEW") != nullptr;
 +    const bool state_is_identity = allow_state_view && !disable_state_view &&
++        n_tokens == 1 &&
 +        n_seqs == 1 && kv_state->get_head() == 0 && kv_state->get_n_rs() == 1 &&
 +        kv_state->s_copy_main_is_identity(n_seqs);
 +
@@ -121,10 +136,9 @@ index e12a8cdc2..dd50a0eb1 100644
  
  ggml_tensor * llm_graph_context::build_rwkv_token_shift_load(
 diff --git a/src/llama-graph.h b/src/llama-graph.h
-index 160e29413..b67d2d1fe 100644
 --- a/src/llama-graph.h
 +++ b/src/llama-graph.h
-@@ -1256,7 +1256,8 @@ struct llm_graph_context {
+@@ -1256,7 +1256,8 @@
                 uint32_t   rs_head,
                 uint32_t   rs_size,
                  int32_t   rs_zero,
@@ -134,7 +148,7 @@ index 160e29413..b67d2d1fe 100644
  
      llm_graph_input_rs * build_rs_inp() const;
  
-@@ -1265,7 +1266,8 @@ struct llm_graph_context {
+@@ -1265,7 +1266,8 @@
              ggml_tensor * s,
                  int32_t   state_size,
                  int32_t   n_seqs,
@@ -145,10 +159,9 @@ index 160e29413..b67d2d1fe 100644
      ggml_tensor * build_rwkv_token_shift_load(
          llm_graph_input_rs * inp,
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
-index ef82eb976..348bfdafd 100644
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
-@@ -1243,6 +1243,22 @@ ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
+@@ -1243,6 +1243,22 @@
      return mem->s_l[il];
  }
  
@@ -172,10 +185,9 @@ index ef82eb976..348bfdafd 100644
      const uint32_t cell_idx = i + mem->head;
      const int32_t  src0     = mem->cells[cell_idx].src0;
 diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
-index b13b7b748..3bf6ee22c 100644
 --- a/src/llama-memory-recurrent.h
 +++ b/src/llama-memory-recurrent.h
-@@ -173,6 +173,11 @@ public:
+@@ -173,6 +173,11 @@
  
      int32_t s_copy(int i) const;
  
@@ -188,10 +200,9 @@ index b13b7b748..3bf6ee22c 100644
      const llama_memory_status status;
  
 diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
-index ad6612647..34ce37486 100644
 --- a/src/models/delta-net-base.cpp
 +++ b/src/models/delta-net-base.cpp
-@@ -460,7 +460,7 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+@@ -460,7 +460,7 @@
  
      const int64_t n_seqs = ubatch.n_seqs;
  
@@ -201,10 +212,9 @@ index ad6612647..34ce37486 100644
  
      conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
 diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
-index 1249d7088..763657938 100644
 --- a/src/models/qwen35moe.cpp
 +++ b/src/models/qwen35moe.cpp
-@@ -429,7 +429,7 @@ ggml_tensor * llama_model_qwen35moe::graph::build_layer_attn_linear(
+@@ -412,7 +412,7 @@
  
      ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
  
