@@ -1,0 +1,205 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Opus 5 <opus5@local>
+Date: Fri, 14 Aug 2026 07:10:00 +0000
+Subject: [PATCH] cuda/hip: fold the MoE expert aggregation into the rms_norm
+ that consumes it (+1.62% decode, bit-exact)
+
+The series README prices the last surviving `k_bin_bcast` population, 40 per
+token, as the shared-expert add. It is not that. Decoding the template
+instantiations in a rocprofv3 kernel trace of the 24-patch frontier splits the
+population in two:
+
+    k_bin_bcast<op_add, f32,f32,f32, 7 x const float *>   39/token, 1.58 us
+    k_bin_bcast<op_add, f32,f32,f32, 1 x const float *>    1/token, 1.76 us
+
+The trailing pointer pack is the fusion width, so the 39-launch family is
+`n_fuse = 7`: the routed-expert aggregation, `moe_out = e0 + e1 + ... + e7`
+over the eight channel views of the routed down projection. The shared-expert
+add is already free - it is one of the two adds inside
+`rms_norm_pre_add_f32<1024, 3, true>` (38/token), which patch 0008 folds into
+the following attention norm along with the residual add.
+
+So the MoE block ends in ONE add chain of nine nodes,
+
+    (((e0 + e1) + ... + e7) + ffn_shexp) + ffn_inp  ->  rms_norm -> mul
+
+and it is split across two dispatches for a layout reason, not a graph one.
+`ggml_cuda_op_fused_add` applies a SINGLE src1 stride to every operand it
+fuses - `k_bin_bcast` computes one `i_src1` and one `s10` for the whole
+pointer pack - and the routed results are channel views of one mul_mat_id
+output with row stride `n_expert_used*n_embd`, while `ffn_shexp` and
+`ffn_inp` are plain contiguous rows. The chain walk therefore stops at that
+boundary, emits the first seven adds as their own launch, and leaves a two-add
+remainder for the norm fold.
+
+`rms_norm_pre_add_f32` has no such constraint: `rms_norm_pre_add_args` already
+carries a `stride_row` per operand. Dropping the same-layout test from the
+norm fold's chain walk - and only from it; the generic multi-add fusion keeps
+it - lets the whole nine-add chain land in the norm kernel:
+
+  - `RMS_NORM_ADD_MAX_OPERANDS` 8 -> 12, launch switches extended to match
+  - the chain walk's cap follows that constant instead of a literal 6
+  - an alias guard: pass 1 stores the chain result while reading every operand
+    at the SAME element index, so an operand may share the result's base
+    pointer (its value at that index is consumed before the store) but must
+    not overlap it at a shift. This matters once the chain reaches back into
+    the aggregation, because ggml-alloc can hand the chain result a block the
+    mul_mat_id output also occupies; the channel views tile that output at
+    exactly this tensor's size, so the coincident view is base-equal and every
+    other view is disjoint.
+
+Accumulation stays left-to-right from src0 of the first add, which is exactly
+what the `k_bin_bcast` comma fold followed by the norm's own chain already
+computed, so no intermediate float changes. Decode-shape perplexity
+(`-c 512 -b 512 -ub 1 --chunks 8`) is identical to every digit and every
+chunk: PPL 5.2682, [1]5.2972 [2]5.9571 [3]5.5067 [4]5.5793 [5]4.9936
+[6]4.9487 [7]5.1110 [8]5.2682.
+
+Measured alone with llama-bench, same binary, `GGML_CUDA_DISABLE_WIDE_PRE_ADD`
+toggle, six whole-process rounds with rotating arm order, median of per-round
+ratios: decode 1.0162 (all six rounds 1.0145-1.0201), prefill 0.9985. Census:
+739.1 -> 701.1 dispatches/token, total kernel 4.933 -> 4.853 ms/token. The
+`k_bin_bcast` population is gone and the norm goes `<1024,3>` at 2.92 us to
+`<1024,10>` at 3.18 us: it absorbs 65.8 us/token of launches for 9.7 us of
+extra work, plus 38 fewer inter-dispatch gaps at ~1.8 us each.
+
+Prefill is untouched by construction. With n_tokens > 1 the channel views are
+not contiguous, the operand test declines them, and the two-add remainder
+folds exactly as before.
+---
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -13,8 +13,12 @@
+ // the (x, mul, dst) base pointers and the local row index depend on the group
+ // segment, and both are integer-only.
+ // Maximum number of operands in an add chain that may be folded into the
+-// following rms_norm (matches the upstream multi-add fusion limit).
+-#define RMS_NORM_ADD_MAX_OPERANDS 8
++// following rms_norm. The upstream multi-add fusion caps at 8 because its
++// kernel carries ONE src1 stride for every fused operand; this kernel carries a
++// stride per operand, so it can also take the MoE routed-expert aggregation
++// (n_expert_used channel views of one mul_mat_id output) in the same chain.
++// 12 covers top-8 routing plus the shared-expert and residual adds.
++#define RMS_NORM_ADD_MAX_OPERANDS 12
+ 
+ // Run an elementwise add chain and the rms_norm+mul that consumes its result in
+ // ONE kernel. The chain result is still written to memory exactly as the
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -889,6 +889,10 @@
+         RMS_NORM_PRE_ADD_QUANT_CASE(6)
+         RMS_NORM_PRE_ADD_QUANT_CASE(7)
+         RMS_NORM_PRE_ADD_QUANT_CASE(8)
++        RMS_NORM_PRE_ADD_QUANT_CASE(9)
++        RMS_NORM_PRE_ADD_QUANT_CASE(10)
++        RMS_NORM_PRE_ADD_QUANT_CASE(11)
++        RMS_NORM_PRE_ADD_QUANT_CASE(12)
+ #undef RMS_NORM_PRE_ADD_QUANT_CASE
+         default: GGML_ABORT("fatal error");
+     }
+@@ -947,20 +951,21 @@
+     const int64_t mul_stride_row = mul_src->nb[1] / sizeof(float);
+ 
+     switch (n_op) {
+-        case 2: rms_norm_pre_add_launch<2>(args, add_dst, add_stride_row, dst, (int) ncols, (int) nrows, eps,
+-                    (const float *) mul_src->data, mul_stride_row, (uint32_t) mul_src->ne[0], (uint32_t) mul_src->ne[1], stream); break;
+-        case 3: rms_norm_pre_add_launch<3>(args, add_dst, add_stride_row, dst, (int) ncols, (int) nrows, eps,
+-                    (const float *) mul_src->data, mul_stride_row, (uint32_t) mul_src->ne[0], (uint32_t) mul_src->ne[1], stream); break;
+-        case 4: rms_norm_pre_add_launch<4>(args, add_dst, add_stride_row, dst, (int) ncols, (int) nrows, eps,
+-                    (const float *) mul_src->data, mul_stride_row, (uint32_t) mul_src->ne[0], (uint32_t) mul_src->ne[1], stream); break;
+-        case 5: rms_norm_pre_add_launch<5>(args, add_dst, add_stride_row, dst, (int) ncols, (int) nrows, eps,
+-                    (const float *) mul_src->data, mul_stride_row, (uint32_t) mul_src->ne[0], (uint32_t) mul_src->ne[1], stream); break;
+-        case 6: rms_norm_pre_add_launch<6>(args, add_dst, add_stride_row, dst, (int) ncols, (int) nrows, eps,
+-                    (const float *) mul_src->data, mul_stride_row, (uint32_t) mul_src->ne[0], (uint32_t) mul_src->ne[1], stream); break;
+-        case 7: rms_norm_pre_add_launch<7>(args, add_dst, add_stride_row, dst, (int) ncols, (int) nrows, eps,
+-                    (const float *) mul_src->data, mul_stride_row, (uint32_t) mul_src->ne[0], (uint32_t) mul_src->ne[1], stream); break;
+-        case 8: rms_norm_pre_add_launch<8>(args, add_dst, add_stride_row, dst, (int) ncols, (int) nrows, eps,
++#define RMS_NORM_PRE_ADD_CASE(N) \
++        case N: rms_norm_pre_add_launch<N>(args, add_dst, add_stride_row, dst, (int) ncols, (int) nrows, eps, \
+                     (const float *) mul_src->data, mul_stride_row, (uint32_t) mul_src->ne[0], (uint32_t) mul_src->ne[1], stream); break;
++        RMS_NORM_PRE_ADD_CASE(2)
++        RMS_NORM_PRE_ADD_CASE(3)
++        RMS_NORM_PRE_ADD_CASE(4)
++        RMS_NORM_PRE_ADD_CASE(5)
++        RMS_NORM_PRE_ADD_CASE(6)
++        RMS_NORM_PRE_ADD_CASE(7)
++        RMS_NORM_PRE_ADD_CASE(8)
++        RMS_NORM_PRE_ADD_CASE(9)
++        RMS_NORM_PRE_ADD_CASE(10)
++        RMS_NORM_PRE_ADD_CASE(11)
++        RMS_NORM_PRE_ADD_CASE(12)
++#undef RMS_NORM_PRE_ADD_CASE
+         default: GGML_ABORT("fatal error");
+     }
+ }
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3974,20 +3974,39 @@
+ // destination - so the stored result is unchanged, and the norm then consumes
+ // the same float values it would have read back from that store.
+ 
++// The MoE block ends in ONE long add chain: the n_expert_used routed-expert
++// results are summed, then the shared expert, then the attention residual, and
++// an rms_norm+mul consumes the total. The upstream multi-add fusion cannot take
++// it whole - its kernel applies a single src1 stride to every fused operand, and
++// the routed results are channel views of one mul_mat_id output (row stride
++// n_expert_used*n_embd) while the shared-expert and residual tensors are plain
++// contiguous rows. It therefore stops at that layout boundary and emits the
++// aggregation as its own k_bin_bcast dispatch.
++//
++// rms_norm_pre_add_f32 carries a stride PER operand, so the boundary is not
++// meaningful to it and the whole chain fits in one kernel. Accumulation stays
++// left-to-right from src0 of the first add, which is the order the split
++// k_bin_bcast + norm pair already produces, so every intermediate float is
++// unchanged.
+ static int ggml_cuda_rms_norm_pre_add_chain_len(const ggml_cgraph * cgraph, const int i) {
+-    // mirrors the multi-add fusion loop in ggml_cuda_try_fuse
++    static const bool wide = !(getenv("GGML_CUDA_DISABLE_WIDE_PRE_ADD") != nullptr &&
++                               std::atoi(getenv("GGML_CUDA_DISABLE_WIDE_PRE_ADD")));
++    // narrow: mirrors the multi-add fusion loop in ggml_cuda_try_fuse
++    const int max_fuse = wide ? RMS_NORM_ADD_MAX_OPERANDS - 2 : 6;
++
+     int     n_fuse = 0;
+-    ggml_op ops[8];
+-    std::fill(ops, ops + 8, GGML_OP_ADD);
++    ggml_op ops[RMS_NORM_ADD_MAX_OPERANDS];
++    std::fill(ops, ops + RMS_NORM_ADD_MAX_OPERANDS, GGML_OP_ADD);
+ 
+-    for (; n_fuse <= 6; ++n_fuse) {
++    for (; n_fuse <= max_fuse; ++n_fuse) {
+         if (!ggml_can_fuse(cgraph, i + n_fuse, ops + n_fuse, 2)) {
+             break;
+         }
+         if (cgraph->nodes[i + n_fuse] != cgraph->nodes[i + n_fuse + 1]->src[0]) {
+             break;
+         }
+-        if (!ggml_are_same_layout(cgraph->nodes[i + n_fuse]->src[1], cgraph->nodes[i + n_fuse + 1]->src[1])) {
++        if (!wide &&
++                !ggml_are_same_layout(cgraph->nodes[i + n_fuse]->src[1], cgraph->nodes[i + n_fuse + 1]->src[1])) {
+             break;
+         }
+     }
+@@ -4070,6 +4089,23 @@
+     if (!ggml_cuda_mmvq_ranges_disjoint(mul, add_last)) {
+         return 0;
+     }
++    // Pass 1 stores the chain result to add_last while reading every operand at
++    // the SAME element index, so an operand may share add_last base pointer -
++    // its value at that index is consumed before the store - but must not
++    // overlap it at a shift. This matters once the chain reaches back into the
++    // routed-expert aggregation: ggml-alloc can hand the chain result a block
++    // that the mul_mat_id output also occupies, and the channel views tile that
++    // output at exactly this tensor size, so the coincident view is base-equal
++    // and every other view is disjoint.
++    for (int k = 0; k <= n_adds; ++k) {
++        const ggml_tensor * operand = k == 0 ? cgraph->nodes[i]->src[0] : cgraph->nodes[i + k - 1]->src[1];
++        if (operand->data == add_last->data) {
++            continue;
++        }
++        if (!ggml_cuda_mmvq_ranges_disjoint(operand, add_last)) {
++            return 0;
++        }
++    }
+     if (!ggml_is_contiguous(mul) || !ggml_are_same_shape(mul, add_last)) {
+         return 0;
+     }

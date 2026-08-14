@@ -1,0 +1,262 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Opus 5 <opus5@local>
+Date: Fri, 14 Aug 2026 07:20:00 +0000
+Subject: [PATCH] cuda/hip: one dispatch for the routed and shared-expert q8_1
+ quantizations (bit-exact)
+
+`quantize_q8_1` is the second-largest dispatch population on this track: 78
+per token at ~1.4 us, in two families of 39 with grids (2,8,1) and (2,1,1).
+They are the two q8_1 buffers a SINGLE MoE down projection consumes - the
+routed experts' hidden states and the shared expert's, which is a separate
+tensor because patch 0018 runs the shared expert as a ninth channel with its
+own activation buffer. `ggml_cuda_mul_mat_vec_q` issues them from two places
+about seventy lines apart with no GPU work in between, so they land as
+back-to-back dispatches over 512-element rows: almost pure launch overhead on
+a box whose average inter-dispatch gap is ~1.8 us.
+
+Both call sites now record a `quantize_q8_1_job` instead of launching, and the
+function issues whatever it collected immediately before the matvec. With one
+job the stock `quantize_row_q8_1_cuda` runs, so every non-MoE path keeps its
+current launch exactly. With two, `quantize_row_q8_1_grouped_cuda` lays the
+segments' rows end to end along the grid's z axis and each block resolves its
+segment from `blockIdx.z`.
+
+Bit-exact by construction: a q8_1 block is reduced by one warp over its own 32
+input values, and the kernel body - the amax/sum warp reductions,
+`d = amax/127.0f`, `roundf(xi/d)` and the `(d, sum)` write - is the stock one,
+unchanged. Only the base pointers and the (i1, i2, i3) decomposition depend on
+the segment, and both are integer-only. Decode-shape perplexity
+(`-c 512 -b 512 -ub 1 --chunks 8`) is identical to every digit and every
+chunk against the frontier arm: PPL 5.2682.
+
+Census with 0025 already applied: 701.1 -> 662.1 dispatches/token; the two
+`quantize_q8_1` families (39 at 1.44 us + 39 at 1.39 us = 110.4 us/token)
+become one `quantize_q8_1_grouped` family (39 at 1.81 us = 70.5 us/token).
+
+Measured together with 0025 (llama-bench, same binary, env toggle, six
+whole-process rounds with rotating arm order, median of per-round ratios):
+decode 1.02834 - all six rounds between 1.0272 and 1.0287 - and prefill
+0.9973. Total kernel 4.933 -> 4.829 ms/token, dispatches 739.1 -> 662.1.
+---
+--- a/ggml/src/ggml-cuda/quantize.cuh
++++ b/ggml/src/ggml-cuda/quantize.cuh
+@@ -26,6 +26,32 @@
+         ggml_type type_src0, int64_t ne00, int64_t s01, int64_t s02, int64_t s03,
+         int64_t ne0, int64_t ne1, int64_t ne2, int64_t ne3, cudaStream_t stream);
+ 
++// Several independent quantize_row_q8_1_cuda calls as ONE dispatch.
++//
++// A MoE launch that carries the shared expert as an extra channel needs two q8_1
++// buffers - the routed activation and the shared expert's - and issues them back
++// to back with no GPU work in between. Each q8_1 block is reduced by one warp
++// over its own 32 input values, so which dispatch a block runs in cannot change
++// the bytes it writes: only the base pointers and the row decomposition depend
++// on the segment, and both are integer-only. Rows of every segment are laid end
++// to end along the grid's z axis.
++#define QUANTIZE_Q8_1_MAX_GROUPS 4
++
++struct quantize_q8_1_job {
++    const float * x;
++    void *        vy;
++    int64_t       ne00;
++    int64_t       s01;
++    int64_t       s02;
++    int64_t       s03;
++    int64_t       ne0;
++    int64_t       ne1;
++    int64_t       ne2;
++    int64_t       ne3;
++};
++
++void quantize_row_q8_1_grouped_cuda(const quantize_q8_1_job * jobs, int n_jobs, cudaStream_t stream);
++
+ void quantize_mmq_fp4_cuda(const float *   x,
+                              const int32_t * ids,
+                              void *          vy,
+--- a/ggml/src/ggml-cuda/quantize.cu
++++ b/ggml/src/ggml-cuda/quantize.cu
+@@ -555,6 +555,122 @@
+     GGML_UNUSED(n_expert_used);
+ }
+ 
++struct quantize_q8_1_grouped_args {
++    const float * x   [QUANTIZE_Q8_1_MAX_GROUPS];
++    void *        vy  [QUANTIZE_Q8_1_MAX_GROUPS];
++    int64_t       ne00[QUANTIZE_Q8_1_MAX_GROUPS];
++    int64_t       s01 [QUANTIZE_Q8_1_MAX_GROUPS];
++    int64_t       s02 [QUANTIZE_Q8_1_MAX_GROUPS];
++    int64_t       s03 [QUANTIZE_Q8_1_MAX_GROUPS];
++    int64_t       ne0 [QUANTIZE_Q8_1_MAX_GROUPS];
++    uint3         ne1 [QUANTIZE_Q8_1_MAX_GROUPS];
++    uint3         ne2 [QUANTIZE_Q8_1_MAX_GROUPS];
++    uint32_t      row_begin[QUANTIZE_Q8_1_MAX_GROUPS];
++};
++
++// Body of quantize_q8_1 with the segment's pointers and shape substituted. The
++// per-block arithmetic (the warp amax/sum reductions, d = amax/127, the roundf
++// and the (d, sum) write) is the stock one, unchanged.
++__launch_bounds__(CUDA_QUANTIZE_BLOCK_SIZE, 1)
++static __global__ void quantize_q8_1_grouped(const quantize_q8_1_grouped_args args, const int n_groups) {
++    ggml_cuda_pdl_lc();
++
++    const uint32_t z = blockIdx.z;
++
++    int g = 0;
++#pragma unroll
++    for (int k = 1; k < QUANTIZE_Q8_1_MAX_GROUPS; ++k) {
++        if (k < n_groups && z >= args.row_begin[k]) {
++            g = k;
++        }
++    }
++
++    const int64_t i0 = (int64_t) blockDim.x*blockIdx.x + threadIdx.x;
++
++    if (i0 >= args.ne0[g]) {
++        return;
++    }
++
++    const float * GGML_CUDA_RESTRICT x  = args.x [g];
++    void        * GGML_CUDA_RESTRICT vy = args.vy[g];
++
++    // rows of this segment are (i1, i2, i3) flattened in that order
++    const uint32_t l   = z - args.row_begin[g];
++    const uint32_t i1  = fastmodulo(l, args.ne1[g]);
++    const uint32_t l2  = fastdiv(l, args.ne1[g]);
++    const uint32_t i2  = fastmodulo(l2, args.ne2[g]);
++    const uint32_t i3  = fastdiv(l2, args.ne2[g]);
++
++    const int64_t ne0  = args.ne0[g];
++    const int64_t ne00 = args.ne00[g];
++
++    const int64_t i_cont = (((int64_t) i3*args.ne2[g].z + i2) * args.ne1[g].z + i1) * ne0 + i0;
++
++    block_q8_1 * y = (block_q8_1 *) vy;
++
++    const int64_t ib  = i_cont / QK8_1; // block index
++    const int64_t iqs = i_cont % QK8_1; // quant index
++
++    ggml_cuda_pdl_sync();
++    const float xi = i0 < ne00
++        ? x[(int64_t) i3*args.s03[g] + (int64_t) i2*args.s02[g] + (int64_t) i1*args.s01[g] + i0]
++        : 0.0f;
++    float amax = fabsf(xi);
++    float sum = xi;
++
++    amax = warp_reduce_max<QK8_1>(amax);
++    sum  = warp_reduce_sum<QK8_1>(sum);
++
++    const float  d = amax / 127.0f;
++    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
++
++    y[ib].qs[iqs] = q;
++
++    if (iqs > 0) {
++        return;
++    }
++
++    y[ib].ds = make_half2(d, sum);
++}
++
++void quantize_row_q8_1_grouped_cuda(const quantize_q8_1_job * jobs, int n_jobs, cudaStream_t stream) {
++    GGML_ASSERT(n_jobs >= 1 && n_jobs <= QUANTIZE_Q8_1_MAX_GROUPS);
++
++    quantize_q8_1_grouped_args args = {};
++
++    uint32_t rows    = 0;
++    int64_t  max_ne0 = 0;
++    for (int g = 0; g < n_jobs; ++g) {
++        GGML_ASSERT(jobs[g].ne0 % QK8_1 == 0);
++        GGML_ASSERT(jobs[g].ne1 > 0 && jobs[g].ne2 > 0 && jobs[g].ne3 > 0);
++
++        args.x   [g] = jobs[g].x;
++        args.vy  [g] = jobs[g].vy;
++        args.ne00[g] = jobs[g].ne00;
++        args.s01 [g] = jobs[g].s01;
++        args.s02 [g] = jobs[g].s02;
++        args.s03 [g] = jobs[g].s03;
++        args.ne0 [g] = jobs[g].ne0;
++        args.ne1 [g] = init_fastdiv_values(jobs[g].ne1);
++        args.ne2 [g] = init_fastdiv_values(jobs[g].ne2);
++        args.row_begin[g] = rows;
++
++        rows    += (uint32_t) (jobs[g].ne1*jobs[g].ne2*jobs[g].ne3);
++        max_ne0  = std::max(max_ne0, jobs[g].ne0);
++    }
++    for (int g = n_jobs; g < QUANTIZE_Q8_1_MAX_GROUPS; ++g) {
++        args.ne1[g] = args.ne1[0];
++        args.ne2[g] = args.ne2[0];
++        args.row_begin[g] = rows;
++    }
++
++    const int64_t block_num_x = (max_ne0 + CUDA_QUANTIZE_BLOCK_SIZE - 1) / CUDA_QUANTIZE_BLOCK_SIZE;
++    const dim3 num_blocks(block_num_x, 1, rows);
++    const dim3 block_size(CUDA_QUANTIZE_BLOCK_SIZE, 1, 1);
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(num_blocks, block_size, 0, stream);
++    ggml_cuda_kernel_launch(quantize_q8_1_grouped, launch_params, args, n_jobs);
++}
++
+ void quantize_row_q8_1_cuda(
+         const float * x, const int32_t * ids, void * vy, const ggml_type type_src0,
+         const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1621,6 +1621,12 @@
+     // contents and the full quantize_row_q8_1_cuda parameter tuple are identical,
+     // so the cached bytes equal what the skipped kernel would have written.
+     // See ggml_cuda_quantized_src1_cache in common.cuh for the lifetime rules.
++    //
++    // The quantizations this launch needs are collected here and issued together
++    // right before the matvec: see quantize_row_q8_1_grouped_cuda.
++    quantize_q8_1_job quant_jobs[QUANTIZE_Q8_1_MAX_GROUPS];
++    int               n_quant_jobs = 0;
++
+     const char * src1_q8_1 = nullptr;
+     {
+         const int64_t s11 = src1->nb[1] / ts_src1;
+@@ -1631,7 +1637,8 @@
+             const size_t size_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+             char * dst_q8_1 = ctx.quantized_src1_cache.insert(
+                 ctx.pool(), src1, stream, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, size_q8_1);
+-            quantize_row_q8_1_cuda(src1_d, nullptr, dst_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++            quant_jobs[n_quant_jobs++] = quantize_q8_1_job{
++                src1_d, dst_q8_1, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13 };
+             src1_q8_1 = dst_q8_1;
+         }
+     }
+@@ -1705,8 +1712,9 @@
+             const size_t size_q8_1 = s_ne13*s_ne12 * s_ne11*s_ne10_padded * sizeof(block_q8_1)/QK8_1;
+             char * d_q8_1 = ctx.quantized_src1_cache.insert(
+                 ctx.pool(), s1, stream, s_ne10, s_s11, s_s12, s_s13, s_ne10_padded, s_ne11, s_ne12, s_ne13, size_q8_1);
+-            quantize_row_q8_1_cuda((const float *) s1->data, nullptr, d_q8_1, shexp->src0->type,
+-                s_ne10, s_s11, s_s12, s_s13, s_ne10_padded, s_ne11, s_ne12, s_ne13, stream);
++            quant_jobs[n_quant_jobs++] = quantize_q8_1_job{
++                (const float *) s1->data, d_q8_1, s_ne10, s_s11, s_s12, s_s13,
++                s_ne10_padded, s_ne11, s_ne12, s_ne13 };
+             s_q8_1 = d_q8_1;
+         }
+ 
+@@ -1729,6 +1737,24 @@
+         extra_p   = &extra;
+     }
+ 
++    // One dispatch for every q8_1 buffer this matvec consumes. A MoE launch that
++    // carries the shared expert needs two and they are otherwise back-to-back
++    // dispatches over 512-element activations - pure launch overhead. With a
++    // single buffer the stock launcher runs, so the common path is untouched.
++    if (n_quant_jobs > 0) {
++        static const bool disable_quant_group = getenv("GGML_CUDA_DISABLE_QUANT_GROUP") != nullptr &&
++                                                std::atoi(getenv("GGML_CUDA_DISABLE_QUANT_GROUP"));
++        if (n_quant_jobs > 1 && !disable_quant_group) {
++            quantize_row_q8_1_grouped_cuda(quant_jobs, n_quant_jobs, stream);
++        } else {
++            for (int g = 0; g < n_quant_jobs; ++g) {
++                const quantize_q8_1_job & j = quant_jobs[g];
++                quantize_row_q8_1_cuda(j.x, nullptr, j.vy, src0->type,
++                    j.ne00, j.s01, j.s02, j.s03, j.ne0, j.ne1, j.ne2, j.ne3, stream);
++            }
++        }
++    }
++
+     mul_mat_vec_q_switch_type(
+         src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,

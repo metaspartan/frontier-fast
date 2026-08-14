@@ -1,6 +1,6 @@
 # laguna-xs-2.1-gguf-r9700-v1 — patch series
 
-The platform's most-worked track. Twenty-four patches applied to llama.cpp
+The platform's most-worked track. Twenty-six patches applied to llama.cpp
 `b10237`, built `GGML_HIP=ON, AMDGPU_TARGETS=gfx1201, Release`. Frontier
 **+60.26%** (158.16 tok/s decode against a 95.43 tok/s baseline) at 0023; the
 top entry is `Adaptive prompt-cache admission`. 0020–0023 are the graph-order
@@ -48,6 +48,8 @@ of kernels already near the memory ceiling.
 | 0020 | attention gate projection joins the Q/K grouped launch | **won** — score **1.3872 (+38.72%)**, decode 1.6474x / **156.8 tok/s**. A one-line graph-order change, bit-identical. Took the track from Cybara's 1.3731. Open lever 1 below is now partly closed. |
 | 0021-0023 | the three host-side patches: adaptive context checkpoints, trailing-ubatch absorption, adaptive prompt-cache admission | **+5.61%, +6.48%, +2.73% of score** — 1.3872 → **1.6026**, from ~229 lines and no kernel code. All three are the same pattern: `llama-server` doing speculative work betting a later request shares a prefix, never checking whether one ever does. Check all three on any llama.cpp server track *before* writing a kernel. |
 | 0024 | MoE routing-weight multiply folded into the routed down projection | **+1.69% decode**, pp neutral, bit-exact (decode-shape PPL identical to every digit). −39.0 dispatches/token; the `k_bin_bcast` y=8 population is gone. Composes with 0017 — the ninth channel is not routed, so it is predicated off the scale and both folds ride one launch. |
+| 0025 | MoE routed-expert aggregation folded into the rms_norm it feeds | **+1.62% decode** alone, prefill neutral, bit-exact (decode-shape PPL identical to every digit and every chunk). The surviving `k_bin_bcast` population was NOT the shared-expert add — see the correction below. −38 dispatches/token; the `k_bin_bcast` population is now gone entirely. |
+| 0026 | routed and shared-expert q8_1 quantizations issued as one dispatch | **+2.83% decode with 0025**, prefill neutral, bit-exact. `quantize_q8_1` 78/token in two families becomes `quantize_q8_1_grouped` 39/token. Together 0025+0026 take the census from 739.1 to 662.1 dispatches/token and total kernel from 4.933 to 4.829 ms/token. |
 
 ## Dead ends — do not spend a slot re-deriving these
 
@@ -92,15 +94,26 @@ Census at 0024 (748 dispatches/token) for sizing anything below: `mul_mat_vec_q`
 `topk_moe` 39, `rms_norm_f32_grouped` 38, `rms_norm_pre_add<1024,3>` 38,
 `rope_neox_grouped` 38.
 
-0. **The last `k_bin_bcast`: 40/token @ 2.04 us, the shared-expert add**
-   (`cur = ggml_add(moe_out, ffn_shexp)`). 0024 removed the other bin_bcast
-   family and this is the twin, worth ~139 us/token including its gap
-   (~+2.3% decode) if it folds. The shared expert's output is already produced
-   by the ninth channel of the same launch that produces the routed result, so
-   the two candidates are an accumulating store on that channel, or absorbing
-   the add as a fourth input to the `rms_norm_pre_add` fold that already sums
-   three. **Start here** — it is the cheapest remaining launch-count play and
-   the machinery for both routes already exists in the series.
+Re-censused at 0026: **662.1 dispatches/token for 4.829 ms of kernel**.
+`k_bin_bcast` is gone, `quantize_q8_1` 78 has become `quantize_q8_1_grouped`
+39 @ 1.81 us, and `rms_norm_pre_add<1024,3>` 38 has become
+`rms_norm_pre_add<1024,10>` 38 @ 3.17 us. The four remaining families at 39-42
+are `mul_mat_vec_f` (the f32 router), `topk_moe`, `rms_norm_pre_add<1024,1>`
+and `k_set_rows_grouped`.
+
+0. **CLOSED by 0025, and the entry above it was misdiagnosed.** The surviving
+   `k_bin_bcast` population was recorded here as the shared-expert add
+   (`cur = ggml_add(moe_out, ffn_shexp)`). It was not. Decoding the template
+   instantiations in the trace splits the 40 into
+   `k_bin_bcast<op_add, f32,f32,f32, 7 x const float *>` at 39/token and a
+   1-pointer straggler at 1/token; the trailing pointer pack is the fusion
+   width, so the 39-launch family is `n_fuse = 7` — the **routed-expert
+   aggregation**, `moe_out = e0 + ... + e7`. The shared-expert add was already
+   free, folded by 0008 into `rms_norm_pre_add<1024,3>` together with the
+   residual add. **Read the pointer pack before pricing a `k_bin_bcast`
+   family**: the name in a truncated census tells you nothing about which
+   adds it carries. 0025 folds the whole nine-add chain into the norm and the
+   family is now gone.
 1. **Merge Q/K/V matvecs into one grouped launch.** Q/K and the attention gate
    are grouped (0004, 0020); V is left out because it is Q6_K and the grouped
    kernel is single-type. Do **not** try to fix that by reordering — that is
