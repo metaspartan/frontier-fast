@@ -1,0 +1,513 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Code (Opus 5) <noreply@anthropic.com>
+Date: Fri, 14 Aug 2026 03:30:00 -0600
+Subject: [PATCH 24/27] cuda: fuse the Mamba CONCAT/conv/SiLU and fold the routed q8_1
+
+Ported from the Nemotron R9700 HIP series to the GB10 CUDA track. Both tracks
+pin llama.cpp 0b1bad14ff20 and llama.cpp's HIP backend is the CUDA backend
+source-translated, so the diff applies to ggml/src/ggml-cuda unchanged.
+
+GB10 leave-one-out: GGML_CUDA_DISABLE_MAMBA_CONV_CONCAT_FUSION=1 costs
+0.19% of decode; GGML_CUDA_NEMO_ROUTED_Q8_FOLD=0 costs 0.17%.
+---
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index fa77245cb..aece1b622 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4020,6 +4020,9 @@ static bool ggml_cuda_byte_ranges_disjoint(
+ // The fused CONCAT remains a pure bit copy and the existing SSM_CONV kernel is
+ // left completely untouched, including its F32 materialization and reduction.
+ struct ggml_cuda_mamba_conv_state_concat_plan {
++    ggml_tensor * conv  = nullptr;
++    ggml_tensor * add   = nullptr;
++    ggml_tensor * silu  = nullptr;
+     ggml_tensor * cpy   = nullptr;
+     ggml_tensor * cache = nullptr;
+     int conv_index = -1;
+@@ -4206,6 +4209,9 @@ static bool ggml_cuda_mamba_conv_state_concat_detect(
+         }
+     }
+ 
++    plan.conv  = conv;
++    plan.add   = add;
++    plan.silu  = silu;
+     plan.cpy   = cpy;
+     plan.cache = cache;
+     plan.conv_index = conv_idx;
+@@ -4215,6 +4221,122 @@ static bool ggml_cuda_mamba_conv_state_concat_detect(
+     return true;
+ }
+ 
++// Additional requirements used only by the full CONCAT+conv fusion.  Keeping
++// these separate leaves GGML_CUDA_DISABLE_MAMBA_CONV_CONCAT_FUSION as a true
++// same-binary control for the already-verified CONCAT+state path above.
++static bool ggml_cuda_mamba_conv_concat_safe(
++        ggml_backend_cuda_context * ctx, const ggml_cuda_mamba_conv_state_concat_plan & plan,
++        const bool diagnostics) {
++    const ggml_tensor * concat = plan.conv->src[0];
++    const ggml_tensor * state  = concat->src[0];
++    const ggml_tensor * x      = concat->src[1];
++    const ggml_tensor * w      = plan.conv->src[1];
++    const ggml_tensor * bias   = plan.add->src[0] == plan.conv ? plan.add->src[1] : plan.add->src[0];
++    constexpr int64_t n_channels = 6144;
++
++    const auto reject = [&](const char * reason) {
++        static std::atomic<uint64_t> n_rejected{0};
++        const uint64_t count = n_rejected.fetch_add(1, std::memory_order_relaxed) + 1;
++        if (diagnostics && (count <= 23 || count % 23 == 0)) {
++            GGML_LOG_INFO("%s: Mamba2 CONCAT+conv reject=%s count=%" PRIu64
++                          ", state_nb=%zu/%zu x_nb=%zu/%zu concat_nb=%zu/%zu"
++                          " weight_nb=%zu/%zu bias_nb=%zu/%zu out_nb=%zu/%zu"
++                          " cache_nb=%zu/%zu node=%s\n",
++                          __func__, reason, count,
++                          state->nb[0], state->nb[1], x->nb[0], x->nb[1],
++                          concat->nb[0], concat->nb[1], w->nb[0], w->nb[1],
++                          bias->nb[0], bias->nb[1], plan.silu->nb[0], plan.silu->nb[1],
++                          plan.cache->nb[0], plan.cache->nb[1], concat->name);
++        }
++        return false;
++    };
++
++    if (state->type != GGML_TYPE_F32 || x->type != GGML_TYPE_F32 ||
++            concat->type != GGML_TYPE_F32 || w->type != GGML_TYPE_F32 ||
++            bias->type != GGML_TYPE_F32 || plan.silu->type != GGML_TYPE_F32 ||
++            plan.cache->type != GGML_TYPE_F32) {
++        return reject("tensor-type");
++    }
++    if (state->ne[0] != 3 || state->ne[1] != n_channels || state->ne[2] != 1 || state->ne[3] != 1 ||
++            x->ne[0] != 1 || x->ne[1] != n_channels || x->ne[2] != 1 || x->ne[3] != 1 ||
++            concat->ne[0] != 4 || concat->ne[1] != n_channels || concat->ne[2] != 1 || concat->ne[3] != 1 ||
++            w->ne[0] != 4 || w->ne[1] != n_channels || w->ne[2] != 1 || w->ne[3] != 1 ||
++            plan.silu->ne[0] != n_channels || plan.silu->ne[1] != 1 ||
++            plan.silu->ne[2] != 1 || plan.silu->ne[3] != 1 ||
++            ggml_nelements(bias) != n_channels || ggml_nelements(plan.cache) != 3*n_channels) {
++        return reject("tensor-shape");
++    }
++    if (state->nb[0] != sizeof(float) || state->nb[1] != 3*sizeof(float) || !ggml_is_contiguous(state)) {
++        return reject("state-stride");
++    }
++    // x->ne[0] is one, so nb[0] is semantically unused.  The verified stock
++    // CONCAT path addresses channels by nb[1], and the fused kernel does too.
++    if (x->nb[1] != sizeof(float) || ((uintptr_t) x->data % alignof(float)) != 0) {
++        return reject("x-channel-stride");
++    }
++    if (concat->nb[0] != sizeof(float) || concat->nb[1] != 4*sizeof(float) || !ggml_is_contiguous(concat)) {
++        return reject("concat-stride");
++    }
++    if (w->nb[0] != sizeof(float) || w->nb[1] != 4*sizeof(float) || !ggml_is_contiguous(w)) {
++        return reject("weight-stride");
++    }
++    if (bias->nb[0] != sizeof(float) || !ggml_is_contiguous(bias)) {
++        return reject("bias-stride");
++    }
++    // Honor a strided channel destination explicitly; require only aligned,
++    // non-overlapping F32 elements and an address span representable in size_t.
++    if (plan.silu->nb[0] < sizeof(float) || plan.silu->nb[0] % alignof(float) != 0 ||
++            ((uintptr_t) plan.silu->data % alignof(float)) != 0 ||
++            plan.silu->nb[0] > (SIZE_MAX - sizeof(float)) / (n_channels - 1)) {
++        return reject("output-channel-stride");
++    }
++    if (plan.cache->data != state->data || plan.cache->nb[0] != sizeof(float) ||
++            !ggml_is_contiguous(plan.cache)) {
++        return reject("cache-stride-or-alias");
++    }
++
++    const size_t state_bytes  = 3*n_channels*sizeof(float);
++    const size_t x_bytes      = n_channels*sizeof(float);
++    const size_t concat_bytes = 4*n_channels*sizeof(float);
++    const size_t weight_bytes = 4*n_channels*sizeof(float);
++    const size_t vector_bytes = n_channels*sizeof(float);
++    const size_t output_span  = (n_channels - 1)*plan.silu->nb[0] + sizeof(float);
++    if (!ggml_cuda_byte_ranges_disjoint(plan.silu->data, output_span, concat->data, concat_bytes) ||
++            !ggml_cuda_byte_ranges_disjoint(plan.silu->data, output_span, state->data, state_bytes) ||
++            !ggml_cuda_byte_ranges_disjoint(plan.silu->data, output_span, x->data, x_bytes) ||
++            !ggml_cuda_byte_ranges_disjoint(plan.silu->data, output_span, w->data, weight_bytes) ||
++            !ggml_cuda_byte_ranges_disjoint(plan.silu->data, output_span, bias->data, vector_bytes) ||
++            !ggml_cuda_byte_ranges_disjoint(concat->data, concat_bytes, w->data, weight_bytes) ||
++            !ggml_cuda_byte_ranges_disjoint(concat->data, concat_bytes, bias->data, vector_bytes) ||
++            !ggml_cuda_byte_ranges_disjoint(state->data, state_bytes, w->data, weight_bytes) ||
++            !ggml_cuda_byte_ranges_disjoint(state->data, state_bytes, bias->data, vector_bytes) ||
++            !ggml_cuda_byte_ranges_disjoint(x->data, x_bytes, w->data, weight_bytes) ||
++            !ggml_cuda_byte_ranges_disjoint(x->data, x_bytes, bias->data, vector_bytes)) {
++        return reject("allocation-alias");
++    }
++
++    for (const auto & [fork_node, event] : ctx->stream_context().concurrent_events) {
++        const ggml_tensor * moved[] = { concat, plan.conv, plan.add, plan.silu, plan.cpy };
++        const auto concat_it = event.stream_mapping.find(concat);
++        const bool concat_mapped = concat_it != event.stream_mapping.end();
++        const int concat_stream = concat_mapped ? concat_it->second : -1;
++        for (const ggml_tensor * moved_node : moved) {
++            if (fork_node == moved_node || event.join_node == moved_node) {
++                return reject("fork-or-join-boundary");
++            }
++            const auto moved_it = event.stream_mapping.find(moved_node);
++            const bool moved_mapped = moved_it != event.stream_mapping.end();
++            if (moved_mapped != concat_mapped) {
++                return reject("cross-stream-membership");
++            }
++            if (moved_mapped && moved_it->second != concat_stream) {
++                return reject("cross-stream-number");
++            }
++        }
++    }
++    return true;
++}
++
+ // Match only the batch-one Nemotron-3.5 Mamba tail:
+ //   SwiGLU {64,64} -> reshape {512,8} -> RMS norm -> per-group scale
+ //   -> reshape {4096,1} -> quantized ssm_out {4096,2688} MMVQ.
+@@ -4743,6 +4865,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         const char * value = std::getenv("GGML_CUDA_DISABLE_RMS_NORM_Q8_FUSION");
+         return value != nullptr && std::atoi(value) != 0;
+     }();
++    static const bool nemo_routed_q8_fold = [] {
++        const char * value = std::getenv("GGML_CUDA_NEMO_ROUTED_Q8_FOLD");
++        return value == nullptr || std::atoi(value) != 0;
++    }();
+     if (nemo_shexp_act_colaunch && !q8_1_cache_disabled && i + 3 < cgraph->n_nodes &&
+             node->op == GGML_OP_UNARY && ggml_get_unary_op(node) == GGML_UNARY_OP_RELU) {
+         ggml_tensor * shared_relu = node;
+@@ -4792,11 +4918,37 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             const int64_t s12 = shared_sqr->nb[2] / ggml_type_size(shared_sqr->type);
+             const int64_t s13 = shared_sqr->nb[3] / ggml_type_size(shared_sqr->type);
+             const size_t size_q8_1 = ne10_padded * sizeof(block_q8_1) / QK8_1;
+-            char * q8_1_dst = cuda_ctx->quantized_src1_cache.insert(
++            char * shared_q8_dst = cuda_ctx->quantized_src1_cache.insert(
+                 cuda_ctx->pool(), shared_sqr, stream,
+                 ne10, s11, s12, s13, ne10_padded, 1, 1, 1, size_q8_1);
++
++            const int64_t routed_ne10 = routed_sqr->ne[0];
++            const int64_t routed_ne10_padded = GGML_PAD(routed_ne10, MATRIX_ROW_PADDING);
++            const int64_t routed_s11 = routed_sqr->nb[1] / ggml_type_size(routed_sqr->type);
++            const int64_t routed_s12 = routed_sqr->nb[2] / ggml_type_size(routed_sqr->type);
++            const int64_t routed_s13 = routed_sqr->nb[3] / ggml_type_size(routed_sqr->type);
++            char * routed_q8_dst = nullptr;
++            if (nemo_routed_q8_fold) {
++                const size_t routed_size_q8_1 = routed_sqr->ne[3] * routed_sqr->ne[2] * routed_sqr->ne[1] *
++                    routed_ne10_padded * sizeof(block_q8_1) / QK8_1;
++                routed_q8_dst = cuda_ctx->quantized_src1_cache.insert(
++                    cuda_ctx->pool(), routed_sqr, stream,
++                    routed_ne10, routed_s11, routed_s12, routed_s13, routed_ne10_padded,
++                    routed_sqr->ne[1], routed_sqr->ne[2], routed_sqr->ne[3], routed_size_q8_1);
++
++                static const bool print_stats = [] {
++                    const char * value = std::getenv("GGML_CUDA_NEMO_ROUTED_Q8_STATS");
++                    return value != nullptr && std::atoi(value) != 0;
++                }();
++                static std::atomic<uint64_t> n_folded{0};
++                const uint64_t count = n_folded.fetch_add(1, std::memory_order_relaxed) + 1;
++                if (print_stats && (count <= 23 || count % 23 == 0)) {
++                    GGML_LOG_INFO("%s: Nemotron routed q8 activation fold fire=%" PRIu64 "\n", __func__, count);
++                }
++            }
+             ggml_cuda_op_relu_sqr_pair_quant(*cuda_ctx,
+-                shared_relu, shared_sqr, routed_relu, routed_sqr, q8_1_dst, ne10_padded);
++                shared_relu, shared_sqr, routed_relu, routed_sqr,
++                shared_q8_dst, ne10_padded, routed_q8_dst, routed_ne10_padded);
+             return 3;
+         }
+     }
+@@ -5824,6 +5976,14 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 const char * value = std::getenv("GGML_CUDA_MAMBA_CONV_STATE_CONCAT_STATS");
+                 return value != nullptr && std::atoi(value) != 0;
+             }();
++            static const bool disable_mamba_conv_concat = [] {
++                const char * value = std::getenv("GGML_CUDA_DISABLE_MAMBA_CONV_CONCAT_FUSION");
++                return value != nullptr && std::atoi(value) != 0;
++            }();
++            static const bool print_mamba_conv_concat = [] {
++                const char * value = std::getenv("GGML_CUDA_MAMBA_CONV_CONCAT_STATS");
++                return value != nullptr && std::atoi(value) != 0;
++            }();
+ 
+             for (int i = 0; i < cgraph->n_nodes; i++) {
+                 ggml_tensor * node = cgraph->nodes[i];
+@@ -5878,6 +6038,35 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                     continue;
+                 }
+ 
++                // Merge the remaining CONCAT launch into the already-fused
++                // decode-shaped SSM_CONV+bias+SiLU launch.  The kernel still
++                // materializes all four CONCAT words bit-for-bit, writes the
++                // recurrent state, and uses the stock four-tap F32 reduction.
++                if (!disable_mamba_conv_concat && !disable_mamba_conv_state_concat && node->op == GGML_OP_CONCAT) {
++                    ggml_cuda_mamba_conv_state_concat_plan plan;
++                    if (ggml_cuda_mamba_conv_state_concat_detect(
++                            cuda_ctx, cgraph, i, plan, print_mamba_conv_concat) &&
++                            ggml_cuda_mamba_conv_concat_safe(cuda_ctx, plan, print_mamba_conv_concat)) {
++                        ggml_cuda_op_ssm_conv_fused_mamba_concat_state(
++                            *cuda_ctx, node, plan.conv, plan.add, plan.silu, plan.cache);
++                        cuda_ctx->quantized_src1_cache.invalidate_views_of(plan.cpy);
++                        mamba_conv_state_concat_done.insert(plan.conv);
++                        mamba_conv_state_concat_done.insert(plan.add);
++                        mamba_conv_state_concat_done.insert(plan.silu);
++                        mamba_conv_state_concat_done.insert(plan.cpy);
++
++                        static std::atomic<uint64_t> n_fused{0};
++                        const uint64_t count = n_fused.fetch_add(1, std::memory_order_relaxed) + 1;
++                        if (print_mamba_conv_concat && (count <= 23 || count % 23 == 0)) {
++                            GGML_LOG_INFO("%s: Mamba2 CONCAT+state+conv+bias+SiLU fire=%" PRIu64
++                                          ", channels=%" PRId64 ", order=%d/%d/%d/%d/%d, node=%s\n",
++                                          __func__, count, node->ne[1], i, plan.conv_index, plan.add_index,
++                                          plan.silu_index, plan.cpy_index, node->name);
++                        }
++                        continue;
++                    }
++                }
++
+                 // Preserve the stock convolution kernel/arithmetic and fold
+                 // only its identity-state CONCAT+CPY prefix into one exact
+                 // bit-copy launch.  CPY is suppressed wherever graph expansion
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index 1463169cf..3e9836965 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -57,6 +57,75 @@ static __global__ void ssm_conv_f32(const float * src0_ptr, const float * src1_p
+     }
+ }
+ 
++// This is deliberately the same four-tap F32 reduction as ssm_conv_f32 above.
++// The only additional work is the exact uint32_t materialization of CONCAT and
++// its identity-mapped recurrent cache.  One thread owns a complete channel, so
++// all old-state words are loaded before any aliased cache word is overwritten.
++static __global__ void nemo_mamba_concat_ssm_conv_f32_bits(
++        const char * state_ptr, const char * x_ptr, const float * weight_ptr, const float * bias_ptr,
++        uint32_t * concat_ptr, uint32_t * cache_ptr, float * dst_ptr,
++        const int64_t state_nb1, const int64_t x_nb1, const int64_t weight_nb1,
++        const int64_t dst_nb0, const int64_t n_channels) {
++    ggml_cuda_pdl_lc();
++    constexpr int d_conv = 4;
++    constexpr int split_d_inner = 128;
++
++    const int tid  = threadIdx.x;
++    const int bidy = blockIdx.y;
++    const int64_t ch = (int64_t) bidy * split_d_inner + tid;
++
++    ggml_cuda_pdl_sync();
++    if (ch >= n_channels) {
++        return;
++    }
++
++    const uint32_t * state = (const uint32_t *) (state_ptr + ch*state_nb1);
++    const uint32_t * x_in  = (const uint32_t *) (x_ptr     + ch*x_nb1);
++
++    const uint32_t s0_bits = state[0];
++    const uint32_t s1_bits = state[1];
++    const uint32_t s2_bits = state[2];
++    const uint32_t x_bits  = x_in[0];
++
++    uint32_t * concat = concat_ptr + d_conv*ch;
++    concat[0] = s0_bits;
++    concat[1] = s1_bits;
++    concat[2] = s2_bits;
++    concat[3] = x_bits;
++
++    uint32_t * cache = cache_ptr + 3*ch;
++    cache[0] = s1_bits;
++    cache[1] = s2_bits;
++    cache[2] = x_bits;
++
++    const float * w_block = (const float *) ((const char *) weight_ptr +
++                                             bidy * split_d_inner * weight_nb1);
++    float w[d_conv] = { 0.0f };
++#pragma unroll
++    for (int j = 0; j < d_conv; ++j) {
++        w[j] = w_block[tid * (weight_nb1 / (int) sizeof(float)) + j];
++    }
++
++    // Bitcasts preserve the exact F32 values written by stock CONCAT.  Keep the
++    // stock loop and accumulation expression unchanged so HIP emits the same
++    // ordered sequence of round-to-nearest multiply-adds.
++    float conv_x[d_conv] = {
++        __uint_as_float(s0_bits),
++        __uint_as_float(s1_bits),
++        __uint_as_float(s2_bits),
++        __uint_as_float(x_bits),
++    };
++    float sumf = 0.0f;
++#pragma unroll
++    for (int j = 0; j < d_conv; ++j) {
++        sumf += conv_x[j] * w[j];
++    }
++    sumf += bias_ptr[ch];
++
++    float * y = (float *) ((char *) dst_ptr + ch*dst_nb0);
++    *y = ggml_cuda_op_silu_single(sumf);
++}
++
+ template <bool apply_silu, size_t split_d_inner, size_t d_conv, int64_t split_n_t>
+ static __global__ void ssm_conv_long_token_f32(const float * __restrict__ src0, const float * __restrict__ src1,
+                                                const float * __restrict__ bias,
+@@ -204,3 +273,23 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
+                           out->nb[2], nc, nr, n_t, n_s, stream);
+     }
+ }
++
++void ggml_cuda_op_ssm_conv_fused_mamba_concat_state(
++        ggml_backend_cuda_context & ctx, ggml_tensor * concat, ggml_tensor * conv,
++        ggml_tensor * bias_add_node, ggml_tensor * silu_dst, ggml_tensor * cache) {
++    const ggml_tensor * state  = concat->src[0];
++    const ggml_tensor * x      = concat->src[1];
++    const ggml_tensor * weight = conv->src[1];
++    const ggml_tensor * bias   = bias_add_node->src[0] == conv ? bias_add_node->src[1] : bias_add_node->src[0];
++
++    constexpr int threads = 128;
++    const int64_t n_channels = state->ne[1];
++    const dim3 blocks(1, n_channels / threads, 1);
++    const ggml_cuda_kernel_launch_params launch_params(blocks, threads, 0, ctx.stream());
++    ggml_cuda_kernel_launch(nemo_mamba_concat_ssm_conv_f32_bits, launch_params,
++        (const char *) state->data, (const char *) x->data,
++        (const float *) weight->data, (const float *) bias->data,
++        (uint32_t *) concat->data, (uint32_t *) cache->data, (float *) silu_dst->data,
++        (int64_t) state->nb[1], (int64_t) x->nb[1], (int64_t) weight->nb[1],
++        (int64_t) silu_dst->nb[0], n_channels);
++}
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cuh b/ggml/src/ggml-cuda/ssm-conv.cuh
+index 8514ca849..492647765 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cuh
++++ b/ggml/src/ggml-cuda/ssm-conv.cuh
+@@ -1,3 +1,10 @@
+ #include "common.cuh"
+ 
+ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node = nullptr, ggml_tensor * silu_dst = nullptr);
++
++// Exact batch-one Nemotron Mamba2 decode path.  Materialize the stock F32
++// CONCAT, update its identity-mapped recurrent state, and execute the existing
++// four-tap SSM_CONV + bias + SiLU arithmetic in one launch.
++void ggml_cuda_op_ssm_conv_fused_mamba_concat_state(
++        ggml_backend_cuda_context & ctx, ggml_tensor * concat, ggml_tensor * conv,
++        ggml_tensor * bias_add_node, ggml_tensor * silu_dst, ggml_tensor * cache);
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index 3e01392b6..0841f893e 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -632,10 +632,12 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
+ // The shared segment comes first so its small working set is dispatched before
+ // the larger routed segment.  Each q8_1 block is still reduced by the exact
+ // same 32 consecutive lanes, in the same order, as quantize_q8_1.
++template <bool quant_routed>
+ static __global__ void relu_sqr_pair_quant_kernel(
+         const float * shared_x, float * shared_dst, const int64_t shared_n,
+         const int64_t shared_padded, block_q8_1 * shared_q8,
+-        const float * routed_x, float * routed_dst, const int64_t routed_n,
++        const float * routed_x, float * routed_dst, const int64_t routed_ne0,
++        const int64_t routed_padded, const int64_t routed_rows, block_q8_1 * routed_q8,
+         const int shared_blocks) {
+     ggml_cuda_pdl_lc();
+ 
+@@ -668,11 +670,40 @@ static __global__ void relu_sqr_pair_quant_kernel(
+         return;
+     }
+ 
+-    if (local >= routed_n) {
+-        return;
++    if constexpr (quant_routed) {
++        const int64_t routed_total_padded = routed_padded * routed_rows;
++        if (local >= routed_total_padded) {
++            return;
++        }
++        ggml_cuda_pdl_sync();
++        const int64_t row = local / routed_padded;
++        const int64_t col = local - row * routed_padded;
++        const int64_t routed_idx = row * routed_ne0 + col;
++        const float val = col < routed_ne0 ? op_relu_sqr(routed_x[routed_idx]) : 0.0f;
++        if (col < routed_ne0) {
++            routed_dst[routed_idx] = val;
++        }
++
++        const int64_t ib  = local / QK8_1;
++        const int64_t iqs = local % QK8_1;
++        float amax = warp_reduce_max<QK8_1>(fabsf(val));
++        float sum  = warp_reduce_sum<QK8_1>(val);
++        const float  d = amax / 127.0f;
++        const int8_t q = amax == 0.0f ? 0 : roundf(val / d);
++        routed_q8[ib].qs[iqs] = q;
++        if (iqs == 0) {
++            routed_q8[ib].ds = make_half2(d, sum);
++        }
++    } else {
++        // Exact verified dual-activation arm: contiguous, unpadded routed
++        // indexing and no routed q8 work or cache destination.
++        const int64_t routed_n = routed_ne0 * routed_rows;
++        if (local >= routed_n) {
++            return;
++        }
++        ggml_cuda_pdl_sync();
++        routed_dst[local] = op_relu_sqr(routed_x[local]);
+     }
+-    ggml_cuda_pdl_sync();
+-    routed_dst[local] = op_relu_sqr(routed_x[local]);
+ }
+ 
+ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node) {
+@@ -695,7 +726,8 @@ void ggml_cuda_op_relu_sqr_pair_quant(
+         ggml_backend_cuda_context & ctx,
+         ggml_tensor * shared_relu, ggml_tensor * shared_sqr,
+         ggml_tensor * routed_relu, ggml_tensor * routed_sqr,
+-        char * q8_1_dst, int64_t shared_padded) {
++        char * shared_q8_dst, int64_t shared_padded,
++        char * routed_q8_dst, int64_t routed_padded) {
+     const ggml_tensor * shared_src = shared_relu->src[0];
+     const ggml_tensor * routed_src = routed_relu->src[0];
+     GGML_ASSERT(shared_sqr->src[0] == shared_relu);
+@@ -705,16 +737,30 @@ void ggml_cuda_op_relu_sqr_pair_quant(
+     GGML_ASSERT(ggml_is_contiguous(shared_src) && ggml_is_contiguous(shared_sqr));
+     GGML_ASSERT(ggml_is_contiguous(routed_src) && ggml_is_contiguous(routed_sqr));
+     GGML_ASSERT(shared_padded % CUDA_RELU_BLOCK_SIZE == 0);
++    GGML_ASSERT(routed_padded % CUDA_RELU_BLOCK_SIZE == 0);
+ 
+     const int64_t shared_n = ggml_nelements(shared_src);
+-    const int64_t routed_n = ggml_nelements(routed_src);
++    const int64_t routed_ne0 = routed_src->ne[0];
++    const int64_t routed_rows = ggml_nrows(routed_src);
+     const int shared_blocks = shared_padded / CUDA_RELU_BLOCK_SIZE;
+-    const int routed_blocks = (routed_n + CUDA_RELU_BLOCK_SIZE - 1) / CUDA_RELU_BLOCK_SIZE;
++    const bool quant_routed = routed_q8_dst != nullptr;
++    const int routed_blocks = quant_routed ? routed_padded * routed_rows / CUDA_RELU_BLOCK_SIZE :
++        (routed_ne0 * routed_rows + CUDA_RELU_BLOCK_SIZE - 1) / CUDA_RELU_BLOCK_SIZE;
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
+         (dim3) (shared_blocks + routed_blocks), CUDA_RELU_BLOCK_SIZE, 0, ctx.stream());
+-    ggml_cuda_kernel_launch(relu_sqr_pair_quant_kernel, launch_params,
+-        (const float *) shared_src->data, (float *) shared_sqr->data, shared_n,
+-        shared_padded, (block_q8_1 *) q8_1_dst,
+-        (const float *) routed_src->data, (float *) routed_sqr->data, routed_n,
+-        shared_blocks);
++    if (quant_routed) {
++        ggml_cuda_kernel_launch((relu_sqr_pair_quant_kernel<true>), launch_params,
++            (const float *) shared_src->data, (float *) shared_sqr->data, shared_n,
++            shared_padded, (block_q8_1 *) shared_q8_dst,
++            (const float *) routed_src->data, (float *) routed_sqr->data, routed_ne0,
++            routed_padded, routed_rows, (block_q8_1 *) routed_q8_dst,
++            shared_blocks);
++    } else {
++        ggml_cuda_kernel_launch((relu_sqr_pair_quant_kernel<false>), launch_params,
++            (const float *) shared_src->data, (float *) shared_sqr->data, shared_n,
++            shared_padded, (block_q8_1 *) shared_q8_dst,
++            (const float *) routed_src->data, (float *) routed_sqr->data, routed_ne0,
++            routed_padded, routed_rows, nullptr,
++            shared_blocks);
++    }
+ }
+diff --git a/ggml/src/ggml-cuda/unary.cuh b/ggml/src/ggml-cuda/unary.cuh
+index dd1573c96..0255b2222 100644
+--- a/ggml/src/ggml-cuda/unary.cuh
++++ b/ggml/src/ggml-cuda/unary.cuh
+@@ -94,13 +94,14 @@ void ggml_cuda_op_unary_mul(ggml_backend_cuda_context & ctx, ggml_tensor * unary
+ void ggml_cuda_op_relu_sqr(ggml_backend_cuda_context & ctx, ggml_tensor * relu_node, ggml_tensor * sqr_node);
+ 
+ // Decode-only Nemotron pair: evaluate two independent ReLU^2 chains in one
+-// launch and materialize the q8_1 cache entry consumed by the shared down
+-// projection.  The caller owns and registers q8_1_dst.
++// launch and materialize both q8_1 cache entries consumed by the down
++// projections. The caller owns and registers the cache destinations.
+ void ggml_cuda_op_relu_sqr_pair_quant(
+     ggml_backend_cuda_context & ctx,
+     ggml_tensor * shared_relu, ggml_tensor * shared_sqr,
+     ggml_tensor * routed_relu, ggml_tensor * routed_sqr,
+-    char * q8_1_dst, int64_t shared_padded);
++    char * shared_q8_dst, int64_t shared_padded,
++    char * routed_q8_dst, int64_t routed_padded);
+ 
+ __device__ __forceinline__ float ggml_cuda_op_silu_single(float x) {
+     return x / (1.0f + expf(-x));

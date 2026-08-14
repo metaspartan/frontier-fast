@@ -1,0 +1,526 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Code (Opus 5) <noreply@anthropic.com>
+Date: Fri, 14 Aug 2026 03:30:00 -0600
+Subject: [PATCH 16/27] cuda: co-launch the Nemotron shared and routed up projections
+
+Ported from the Nemotron R9700 HIP series to the GB10 CUDA track. Both tracks
+pin llama.cpp 0b1bad14ff20 and llama.cpp's HIP backend is the CUDA backend
+source-translated, so the diff applies to ggml/src/ggml-cuda unchanged.
+
+Shared-up and routed-up consume the exact same F32 activation and the same
+Q5_0 K=2688 weights. With the graph relay making them adjacent, one
+flattened MMVQ grid carries both while each side retains its standalone
+row/K mapping.
+
+GB10 leave-one-out: GGML_CUDA_NEMO_SHEXP_UP_COLAUNCH=0 costs 0.44%.
+---
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7cc1071cc..191ae28cc 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4207,6 +4207,75 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         }
+     }
+ 
++    // Nemotron decode: shared-up and routed-up consume the exact same F32
++    // activation and use Q5_0 K=2688 weights. The graph relay makes them
++    // adjacent so one flattened MMVQ grid can retain both standalone row/K
++    // mappings while removing one dispatch per MoE layer. Setting =0 also
++    // restores the pre-existing early shared-up graph order.
++    static const bool nemo_shexp_up_colaunch = [] {
++        const char * value = std::getenv("GGML_CUDA_NEMO_SHEXP_UP_COLAUNCH");
++        return value == nullptr || std::atoi(value) != 0;
++    }();
++    if (nemo_shexp_up_colaunch && i + 1 < cgraph->n_nodes &&
++            node->op == GGML_OP_MUL_MAT && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT_ID) {
++        ggml_tensor * shared = node;
++        ggml_tensor * routed = cgraph->nodes[i + 1];
++        const ggml_tensor * sw = shared->src[0];
++        const ggml_tensor * rw = routed->src[0];
++        const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID };
++        const int out_nodes[] = { i, i + 1 };
++
++        const bool shape_ok = sw != nullptr && rw != nullptr && shared->src[1] != nullptr &&
++            routed->src[1] == shared->src[1] && routed->src[2] != nullptr &&
++            sw->type == GGML_TYPE_Q5_0 && rw->type == GGML_TYPE_Q5_0 &&
++            sw->ne[0] == 2688 && sw->ne[1] == 3712 && sw->ne[2] == 1 && sw->ne[3] == 1 &&
++            shared->src[1]->type == GGML_TYPE_F32 &&
++            shared->src[1]->ne[0] == 2688 && shared->src[1]->ne[1] == 1 &&
++            shared->src[1]->ne[2] == 1 && shared->src[1]->ne[3] == 1 &&
++            shared->ne[0] == 3712 && shared->ne[1] == 1 && shared->ne[2] == 1 && shared->ne[3] == 1 &&
++            rw->ne[0] == 2688 && rw->ne[1] == 1856 && rw->ne[2] == 128 && rw->ne[3] == 1 &&
++            routed->ne[0] == 1856 && routed->ne[1] == 6 && routed->ne[2] == 1 && routed->ne[3] == 1 &&
++            routed->src[2]->type == GGML_TYPE_I32 && routed->src[2]->ne[0] == 6 &&
++            ggml_is_contiguous_1(shared->src[1]) && ggml_is_contiguous_1(shared) &&
++            ggml_is_contiguous_1(routed);
++
++        const auto disjoint = [](const ggml_tensor * a, const ggml_tensor * b) {
++            const uintptr_t a0 = (uintptr_t) a->data;
++            const uintptr_t b0 = (uintptr_t) b->data;
++            const uintptr_t a1 = a0 + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
++            const uintptr_t b1 = b0 + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
++            return a1 <= b0 || b1 <= a0;
++        };
++
++        if (shape_ok && ggml_cuda_should_fuse_mul_mat_vec_q(shared) &&
++                ggml_cuda_should_fuse_mul_mat_vec_q(routed) && disjoint(shared, routed) &&
++                ggml_can_fuse_subgraph(cgraph, i, 2, ops, out_nodes, 2) &&
++                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 2, out_nodes, 2)) {
++            mmvq_nemo_routed_up_guest guest;
++            guest.src0 = routed->src[0];
++            guest.src1 = routed->src[1];
++            guest.ids  = routed->src[2];
++            guest.dst  = routed;
++            bool guest_launched = false;
++            ggml_cuda_mul_mat_vec_q(*cuda_ctx, shared->src[0], shared->src[1], nullptr, shared,
++                                    nullptr, nullptr, nullptr, &guest, &guest_launched);
++            if (!guest_launched) {
++                // The host has already run; execute only the declined guest.
++                ggml_cuda_mul_mat_vec_q(*cuda_ctx, routed->src[0], routed->src[1], routed->src[2], routed);
++            } else {
++                static const bool print_stats = std::getenv("GGML_CUDA_NEMO_SHEXP_UP_STATS") != nullptr &&
++                                                std::atoi(std::getenv("GGML_CUDA_NEMO_SHEXP_UP_STATS")) != 0;
++                static std::atomic<uint64_t> n_fused{0};
++                const uint64_t count = n_fused.fetch_add(1, std::memory_order_relaxed) + 1;
++                if (print_stats && (count <= 23 || count % 23 == 0)) {
++                    GGML_LOG_INFO("%s: Nemotron shared/routed up co-launch fire=%" PRIu64 "\n",
++                                  __func__, count);
++                }
++            }
++            return 1;
++        }
++    }
++
+     // Nemotron decode: the graph relay in nemotron-h.cpp places the independent
+     // shared and routed ReLU^2 chains next to one another. Evaluate both in a
+     // single dispatch and write the shared activation's q8_1 cache bytes in the
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index ef9d2af1f..fe456b540 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -496,8 +496,24 @@ struct mmvq_nemo_down_guest_args {
+     uint32_t      stride_channel_dst = 0;
+ };
+ 
++struct mmvq_nemo_up_guest_args {
++    const void *    vx                  = nullptr;
++    const void *    vy                  = nullptr;
++    const int32_t * ids                 = nullptr;
++    float *         dst                 = nullptr;
++    uint32_t        ncols_x             = 0;
++    uint32_t        nrows               = 0;
++    uint32_t        nchannels           = 0;
++    uint32_t        nblocks             = 0;
++    uint32_t        nblocks_per_channel = 0;
++    uint32_t        stride_row_x        = 0;
++    uint32_t        stride_channel_x    = 0;
++    uint32_t        stride_channel_dst  = 0;
++};
++
+ template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false,
+-          bool has_nemo_down_guest = false, int nemo_guest_warps = 1>
++          bool has_nemo_down_guest = false, int nemo_guest_warps = 1,
++          bool has_nemo_up_guest = false>
+ __launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
+ static __global__ void mul_mat_vec_q(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+@@ -505,7 +521,8 @@ static __global__ void mul_mat_vec_q(
+         const uint32_t stride_col_dst, const uint3 channel_ratio, const uint32_t stride_channel_x,
+         const uint32_t stride_channel_y, const uint32_t stride_channel_dst, const uint3 sample_ratio,
+         const uint32_t stride_sample_x, const uint32_t stride_sample_y, const uint32_t stride_sample_dst,
+-        const uint32_t ids_stride, const mmvq_nemo_down_guest_args nemo_guest = mmvq_nemo_down_guest_args()) {
++        const uint32_t ids_stride, const mmvq_nemo_down_guest_args nemo_guest = mmvq_nemo_down_guest_args(),
++        const mmvq_nemo_up_guest_args nemo_up_guest = mmvq_nemo_up_guest_args()) {
+     const void    * GGML_CUDA_RESTRICT vx  = vx_ptr;
+     const void    * GGML_CUDA_RESTRICT vy  = vy_ptr;
+     const int32_t * GGML_CUDA_RESTRICT ids = ids_ptr;
+@@ -526,6 +543,57 @@ static __global__ void mul_mat_vec_q(
+     // assignment and the stock reduction order.
+     const uint32_t nwarps_launched = blockDim.y;
+ 
++    // Routed-up guest blocks occupy the front of a flattened grid.  Unlike the
++    // down guest, this path deliberately does not repack rows: Q5_0 K=2688 has
++    // six launched wavefronts but the stock kernel's compile-time eight-wave
++    // K stride and seven-add reduction skeleton. Keeping those two details
++    // unchanged makes every output row bit-identical to its standalone launch.
++    if constexpr (has_nemo_up_guest) {
++        if (blockIdx.x < nemo_up_guest.nblocks) {
++            const uint32_t channel = blockIdx.x / nemo_up_guest.nblocks_per_channel;
++            const uint32_t grow = blockIdx.x - channel * nemo_up_guest.nblocks_per_channel;
++            const int tid = warp_size * threadIdx.y + threadIdx.x;
++            const int blocks_per_row_g = nemo_up_guest.ncols_x / qk;
++            constexpr int blocks_per_iter_g = vdr * nwarps * warp_size / qi;
++
++            ggml_cuda_pdl_sync();
++            const uint32_t expert = nemo_up_guest.ids[channel];
++            const int g_offset = expert * nemo_up_guest.stride_channel_x + grow * nemo_up_guest.stride_row_x;
++            float gtmp = 0.0f;
++            for (int kbx = tid / (qi/vdr); kbx < blocks_per_row_g; kbx += blocks_per_iter_g) {
++                const int kby = kbx * (qk/QK8_1);
++                const int kqs = vdr * (tid % (qi/vdr));
++                gtmp += vec_dot_q_cuda(nemo_up_guest.vx, &((const block_q8_1 *) nemo_up_guest.vy)[kby],
++                                       g_offset + kbx, kqs);
++            }
++
++            __shared__ float up_guest_shared[nwarps - 1 > 0 ? nwarps - 1 : 1][warp_size];
++            // Mirror the stock trimmed-launch zero fill exactly. The missing
++            // wavefronts have empty K loops in the ordinary kernel.
++            if (threadIdx.y == 0 && nwarps_launched < uint32_t(nwarps)) {
++                for (uint32_t l = nwarps_launched - 1; l < uint32_t(nwarps) - 1; ++l) {
++                    up_guest_shared[l][threadIdx.x] = 0.0f;
++                }
++            }
++            if (threadIdx.y > 0) {
++                up_guest_shared[threadIdx.y - 1][threadIdx.x] = gtmp;
++            }
++            __syncthreads();
++            if (threadIdx.y > 0) {
++                return;
++            }
++#pragma unroll
++            for (int l = 0; l < nwarps - 1; ++l) {
++                gtmp += up_guest_shared[l][threadIdx.x];
++            }
++            gtmp = warp_reduce_sum<warp_size>(gtmp);
++            if (threadIdx.x == 0) {
++                nemo_up_guest.dst[channel * nemo_up_guest.stride_channel_dst + grow] = gtmp;
++            }
++            return;
++        }
++    }
++
+     // Routed-down guest blocks occupy the FRONT of a flattened grid.  A Q5_0
+     // routed row launches four of the compile-time eight warps, so an eight-warp
+     // host block carries two guest rows; Q8_0 uses all eight and carries one.
+@@ -583,7 +651,8 @@ static __global__ void mul_mat_vec_q(
+     }
+ 
+     const     int tid = warp_size*threadIdx.y + threadIdx.x;
+-    const uint32_t host_block = has_nemo_down_guest ? blockIdx.x - nemo_guest.nblocks : blockIdx.x;
++    const uint32_t host_block = has_nemo_down_guest ? blockIdx.x - nemo_guest.nblocks :
++                                has_nemo_up_guest   ? blockIdx.x - nemo_up_guest.nblocks : blockIdx.x;
+     const     int row0 = rows_per_cuda_block*host_block;
+     const     int blocks_per_row_x = ncols_x / qk;
+     constexpr int blocks_per_iter = vdr * nwarps*warp_size / qi;
+@@ -969,7 +1038,7 @@ static bool mul_mat_vec_q_nemo_down_colaunch(
+                 channel_ratio_fd, (uint32_t) stride_channel_x, (uint32_t) stride_channel_y,
+                 (uint32_t) stride_channel_dst, sample_ratio_fd,
+                 (uint32_t) stride_sample_x, (uint32_t) stride_sample_y, (uint32_t) stride_sample_dst,
+-                0, guest);
++                0, guest, mmvq_nemo_up_guest_args());
+             break;
+         case 8:
+             ggml_cuda_kernel_launch((mul_mat_vec_q<type, 1, false, false, true, 8>), launch_params,
+@@ -978,7 +1047,7 @@ static bool mul_mat_vec_q_nemo_down_colaunch(
+                 channel_ratio_fd, (uint32_t) stride_channel_x, (uint32_t) stride_channel_y,
+                 (uint32_t) stride_channel_dst, sample_ratio_fd,
+                 (uint32_t) stride_sample_x, (uint32_t) stride_sample_y, (uint32_t) stride_sample_dst,
+-                0, guest);
++                0, guest, mmvq_nemo_up_guest_args());
+             break;
+         default:
+             return false;
+@@ -986,6 +1055,51 @@ static bool mul_mat_vec_q_nemo_down_colaunch(
+     return true;
+ }
+ 
++template <ggml_type type>
++static bool mul_mat_vec_q_nemo_up_colaunch(
++        const void * vx, const void * vy, float * dst,
++        const int ncols_x, const int nrows_x,
++        const int stride_row_x, const int stride_col_y, const int stride_col_dst,
++        const int stride_channel_x, const int stride_channel_y, const int stride_channel_dst,
++        const int stride_sample_x, const int stride_sample_y, const int stride_sample_dst,
++        mmvq_nemo_up_guest_args guest,
++        const int warp_size, const mmvq_parameter_table_id table_id, cudaStream_t stream) {
++    constexpr int c_ncols_dst = 1;
++    const auto host_dims = calc_launch_params<type>(
++        c_ncols_dst, ncols_x, nrows_x, 1, 1, warp_size, table_id);
++    const auto guest_dims = calc_launch_params<type>(
++        c_ncols_dst, guest.ncols_x, guest.nrows, guest.nchannels, 1, warp_size, table_id);
++
++    // Both standalone UP projections must use one row per block and the same
++    // trimmed block dimensions. This is true for Nemotron's Q5_0 K=2688 path;
++    // declining anything else keeps the ordinary two-launch path.
++    if (host_dims.first.y != 1 || host_dims.first.z != 1 || guest_dims.first.z != 1 ||
++            host_dims.first.x != (uint32_t) nrows_x || guest_dims.first.x != guest.nrows ||
++            host_dims.second.x != guest_dims.second.x ||
++            host_dims.second.y != guest_dims.second.y ||
++            host_dims.second.z != guest_dims.second.z) {
++        return false;
++    }
++    guest.nblocks_per_channel = guest.nrows;
++    guest.nblocks = guest.nblocks_per_channel * guest.nchannels;
++
++    const dim3 merged_grid(guest.nblocks + host_dims.first.x, 1, 1);
++    const uint3 nchannels_y_fd = make_uint3(0, 0, 0);
++    const uint3 channel_ratio_fd = init_fastdiv_values(1);
++    const uint3 sample_ratio_fd = init_fastdiv_values(1);
++    const ggml_cuda_mm_fusion_args_device fusion{};
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(
++        merged_grid, host_dims.second, 0, stream);
++    ggml_cuda_kernel_launch((mul_mat_vec_q<type, 1, false, false, false, 1, true>), launch_params,
++        vx, vy, nullptr, fusion, dst, (uint32_t) ncols_x, nchannels_y_fd,
++        (uint32_t) stride_row_x, (uint32_t) stride_col_y, (uint32_t) stride_col_dst,
++        channel_ratio_fd, (uint32_t) stride_channel_x, (uint32_t) stride_channel_y,
++        (uint32_t) stride_channel_dst, sample_ratio_fd,
++        (uint32_t) stride_sample_x, (uint32_t) stride_sample_y, (uint32_t) stride_sample_dst,
++        0, mmvq_nemo_down_guest_args(), guest);
++    return true;
++}
++
+ template<ggml_type type, int c_ncols_dst, bool small_k = false>
+ static void mul_mat_vec_q_switch_fusion(
+         const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device fusion, float * dst,
+@@ -1004,7 +1118,8 @@ static void mul_mat_vec_q_switch_fusion(
+             ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, true, small_k>, launch_params,
+                  vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+                  channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+-                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_nemo_down_guest_args());
++                 sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride,
++                 mmvq_nemo_down_guest_args(), mmvq_nemo_up_guest_args());
+             return;
+         }
+     }
+@@ -1015,7 +1130,8 @@ static void mul_mat_vec_q_switch_fusion(
+     ggml_cuda_kernel_launch(mul_mat_vec_q<type, c_ncols_dst, false, small_k>, launch_params,
+         vx, vy, ids, fusion, dst, ncols_x, nchannels_y, stride_row_x, stride_col_y, stride_col_dst,
+         channel_ratio, stride_channel_x, stride_channel_y, stride_channel_dst,
+-        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, mmvq_nemo_down_guest_args());
++        sample_ratio, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride,
++        mmvq_nemo_down_guest_args(), mmvq_nemo_up_guest_args());
+ }
+ 
+ template <ggml_type type>
+@@ -1358,10 +1474,15 @@ void ggml_cuda_mul_mat_vec_q(
+         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+         const ggml_cuda_mm_fusion_args_host * fusion,
+         const mmvq_nemo_routed_down_guest * nemo_guest,
+-        bool * nemo_guest_launched) {
++        bool * nemo_guest_launched,
++        const mmvq_nemo_routed_up_guest * nemo_up_guest,
++        bool * nemo_up_guest_launched) {
+     if (nemo_guest_launched != nullptr) {
+         *nemo_guest_launched = false;
+     }
++    if (nemo_up_guest_launched != nullptr) {
++        *nemo_up_guest_launched = false;
++    }
+     GGML_ASSERT(        src1->type == GGML_TYPE_F32);
+     GGML_ASSERT(        dst->type  == GGML_TYPE_F32);
+     GGML_ASSERT(!ids || ids->type  == GGML_TYPE_I32); // Optional, used for batched GGML_MUL_MAT_ID.
+@@ -1594,6 +1715,57 @@ void ggml_cuda_mul_mat_vec_q(
+         }
+     }
+ 
++    // Decode-only Nemotron shared/routed UP co-launch. The routed guest uses
++    // the host's already-created q8_1 bytes because both standalone operations
++    // consume the exact same [2688, 1] F32 tensor with the same Q5_0 tuple.
++    if (nemo_up_guest != nullptr && nemo_guest == nullptr && fusion == nullptr && ids == nullptr &&
++            src0->type == GGML_TYPE_Q5_0) {
++        const ggml_tensor * g0   = nemo_up_guest->src0;
++        const ggml_tensor * g1   = nemo_up_guest->src1;
++        const ggml_tensor * gids = nemo_up_guest->ids;
++        ggml_tensor *       gd   = nemo_up_guest->dst;
++        const bool shapes_ok = g0 != nullptr && g1 != nullptr && gids != nullptr && gd != nullptr &&
++            g0->type == GGML_TYPE_Q5_0 && g1 == src1 && g1->data == src1->data &&
++            g1->type == GGML_TYPE_F32 && gids->type == GGML_TYPE_I32 && gd->type == GGML_TYPE_F32 &&
++            src0->ne[0] == 2688 && src0->ne[1] == 3712 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
++            src1->ne[0] == 2688 && src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
++            dst->ne[0] == 3712 && dst->ne[1] == 1 && dst->ne[2] == 1 && dst->ne[3] == 1 &&
++            g0->ne[0] == 2688 && g0->ne[1] == 1856 && g0->ne[2] == 128 && g0->ne[3] == 1 &&
++            gd->ne[0] == 1856 && gd->ne[1] == 6 && gd->ne[2] == 1 && gd->ne[3] == 1 &&
++            gids->ne[0] == 6 && ggml_is_contiguous_1(g1) && ggml_is_contiguous_1(gd);
++
++        if (shapes_ok) {
++            const size_t g_ts0 = ggml_type_size(g0->type);
++            const size_t g_tsd = ggml_type_size(gd->type);
++            mmvq_nemo_up_guest_args g_args{};
++            g_args.vx                  = g0->data;
++            g_args.vy                  = src1_q8_1;
++            g_args.ids                 = (const int32_t *) gids->data;
++            g_args.dst                 = (float *) gd->data;
++            g_args.ncols_x             = g0->ne[0];
++            g_args.nrows               = g0->ne[1];
++            g_args.nchannels           = gd->ne[1];
++            g_args.stride_row_x        = g0->nb[1] / g_ts0;
++            g_args.stride_channel_x    = g0->nb[2] / g_ts0;
++            g_args.stride_channel_dst  = gd->nb[1] / g_tsd;
++
++            const int device = ggml_cuda_get_device();
++            const int warp_size = ggml_cuda_info().devices[device].warp_size;
++            const mmvq_parameter_table_id table_id = get_device_table_id(ggml_cuda_info().devices[device].cc);
++            const bool launched = mul_mat_vec_q_nemo_up_colaunch<GGML_TYPE_Q5_0>(
++                src0->data, src1_q8_1, dst_d, ne00, ne01,
++                s01, stride_col_y, stride_col_dst,
++                s02, stride_channel_y, stride_channel_dst,
++                s03, s13, s3, g_args, warp_size, table_id, stream);
++            if (launched) {
++                if (nemo_up_guest_launched != nullptr) {
++                    *nemo_up_guest_launched = true;
++                }
++                return;
++            }
++        }
++    }
++
+     mul_mat_vec_q_switch_type(
+         src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+diff --git a/ggml/src/ggml-cuda/mmvq.cuh b/ggml/src/ggml-cuda/mmvq.cuh
+index 35a73f09d..2e896be5a 100644
+--- a/ggml/src/ggml-cuda/mmvq.cuh
++++ b/ggml/src/ggml-cuda/mmvq.cuh
+@@ -18,11 +18,23 @@ struct mmvq_nemo_routed_down_guest {
+     ggml_tensor *       dst  = nullptr;
+ };
+ 
++// Routed-up projection appended to a plain shared-up MMVQ. Both matrices use
++// the same Q5_0 K=2688 activation, but keep independent weights, expert ids,
++// output rows, and destinations.
++struct mmvq_nemo_routed_up_guest {
++    const ggml_tensor * src0 = nullptr;
++    const ggml_tensor * src1 = nullptr;
++    const ggml_tensor * ids  = nullptr;
++    ggml_tensor *       dst  = nullptr;
++};
++
+ void ggml_cuda_mul_mat_vec_q(ggml_backend_cuda_context & ctx,
+     const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+     const ggml_cuda_mm_fusion_args_host * fusion = nullptr,
+     const mmvq_nemo_routed_down_guest * nemo_guest = nullptr,
+-    bool * nemo_guest_launched = nullptr);
++    bool * nemo_guest_launched = nullptr,
++    const mmvq_nemo_routed_up_guest * nemo_up_guest = nullptr,
++    bool * nemo_up_guest_launched = nullptr);
+ 
+ void ggml_cuda_op_mul_mat_vec_q(
+     ggml_backend_cuda_context & ctx,
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index ddac90838..a5c70e894 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -1888,6 +1888,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * gate_exps_s,
+          ggml_tensor * down_exps_s,
+          ggml_tensor * selected_experts_in,
++         ggml_tensor * pin_pre_up,
+          ggml_tensor * pin_post_up,
+          ggml_tensor * pin_pre_down) const {
+     return build_moe_ffn(
+@@ -1911,6 +1912,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         gate_exps_s,
+         down_exps_s,
+         selected_experts_in,
++        pin_pre_up,
+         pin_post_up,
+         pin_pre_down
+     );
+@@ -1941,6 +1943,7 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+          ggml_tensor * gate_exps_s,
+          ggml_tensor * down_exps_s,
+          ggml_tensor * selected_experts_in,
++         ggml_tensor * pin_pre_up,
+          ggml_tensor * pin_post_up,
+          ggml_tensor * pin_pre_down) const {
+     const int64_t n_embd   = cur->ne[0];
+@@ -2144,9 +2147,17 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
+         }
+     }
+ 
+-    // Nemotron decode can place its already-independent shared-expert
+-    // activation here.  Expanding the routed up first keeps all dependencies
+-    // intact while making the two ReLU^2 chains adjacent for the backend.
++    // Nemotron decode can place its independent shared-up immediately before
++    // routed-up.  Both consume the same activation, so this dependency-neutral
++    // order lets the backend concatenate their MMVQ grids.
++    if (pin_pre_up != nullptr) {
++        ggml_build_forward_expand(gf, pin_pre_up);
++        ggml_build_forward_expand(gf, cur);
++    }
++
++    // The already-independent shared-expert activation follows routed-up.
++    // Expanding routed-up first keeps all dependencies intact while making the
++    // two ReLU^2 chains adjacent for the backend.
+     if (pin_post_up != nullptr) {
+         ggml_build_forward_expand(gf, cur);
+         ggml_build_forward_expand(gf, pin_post_up);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index a65ac8aa9..ec2c726b9 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -1082,6 +1082,7 @@ struct llm_graph_context {
+              ggml_tensor * gate_exps_s = nullptr,
+              ggml_tensor * down_exps_s = nullptr,
+              ggml_tensor * selected_experts_in = nullptr,
++             ggml_tensor * pin_pre_up = nullptr,
+              ggml_tensor * pin_post_up = nullptr,
+              ggml_tensor * pin_pre_down = nullptr) const;
+ 
+@@ -1111,9 +1112,10 @@ struct llm_graph_context {
+              ggml_tensor * down_exps_s = nullptr,
+              ggml_tensor * selected_experts_in = nullptr,
+              // Optional independent work relayed into the routed MoE order.
+-             // The first pin is emitted after the routed up projection and
+-             // before its activation; the second is emitted after the routed
+-             // activation and before the routed down projection.
++             // The first pin is emitted immediately before the routed up
++             // projection, the second after routed up and before activation,
++             // and the third after activation and before routed down.
++             ggml_tensor * pin_pre_up = nullptr,
+              ggml_tensor * pin_post_up = nullptr,
+              ggml_tensor * pin_pre_down = nullptr) const;
+ 
+diff --git a/src/models/nemotron-h.cpp b/src/models/nemotron-h.cpp
+index f5121b388..1851f8cbd 100644
+--- a/src/models/nemotron-h.cpp
++++ b/src/models/nemotron-h.cpp
+@@ -287,20 +287,32 @@ ggml_tensor * llama_model_nemotron_h::graph::build_ffn_layer(ggml_tensor * cur,
+             const char * value = std::getenv("GGML_NEMO_SHEXP_PIN");
+             return value == nullptr || std::atoi(value) != 0;
+         }();
++        static const bool shexp_up_colaunch_enabled = [] {
++            const char * value = std::getenv("GGML_CUDA_NEMO_SHEXP_UP_COLAUNCH");
++            return value == nullptr || std::atoi(value) != 0;
++        }();
+         const bool shexp_pin = shexp_pin_enabled && inp_emb->ne[1] == 1 &&
+             model.layers[il].ffn_latent_up == nullptr &&
+             model.layers[il].ffn_up_shexp_s == nullptr &&
+             model.layers[il].ffn_down_shexp_s == nullptr;
++        // A shared activation is required by the existing activation/down
++        // relays.  Delay shared-up itself only when routed-up consumes the
++        // exact same tensor; =0 restores the current early shared-up order.
++        const bool shexp_up_colaunch = shexp_pin && shexp_up_colaunch_enabled &&
++            model.layers[il].ffn_latent_down == nullptr && inp_latent == inp_emb;
+ 
++        ggml_tensor * shexp_up   = nullptr;
+         ggml_tensor * shexp_act  = nullptr;
+         ggml_tensor * shexp_down = nullptr;
+         if (shexp_pin) {
+-            ggml_tensor * shexp_up = build_lora_mm(model.layers[il].ffn_up_shexp, inp_emb);
++            shexp_up = build_lora_mm(model.layers[il].ffn_up_shexp, inp_emb);
+             cb(shexp_up, "ffn_up", il);
+ 
+-            // Compute the large shared projection early.  The activation is
+-            // only CREATED here; build_moe_ffn emits it after routed-up.
+-            ggml_build_forward_expand(gf, shexp_up);
++            // The disabled arm retains the exact pre-existing graph order.
++            // The enabled arm relays shared-up beside routed-up below.
++            if (!shexp_up_colaunch) {
++                ggml_build_forward_expand(gf, shexp_up);
++            }
+             ggml_tensor * shexp_relu = ggml_relu(ctx0, shexp_up);
+             cb(shexp_relu, "ffn_relu", il);
+             shexp_act = ggml_sqr(ctx0, shexp_relu);
+@@ -327,6 +339,7 @@ ggml_tensor * llama_model_nemotron_h::graph::build_ffn_layer(ggml_tensor * cur,
+                     nullptr, // no gate
+                     model.layers[il].ffn_down_exps_s,
+                     /* selected_experts_in */ nullptr,
++                    shexp_up_colaunch ? shexp_up : nullptr,
+                     shexp_act,
+                     shexp_down);
+         cb(moe_out, "ffn_moe_out", il);
+-- 
+2.49.0.windows.1
+
+

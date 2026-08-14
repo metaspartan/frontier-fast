@@ -1,0 +1,303 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Code (Opus 5) <noreply@anthropic.com>
+Date: Fri, 14 Aug 2026 03:30:00 -0600
+Subject: [PATCH 14/27] cuda: fuse the Nemotron Mamba SwiGLU into the RMS q8 producer
+
+Ported from the Nemotron R9700 HIP series to the GB10 CUDA track. Both tracks
+pin llama.cpp 0b1bad14ff20 and llama.cpp's HIP backend is the CUDA backend
+source-translated, so the diff applies to ggml/src/ggml-cuda unchanged.
+
+GB10 leave-one-out:
+GGML_CUDA_DISABLE_NEMO_MAMBA_SWIGLU_NORM_Q8_FUSION=1 costs 0.31% of decode.
+---
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index dd1233a5d..dddc4b9e9 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3495,7 +3495,11 @@ static cudaStream_t ggml_cuda_norm_quant_node_stream(ggml_backend_cuda_context *
+ static const ggml_tensor * ggml_cuda_norm_quant_find_mmvq_consumer(ggml_backend_cuda_context * ctx,
+                                                                   const ggml_cgraph * cgraph,
+                                                                   const int from,
+-                                                                  const ggml_tensor * t) {
++                                                                  const ggml_tensor * t,
++                                                                  const ggml_tensor ** mm_node_out = nullptr) {
++    if (mm_node_out != nullptr) {
++        *mm_node_out = nullptr;
++    }
+     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+     const cudaStream_t producer_stream = ctx->stream();
+ 
+@@ -3534,6 +3538,9 @@ static const ggml_tensor * ggml_cuda_norm_quant_find_mmvq_consumer(ggml_backend_
+         if (ggml_cuda_norm_quant_node_stream(ctx, n) != producer_stream) {
+             continue;
+         }
++        if (mm_node_out != nullptr) {
++            *mm_node_out = n;
++        }
+         return s1;
+     }
+     return nullptr;
+@@ -3718,6 +3725,86 @@ static int ggml_cuda_nemo_pre_add_norm_detect(const ggml_cgraph * cgraph, const
+     return n_adds;
+ }
+ 
++// Match only the batch-one Nemotron-3.5 Mamba tail:
++//   SwiGLU {64,64} -> reshape {512,8} -> RMS norm -> per-group scale
++//   -> reshape {4096,1} -> quantized ssm_out {4096,2688} MMVQ.
++// All elided nodes have graph closure, and the standard fusion range check
++// rejects allocator aliasing between the final write and live GLU inputs.
++static bool ggml_cuda_nemo_mamba_swiglu_norm_q8_ok(
++        ggml_backend_cuda_context * ctx, const ggml_cgraph * cgraph, const int i) {
++    if (i + 3 >= cgraph->n_nodes ||
++            !ggml_can_fuse_subgraph(cgraph, i,
++                { GGML_OP_GLU, GGML_OP_RESHAPE, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i + 3 })) {
++        return false;
++    }
++
++    const ggml_tensor * glu     = cgraph->nodes[i];
++    const ggml_tensor * reshape = cgraph->nodes[i + 1];
++    const ggml_tensor * norm    = cgraph->nodes[i + 2];
++    const ggml_tensor * mul     = cgraph->nodes[i + 3];
++    const ggml_tensor * x       = glu->src[0];
++    const ggml_tensor * g       = glu->src[1];
++
++    if (x == nullptr || g == nullptr || reshape->src[0] != glu || norm->src[0] != reshape ||
++            ggml_get_glu_op(glu) != GGML_GLU_OP_SWIGLU || ggml_get_op_params_i32(glu, 1) != 0) {
++        return false;
++    }
++
++    const ggml_tensor * scale = nullptr;
++    if (mul->src[0] == norm) {
++        scale = mul->src[1];
++    } else if (mul->src[1] == norm) {
++        scale = mul->src[0];
++    } else {
++        return false;
++    }
++
++    const auto shape_64x64 = [](const ggml_tensor * t) {
++        return t->ne[0] == 64 && t->ne[1] == 64 && t->ne[2] == 1 && t->ne[3] == 1;
++    };
++    const auto shape_512x8 = [](const ggml_tensor * t) {
++        return t->ne[0] == 512 && t->ne[1] == 8 && t->ne[2] == 1 && t->ne[3] == 1;
++    };
++
++    if (x->type != GGML_TYPE_F32 || g->type != GGML_TYPE_F32 || glu->type != GGML_TYPE_F32 ||
++            reshape->type != GGML_TYPE_F32 || norm->type != GGML_TYPE_F32 ||
++            scale == nullptr || scale->type != GGML_TYPE_F32 || mul->type != GGML_TYPE_F32 ||
++            !shape_64x64(x) || !shape_64x64(g) || !shape_64x64(glu) ||
++            !shape_512x8(reshape) || !shape_512x8(norm) || !shape_512x8(scale) || !shape_512x8(mul) ||
++            !ggml_is_contiguous(x) || !ggml_is_contiguous(g) || !ggml_is_contiguous(glu) ||
++            !ggml_is_contiguous(reshape) || !ggml_is_contiguous(norm) ||
++            !ggml_is_contiguous(scale) || !ggml_is_contiguous(mul) ||
++            reshape->data != glu->data) {
++        return false;
++    }
++
++    const cudaStream_t stream = ctx->stream();
++    if (ggml_cuda_norm_quant_node_stream(ctx, glu) != stream ||
++            ggml_cuda_norm_quant_node_stream(ctx, norm) != stream ||
++            ggml_cuda_norm_quant_node_stream(ctx, mul) != stream) {
++        return false;
++    }
++
++    const int out_nodes[] = { i + 3 };
++    return ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, out_nodes, 1);
++}
++
++static bool ggml_cuda_nemo_mamba_ssm_out_ok(
++        const ggml_tensor * mm, const ggml_tensor * activation) {
++    if (mm == nullptr || activation == nullptr || mm->op != GGML_OP_MUL_MAT ||
++            mm->src[0] == nullptr || mm->src[1] != activation) {
++        return false;
++    }
++    const ggml_tensor * w = mm->src[0];
++    return activation->type == GGML_TYPE_F32 && ggml_is_contiguous(activation) &&
++        activation->ne[0] == 4096 && activation->ne[1] == 1 &&
++        activation->ne[2] == 1 && activation->ne[3] == 1 &&
++        ggml_is_quantized(w->type) && w->ne[0] == 4096 && w->ne[1] == 2688 &&
++        w->ne[2] == 1 && w->ne[3] == 1 &&
++        mm->type == GGML_TYPE_F32 && mm->ne[0] == 2688 && mm->ne[1] == 1 &&
++        mm->ne[2] == 1 && mm->ne[3] == 1;
++}
++
+ // try and fuse nodes and return the number of nodes to skip
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+@@ -4600,6 +4687,40 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return fused_node_count - 1;
+     }
+ 
++    // Collapse the exact decode-shaped Nemotron Mamba producer chain into
++    // 0011's post-RMS q8_1 cache entry.  Disabling this falls back to the
++    // existing RMS-norm+q8 fusion, giving a same-binary launch-removal A/B.
++    static const bool disable_nemo_mamba_swiglu_norm_q8 = [] {
++        const char * value = std::getenv("GGML_CUDA_DISABLE_NEMO_MAMBA_SWIGLU_NORM_Q8_FUSION");
++        return value != nullptr && std::atoi(value) != 0;
++    }();
++    if (!disable_nemo_mamba_swiglu_norm_q8 && !disable_rms_norm_q8 && !q8_1_cache_disabled &&
++            ggml_cuda_nemo_mamba_swiglu_norm_q8_ok(cuda_ctx, cgraph, i)) {
++        ggml_tensor * mul_node = cgraph->nodes[i + 3];
++        const ggml_tensor * mm_node = nullptr;
++        const ggml_tensor * activation = ggml_cuda_norm_quant_find_mmvq_consumer(
++            cuda_ctx, cgraph, i + 4, mul_node, &mm_node);
++        if (ggml_cuda_nemo_mamba_ssm_out_ok(mm_node, activation)) {
++            char * q8_1_dst = ggml_cuda_norm_quant_register(cuda_ctx, cgraph, i + 4, mul_node);
++            if (q8_1_dst != nullptr) {
++                static const bool print_stats = [] {
++                    const char * value = std::getenv("GGML_CUDA_NEMO_MAMBA_SWIGLU_NORM_Q8_STATS");
++                    return value != nullptr && std::atoi(value) != 0;
++                }();
++                static std::atomic<uint64_t> n_fused{0};
++                const uint64_t count = n_fused.fetch_add(1, std::memory_order_relaxed) + 1;
++                if (print_stats && (count <= 23 || count % 23 == 0)) {
++                    GGML_LOG_INFO("%s: Nemotron Mamba SwiGLU+RMS+q8_1 fire=%" PRIu64
++                                  ", activation=%s, output=%s\n",
++                                  __func__, count, activation->name, mm_node->name);
++                }
++                ggml_cuda_op_nemo_mamba_swiglu_rms_norm_fused_quant(
++                    *cuda_ctx, node, cgraph->nodes[i + 2], mul_node, q8_1_dst);
++                return 3;
++            }
++        }
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ROPE, GGML_OP_VIEW, GGML_OP_SET_ROWS }, {})) {
+         ggml_cuda_op_rms_norm_mul_rope_fused(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2], cgraph->nodes[i + 4]);
+         return 4;
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index a1f995f19..ee56a0f18 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -1,4 +1,5 @@
+ #include "norm.cuh"
++#include "unary.cuh"
+ #include <cstdint>
+ 
+ template <int block_size>
+@@ -439,6 +440,70 @@ void ggml_cuda_op_rms_norm_fused_pre_add(ggml_backend_cuda_context & ctx,
+ #undef RMS_NORM_PRE_ADD_LAUNCH_CASE
+ }
+ 
++// Decode-only Nemotron Mamba tail.  One block owns one complete 512-value
++// grouped-RMS row.  Keeping the SwiGLU result in volatile F32 shared memory
++// preserves the standalone GLU kernel's F32 store/load boundary before the
++// RMS reduction, while eliminating that launch and its global round trip.
++// The RMS and q8_1 statements below intentionally match
++// rms_norm_mul_quant_f32 exactly.
++static __global__ void nemo_mamba_swiglu_rms_norm_mul_quant_f32(
++        const float * x, const float * g, const float * mul, float * dst,
++        const float eps, void * q8_1_dst) {
++    constexpr int ncols = 512;
++    constexpr int block_size = 256;
++
++    ggml_cuda_pdl_lc();
++    const int row = blockIdx.x;
++    const int tid = threadIdx.x;
++
++    extern __shared__ float shared[];
++    volatile float * glu_round = shared;
++    float * s_sum = shared + ncols;
++
++    ggml_cuda_pdl_sync();
++    for (int col = tid; col < ncols; col += block_size) {
++        const int i = row*ncols + col;
++        glu_round[col] = ggml_cuda_op_silu_single(x[i]) * g[i];
++    }
++    __syncthreads();
++
++    float tmp = 0.0f;
++    for (int col = tid; col < ncols; col += block_size) {
++        const float xi = glu_round[col];
++        tmp += xi * xi;
++    }
++
++    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++
++    const float mean  = tmp / ncols;
++    const float scale = rsqrtf(mean + eps);
++    block_q8_1 * y = (block_q8_1 *) q8_1_dst;
++
++    for (int col = tid; col < ncols; col += block_size) {
++        const float val = scale * glu_round[col] * mul[row*ncols + col];
++        const int64_t i_cont = (int64_t) row*ncols + col;
++        const int64_t ib     = i_cont / QK8_1;
++        const int64_t iqs    = i_cont % QK8_1;
++
++        dst[i_cont] = val;
++
++        const float xq = val;
++        float amax = fabsf(xq);
++        float sum  = xq;
++
++        amax = warp_reduce_max<QK8_1>(amax);
++        sum  = warp_reduce_sum<QK8_1>(sum);
++
++        const float  d = amax / 127.0f;
++        const int8_t q = amax == 0.0f ? 0 : roundf(xq / d);
++
++        y[ib].qs[iqs] = q;
++        if (iqs == 0) {
++            y[ib].ds = make_half2(d, sum);
++        }
++    }
++}
++
+ template <int block_size>
+ static __global__ void rms_norm_back_f32(
+         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
+@@ -942,6 +1007,34 @@ void ggml_cuda_op_rms_norm_fused_quant(ggml_backend_cuda_context & ctx,
+         eps, q8_1_dst, ctx.stream());
+ }
+ 
++void ggml_cuda_op_nemo_mamba_swiglu_rms_norm_fused_quant(
++        ggml_backend_cuda_context & ctx, ggml_tensor * glu, ggml_tensor * rms_norm,
++        ggml_tensor * mul_tensor, char * q8_1_dst) {
++    const ggml_tensor * x = glu->src[0];
++    const ggml_tensor * g = glu->src[1];
++    const ggml_tensor * mul_src = mul_tensor->src[0] == rms_norm ?
++        mul_tensor->src[1] : mul_tensor->src[0];
++
++    float eps = 0.0f;
++    memcpy(&eps, rms_norm->op_params, sizeof(float));
++
++    GGML_ASSERT(x != nullptr && g != nullptr && mul_src != nullptr && q8_1_dst != nullptr);
++    GGML_ASSERT(x->type == GGML_TYPE_F32 && g->type == GGML_TYPE_F32);
++    GGML_ASSERT(glu->type == GGML_TYPE_F32 && rms_norm->type == GGML_TYPE_F32);
++    GGML_ASSERT(mul_src->type == GGML_TYPE_F32 && mul_tensor->type == GGML_TYPE_F32);
++    GGML_ASSERT(eps >= 0.0f);
++
++    const dim3 blocks_num(8, 1, 1);
++    const dim3 block_dims(256, 1, 1);
++    const size_t shared_bytes = (512 + 32)*sizeof(float);
++    const ggml_cuda_kernel_launch_params launch_params = {
++        blocks_num, block_dims, shared_bytes, ctx.stream()
++    };
++    ggml_cuda_kernel_launch(nemo_mamba_swiglu_rms_norm_mul_quant_f32, launch_params,
++        (const float *) x->data, (const float *) g->data, (const float *) mul_src->data,
++        (float *) mul_tensor->data, eps, q8_1_dst);
++}
++
+ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+                                      ggml_tensor *               dst,
+                                      ggml_tensor *               mul_tensor,
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+index a5a6dcf56..f2c1db6f5 100644
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -25,6 +25,11 @@ void ggml_cuda_op_rms_norm_fused_pre_add(ggml_backend_cuda_context & ctx,
+                                          ggml_tensor * norm, ggml_tensor * mul_tensor,
+                                          char * q8_1_dst);
+ 
++// Exact decode-shaped Nemotron Mamba SwiGLU + grouped RMS norm + scale + q8_1.
++void ggml_cuda_op_nemo_mamba_swiglu_rms_norm_fused_quant(
++        ggml_backend_cuda_context & ctx, ggml_tensor * glu, ggml_tensor * rms_norm,
++        ggml_tensor * mul_tensor, char * q8_1_dst);
++
+ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+                                      ggml_tensor *               dst,
+                                      ggml_tensor *               mul_tensor,
+-- 
+2.49.0.windows.1
+
+

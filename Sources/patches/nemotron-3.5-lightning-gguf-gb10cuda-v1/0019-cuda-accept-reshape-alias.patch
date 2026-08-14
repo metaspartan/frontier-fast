@@ -1,0 +1,78 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Code (Opus 5) <noreply@anthropic.com>
+Date: Fri, 14 Aug 2026 03:30:00 -0600
+Subject: [PATCH 19/27] cuda: accept an exact reshape alias for the routed-up activation
+
+Ported from the Nemotron R9700 HIP series to the GB10 CUDA track. Both tracks
+pin llama.cpp 0b1bad14ff20 and llama.cpp's HIP backend is the CUDA backend
+source-translated, so the diff applies to ggml/src/ggml-cuda unchanged.
+---
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 0a260a05c..0e8d5b5e2 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -4251,8 +4251,31 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         const ggml_op ops[] = { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID };
+         const int out_nodes[] = { i, i + 1 };
+ 
++        const ggml_tensor * shared_src = shared->src[1];
++        const ggml_tensor * routed_src = routed->src[1];
++        const auto view_root = [](const ggml_tensor * t) {
++            return t != nullptr && t->view_src != nullptr ? t->view_src : t;
++        };
++        const auto view_offset = [](const ggml_tensor * t) {
++            return t != nullptr && t->view_src != nullptr ? t->view_offs : size_t(0);
++        };
++        // build_moe_ffn reshapes the routed activation from [2688,1] to
++        // [2688,1,1] metadata. Accept only an exact zero-offset alias: same
++        // root, address, buffer, F32 shape/strides, byte extent, and allocator
++        // range. Shifted or partial views remain rejected.
++        const bool activation_alias = shared_src != nullptr && routed_src != nullptr &&
++            shared_src->type == GGML_TYPE_F32 && routed_src->type == GGML_TYPE_F32 &&
++            view_root(shared_src) == view_root(routed_src) &&
++            view_offset(shared_src) == 0 && view_offset(routed_src) == 0 &&
++            shared_src->buffer != nullptr && shared_src->buffer == routed_src->buffer &&
++            shared_src->data == routed_src->data &&
++            ggml_are_same_shape(shared_src, routed_src) && ggml_are_same_stride(shared_src, routed_src) &&
++            ggml_nelements(shared_src) == ggml_nelements(routed_src) &&
++            ggml_nbytes(shared_src) == ggml_nbytes(routed_src) &&
++            ggml_backend_buffer_get_alloc_size(shared_src->buffer, shared_src) ==
++                ggml_backend_buffer_get_alloc_size(routed_src->buffer, routed_src);
+         const bool shape_ok = sw != nullptr && rw != nullptr && shared->src[1] != nullptr &&
+-            routed->src[1] == shared->src[1] && routed->src[2] != nullptr &&
++            activation_alias && routed->src[2] != nullptr &&
+             sw->type == GGML_TYPE_Q5_0 && rw->type == GGML_TYPE_Q5_0 &&
+             sw->ne[0] == 2688 && sw->ne[1] == 3712 && sw->ne[2] == 1 && sw->ne[3] == 1 &&
+             shared->src[1]->type == GGML_TYPE_F32 &&
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index fe456b540..cc6e81d0e 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1724,8 +1724,22 @@ void ggml_cuda_mul_mat_vec_q(
+         const ggml_tensor * g1   = nemo_up_guest->src1;
+         const ggml_tensor * gids = nemo_up_guest->ids;
+         ggml_tensor *       gd   = nemo_up_guest->dst;
++        const auto view_root = [](const ggml_tensor * t) {
++            return t != nullptr && t->view_src != nullptr ? t->view_src : t;
++        };
++        const auto view_offset = [](const ggml_tensor * t) {
++            return t != nullptr && t->view_src != nullptr ? t->view_offs : size_t(0);
++        };
++        const bool same_activation = g1 != nullptr &&
++            g1->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 &&
++            view_root(g1) == view_root(src1) && view_offset(g1) == 0 && view_offset(src1) == 0 &&
++            g1->buffer != nullptr && g1->buffer == src1->buffer && g1->data == src1->data &&
++            ggml_are_same_shape(g1, src1) && ggml_are_same_stride(g1, src1) &&
++            ggml_nelements(g1) == ggml_nelements(src1) && ggml_nbytes(g1) == ggml_nbytes(src1) &&
++            ggml_backend_buffer_get_alloc_size(g1->buffer, g1) ==
++                ggml_backend_buffer_get_alloc_size(src1->buffer, src1);
+         const bool shapes_ok = g0 != nullptr && g1 != nullptr && gids != nullptr && gd != nullptr &&
+-            g0->type == GGML_TYPE_Q5_0 && g1 == src1 && g1->data == src1->data &&
++            g0->type == GGML_TYPE_Q5_0 && same_activation &&
+             g1->type == GGML_TYPE_F32 && gids->type == GGML_TYPE_I32 && gd->type == GGML_TYPE_F32 &&
+             src0->ne[0] == 2688 && src0->ne[1] == 3712 && src0->ne[2] == 1 && src0->ne[3] == 1 &&
+             src1->ne[0] == 2688 && src1->ne[1] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 &&
+-- 
+2.49.0.windows.1
+
+

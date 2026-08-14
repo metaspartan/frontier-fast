@@ -1,0 +1,390 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Code (Opus 5) <noreply@anthropic.com>
+Date: Fri, 14 Aug 2026 03:30:00 -0600
+Subject: [PATCH 13/27] cuda: prepare the Mamba2 dt decay once per head
+
+Ported from the Nemotron R9700 HIP series to the GB10 CUDA track. Both tracks
+pin llama.cpp 0b1bad14ff20 and llama.cpp's HIP backend is the CUDA backend
+source-translated, so the diff applies to ggml/src/ggml-cuda unchanged.
+
+softplus(dt) and exp(softplus(dt)*A) depend only on the head, but the scan
+recomputes both in every warp that shares that head. Compute them once in a
+small preparation kernel that also absorbs the dt bias ADD.
+
+This patch is architecture-gated in the source it was ported from; see patch
+0026, which opens the gate for sm_121. GB10 leave-one-out with the gate open:
+GGML_CUDA_DISABLE_SSM_DT_PREP_FUSION=1 costs 0.32% of decode.
+---
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index dd1233a5d..2afa35d74 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3006,6 +3006,116 @@ static int ggml_cuda_try_ssm_state_writeback_fusion(
+     return fused_skip;
+ }
+ 
++// Replace Nemotron's decode-shaped dt+bias ADD with a head-wise preparation
++// launch, then let the scan consume rounded F32 softplus(dt) and dA values.
++// The scan recurrence and reduction are untouched. This matcher deliberately
++// composes with the existing direct-state/output-D fusion so no intermediate
++// ADD destination or scan tail remains live after the skipped range.
++static int ggml_cuda_try_ssm_dt_prep_fusion(
++        ggml_backend_cuda_context * cuda_ctx,
++        const ggml_cgraph * cgraph, int node_idx, bool fuse_output_d,
++        ggml_tensor * & scan_out,
++        ggml_cuda_ssm_scan_fused_cache & fused_cache,
++        ggml_cuda_ssm_scan_fused_dt & fused_dt) {
++    ggml_tensor * add = cgraph->nodes[node_idx];
++    if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 ||
++        (add->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return 0;
++    }
++
++    const int cc = ggml_cuda_info().devices[cuda_ctx->device].cc;
++    if (!GGML_CUDA_CC_IS_RDNA4(cc)) {
++        return 0;
++    }
++
++    const ggml_tensor * dt_raw  = add->src[0];
++    const ggml_tensor * dt_bias = add->src[1];
++    if (dt_raw == nullptr || dt_bias == nullptr ||
++        dt_raw->type != GGML_TYPE_F32 || dt_bias->type != GGML_TYPE_F32 ||
++        !ggml_is_contiguous(dt_raw) || !ggml_is_contiguous(dt_bias) || !ggml_is_contiguous(add) ||
++        add->ne[0] != 64 || add->ne[1] != 1 || add->ne[2] != 1 || add->ne[3] != 1 ||
++        !ggml_are_same_shape(dt_raw, add) || ggml_nelements(dt_bias) != 64) {
++        return 0;
++    }
++
++    // Views/reshapes carry no work. Any real node between this ADD and its
++    // scan makes the fusion unsafe because the loop will skip the full range.
++    int scan_idx = -1;
++    ggml_tensor * scan = nullptr;
++    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
++        ggml_tensor * n = cgraph->nodes[j];
++        if (ggml_cuda_is_view_or_noop(n)) {
++            continue;
++        }
++        if (n->op != GGML_OP_SSM_SCAN) {
++            return 0;
++        }
++        scan_idx = j;
++        scan = n;
++        break;
++    }
++    if (scan == nullptr || scan->src[2] != add || scan->type != GGML_TYPE_F32) {
++        return 0;
++    }
++
++    const ggml_tensor * state = scan->src[0];
++    const ggml_tensor * x     = scan->src[1];
++    const ggml_tensor * A     = scan->src[3];
++    const ggml_tensor * B     = scan->src[4];
++    const ggml_tensor * C     = scan->src[5];
++    if (state == nullptr || x == nullptr || A == nullptr || B == nullptr || C == nullptr ||
++        state->ne[0] != 128 || x->ne[0] != 64 || x->ne[1] != 64 || x->ne[2] != 1 || x->ne[3] != 1 ||
++        A->ne[0] != 1 || A->ne[1] != 64 ||
++        B->ne[0] != 128 || B->ne[1] != 8 || C->ne[0] != 128 || C->ne[1] != 8) {
++        return 0;
++    }
++
++    // The skipped ADD result must have exactly one reader: this scan.
++    int add_users = 0;
++    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
++        for (int k = 0; k < GGML_MAX_SRC; ++k) {
++            if (cgraph->nodes[j]->src[k] == add) {
++                ++add_users;
++            }
++        }
++    }
++    if (add_users != 1) {
++        return 0;
++    }
++
++    const int scan_skip = ggml_cuda_try_ssm_state_writeback_fusion(
++        cuda_ctx, cgraph, scan_idx, fuse_output_d, fused_cache);
++    if (scan_skip <= 0) {
++        return 0;
++    }
++
++    // The existing scan matcher proves the scan-through-output range stays on
++    // one concurrent stream. Extend that proof backward over ADD and no-ops.
++    for (const auto & [fork_node, event] : cuda_ctx->stream_context().concurrent_events) {
++        const auto scan_it = event.stream_mapping.find(scan);
++        const bool scan_mapped = scan_it != event.stream_mapping.end();
++        for (int j = node_idx; j < scan_idx; ++j) {
++            const ggml_tensor * n = cgraph->nodes[j];
++            if (fork_node == n || event.join_node == n) {
++                return 0;
++            }
++            const auto it = event.stream_mapping.find(n);
++            if (scan_mapped) {
++                if (it == event.stream_mapping.end() || it->second != scan_it->second) {
++                    return 0;
++                }
++            } else if (it != event.stream_mapping.end()) {
++                return 0;
++            }
++        }
++    }
++
++    scan_out        = scan;
++    fused_dt.dt_raw = (const float *) dt_raw->data;
++    fused_dt.dt_bias = (const float *) dt_bias->data;
++    return (scan_idx - node_idx) + scan_skip;
++}
++
+ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
+     args.sigmoid         = false;
+     args.sqrt_softplus   = false;
+@@ -3737,6 +3847,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     static const bool disable_ssm_output_d =
+         getenv("GGML_CUDA_DISABLE_SSM_OUTPUT_D_FUSION") != nullptr &&
+         std::atoi(getenv("GGML_CUDA_DISABLE_SSM_OUTPUT_D_FUSION"));
++    static const bool disable_ssm_dt_prep =
++        getenv("GGML_CUDA_DISABLE_SSM_DT_PREP_FUSION") != nullptr &&
++        std::atoi(getenv("GGML_CUDA_DISABLE_SSM_DT_PREP_FUSION"));
++
++    // Nemotron Mamba2 decode: the dt+bias ADD is the last real dependency
++    // before SSM_SCAN. Replace it with one head-wise preparation launch and
++    // issue the existing direct-state/output-D scan fusion immediately after.
++    // Disabling only this path retains all earlier fusions in the same binary.
++    if (node->op == GGML_OP_ADD && !disable_ssm_dt_prep && !disable_ssm_state_writeback) {
++        ggml_tensor * scan = nullptr;
++        ggml_cuda_ssm_scan_fused_cache fused_cache;
++        ggml_cuda_ssm_scan_fused_dt fused_dt;
++        const int nodes_to_skip = ggml_cuda_try_ssm_dt_prep_fusion(
++            cuda_ctx, cgraph, i, !disable_ssm_output_d, scan, fused_cache, fused_dt);
++        if (nodes_to_skip > 0) {
++            static const bool print_stats = getenv("GGML_CUDA_SSM_DT_PREP_STATS") != nullptr &&
++                                            std::atoi(getenv("GGML_CUDA_SSM_DT_PREP_STATS"));
++            static std::atomic<uint64_t> n_fused{0};
++            const uint64_t count = n_fused.fetch_add(1, std::memory_order_relaxed) + 1;
++            if (print_stats && (count <= 23 || count % 23 == 0)) {
++                GGML_LOG_INFO("%s: Mamba2 dt preparation fire=%" PRIu64
++                              ", heads=%" PRId64 ", skipped=%d, scan=%s\n",
++                              __func__, count, scan->src[1]->ne[1], nodes_to_skip, scan->name);
++            }
++            ggml_cuda_op_ssm_scan(*cuda_ctx, scan, &fused_cache, &fused_dt);
++            return nodes_to_skip;
++        }
++    }
+     if (node->op == GGML_OP_SSM_SCAN && !disable_ssm_state_writeback) {
+         ggml_cuda_ssm_scan_fused_cache fused_cache;
+         const int nodes_to_skip = ggml_cuda_try_ssm_state_writeback_fusion(
+diff --git a/ggml/src/ggml-cuda/ssm-scan.cu b/ggml/src/ggml-cuda/ssm-scan.cu
+index 0f888f8ac..618c129f0 100644
+--- a/ggml/src/ggml-cuda/ssm-scan.cu
++++ b/ggml/src/ggml-cuda/ssm-scan.cu
+@@ -139,14 +139,36 @@ __global__ void __launch_bounds__(splitD, 1)
+ #pragma clang diagnostic pop
+ #endif // __clang__
+ 
++// Preserve the stock ADD-kernel rounding point, then evaluate the two
++// head-shared transcendental values once.  Nemotron decode has one value per
++// head, while the scan otherwise repeats this chain in all d_head warps.
++static __global__ void ssm_dt_prepare_f32(
++        const float * dt_raw, const float * dt_bias, const float * A,
++        float * dt_softplus, float * dA, const int64_t n_head) {
++    const int64_t head = blockIdx.x * blockDim.x + threadIdx.x;
++    if (head >= n_head) {
++        return;
++    }
++
++    float dt = __fadd_rn(dt_raw[head], dt_bias[head]);
++#if defined(__HIP_PLATFORM_AMD__)
++    // The ordinary ADD is a separate kernel.  Keep the rounded sum from being
++    // reassociated into the softplus chain under hipcc's unsafe-math flags.
++    asm volatile("" : "+v"(dt));
++#endif
++    const float dt_sp = dt <= 20.0f ? log1pf(expf(dt)) : dt;
++    dt_softplus[head] = dt_sp;
++    dA[head]          = expf(dt_sp * A[head]);
++}
++
+ // assumes as many threads as d_state
+-template <int c_factor, int d_state>
++template <int c_factor, int d_state, bool use_prepared_dt>
+ __global__ void __launch_bounds__(d_state, 1)
+     ssm_scan_f32_group(
+         const float * src0_ptr, const float * src1_ptr, const float * src2_ptr,
+         const float * src3_ptr, const float * src4_ptr, const float * src5_ptr,
+         const int32_t * src6_ptr, float * dst_ptr, float * state_dst_ptr,
+-        const float * output_d_ptr, float * output_d_dst_ptr,
++        const float * output_d_ptr, float * output_d_dst_ptr, const float * prepared_dA_ptr,
+         const int src0_nb2, const int src0_nb3, const int src1_nb2, const int src1_nb3,
+         const int src2_nb1, const int src2_nb2, const int src3_nb1,
+         const int src4_nb2, const int src4_nb3, const int src5_nb2, const int src5_nb3,
+@@ -179,6 +201,7 @@ __global__ void __launch_bounds__(d_state, 1)
+     const float * x_warp  = (const float *) ((const char *) src1 + (seq_idx * src1_nb3) + (warp_idx * sizeof(float)));
+     const float * dt_warp = (const float *) ((const char *) src2 + (seq_idx * src2_nb2) + head_idx * sizeof(float));
+     const float * A_warp  = (const float *) ((const char *) src3 + head_idx * src3_nb1);
++    const float * dA_warp = use_prepared_dt ? prepared_dA_ptr + seq_idx * n_tok * n_head + head_idx : nullptr;
+     const float * B_warp  = (const float *) ((const char *) src4 + (seq_idx * src4_nb3) + (group_off));
+     const float * C_warp  = (const float *) ((const char *) src5 + (seq_idx * src5_nb3) + (group_off));
+     float *       y_base  = output_d_dst_ptr != nullptr ? output_d_dst_ptr : dst;
+@@ -202,12 +225,20 @@ __global__ void __launch_bounds__(d_state, 1)
+     }
+ 
+     for (int64_t i = 0; i < n_tok; i++) {
+-        // NOTE: dt_soft_plus, dA and x_dt have the same value for a warp here.
+-        // Recalculation is intentional; sharing via shuffles/smem proved slower due to sync overhead.
+-        const float dt_soft_plus = (dt_warp[i * stride_dt] <= 20.0f ? log1pf(expf(dt_warp[i * stride_dt])) : dt_warp[i * stride_dt]);
++        float dt_soft_plus;
++        float dA;
++        if constexpr (use_prepared_dt) {
++            dt_soft_plus = dt_warp[i * stride_dt];
++            dA           = dA_warp[i * n_head];
++        } else {
++            // NOTE: dt_soft_plus and dA have the same value for every warp in
++            // a head. The stock path deliberately retains its exact code.
++            const float dt = dt_warp[i * stride_dt];
++            dt_soft_plus = dt <= 20.0f ? log1pf(expf(dt)) : dt;
++            dA           = expf(dt_soft_plus * A_warp[0]);
++        }
+ 
+         state_sum = 0.0f;
+-        const float dA   = expf(dt_soft_plus * A_warp[0]);
+         const float x_dt = x_warp[i * stride_x] * dt_soft_plus;
+ #pragma unroll
+         for (int j = 0; j < c_factor; j++) {
+@@ -249,7 +280,7 @@ __global__ void __launch_bounds__(d_state, 1)
+ 
+ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const float * src2, const float * src3,
+                               const float * src4, const float * src5, const int32_t * src6, float * dst,
+-                              float * state_dst, const float * output_d, float * output_d_dst,
++                              float * state_dst, const float * output_d, float * output_d_dst, const float * prepared_dA,
+                               const int src0_nb2, const int src0_nb3, const int src1_nb2, const int src1_nb3, const int src2_nb1,
+                               const int src2_nb2, const int src3_nb1, const int src4_nb2, const int src4_nb3, const int src5_nb2,
+                               const int src5_nb3, const int64_t s_off, const int64_t d_state, const int64_t head_dim,
+@@ -264,28 +295,44 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
+ 
+             const dim3 blocks((n_head * head_dim + (num_warps - 1)) / num_warps, n_seq, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
+-            ggml_cuda_kernel_launch(ssm_scan_f32_group<128/WARP_SIZE, 128>, launch_params,
+-                    src0, src1, src2, src3, src4, src5, src6, dst,
+-                    state_dst, output_d, output_d_dst,
+-                    src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
+-                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok);
++            if (prepared_dA != nullptr) {
++                ggml_cuda_kernel_launch(ssm_scan_f32_group<128/WARP_SIZE, 128, true>, launch_params,
++                        src0, src1, src2, src3, src4, src5, src6, dst,
++                        state_dst, output_d, output_d_dst, prepared_dA,
++                        src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
++                        src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok);
++            } else {
++                ggml_cuda_kernel_launch(ssm_scan_f32_group<128/WARP_SIZE, 128, false>, launch_params,
++                        src0, src1, src2, src3, src4, src5, src6, dst,
++                        state_dst, output_d, output_d_dst, nullptr,
++                        src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
++                        src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok);
++            }
+         } else if (d_state == 256) { // Falcon-H1
+             constexpr int threads   = 256;
+             constexpr int num_warps = threads/WARP_SIZE;
+ 
+             const dim3 blocks((n_head * head_dim + (num_warps - 1)) / num_warps, n_seq, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
+-            ggml_cuda_kernel_launch(ssm_scan_f32_group<256/WARP_SIZE, 256>, launch_params,
+-                    src0, src1, src2, src3, src4, src5, src6, dst,
+-                    state_dst, output_d, output_d_dst,
+-                    src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
+-                    src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok);
++            if (prepared_dA != nullptr) {
++                ggml_cuda_kernel_launch(ssm_scan_f32_group<256/WARP_SIZE, 256, true>, launch_params,
++                        src0, src1, src2, src3, src4, src5, src6, dst,
++                        state_dst, output_d, output_d_dst, prepared_dA,
++                        src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
++                        src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok);
++            } else {
++                ggml_cuda_kernel_launch(ssm_scan_f32_group<256/WARP_SIZE, 256, false>, launch_params,
++                        src0, src1, src2, src3, src4, src5, src6, dst,
++                        state_dst, output_d, output_d_dst, nullptr,
++                        src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
++                        src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok);
++            }
+         } else {
+             GGML_ABORT("doesn't support d_state!=(128 or 256).");
+         }
+     } else {
+         // Mamba-1
+-        GGML_ASSERT(state_dst == nullptr && output_d == nullptr && output_d_dst == nullptr &&
++        GGML_ASSERT(state_dst == nullptr && output_d == nullptr && output_d_dst == nullptr && prepared_dA == nullptr &&
+                     "direct recurrent-state/output fusion is Mamba2-only");
+         constexpr int threads = 128;
+         GGML_ASSERT(n_head % threads == 0);
+@@ -781,7 +828,8 @@ static void ssm_scan_ssd_f32_cuda(
+ #endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
+ 
+ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+-                           const ggml_cuda_ssm_scan_fused_cache * cache) {
++                           const ggml_cuda_ssm_scan_fused_cache * cache,
++                           const ggml_cuda_ssm_scan_fused_dt * dt_fusion) {
+     const struct ggml_tensor * src0 = dst->src[0];  // s
+     const struct ggml_tensor * src1 = dst->src[1];  // x
+     const struct ggml_tensor * src2 = dst->src[2];  // dt
+@@ -821,6 +869,22 @@ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+     float *       output_d_dst_d = cache != nullptr ? cache->output_d_dst : nullptr;
+     cudaStream_t  stream = ctx.stream();
+ 
++    ggml_cuda_pool_alloc<float> dt_prepared(ctx.pool());
++    const float * prepared_dA_d = nullptr;
++    if (dt_fusion != nullptr) {
++        GGML_ASSERT(dt_fusion->dt_raw != nullptr && dt_fusion->dt_bias != nullptr);
++        GGML_ASSERT(n_t == 1 && n_s == 1 && src3->nb[1] == sizeof(float));
++
++        float * prepared = dt_prepared.alloc(2 * nh);
++        constexpr int threads = 64;
++        const dim3 blocks((nh + threads - 1) / threads, 1, 1);
++        ssm_dt_prepare_f32<<<blocks, threads, 0, stream>>>(
++            dt_fusion->dt_raw, dt_fusion->dt_bias, src3_d,
++            prepared, prepared + nh, nh);
++        src2_d       = prepared;
++        prepared_dA_d = prepared + nh;
++    }
++
+     GGML_ASSERT(src0->type == GGML_TYPE_F32);
+     GGML_ASSERT(src6->type == GGML_TYPE_I32);
+     GGML_ASSERT(dst->type == GGML_TYPE_F32);
+@@ -851,6 +915,7 @@ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                       && nr % 8 == 0;  // cuBLAS requires 8-element (16-byte) alignment
+ 
+     if (use_ssd) {
++        GGML_ASSERT(dt_fusion == nullptr);
+         // ssm_ssd_init_state_kernel uses flat linear indexing within each sequence,
+         // so src0 must be fully contiguous across all inner dimensions.
+         // The scan path handles non-contiguous nb[2] via src0_nb2 but does not handle nb[1].
+@@ -870,7 +935,7 @@ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+     }
+ #endif
+     ssm_scan_f32_cuda(src0_d, src1_d, src2_d, src3_d, src4_d, src5_d, src6_d, dst_d,
+-                      state_dst_d, output_d_d, output_d_dst_d,
++                      state_dst_d, output_d_d, output_d_dst_d, prepared_dA_d,
+                       src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3], src2->nb[1], src2->nb[2],
+                       src3->nb[1], src4->nb[2], src4->nb[3], src5->nb[2], src5->nb[3],
+                       s_off, nc, nr, nh, ng, n_t, n_s, stream);
+diff --git a/ggml/src/ggml-cuda/ssm-scan.cuh b/ggml/src/ggml-cuda/ssm-scan.cuh
+index e4d0ffa90..bdb7c60a3 100644
+--- a/ggml/src/ggml-cuda/ssm-scan.cuh
++++ b/ggml/src/ggml-cuda/ssm-scan.cuh
+@@ -9,5 +9,16 @@ struct ggml_cuda_ssm_scan_fused_cache {
+     float       * output_d_dst     = nullptr;
+ };
+ 
++// Decode-shaped Mamba2 dt preparation. The graph still contains the stock
++// dt+bias ADD so non-CUDA backends and the disabled path are unchanged. A
++// CUDA graph fusion may replace that ADD with one tiny preparation launch and
++// pass its original inputs here; the scan then consumes the two rounded F32
++// arrays produced by that launch.
++struct ggml_cuda_ssm_scan_fused_dt {
++    const float * dt_raw  = nullptr;
++    const float * dt_bias = nullptr;
++};
++
+ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+-                           const ggml_cuda_ssm_scan_fused_cache * cache = nullptr);
++                           const ggml_cuda_ssm_scan_fused_cache * cache = nullptr,
++                           const ggml_cuda_ssm_scan_fused_dt * dt_fusion = nullptr);
+-- 
+2.49.0.windows.1
+
+

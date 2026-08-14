@@ -1,0 +1,360 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Code (Opus 5) <noreply@anthropic.com>
+Date: Fri, 14 Aug 2026 03:30:00 -0600
+Subject: [PATCH 11/27] cuda: fold the Mamba2 x*D output path into the scan
+
+Ported from the Nemotron R9700 HIP series to the GB10 CUDA track. Both tracks
+pin llama.cpp 0b1bad14ff20 and llama.cpp's HIP backend is the CUDA backend
+source-translated, so the diff applies to ggml/src/ggml-cuda unchanged.
+
+Stock materializes x*D in one bin-broadcast kernel and adds the scan output
+in a second. The scan already holds both operands, so it writes the exact
+two-rounded-operation result directly to the ADD destination. __fmul_rn and
+__fadd_rn keep it two roundings; the HIP-only asm barrier beside them is a
+no-op under nvcc, which does not contract or reassociate those intrinsics
+even at -use_fast_math.
+
+GB10 leave-one-out: GGML_CUDA_DISABLE_SSM_OUTPUT_D_FUSION=1 costs 0.41%.
+---
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 71189a157..181af6d44 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2807,7 +2807,8 @@ static int ggml_cuda_try_gdn_cache_fusion(
+ // while removing a large D2D copy and its launch.
+ static int ggml_cuda_try_ssm_state_writeback_fusion(
+         ggml_backend_cuda_context * cuda_ctx,
+-        const ggml_cgraph * cgraph, int node_idx, ggml_cuda_ssm_scan_fused_cache & fused_cache) {
++        const ggml_cgraph * cgraph, int node_idx, bool fuse_output_d,
++        ggml_cuda_ssm_scan_fused_cache & fused_cache) {
+     const ggml_tensor * scan = cgraph->nodes[node_idx];
+ 
+     if (scan->op != GGML_OP_SSM_SCAN || scan->type != GGML_TYPE_F32 ||
+@@ -2875,6 +2876,85 @@ static int ggml_cuda_try_ssm_state_writeback_fusion(
+         return 0;
+     }
+ 
++    // Decode-only Mamba2 has two elementwise nodes immediately after the
++    // state writeback: x*D, then scan_y + x*D. The scan can materialize the
++    // same two-rounded-operation result directly in the ADD destination.
++    // Keep this optional: if any graph/detail check fails, retain the exact
++    // direct-state writeback above and execute the ordinary MUL + ADD nodes.
++    const ggml_tensor * output_mul = nullptr;
++    const ggml_tensor * output_add = nullptr;
++    const ggml_tensor * output_y   = nullptr;
++    const ggml_tensor * output_d   = nullptr;
++    int output_skip = skip;
++    if (fuse_output_d) {
++        const auto next_real_node = [&](int after, int & index) -> const ggml_tensor * {
++            for (int j = after + 1; j < cgraph->n_nodes; ++j) {
++                if (!ggml_cuda_is_view_or_noop(cgraph->nodes[j])) {
++                    index = j;
++                    return cgraph->nodes[j];
++                }
++            }
++            return nullptr;
++        };
++
++        int mul_idx = -1;
++        int add_idx = -1;
++        const ggml_tensor * mul = next_real_node(node_idx + skip, mul_idx);
++        const ggml_tensor * add = mul != nullptr ? next_real_node(mul_idx, add_idx) : nullptr;
++
++        if (mul != nullptr && add != nullptr && mul->op == GGML_OP_MUL && add->op == GGML_OP_ADD &&
++            !(mul->flags & GGML_TENSOR_FLAG_OUTPUT) && !(add->flags & GGML_TENSOR_FLAG_OUTPUT) &&
++            mul->type == GGML_TYPE_F32 && add->type == GGML_TYPE_F32 &&
++            ggml_is_contiguous(mul) && ggml_is_contiguous(add) &&
++            ggml_nelements(mul) == y_ne && ggml_nelements(add) == y_ne) {
++            if (mul->src[0] == x) {
++                output_d = mul->src[1];
++            } else if (mul->src[1] == x) {
++                output_d = mul->src[0];
++            }
++
++            if (add->src[0] == mul) {
++                output_y = add->src[1];
++            } else if (add->src[1] == mul) {
++                output_y = add->src[0];
++            }
++
++            const bool d_ok = output_d != nullptr && output_d->type == GGML_TYPE_F32 &&
++                output_d->data != nullptr && ggml_is_contiguous(output_d) &&
++                output_d->ne[0] == 1 && output_d->ne[1] == x->ne[1] &&
++                output_d->ne[2] == 1 && output_d->ne[3] == 1;
++            const bool y_ok = output_y != nullptr && output_y->view_src == scan &&
++                output_y->view_offs == 0 && output_y->type == GGML_TYPE_F32 &&
++                ggml_is_contiguous(output_y) && ggml_nelements(output_y) == y_ne;
++
++            bool users_ok = d_ok && y_ok && add->data != nullptr;
++            for (int j = node_idx + 1; users_ok && j < cgraph->n_nodes; ++j) {
++                const ggml_tensor * n = cgraph->nodes[j];
++                if (ggml_cuda_is_view_or_noop(n)) {
++                    continue;
++                }
++                for (int k = 0; k < GGML_MAX_SRC; ++k) {
++                    const ggml_tensor * input = n->src[k];
++                    const bool scan_input = input == scan || (input != nullptr && input->view_src == scan);
++                    if (scan_input && !((n == cpy && input == src) || (n == add && input == output_y))) {
++                        users_ok = false;
++                        break;
++                    }
++                    if (input == mul && n != add) {
++                        users_ok = false;
++                        break;
++                    }
++                }
++            }
++
++            if (users_ok) {
++                output_mul  = mul;
++                output_add  = add;
++                output_skip = add_idx - node_idx;
++            }
++        }
++    }
++
+     // Do not leave any other reader of the normally-produced state tail behind.
+     // Prefix views used for y are fine; a view crossing tail_off is not.
+     for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
+@@ -2895,31 +2975,35 @@ static int ggml_cuda_try_ssm_state_writeback_fusion(
+     // A fused skip must not cross a concurrent-region boundary. It is safe
+     // inside a region only when every skipped graph node is mapped to the same
+     // stream as the scan; otherwise fall back to the ordinary scan + CPY path.
++    const ggml_tensor * fused_end = output_add != nullptr ? output_add : cpy;
++    const int fused_skip = output_add != nullptr ? output_skip : skip;
+     for (const auto & [fork_node, event] : cuda_ctx->stream_context().concurrent_events) {
+-        if (fork_node == scan || fork_node == cpy || event.join_node == scan || event.join_node == cpy) {
++        if (fork_node == scan || fork_node == cpy || fork_node == fused_end ||
++            event.join_node == scan || event.join_node == cpy || event.join_node == fused_end) {
+             return 0;
+         }
+ 
+         const auto scan_it = event.stream_mapping.find(scan);
+-        const auto cpy_it  = event.stream_mapping.find(cpy);
+-        if ((scan_it == event.stream_mapping.end()) != (cpy_it == event.stream_mapping.end())) {
+-            return 0;
+-        }
+-        if (scan_it != event.stream_mapping.end()) {
+-            if (scan_it->second != cpy_it->second) {
+-                return 0;
+-            }
+-            for (int j = node_idx + 1; j <= node_idx + skip; ++j) {
+-                const auto it = event.stream_mapping.find(cgraph->nodes[j]);
++        const bool scan_mapped = scan_it != event.stream_mapping.end();
++        for (int j = node_idx + 1; j <= node_idx + fused_skip; ++j) {
++            const auto it = event.stream_mapping.find(cgraph->nodes[j]);
++            if (scan_mapped) {
+                 if (it == event.stream_mapping.end() || it->second != scan_it->second) {
+                     return 0;
+                 }
++            } else if (it != event.stream_mapping.end()) {
++                return 0;
+             }
+         }
+     }
+ 
+     fused_cache.data = (float *) dst->data;
+-    return skip;
++    if (output_add != nullptr) {
++        GGML_ASSERT(output_mul != nullptr && output_d != nullptr);
++        fused_cache.output_d     = (const float *) output_d->data;
++        fused_cache.output_d_dst = (float *) output_add->data;
++    }
++    return fused_skip;
+ }
+ 
+ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
+@@ -3408,17 +3492,23 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     static const bool disable_ssm_state_writeback =
+         getenv("GGML_CUDA_DISABLE_SSM_STATE_WRITEBACK_FUSION") != nullptr &&
+         std::atoi(getenv("GGML_CUDA_DISABLE_SSM_STATE_WRITEBACK_FUSION"));
++    static const bool disable_ssm_output_d =
++        getenv("GGML_CUDA_DISABLE_SSM_OUTPUT_D_FUSION") != nullptr &&
++        std::atoi(getenv("GGML_CUDA_DISABLE_SSM_OUTPUT_D_FUSION"));
+     if (node->op == GGML_OP_SSM_SCAN && !disable_ssm_state_writeback) {
+         ggml_cuda_ssm_scan_fused_cache fused_cache;
+-        const int nodes_to_skip = ggml_cuda_try_ssm_state_writeback_fusion(cuda_ctx, cgraph, i, fused_cache);
++        const int nodes_to_skip = ggml_cuda_try_ssm_state_writeback_fusion(
++            cuda_ctx, cgraph, i, !disable_ssm_output_d, fused_cache);
+         if (nodes_to_skip > 0) {
+             static const bool print_stats = getenv("GGML_CUDA_SSM_STATE_WRITEBACK_STATS") != nullptr &&
+                                             std::atoi(getenv("GGML_CUDA_SSM_STATE_WRITEBACK_STATS"));
+             static std::atomic<uint64_t> n_fused{0};
+             const uint64_t count = n_fused.fetch_add(1, std::memory_order_relaxed) + 1;
+             if (print_stats && (count <= 23 || count % 23 == 0)) {
+-                GGML_LOG_INFO("%s: direct Mamba2 state writeback fire=%" PRIu64 ", bytes=%zu, node=%s\n",
+-                              __func__, count, ggml_nbytes(node->src[0]), node->name);
++                GGML_LOG_INFO("%s: direct Mamba2 state writeback fire=%" PRIu64
++                              ", bytes=%zu, output_d=%d, skipped=%d, node=%s\n",
++                              __func__, count, ggml_nbytes(node->src[0]), fused_cache.output_d != nullptr,
++                              nodes_to_skip, node->name);
+             }
+             ggml_cuda_op_ssm_scan(*cuda_ctx, node, &fused_cache);
+             return nodes_to_skip;
+diff --git a/ggml/src/ggml-cuda/ssm-scan.cu b/ggml/src/ggml-cuda/ssm-scan.cu
+index b3542e96d..0f888f8ac 100644
+--- a/ggml/src/ggml-cuda/ssm-scan.cu
++++ b/ggml/src/ggml-cuda/ssm-scan.cu
+@@ -146,6 +146,7 @@ __global__ void __launch_bounds__(d_state, 1)
+         const float * src0_ptr, const float * src1_ptr, const float * src2_ptr,
+         const float * src3_ptr, const float * src4_ptr, const float * src5_ptr,
+         const int32_t * src6_ptr, float * dst_ptr, float * state_dst_ptr,
++        const float * output_d_ptr, float * output_d_dst_ptr,
+         const int src0_nb2, const int src0_nb3, const int src1_nb2, const int src1_nb3,
+         const int src2_nb1, const int src2_nb2, const int src3_nb1,
+         const int src4_nb2, const int src4_nb3, const int src5_nb2, const int src5_nb3,
+@@ -180,7 +181,8 @@ __global__ void __launch_bounds__(d_state, 1)
+     const float * A_warp  = (const float *) ((const char *) src3 + head_idx * src3_nb1);
+     const float * B_warp  = (const float *) ((const char *) src4 + (seq_idx * src4_nb3) + (group_off));
+     const float * C_warp  = (const float *) ((const char *) src5 + (seq_idx * src5_nb3) + (group_off));
+-    float *       y_warp  = dst + (seq_idx * n_tok * n_head * d_head) + warp_idx;
++    float *       y_base  = output_d_dst_ptr != nullptr ? output_d_dst_ptr : dst;
++    float *       y_warp  = y_base + (seq_idx * n_tok * n_head * d_head) + warp_idx;
+     float *       s_base  = state_dst_ptr != nullptr ? state_dst_ptr : (float *) ((char *) dst + s_off);
+     float *       s_warp  = (float *) ((char *) s_base + seq_idx * src0_nb3 + head_idx * src0_nb2 + head_off * d_state);
+ 
+@@ -219,7 +221,22 @@ __global__ void __launch_bounds__(d_state, 1)
+         state_sum = warp_reduce_sum(state_sum);
+ 
+         if (lane == 0) {
+-            y_warp[i * stride_y] = state_sum;
++            if (output_d_ptr != nullptr) {
++                // Stock materializes x*D in one F32 bin-broadcast kernel and
++                // adds the scan output in a second one. Use explicit RN ops so
++                // this stays two rounded operations rather than contracting
++                // to an FMA after moving the work into the scan kernel.
++                float x_d = __fmul_rn(x_warp[i * stride_x], output_d_ptr[head_idx]);
++#if defined(__HIP_PLATFORM_AMD__)
++                // hipcc is invoked with unsafe-math and otherwise contracts
++                // even __fmul_rn + __fadd_rn. Make the rounded product cross
++                // an optimizer barrier, matching the stock kernel boundary.
++                asm volatile("" : "+v"(x_d));
++#endif
++                y_warp[i * stride_y] = __fadd_rn(state_sum, x_d);
++            } else {
++                y_warp[i * stride_y] = state_sum;
++            }
+         }
+     }
+ 
+@@ -232,7 +249,7 @@ __global__ void __launch_bounds__(d_state, 1)
+ 
+ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const float * src2, const float * src3,
+                               const float * src4, const float * src5, const int32_t * src6, float * dst,
+-                              float * state_dst,
++                              float * state_dst, const float * output_d, float * output_d_dst,
+                               const int src0_nb2, const int src0_nb3, const int src1_nb2, const int src1_nb3, const int src2_nb1,
+                               const int src2_nb2, const int src3_nb1, const int src4_nb2, const int src4_nb3, const int src5_nb2,
+                               const int src5_nb3, const int64_t s_off, const int64_t d_state, const int64_t head_dim,
+@@ -249,7 +266,7 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
+             ggml_cuda_kernel_launch(ssm_scan_f32_group<128/WARP_SIZE, 128>, launch_params,
+                     src0, src1, src2, src3, src4, src5, src6, dst,
+-                    state_dst,
++                    state_dst, output_d, output_d_dst,
+                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
+                     src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok);
+         } else if (d_state == 256) { // Falcon-H1
+@@ -260,7 +277,7 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
+             ggml_cuda_kernel_launch(ssm_scan_f32_group<256/WARP_SIZE, 256>, launch_params,
+                     src0, src1, src2, src3, src4, src5, src6, dst,
+-                    state_dst,
++                    state_dst, output_d, output_d_dst,
+                     src0_nb2, src0_nb3, src1_nb2, src1_nb3, src2_nb1, src2_nb2, src3_nb1,
+                     src4_nb2, src4_nb3, src5_nb2, src5_nb3, s_off, n_head, head_dim, n_group, n_tok);
+         } else {
+@@ -268,7 +285,8 @@ static void ssm_scan_f32_cuda(const float * src0, const float * src1, const floa
+         }
+     } else {
+         // Mamba-1
+-        GGML_ASSERT(state_dst == nullptr && "direct recurrent-state writeback is Mamba2-only");
++        GGML_ASSERT(state_dst == nullptr && output_d == nullptr && output_d_dst == nullptr &&
++                    "direct recurrent-state/output fusion is Mamba2-only");
+         constexpr int threads = 128;
+         GGML_ASSERT(n_head % threads == 0);
+         GGML_ASSERT(head_dim == 1);
+@@ -799,11 +817,14 @@ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+     const int32_t * src6_d = (const int32_t *) src6->data;
+     float *       dst_d  = (float *) dst->data;
+     float *       state_dst_d = cache != nullptr ? cache->data : nullptr;
++    const float * output_d_d = cache != nullptr ? cache->output_d : nullptr;
++    float *       output_d_dst_d = cache != nullptr ? cache->output_d_dst : nullptr;
+     cudaStream_t  stream = ctx.stream();
+ 
+     GGML_ASSERT(src0->type == GGML_TYPE_F32);
+     GGML_ASSERT(src6->type == GGML_TYPE_I32);
+     GGML_ASSERT(dst->type == GGML_TYPE_F32);
++    GGML_ASSERT((output_d_d == nullptr) == (output_d_dst_d == nullptr));
+ 
+     // Byte strides are narrowed to int for both scan and SSD paths.
+     GGML_ASSERT(src0->nb[2] <= (size_t)INT_MAX);
+@@ -849,7 +870,7 @@ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+     }
+ #endif
+     ssm_scan_f32_cuda(src0_d, src1_d, src2_d, src3_d, src4_d, src5_d, src6_d, dst_d,
+-                      state_dst_d,
++                      state_dst_d, output_d_d, output_d_dst_d,
+                       src0->nb[2], src0->nb[3], src1->nb[2], src1->nb[3], src2->nb[1], src2->nb[2],
+                       src3->nb[1], src4->nb[2], src4->nb[3], src5->nb[2], src5->nb[3],
+                       s_off, nc, nr, nh, ng, n_t, n_s, stream);
+diff --git a/ggml/src/ggml-cuda/ssm-scan.cuh b/ggml/src/ggml-cuda/ssm-scan.cuh
+index 115adfddc..e4d0ffa90 100644
+--- a/ggml/src/ggml-cuda/ssm-scan.cuh
++++ b/ggml/src/ggml-cuda/ssm-scan.cuh
+@@ -1,10 +1,12 @@
+ #include "common.cuh"
+ 
+-// Optional direct destination for the Mamba2 final recurrent state. When set,
+-// the scan still writes its token output to dst, but writes the state normally
+-// placed in dst's tail directly to this cache row.
++// Optional direct destinations for the Mamba2 final recurrent state and the
++// decode-only scan_y + x*D result. Null output_d/output_d_dst retains the
++// ordinary scan token output while still allowing direct state writeback.
+ struct ggml_cuda_ssm_scan_fused_cache {
+-    float * data = nullptr;
++    float       * data             = nullptr;
++    const float * output_d         = nullptr;
++    float       * output_d_dst     = nullptr;
+ };
+ 
+ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+diff --git a/src/models/mamba-base.cpp b/src/models/mamba-base.cpp
+index 3f3b256fc..330892bb3 100644
+--- a/src/models/mamba-base.cpp
++++ b/src/models/mamba-base.cpp
+@@ -2,6 +2,8 @@
+ 
+ #include "llama-memory-recurrent.h"
+ 
++#include <cstdlib>
++
+ llm_build_mamba_base::llm_build_mamba_base(const llm_graph_params & params) : llm_graph_context(params) {}
+ 
+ ggml_tensor * llm_build_mamba_base::build_mamba_layer(llm_graph_input_rs * inp,
+@@ -266,6 +268,21 @@ ggml_tensor * llm_build_mamba_base::build_mamba2_layer(llm_graph_input_rs * inp,
+         // TODO: skip computing output earlier for unused tokens
+ 
+         y = ggml_add(ctx0, y, ggml_mul(ctx0, x, model.layers[il].ssm_d));
++
++        // Keep the decode-shaped x*D -> scan_y+x*D chain adjacent to the
++        // already-expanded recurrent-state writeback.  Without this pin the
++        // independent z continuation is expanded first, so the CUDA scan
++        // fusion cannot skip the two elementwise nodes without also skipping
++        // required work.  The shared environment toggle restores both the
++        // original graph order and the stock CUDA launches for strict A/B.
++        static const bool disable_ssm_output_d_fusion = [] {
++            const char * value = std::getenv("GGML_CUDA_DISABLE_SSM_OUTPUT_D_FUSION");
++            return value != nullptr && std::atoi(value) != 0;
++        }();
++        if (!disable_ssm_output_d_fusion && n_seq_tokens == 1 && n_seqs == 1) {
++            ggml_build_forward_expand(gf, y);
++        }
++
+         cb(y, "mamba2_y_add_d", il);
+         y = ggml_swiglu_split(ctx0, ggml_cont(ctx0, z), y);
+ 
+-- 
+2.49.0.windows.1
+
+

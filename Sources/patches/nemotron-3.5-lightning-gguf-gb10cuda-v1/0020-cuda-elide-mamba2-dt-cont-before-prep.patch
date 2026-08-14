@@ -1,0 +1,202 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Code (Opus 5) <noreply@anthropic.com>
+Date: Fri, 14 Aug 2026 03:30:00 -0600
+Subject: [PATCH 20/27] cuda: elide the Mamba2 dt CONT before the decay preparation
+
+Ported from the Nemotron R9700 HIP series to the GB10 CUDA track. Both tracks
+pin llama.cpp 0b1bad14ff20 and llama.cpp's HIP backend is the CUDA backend
+source-translated, so the diff applies to ggml/src/ggml-cuda unchanged.
+
+GB10 leave-one-out: GGML_CUDA_DISABLE_SSM_DT_CONT_ELISION=1 costs 0.16%.
+---
+diff --git a/ggml/src/ggml-cuda/ssm-scan.cuh b/ggml/src/ggml-cuda/ssm-scan.cuh
+index 6450e9e98..912b38f5b 100644
+--- a/ggml/src/ggml-cuda/ssm-scan.cuh
++++ b/ggml/src/ggml-cuda/ssm-scan.cuh
+@@ -17,8 +17,9 @@ struct ggml_cuda_ssm_scan_fused_cache {
+ // pass its original inputs here; the scan then consumes the two rounded F32
+ // arrays produced by that launch.
+ struct ggml_cuda_ssm_scan_fused_dt {
+-    const float * dt_raw  = nullptr;
+-    const float * dt_bias = nullptr;
++    const float * dt_raw      = nullptr;
++    const float * dt_bias     = nullptr;
++    int64_t       dt_raw_nb0  = sizeof(float);
+ };
+ 
+ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+diff --git a/ggml/src/ggml-cuda/ssm-scan.cu b/ggml/src/ggml-cuda/ssm-scan.cu
+index 87717e86b..71d752d29 100644
+--- a/ggml/src/ggml-cuda/ssm-scan.cu
++++ b/ggml/src/ggml-cuda/ssm-scan.cu
+@@ -144,14 +144,16 @@ __global__ void __launch_bounds__(splitD, 1)
+ // head-shared transcendental values once.  Nemotron decode has one value per
+ // head, while the scan otherwise repeats this chain in all d_head warps.
+ static __global__ void ssm_dt_prepare_f32(
+-        const float * dt_raw, const float * dt_bias, const float * A,
+-        float * dt_softplus, float * dA, const int64_t n_head) {
++        const char * dt_raw, const int64_t dt_raw_nb0,
++        const float * dt_bias, const float * A,
++        float * dt_softplus, float * dA, const int64_t n_head) {
+     const int64_t head = blockIdx.x * blockDim.x + threadIdx.x;
+     if (head >= n_head) {
+         return;
+     }
+ 
+-    float dt = __fadd_rn(dt_raw[head], dt_bias[head]);
++    const float dt_value = *(const float *) (dt_raw + head*dt_raw_nb0);
++    float dt = __fadd_rn(dt_value, dt_bias[head]);
+ #if defined(__HIP_PLATFORM_AMD__)
+     // The ordinary ADD is a separate kernel.  Keep the rounded sum from being
+     // reassociated into the softplus chain under hipcc's unsafe-math flags.
+@@ -879,7 +881,8 @@ void ggml_cuda_op_ssm_scan(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+         constexpr int threads = 64;
+         const dim3 blocks((nh + threads - 1) / threads, 1, 1);
+         ssm_dt_prepare_f32<<<blocks, threads, 0, stream>>>(
+-            dt_fusion->dt_raw, dt_fusion->dt_bias, src3_d,
++            (const char *) dt_fusion->dt_raw, dt_fusion->dt_raw_nb0,
++            dt_fusion->dt_bias, src3_d,
+             prepared, prepared + nh, nh);
+         src2_d       = prepared;
+         prepared_dA_d = prepared + nh;
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 7cc1071cc..ec63eb179 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3011,9 +3011,44 @@ static int ggml_cuda_try_ssm_dt_prep_fusion(
+         const ggml_cgraph * cgraph, int node_idx, bool fuse_output_d,
+         ggml_tensor * & scan_out,
+         ggml_cuda_ssm_scan_fused_cache & fused_cache,
+-        ggml_cuda_ssm_scan_fused_dt & fused_dt) {
+-    ggml_tensor * add = cgraph->nodes[node_idx];
++        ggml_cuda_ssm_scan_fused_dt & fused_dt,
++        bool & cont_elided) {
++    ggml_tensor * first = cgraph->nodes[node_idx];
++    ggml_tensor * add = first;
++    const ggml_tensor * dt_direct = nullptr;
++    int add_idx = node_idx;
++    cont_elided = false;
++
++    // In decode, dt is a 64-element view at an offset in zxBCdt. The model
++    // unconditionally wraps it in CONT before the bias ADD even though its
++    // live one-token row has unit element stride. Execute the already-exact dt
++    // preparation while that view is live and skip the pure bit-copy launch.
++    if (first->op == GGML_OP_CONT) {
++        const ggml_tensor * cont_src = first->src[0];
++        if (first->type != GGML_TYPE_F32 || (first->flags & GGML_TENSOR_FLAG_OUTPUT) ||
++                cont_src == nullptr || cont_src->type != GGML_TYPE_F32 ||
++                first->ne[0] != 64 || first->ne[1] != 1 || first->ne[2] != 1 || first->ne[3] != 1 ||
++                !ggml_are_same_shape(cont_src, first) || !ggml_is_contiguous(first) ||
++                cont_src->nb[0] != sizeof(float) || cont_src->data == nullptr || first->data == nullptr) {
++            return 0;
++        }
++        for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
++            ggml_tensor * n = cgraph->nodes[j];
++            if (ggml_cuda_is_view_or_noop(n)) {
++                continue;
++            }
++            add = n;
++            add_idx = j;
++            break;
++        }
++        if (add == first || add->op != GGML_OP_ADD || add->src[0] != first) {
++            return 0;
++        }
++        dt_direct = cont_src;
++        cont_elided = true;
++    }
++
+     if (add->op != GGML_OP_ADD || add->type != GGML_TYPE_F32 ||
+         (add->flags & GGML_TENSOR_FLAG_OUTPUT)) {
+         return 0;
+     }
+@@ -3041,7 +3076,7 @@ static int ggml_cuda_try_ssm_dt_prep_fusion(
+     // scan makes the fusion unsafe because the loop will skip the full range.
+     int scan_idx = -1;
+     ggml_tensor * scan = nullptr;
+-    for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
++    for (int j = add_idx + 1; j < cgraph->n_nodes; ++j) {
+         ggml_tensor * n = cgraph->nodes[j];
+         if (ggml_cuda_is_view_or_noop(n)) {
+             continue;
+@@ -3070,6 +3105,23 @@ static int ggml_cuda_try_ssm_dt_prep_fusion(
+         return 0;
+     }
+ 
++    // The skipped CONT must likewise have exactly one reader: the ADD. No
++    // allocation-lifetime extension is required because the fused preparation
++    // launch consumes dt_direct at the CONT graph position itself.
++    if (cont_elided) {
++        int cont_users = 0;
++        for (int j = node_idx + 1; j < cgraph->n_nodes; ++j) {
++            for (int k = 0; k < GGML_MAX_SRC; ++k) {
++                if (cgraph->nodes[j]->src[k] == first) {
++                    ++cont_users;
++                }
++            }
++        }
++        if (cont_users != 1) {
++            return 0;
++        }
++    }
++
+     const int scan_skip = ggml_cuda_try_ssm_state_writeback_fusion(
+         cuda_ctx, cgraph, scan_idx, fuse_output_d, fused_cache);
+     if (scan_skip <= 0) {
+@@ -3098,7 +3150,8 @@ static int ggml_cuda_try_ssm_dt_prep_fusion(
+     }
+ 
+     scan_out        = scan;
+-    fused_dt.dt_raw = (const float *) dt_raw->data;
++    fused_dt.dt_raw = (const float *) (cont_elided ? dt_direct->data : dt_raw->data);
+     fused_dt.dt_bias = (const float *) dt_bias->data;
++    fused_dt.dt_raw_nb0 = cont_elided ? dt_direct->nb[0] : dt_raw->nb[0];
+     return (scan_idx - node_idx) + scan_skip;
+ }
+@@ -4163,17 +4216,22 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+     static const bool disable_ssm_dt_prep =
+         getenv("GGML_CUDA_DISABLE_SSM_DT_PREP_FUSION") != nullptr &&
+         std::atoi(getenv("GGML_CUDA_DISABLE_SSM_DT_PREP_FUSION"));
++    static const bool disable_ssm_dt_cont =
++        getenv("GGML_CUDA_DISABLE_SSM_DT_CONT_ELISION") != nullptr &&
++        std::atoi(getenv("GGML_CUDA_DISABLE_SSM_DT_CONT_ELISION"));
+ 
+     // Nemotron Mamba2 decode: the dt+bias ADD is the last real dependency
+     // before SSM_SCAN. Replace it with one head-wise preparation launch and
+     // issue the existing direct-state/output-D scan fusion immediately after.
+     // Disabling only this path retains all earlier fusions in the same binary.
+-    if (node->op == GGML_OP_ADD && !disable_ssm_dt_prep && !disable_ssm_state_writeback) {
++    if ((node->op == GGML_OP_ADD || (node->op == GGML_OP_CONT && !disable_ssm_dt_cont)) &&
++            !disable_ssm_dt_prep && !disable_ssm_state_writeback) {
+         ggml_tensor * scan = nullptr;
+         ggml_cuda_ssm_scan_fused_cache fused_cache;
+         ggml_cuda_ssm_scan_fused_dt fused_dt;
++        bool cont_elided = false;
+         const int nodes_to_skip = ggml_cuda_try_ssm_dt_prep_fusion(
+-            cuda_ctx, cgraph, i, !disable_ssm_output_d, scan, fused_cache, fused_dt);
++            cuda_ctx, cgraph, i, !disable_ssm_output_d, scan, fused_cache, fused_dt, cont_elided);
+         if (nodes_to_skip > 0) {
+             static const bool print_stats = getenv("GGML_CUDA_SSM_DT_PREP_STATS") != nullptr &&
+                                             std::atoi(getenv("GGML_CUDA_SSM_DT_PREP_STATS"));
+@@ -4181,8 +4239,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             const uint64_t count = n_fused.fetch_add(1, std::memory_order_relaxed) + 1;
+             if (print_stats && (count <= 23 || count % 23 == 0)) {
+                 GGML_LOG_INFO("%s: Mamba2 dt preparation fire=%" PRIu64
+-                              ", heads=%" PRId64 ", skipped=%d, scan=%s\n",
+-                              __func__, count, scan->src[1]->ne[1], nodes_to_skip, scan->name);
++                              ", heads=%" PRId64 ", skipped=%d, cont_elided=%d, scan=%s\n",
++                              __func__, count, scan->src[1]->ne[1], nodes_to_skip, cont_elided, scan->name);
++            }
++            if (cont_elided) {
++                static const bool print_cont_stats = getenv("GGML_CUDA_SSM_DT_CONT_STATS") != nullptr &&
++                                                     std::atoi(getenv("GGML_CUDA_SSM_DT_CONT_STATS"));
++                static std::atomic<uint64_t> n_cont_elided{0};
++                const uint64_t cont_count = n_cont_elided.fetch_add(1, std::memory_order_relaxed) + 1;
++                if (print_cont_stats && (cont_count <= 23 || cont_count % 23 == 0)) {
++                    GGML_LOG_INFO("%s: Mamba2 dt CONT elision fire=%" PRIu64 ", skipped=%d, scan=%s\n",
++                                  __func__, cont_count, nodes_to_skip, scan->name);
++                }
+             }
+             ggml_cuda_op_ssm_scan(*cuda_ctx, scan, &fused_cache, &fused_dt);
+             return nodes_to_skip;
+

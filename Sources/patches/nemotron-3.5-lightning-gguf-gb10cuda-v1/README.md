@@ -1,10 +1,22 @@
 # nemotron-3.5-lightning-gguf-gb10cuda-v1
 
 Patch series for Nemotron 3.5 Lightning 30B-A3B (Q4_K_M) on the DGX Spark GB10,
-via llama.cpp CUDA. Empty today — newly commissioned.
+via llama.cpp CUDA.
+
+The series is 0001-0002 (server/graph prompt-side, measured on this box) plus
+0003-0027, a port of the Nemotron R9700 HIP series. llama.cpp's HIP backend is
+the CUDA backend source-translated and both tracks pin the same engine commit,
+so those diffs apply to `ggml/src/ggml-cuda` unchanged; the two CUDA-specific
+patches the port needed are 0026 (an RDNA4-only gate that made one fusion dead
+code on sm_121) and 0027 (the q8_1 reuse cache frees out of order, which the
+CUDA VMM pool asserts on and the HIP leg pool tolerates).
+
+R9700 patch 0009, adaptive prompt-cache admission, is deliberately NOT ported:
+the llama.cpp bench harness sends `cache_prompt: false` on every request, so
+the lever cannot fire and there is nothing to measure.
 
 **This track does not build the platform default engine.** It pins llama.cpp at
-`7a20b417f452` rather than `b10237`, for the same reason its R9700 twin does:
+`0b1bad14ff20` rather than `b10237`, for the same reason its R9700 twin does:
 the ggml-org GGUF was converted after upstream reworked the `nemotron_h_moe`
 tensor layout, and the older tree refuses it with
 

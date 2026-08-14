@@ -1,0 +1,49 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Code (Opus 5) <noreply@anthropic.com>
+Date: Fri, 14 Aug 2026 03:30:00 -0600
+Subject: [PATCH 08/27] cuda: allow the exact in-place Nemotron activation co-launch
+
+Ported from the Nemotron R9700 HIP series to the GB10 CUDA track. Both tracks
+pin llama.cpp 0b1bad14ff20 and llama.cpp's HIP backend is the CUDA backend
+source-translated, so the diff applies to ggml/src/ggml-cuda unchanged.
+
+Admits the in-place case the co-launch predicate previously rejected.
+---
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index f3b8b004b..71189a157 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3454,9 +3454,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             ggml_is_contiguous(shared_relu->src[0]) && ggml_is_contiguous(shared_sqr) &&
+             ggml_is_contiguous(routed_relu->src[0]) && ggml_is_contiguous(routed_sqr);
+ 
++        const auto disjoint_ranges = [](const ggml_tensor * a, const ggml_tensor * b) {
++            const uintptr_t a0 = (uintptr_t) a->data;
++            const uintptr_t b0 = (uintptr_t) b->data;
++            const uintptr_t a1 = a0 + ggml_backend_buft_get_alloc_size(a->buffer->buft, a);
++            const uintptr_t b1 = b0 + ggml_backend_buft_get_alloc_size(b->buffer->buft, b);
++            return a1 <= b0 || b1 <= a0;
++        };
++        // Both stock ReLU^2 chains are deliberately in-place: each output owns
++        // exactly the allocation of its input.  The general fusion-memory
++        // checker rejects that self-alias, so prove the narrower condition here:
++        // own-chain identity is allowed, cross-chain ranges must be disjoint.
++        const bool alias_ok = shared_sqr->data == shared_relu->src[0]->data &&
++                              routed_sqr->data == routed_relu->src[0]->data &&
++                              ggml_backend_buft_get_alloc_size(shared_sqr->buffer->buft, shared_sqr) ==
++                                  ggml_backend_buft_get_alloc_size(shared_relu->src[0]->buffer->buft, shared_relu->src[0]) &&
++                              ggml_backend_buft_get_alloc_size(routed_sqr->buffer->buft, routed_sqr) ==
++                                  ggml_backend_buft_get_alloc_size(routed_relu->src[0]->buffer->buft, routed_relu->src[0]) &&
++                              disjoint_ranges(shared_sqr, routed_sqr);
++
+         if (chain_ok && shape_ok &&
+                 ggml_can_fuse_subgraph(cgraph, i, 4, ops, out_nodes, 2) &&
+-                ggml_cuda_check_fusion_memory_ranges(cgraph, i, 4, out_nodes, 2)) {
++                alias_ok) {
+             cudaStream_t stream = cuda_ctx->stream();
+             const int64_t ne10 = shared_sqr->ne[0];
+             const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+-- 
+2.49.0.windows.1
+
+

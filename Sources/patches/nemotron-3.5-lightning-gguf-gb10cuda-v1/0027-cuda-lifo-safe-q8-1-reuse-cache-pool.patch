@@ -1,0 +1,152 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Code (Opus 5) <noreply@anthropic.com>
+Date: Fri, 14 Aug 2026 03:30:00 -0600
+Subject: [PATCH 27/27] cuda: give the q8_1 reuse cache a pool it can free in LIFO order
+
+Patch 0004's cache holds pool suballocations across many graph nodes and
+releases them from the middle of the vector: the oldest entry on capacity
+eviction, and arbitrary matches on view invalidation. ggml_cuda_pool_vmm,
+which CUDA selects whenever VMM is available and GB10 does, asserts that
+every free is the top of its suballocation stack:
+
+  GGML_ASSERT(ptr == (void *) ((char *)(pool_addr) + pool_used)) failed
+  ggml_cuda_pool_vmm::free -> ggml_cuda_quantized_src1_cache::insert
+
+The HIP build never reached this because it does not take the VMM pool, and
+the leg pool tolerates out-of-order frees. The full series aborts on the
+first decode step on CUDA without this patch.
+
+Two changes, both structural rather than tuning. Give the cache its own pool
+so it never interleaves with dispatch scratch, and make every removal path
+release back to front: capacity eviction drops the whole cache, and view
+invalidation drops the oldest affected entry together with everything
+allocated after it. Dropping a still-valid suffix only costs a re-quantize.
+---
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 407399b1..2be5e0cf 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1262,8 +1262,14 @@ struct ggml_cuda_quantized_src1_cache {
+ 
+     std::vector<std::unique_ptr<ggml_cuda_quantized_src1_entry>> entries;
+ 
++    // Buffers come from a dedicated pool (ggml_backend_cuda_context::q8_1_pool).
++    // ggml_cuda_pool_vmm, which CUDA uses whenever VMM is available, asserts
++    // that every free is the top of its suballocation stack, so every removal
++    // path here has to release in reverse allocation order.
+     void clear() {
+-        entries.clear();
++        while (!entries.empty()) {
++            entries.pop_back();
++        }
+     }
+ 
+     // Drop entries whose source contents may be modified by `node`, an op that
+@@ -1275,9 +1281,18 @@ struct ggml_cuda_quantized_src1_cache {
+         }
+         // view_src always points at the root of the chain, flatten defensively anyway:
+         const ggml_tensor * origin = node->view_src->view_src != nullptr ? node->view_src->view_src : node->view_src;
+-        entries.erase(std::remove_if(entries.begin(), entries.end(),
+-            [origin](const std::unique_ptr<ggml_cuda_quantized_src1_entry> & e) { return e->origin == origin; }),
+-            entries.end());
++        // Drop the oldest invalidated entry and everything allocated after it.
++        // Erasing only the matches would free below live suballocations.
++        size_t first = entries.size();
++        for (size_t i = 0; i < entries.size(); ++i) {
++            if (entries[i]->origin == origin) {
++                first = i;
++                break;
++            }
++        }
++        while (entries.size() > first) {
++            entries.pop_back();
++        }
+     }
+ 
+     const char * find(const ggml_tensor * src1, cudaStream_t stream,
+@@ -1298,7 +1313,7 @@ struct ggml_cuda_quantized_src1_cache {
+             const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+             const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, const size_t size) {
+         if (entries.size() >= max_entries) {
+-            entries.erase(entries.begin());
++            clear();
+         }
+         auto e = std::make_unique<ggml_cuda_quantized_src1_entry>(pool, size);
+         e->origin = src1->view_src != nullptr ? src1->view_src : src1;
+@@ -1633,6 +1648,20 @@ struct ggml_backend_cuda_context {
+     ggml_cuda_pool & pool() {
+         return pool(device);
+     }
++
++    // Dedicated pool for the q8_1 reuse cache.  Cache buffers outlive the
++    // dispatch that allocates them, so mixing them into the general pool
++    // interleaves long-lived and scratch suballocations and breaks the LIFO
++    // discipline ggml_cuda_pool_vmm enforces.  A separate pool holds nothing
++    // but cache entries, so releasing them back-to-front is always legal.
++    std::unique_ptr<ggml_cuda_pool> q8_1_pools[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_STREAMS];
++
++    ggml_cuda_pool & q8_1_pool() {
++        if (q8_1_pools[device][curr_stream_no] == nullptr) {
++            q8_1_pools[device][curr_stream_no] = new_pool_for_device(device, curr_stream_no);
++        }
++        return *q8_1_pools[device][curr_stream_no];
++    }
+ };
+ 
+ struct ggml_cuda_mm_fusion_args_host {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 88b24189..222ff40d 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3852,7 +3852,7 @@ static char * ggml_cuda_norm_quant_register(ggml_backend_cuda_context * ctx,
+     }
+ 
+     const size_t size_q8_1 = consumer->ne[3]*consumer->ne[2] * consumer->ne[1]*ne10_padded * sizeof(block_q8_1)/QK8_1;
+-    return ctx->quantized_src1_cache.insert(ctx->pool(), consumer, stream,
++    return ctx->quantized_src1_cache.insert(ctx->q8_1_pool(), consumer, stream,
+         ne10, s11, s12, s13, ne10_padded,
+         consumer->ne[1], consumer->ne[2], consumer->ne[3], size_q8_1);
+ }
+@@ -4920,7 +4920,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+             const int64_t s13 = shared_sqr->nb[3] / ggml_type_size(shared_sqr->type);
+             const size_t size_q8_1 = ne10_padded * sizeof(block_q8_1) / QK8_1;
+             char * shared_q8_dst = cuda_ctx->quantized_src1_cache.insert(
+-                cuda_ctx->pool(), shared_sqr, stream,
++                cuda_ctx->q8_1_pool(), shared_sqr, stream,
+                 ne10, s11, s12, s13, ne10_padded, 1, 1, 1, size_q8_1);
+ 
+             const int64_t routed_ne10 = routed_sqr->ne[0];
+@@ -4933,7 +4933,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+                 const size_t routed_size_q8_1 = routed_sqr->ne[3] * routed_sqr->ne[2] * routed_sqr->ne[1] *
+                     routed_ne10_padded * sizeof(block_q8_1) / QK8_1;
+                 routed_q8_dst = cuda_ctx->quantized_src1_cache.insert(
+-                    cuda_ctx->pool(), routed_sqr, stream,
++                    cuda_ctx->q8_1_pool(), routed_sqr, stream,
+                     routed_ne10, routed_s11, routed_s12, routed_s13, routed_ne10_padded,
+                     routed_sqr->ne[1], routed_sqr->ne[2], routed_sqr->ne[3], routed_size_q8_1);
+ 
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index cc6e81d0..6447c0fe 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1586,7 +1586,7 @@ void ggml_cuda_mul_mat_vec_q(
+             src1_q8_1 = ctx.quantized_src1_cache.find(src1, stream, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13);
+             if (src1_q8_1 == nullptr) {
+                 char * dst_q8_1 = ctx.quantized_src1_cache.insert(
+-                    ctx.pool(), src1, stream, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, size_q8_1);
++                    ctx.q8_1_pool(), src1, stream, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, size_q8_1);
+                 quantize_row_q8_1_cuda(src1_d, nullptr, dst_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+                 src1_q8_1 = dst_q8_1;
+             }
+@@ -1657,7 +1657,7 @@ void ggml_cuda_mul_mat_vec_q(
+                     g_ne10, g_s11_src, g_s12_src, g_s13_src, g_ne10_padded,
+                     g1->ne[1], g1->ne[2], g1->ne[3]);
+                 if (g_q8_1 == nullptr) {
+-                    char * q8 = ctx.quantized_src1_cache.insert(ctx.pool(), g1, stream,
++                    char * q8 = ctx.quantized_src1_cache.insert(ctx.q8_1_pool(), g1, stream,
+                         g_ne10, g_s11_src, g_s12_src, g_s13_src, g_ne10_padded,
+                         g1->ne[1], g1->ne[2], g1->ne[3], g_size_q8_1);
+                     quantize_row_q8_1_cuda((const float *) g1->data, nullptr, q8, g0->type,
+-- 
+2.43.0
+
