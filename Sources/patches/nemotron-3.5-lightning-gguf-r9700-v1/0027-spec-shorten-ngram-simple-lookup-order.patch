@@ -1,0 +1,34 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Code <noreply@anthropic.com>
+Date: Sat, 15 Aug 2026 07:00:00 +0000
+Subject: [PATCH] spec: shorten the ngram-simple lookup order for Nemotron-3.5
+
+diff --git a/common/common.h b/common/common.h
+index d485d4fb4..80f654920 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -373,7 +373,23 @@ struct common_params_speculative {
+     common_params_speculative_draft draft;
+ 
+     common_params_speculative_ngram_mod ngram_mod;
+-    common_params_speculative_ngram_map ngram_simple;
++    // Prompt-lookup drafting order for `--spec-type ngram-simple`.
++    //
++    // The shared default of 12 is a conservative choice that suppresses
++    // mispredictions on models whose continuations rarely quote their own
++    // context. On Nemotron-3.5-Lightning the binding constraint is the
++    // opposite one: greedy continuations reproduce long verbatim spans of the
++    // prompt, and a 12-token key simply fails to find them. Shortening the key
++    // raises the hit rate at no measured accuracy cost, because every proposed
++    // block is still verified by the target before it is emitted.
++    //
++    // Measured on the R9700 over the nine ranked prompts, decode against the
++    // same binary with speculation off: 16 -> +14.8%, 12 -> +15.6%, 10 -> +18.2%,
++    // 8 -> +19.2%, 6 -> +19.2%. The floor is at 8, not 6: at 6 the key stops
++    // being selective, drafts start being rejected, and a rejection both costs a
++    // full recurrent-state checkpoint and perturbs the numerics of the target
++    // itself (4 of 16 completions changed at 6; 0 of 16 at 8).
++    common_params_speculative_ngram_map ngram_simple = { /* size_n */ 8, /* size_m */ 48, /* min_hits */ 1 };
+     common_params_speculative_ngram_map ngram_map_k;
+     common_params_speculative_ngram_map ngram_map_k4v;
+ 
