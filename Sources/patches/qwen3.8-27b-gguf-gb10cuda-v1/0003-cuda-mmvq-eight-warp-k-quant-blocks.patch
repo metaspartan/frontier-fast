@@ -1,0 +1,28 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 3ec9e2361..9e9d38bf4 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -353,6 +353,23 @@ static constexpr __device__ int get_mmvq_mmid_max_batch_for_device() {
+ 
+ static constexpr __host__ __device__ int calc_nwarps(ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id) {
+     if (table_id == MMVQ_PARAMETERS_GENERIC) {
++        // Eight-warp blocks for the K-quants at batch 1. Block width sets how much
++        // of a weight row a block consumes per K-loop iteration -- 2*nwarps
++        // super-blocks -- and on GB10 the wider fetch is worth several percent of
++        // achievable read bandwidth. It only pays in company with the launch bound
++        // in 0002: at 256 threads the stock register budget fits four or five
++        // resident blocks, and the occupancy lost that way cancels the wider fetch.
++        // Measured on this device the pair is a win where each half alone is not.
++        if (ncols_dst == 1) {
++            switch (type) {
++                case GGML_TYPE_Q4_K:
++                case GGML_TYPE_Q5_K:
++                case GGML_TYPE_Q6_K:
++                    return 8;
++                default:
++                    break;
++            }
++        }
+         switch (ncols_dst) {
+             case 1:
+             case 2:

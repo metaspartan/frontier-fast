@@ -1,0 +1,35 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 0589e65bd..3ec9e2361 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -477,8 +477,29 @@ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int
+     return 1;
+ }
+ 
++// The GB10 SM holds 1536 threads but the register file, not the scheduler, sets
++// residency: at the 48 registers ptxas picks for the K-quant batch-1 matvec only
++// 10 of the 12 possible 128-thread blocks fit, so 40 of 48 warp slots are used.
++// Naming the full block count makes ptxas target the 40-register budget that 100%
++// occupancy allows. It fits without spilling, and the extra warps are what keep
++// enough loads in flight to feed a kernel bound by memory-level parallelism.
++static constexpr __host__ __device__ int calc_mmvq_min_blocks(
++        ggml_type type, int ncols_dst, mmvq_parameter_table_id table_id, bool small_k) {
++#if defined(GGML_USE_HIP)
++    GGML_UNUSED_VARS(type, ncols_dst, table_id, small_k);
++    return 1;
++#else
++    if (ncols_dst != 1 || small_k) {
++        return 1;
++    }
++    const int nthreads = calc_nwarps(type, ncols_dst, table_id) * 32;
++    return nthreads > 0 && nthreads <= 1536 ? 1536 / nthreads : 1;
++#endif
++}
++
+ template <ggml_type type, int ncols_dst, bool has_fusion, bool small_k = false>
+-__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(), 1)
++__launch_bounds__(calc_nwarps(type, ncols_dst, get_device_table_id())*ggml_cuda_get_physical_warp_size(),
++                  calc_mmvq_min_blocks(type, ncols_dst, get_device_table_id(), small_k))
+ static __global__ void mul_mat_vec_q(
+         const void * vx_ptr, const void * vy_ptr, const int32_t * ids_ptr, const ggml_cuda_mm_fusion_args_device fusion, float * dst_ptr,
+         const uint32_t ncols_x, const uint3 nchannels_y, const uint32_t stride_row_x, const uint32_t stride_col_y,
