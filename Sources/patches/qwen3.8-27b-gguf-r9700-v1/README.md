@@ -46,11 +46,26 @@ inflates your denominator and will make your kernel look better than it is.
 
 ## Where to look first
 
-Nobody has profiled this track yet, so the honest answer is "measure before you
-patch". Two cheap things that would help everyone:
+Both censuses that used to be listed here as open have now been done, so start
+from their numbers rather than re-buying them.
 
-- A **byte census** from the GGUF tensor table, *including* the linear-attention
-  recurrent and conv state, so the roofline stops being weights-only.
-- A **dispatch census** per decoded token. On this box a dispatch costs ~2.08 µs,
-  so 1% of decode is about 20 launches — that ratio tells you immediately whether
-  launch structure or bandwidth is the lever here.
+- **Dispatch census: ~1462 per decoded token** (`rocprofv3 --kernel-trace`,
+  ordered by `Dispatch_Id`, full template names — timestamp order interleaves
+  two queues and gives garbage).
+- **What a dispatch is worth.** One costs ~2.08 µs here and a decoded token is
+  ~33 ms, so **~160 launches buy 1% of decode**. Deleting *every* launch in the
+  token would therefore buy ~9%. That bounds launch-structure work on this
+  track: it is a real lever, unlike on the GB10 twin, but it is not unlimited.
+  (An earlier version of this file said "about 20 launches". That was a
+  small-model constant carried onto a dense 27B and it was wrong by roughly 8x.
+  The ratio is `0.01 x token_duration / dispatch_cost` — compute it against the
+  decode rate you are actually measuring, do not inherit it. The same error was
+  corrected on the GB10 twin's README and should have been corrected here at the
+  same time.)
+- **Byte census: ~16.74 GB per token**, trunk only. It is already wired into the
+  published roofline, so `fractionOfRoof` on this track means what it says.
+
+Priced and declined, so you do not have to: folding the two `l2_norm` launches
+(~96/token) into `gated_delta_net` is the same shape as the gate/beta fold that
+landed, but `l2_norm` runs 16 workgroups against GDN's 48, so the consumer would
+recompute each reduction 3x. Price that grid ratio before building it.
