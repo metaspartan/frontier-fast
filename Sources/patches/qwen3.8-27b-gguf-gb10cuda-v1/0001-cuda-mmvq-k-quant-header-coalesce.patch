@@ -1,0 +1,116 @@
+diff --git a/ggml/src/ggml-cuda/vecdotq.cuh b/ggml/src/ggml-cuda/vecdotq.cuh
+index 0f039c73..3894ee7e 100644
+--- a/ggml/src/ggml-cuda/vecdotq.cuh
++++ b/ggml/src/ggml-cuda/vecdotq.cuh
+@@ -907,6 +907,25 @@ static __device__ __forceinline__ float vec_dot_q3_K_q8_1(
+     return vec_dot_q3_K_q8_1_impl_mmvq(vl, vh, u, bq3_K->scales, scale_offset, d, d8);
+ }
+ 
++
++// The 16 bytes at the start of a block_q4_K / block_q5_K are a contiguous
++// header: ggml_half2 dm followed by the twelve 6-bit-packed scale/min bytes.
++// Fetching it with one 128-bit load and picking the needed words out of
++// registers replaces three to four narrow global loads per super-block, each of
++// which every thread of the lane group issued for the same bytes. These helpers
++// do the register-side selection; the arithmetic that consumes them is
++// unchanged, so results are bit-identical.
++static __device__ __forceinline__ uint16_t ggml_cuda_k_hdr_scale16(
++        const int hy, const int hz, const int hw, const int k) {
++    const int s = k < 2 ? hy : (k < 4 ? hz : hw);
++    return (uint16_t) ((k & 1) ? (((unsigned int) s) >> 16) : ((unsigned int) s));
++}
++
++static __device__ __forceinline__ half2 ggml_cuda_k_hdr_dm(const int hx) {
++    return __halves2half2(__ushort_as_half((unsigned short)  (((unsigned int) hx)        & 0xffff)),
++                          __ushort_as_half((unsigned short)  (((unsigned int) hx) >> 16)         ));
++}
++
+ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
+     const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs) {
+ 
+@@ -916,6 +935,11 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
+     int    u[2*QR4_K];
+     float d8[QR4_K];
+ 
++    // dm + scales[12] is a contiguous 16-byte header at offset 0. Every block is
++    // 16-byte aligned: the CUDA buffer alignment is 128 and sizeof(block_q4_K)
++    // is 144 = 9*16, so base + 144*kbx stays 16-byte aligned for every kbx.
++    const int4 hdr = *((const int4 *) bq4_K);
++
+     // iqs is in 0,2..30. bq8_offset = iqs/4 -> bq8_offset = 0, 2, 4, 6
+     const int bq8_offset = QR4_K * ((iqs/2) / (QI8_1/2));
+ 
+@@ -928,15 +952,16 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
+     v[0] = q4[0];
+     v[1] = q4[4];
+ 
+-    const uint16_t * scales = (const uint16_t *)bq4_K->scales;
+     uint16_t aux[2];
+     const int j = bq8_offset/2;
+     if (j < 2) {
+-        aux[0] = scales[j+0] & 0x3f3f;
+-        aux[1] = scales[j+2] & 0x3f3f;
++        aux[0] = ggml_cuda_k_hdr_scale16(hdr.y, hdr.z, hdr.w, j+0) & 0x3f3f;
++        aux[1] = ggml_cuda_k_hdr_scale16(hdr.y, hdr.z, hdr.w, j+2) & 0x3f3f;
+     } else {
+-        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+-        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
++        aux[0] = ((ggml_cuda_k_hdr_scale16(hdr.y, hdr.z, hdr.w, j+2) >> 0) & 0x0f0f)
++               | ((ggml_cuda_k_hdr_scale16(hdr.y, hdr.z, hdr.w, j-2) & 0xc0c0) >> 2);
++        aux[1] = ((ggml_cuda_k_hdr_scale16(hdr.y, hdr.z, hdr.w, j+2) >> 4) & 0x0f0f)
++               | ((ggml_cuda_k_hdr_scale16(hdr.y, hdr.z, hdr.w, j-0) & 0xc0c0) >> 2);
+     }
+     const uint8_t * sc = (const uint8_t *)aux;
+     const uint8_t * m  = sc + 2;
+@@ -950,7 +975,7 @@ static __device__ __forceinline__ float vec_dot_q4_K_q8_1(
+         u[2*i+1] = q8[4];
+     }
+ 
+-    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, bq4_K->dm, d8);
++    return vec_dot_q4_K_q8_1_impl_vmmq(v, u, sc, m, ggml_cuda_k_hdr_dm(hdr.x), d8);
+ }
+ 
+ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
+@@ -963,6 +988,11 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
+     int    u[2*QR5_K];
+     float d8[QR5_K];
+ 
++    // Same 16-byte dm+scales header as block_q4_K, and sizeof(block_q5_K) is
++    // 176 = 11*16, so every block is 16-byte aligned under the 128-byte CUDA
++    // buffer alignment.
++    const int4 hdr = *((const int4 *) bq5_K);
++
+     const int bq8_offset = QR5_K * ((iqs/2) / (QI8_1/2));
+     const int * ql = (const int *)(bq5_K->qs + 16 * bq8_offset + 4 * ((iqs/2)%4));
+     const int * qh = (const int *)(bq5_K->qh + 4 * ((iqs/2)%4));
+@@ -973,15 +1003,16 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
+     vh[0] = qh[0] >> bq8_offset;
+     vh[1] = qh[4] >> bq8_offset;
+ 
+-    const uint16_t * scales = (const uint16_t *)bq5_K->scales;
+     uint16_t aux[2];
+     const int j = bq8_offset/2;
+     if (j < 2) {
+-        aux[0] = scales[j+0] & 0x3f3f;
+-        aux[1] = scales[j+2] & 0x3f3f;
++        aux[0] = ggml_cuda_k_hdr_scale16(hdr.y, hdr.z, hdr.w, j+0) & 0x3f3f;
++        aux[1] = ggml_cuda_k_hdr_scale16(hdr.y, hdr.z, hdr.w, j+2) & 0x3f3f;
+     } else {
+-        aux[0] = ((scales[j+2] >> 0) & 0x0f0f) | ((scales[j-2] & 0xc0c0) >> 2);
+-        aux[1] = ((scales[j+2] >> 4) & 0x0f0f) | ((scales[j-0] & 0xc0c0) >> 2);
++        aux[0] = ((ggml_cuda_k_hdr_scale16(hdr.y, hdr.z, hdr.w, j+2) >> 0) & 0x0f0f)
++               | ((ggml_cuda_k_hdr_scale16(hdr.y, hdr.z, hdr.w, j-2) & 0xc0c0) >> 2);
++        aux[1] = ((ggml_cuda_k_hdr_scale16(hdr.y, hdr.z, hdr.w, j+2) >> 4) & 0x0f0f)
++               | ((ggml_cuda_k_hdr_scale16(hdr.y, hdr.z, hdr.w, j-0) & 0xc0c0) >> 2);
+     }
+     const uint8_t * sc = (const uint8_t *)aux;
+     const uint8_t * m  = sc + 2;
+@@ -996,7 +1027,7 @@ static __device__ __forceinline__ float vec_dot_q5_K_q8_1(
+         u[2*i+1] = q8[4];
+     }
+ 
+-    return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, bq5_K->dm, d8);
++    return vec_dot_q5_K_q8_1_impl_vmmq(vl, vh, u, sc, m, ggml_cuda_k_hdr_dm(hdr.x), d8);
+ }
+ 
+ static __device__ __forceinline__ float vec_dot_q6_K_q8_1(
