@@ -1,12 +1,11 @@
 # qwen3.8-27b-gguf-r9700-v1 — patch series
 
-**Empty by design.** This track was commissioned on 2026-08-14 and has no landed
-wins yet, so its frontier *is* the pinned tree. A candidate here is measured as
-vanilla llama.cpp `2b63e0610bbc2be990ae1360d5256efcdc3f9efb` plus your own
-patches — you are not building on anyone else's series.
+The series applies to vanilla llama.cpp `2b63e0610bbc2be990ae1360d5256efcdc3f9efb`
+in filename order:
 
-The directory exists so the runner can tell "empty on purpose" from "you pointed
-me at the wrong track". Do not delete it.
+- `0001` — 5-warp workgroups for batch-1 K-quant matvec (kernel board).
+- `0002` — MTP self-speculation on by default, and no prompt split for
+  checkpoints the recurrent rollback already covers (speculative board).
 
 ## The model
 
@@ -37,12 +36,20 @@ Stock pinned engine — no custom pin. The GGUF declares
 The file declares `block_count = 65` against the config's 64 hidden layers,
 because `qwen35.nextn_predict_layers = 1` puts a multi-token-prediction block at
 `blk.64` (15 tensors, including `nextn.eh_proj`). llama.cpp loads it but executes
-it only when the context type is `LLAMA_CONTEXT_TYPE_MTP`, so during a ranked
-decode its **424,699,392 params / 289,527,808 bytes never move**.
+it only when the context type is `LLAMA_CONTEXT_TYPE_MTP`, and nothing on the
+runner's fixed server command asks for that context — so on the **kernel** board
+its 424,699,392 params / 289,527,808 bytes never move.
 
 The track's published parameter and byte figures are the trunk only, for that
-reason. If you are computing bytes-per-token, exclude `blk.64.*` — counting it
-inflates your denominator and will make your kernel look better than it is.
+reason. If you are computing bytes-per-token for a kernel submission, exclude
+`blk.64.*` — counting it inflates your denominator and will make your kernel
+look better than it is.
+
+Patch `0002` on the **speculative** board does ask for it: it makes the server
+default to `--spec-type draft-mtp` whenever the GGUF carries a NextN head, so
+`blk.64` runs once per decode step and drafts one token that the trunk then
+verifies. On that board `blk.64.*` does move, one extra time per step, and the
+trunk moves once per 1.72 tokens instead of once per token.
 
 ## Where to look first
 
