@@ -1,0 +1,32 @@
+diff --git a/ggml/src/ggml-cuda/mmq-config-blackwell.cuh b/ggml/src/ggml-cuda/mmq-config-blackwell.cuh
+index 9fbe32b..05a24c0 100644
+--- a/ggml/src/ggml-cuda/mmq-config-blackwell.cuh
++++ b/ggml/src/ggml-cuda/mmq-config-blackwell.cuh
+@@ -33,5 +33,27 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
+     CASE(GGML_TYPE_NVFP4, 256, 1, 128, 112, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
+     CASE(GGML_TYPE_NVFP4, 256, 1, 128, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_FP4, MMQ_ITER_K_FP4, true, false);
+ 
++
++    // sm_120+: run the K-quant J=128 tile as two blocks per SM.
++    // The generic Ampere shape reached by the fall-through below (256 threads,
++    // launch_bounds(256, 1), I=128) compiles to 255 registers per thread, and
++    // 255*256 = 65280 of the 65536 registers on an SM, so exactly one block is
++    // resident. MMQ does not double-buffer its shared memory tiles with cp.async,
++    // so a single resident block makes every tile load a full-SM stall: the MMA
++    // pipes idle through each load and the loads idle through each MMA.
++    // Accumulators per thread are I*J/nthreads, so halving the block and I
++    // together holds them at 64 and the register count at 255, while making room
++    // for a second block: 2*128*255 = 65280 registers and 2*37.5 = 75 KiB of the
++    // 100 KiB of shared memory per SM. Resident warps are unchanged at 8. What
++    // changes is that the two blocks reach their __syncthreads() independently,
++    // so the MMA of one covers the tile load of the other. This is the same
++    // block shape the RDNA3 and RDNA4 tables already use.
++    CASE(GGML_TYPE_Q4_K, 128, 2, 64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, true);
++    CASE(GGML_TYPE_Q4_K, 128, 2, 64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_Q5_K, 128, 2, 64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, true);
++    CASE(GGML_TYPE_Q5_K, 128, 2, 64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
++    CASE(GGML_TYPE_Q6_K, 128, 2, 64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, true);
++    CASE(GGML_TYPE_Q6_K, 128, 2, 64, 128, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, false);
++
+     return ggml_cuda_mmq_get_config_ampere(type, J, fallback);
+ }
