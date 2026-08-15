@@ -1,0 +1,303 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2026
+From: Claude Opus 5 <opus5@local>
+Date: Sat, 15 Aug 2026 07:30:00 +0000
+Subject: [PATCH] CUDA/HIP: one q8_1 quantization per activation per graph evaluation
+
+ggml_cuda_mul_mat_vec_q quantizes its activation vector to q8_1 before every
+batch-1 matvec. On Qwen3.8-27B that is the largest dispatch population after the
+matvecs themselves: 337.1 quantize_q8_1 dispatches per decoded token at 1.27 us
+each, one for every mul_mat_vec_q. Several of those matvecs consume the SAME
+activation tensor within one graph evaluation - separate Q/K/V projections take
+one normed hidden state, and a linear-attention layer's input projections take
+another - so the same bytes are recomputed from the same input.
+
+This adds a per-context cache of q8_1-quantized src1 copies. An entry is keyed on
+the root tensor of src1's view chain, src1->data, the stream, and the full
+quantize_row_q8_1_cuda parameter tuple (ne00, s01, s02, s03, ne0, ne1, ne2, ne3).
+type_src0 and ids are unused by that launcher, so a hit returns exactly the bytes
+the skipped kernel would have written; the matvec kernels are untouched.
+
+Contents-identity and lifetime:
+- Cleared on entry to ggml_backend_cuda_graph_compute, so nothing survives an
+  evaluation and a recycled pointer can never hit a stale entry.
+- Within an evaluation a node is computed once and the graph allocator cannot
+  recycle its buffer while consumers remain, so the same root implies the same
+  bytes. Ops that write THROUGH a view (CPY / SET_ROWS / *_inplace) drop matching
+  entries from the evaluation loop, including nodes swallowed by kernel fusion.
+- The stream is part of the key, so in-stream ordering proves the producer runs
+  before every consumer.
+- Entries own their pool allocation until eviction (16-deep FIFO) or clear, so a
+  cached buffer cannot be handed to another op while a consumer may still be
+  issued. Eviction frees into per-stream pools, so an evicted buffer is only
+  re-issued to later ops on the same stream.
+- The context destructor releases the cache before the pools are destroyed;
+  otherwise llama-bench trips GGML_ASSERT(pool_size == 0) between configurations.
+
+GGML_MMVQ_Q8_1_REUSE=0 restores the stock scoped-alloc path exactly, so one
+binary can run both arms of an A/B. Unset or any other value keeps the reuse on.
+
+Measured on Radeon AI PRO R9700 (gfx1201, ROCm 7.14) on top of 0001:
+
+- Census (rocprofv3 --kernel-trace, rows ordered by Dispatch_Id, steady-state
+  decode normalised by the 16 flash_attn_tile dispatches per token):
+  1729.8 -> 1652.6 dispatches/token; quantize_q8_1 337.1 -> 257.1 (-80.1, -23.8%)
+  and every other kernel population is unchanged - mul_mat_vec_q stays at 337.1.
+- Bit-exact: greedy decode (temp 0, top_k 1, 128 tokens) gives the same text hash
+  and the same hash over the full top-5 per-position logprobs in both arms.
+  Perplexity identical to every digit: 2.9608 at -c 512 --chunks 8 and 5.2132 at
+  16k.
+- Speed: one binary, arms selected at runtime, 8 whole-process server boots in
+  ABBA order with balanced slot positions, 7 timed completions per boot.
+  decode 29.598 -> 29.798 tok/s (+0.676%), prefill 892.78 -> 892.97 (+0.02%),
+  TTFT 1.0288 -> 1.0286 s. Within-boot sd 0.07%; the four candidate boots span
+  29.788-29.813.
+
+The token shortens by 237 us for 80.1 removed dispatches, of which 86 us is the
+removed kernels' own GPU time - 1.9 us per dispatch of launch structure, matching
+the 2.08 us marginal dispatch cost measured for this box.
+---
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 33be16dc5..c50c826d4 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1215,6 +1215,114 @@ struct ggml_cuda_pool_alloc {
+ };
+ 
+ 
++// Cache of q8_1-quantized copies of src1 activations, used by the MMVQ path
++// (see ggml_cuda_mul_mat_vec_q in mmvq.cu).
++//
++// During decode several matrix-vector ops consume the same activation tensor:
++// separate Q/K/V projections take the same normed hidden state, a hybrid layer's
++// input projections take the same normed hidden state, and MoE expert gate/up
++// take (a reshaped view of) the same tensor as the shared expert's gate/up.
++// Stock code re-runs quantize_q8_1 on identical input once per op.  The kernel's
++// output bytes are a pure function of (input data, ne00, s01, s02, s03, ne0,
++// ne1, ne2, ne3) - type_src0 and ids are unused in quantize_row_q8_1_cuda - so
++// when the full parameter tuple matches and the source contents are unchanged,
++// the first result is bit-identical to what a re-run would produce.
++//
++// Contents-identity is established by keying on the root tensor of src1's view
++// chain: within a single backend graph evaluation a node is computed exactly
++// once, and the graph allocator cannot recycle its buffer while consumers
++// remain.  The two ways contents could still change under a live key are
++// handled explicitly:
++//   * ops that write through a view (GGML_OP_CPY / GGML_OP_SET_ROWS / any
++//     *_inplace op) drop matching entries via invalidate_views_of(), called
++//     from the graph evaluation loop for every executed node, including nodes
++//     consumed by fusion;
++//   * nothing survives an evaluation: the cache is cleared on entry to
++//     ggml_backend_cuda_graph_compute, so graph splits (partial CPU offload),
++//     new tokens and new captures always start empty.
++// The stream is part of the key, so a cached result is only reused where
++// in-stream ordering proves the producing kernel precedes the consumer.
++// Entries hold their pool allocation until eviction or clear() so the buffer
++// cannot be handed out to another op while a consumer may still be issued.
++// Eviction (oldest first) is safe for in-flight work because pool buffers are
++// per-stream: a freed buffer is only re-issued to ops on the same stream,
++// after all previously issued reads.
++// Runtime kill switch for the q8_1 reuse cache below, so a single binary can run
++// both arms of an A/B.  Read once; unset or any value other than "0" keeps the
++// cache on, which is the intended configuration.
++static inline bool ggml_cuda_mmvq_q8_1_reuse_enabled() {
++    static const bool enabled = []() {
++        const char * s = getenv("GGML_MMVQ_Q8_1_REUSE");
++        return s == nullptr || s[0] != '0';
++    }();
++    return enabled;
++}
++
++struct ggml_cuda_quantized_src1_entry {
++    const ggml_tensor * origin = nullptr; // root of src1's view chain: identity for contents
++    const void *        data   = nullptr; // src1->data actually quantized
++    cudaStream_t        stream = nullptr;
++    int64_t             key[8] = {0};     // ne00, s01, s02, s03, ne0, ne1, ne2, ne3
++    ggml_cuda_pool_alloc<char> buf;
++
++    ggml_cuda_quantized_src1_entry(ggml_cuda_pool & pool, size_t size) : buf(pool, size) {}
++};
++
++struct ggml_cuda_quantized_src1_cache {
++    static constexpr size_t max_entries = 16;
++
++    std::vector<std::unique_ptr<ggml_cuda_quantized_src1_entry>> entries;
++
++    void clear() {
++        entries.clear();
++    }
++
++    // Drop entries whose source contents may be modified by `node`, an op that
++    // writes through a view.  Must be called (in execution order) for every
++    // graph node that performs a write and has view_src set.
++    void invalidate_views_of(const ggml_tensor * node) {
++        if (entries.empty() || node->view_src == nullptr) {
++            return;
++        }
++        // view_src always points at the root of the chain, flatten defensively anyway:
++        const ggml_tensor * origin = node->view_src->view_src != nullptr ? node->view_src->view_src : node->view_src;
++        entries.erase(std::remove_if(entries.begin(), entries.end(),
++            [origin](const std::unique_ptr<ggml_cuda_quantized_src1_entry> & e) { return e->origin == origin; }),
++            entries.end());
++    }
++
++    const char * find(const ggml_tensor * src1, cudaStream_t stream,
++            const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
++            const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3) const {
++        const ggml_tensor * origin = src1->view_src != nullptr ? src1->view_src : src1;
++        const int64_t key[8] = {ne00, s01, s02, s03, ne0, ne1, ne2, ne3};
++        for (const auto & e : entries) {
++            if (e->origin == origin && e->data == src1->data && e->stream == stream &&
++                    std::equal(std::begin(key), std::end(key), std::begin(e->key))) {
++                return e->buf.ptr;
++            }
++        }
++        return nullptr;
++    }
++
++    char * insert(ggml_cuda_pool & pool, const ggml_tensor * src1, cudaStream_t stream,
++            const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
++            const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3, const size_t size) {
++        if (entries.size() >= max_entries) {
++            entries.erase(entries.begin());
++        }
++        auto e = std::make_unique<ggml_cuda_quantized_src1_entry>(pool, size);
++        e->origin = src1->view_src != nullptr ? src1->view_src : src1;
++        e->data   = src1->data;
++        e->stream = stream;
++        const int64_t key[8] = {ne00, s01, s02, s03, ne0, ne1, ne2, ne3};
++        std::copy(std::begin(key), std::end(key), e->key);
++        entries.push_back(std::move(e));
++        return entries.back()->buf.ptr;
++    }
++};
++
++
+ // backend interface
+ 
+ struct ggml_tensor_extra_gpu {
+@@ -1480,6 +1588,10 @@ struct ggml_backend_cuda_context {
+ 
+     ggml_cuda_stream_context concurrent_stream_context;
+ 
++    // q8_1-quantized src1 reuse for the MMVQ path; valid only within a single
++    // graph evaluation (cleared on entry to ggml_backend_cuda_graph_compute)
++    ggml_cuda_quantized_src1_cache quantized_src1_cache;
++
+     ~ggml_backend_cuda_context();
+ 
+     cudaStream_t stream(int device, int stream) {
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 561ab7ac5..257e870d2 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -700,6 +700,17 @@ static std::condition_variable ggml_cuda_lock_cv;
+ static std::atomic<int> ggml_cuda_lock_counter;
+ 
+ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
++    // The q8_1 reuse cache owns pool allocations, and it is declared ahead of
++    // `pools` in the context. Members are destroyed in reverse declaration order,
++    // so on teardown the pools would go first and the cache would then return its
++    // buffers to a destroyed pool - ggml_cuda_pool_leg's destructor catches that
++    // as GGML_ASSERT(pool_size == 0) and aborts the process. The destructor BODY
++    // runs before any member is destroyed, so releasing the cache here is what
++    // keeps the two in order. Only reached at context teardown; a server that
++    // never frees its context never saw it, but llama-bench frees one per
++    // configuration and aborted between them.
++    quantized_src1_cache.clear();
++
+     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
+     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
+ 
+@@ -3980,6 +3991,13 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+ 
+             for (int i = 0; i < cgraph->n_nodes; i++) {
+                 ggml_tensor * node = cgraph->nodes[i];
++
++                // An op that writes through a view modifies a pre-existing tensor:
++                // drop any cached q8_1 quantization of that tensor.
++                if (node->view_src != nullptr && !ggml_cuda_is_view_or_noop(node)) {
++                    cuda_ctx->quantized_src1_cache.invalidate_views_of(node);
++                }
++
+                 if (is_concurrent_event_active) {
+                     GGML_ASSERT(concurrent_event);
+ 
+@@ -4029,6 +4047,16 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                             nodes_to_skip + 1, ggml_op_name(node->op), node->name,
+                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
+ #endif
++                    // Nodes consumed by the fused op bypass the loop head: run the
++                    // view-write invalidation for them here (after the fused compute,
++                    // which is when their writes are issued).
++                    for (int k = 1; k <= nodes_to_skip; ++k) {
++                        const ggml_tensor * fused_node = cgraph->nodes[i + k];
++                        if (fused_node->view_src != nullptr && !ggml_cuda_is_view_or_noop(fused_node)) {
++                            cuda_ctx->quantized_src1_cache.invalidate_views_of(fused_node);
++                        }
++                    }
++
+                     i += nodes_to_skip;
+                     continue;
+                 }
+@@ -4116,6 +4144,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend,
+ 
+     ggml_cuda_set_device(cuda_ctx->device);
+ 
++    // Quantized-src1 reuse is only valid within a single graph evaluation: start
++    // empty so nothing computed before this call (another graph split, CPU ops,
++    // a previous token) can alias a cached entry.
++    cuda_ctx->quantized_src1_cache.clear();
++
+     bool use_cuda_graph             = false;
+     bool cuda_graph_update_required = false;
+     const void * graph_key = nullptr;
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 5e36b0934..3fe4adc1f 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -1237,12 +1237,34 @@ void ggml_cuda_mul_mat_vec_q(
+     }
+ 
+     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
+-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
++
++    // Reuse an identical q8_1 quantization of src1 from earlier in this graph
++    // evaluation if one exists: several matvecs in a layer consume the same
++    // activation tensor and each would otherwise re-quantize it.
++    // Bit-exact by construction: the cache only hits when the source tensor's
++    // contents and the full quantize_row_q8_1_cuda parameter tuple are identical,
++    // so the cached bytes equal what the skipped kernel would have written.
++    // See ggml_cuda_quantized_src1_cache in common.cuh for the lifetime rules.
++    const size_t size_q8_1 = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
++    ggml_cuda_pool_alloc<char> src1_q8_1_scoped(ctx.pool());
++    const char * src1_q8_1 = nullptr;
+     {
+         const int64_t s11 = src1->nb[1] / ts_src1;
+         const int64_t s12 = src1->nb[2] / ts_src1;
+         const int64_t s13 = src1->nb[3] / ts_src1;
+-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++        if (ggml_cuda_mmvq_q8_1_reuse_enabled()) {
++            src1_q8_1 = ctx.quantized_src1_cache.find(src1, stream, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13);
++            if (src1_q8_1 == nullptr) {
++                char * dst_q8_1 = ctx.quantized_src1_cache.insert(
++                    ctx.pool(), src1, stream, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, size_q8_1);
++                quantize_row_q8_1_cuda(src1_d, nullptr, dst_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++                src1_q8_1 = dst_q8_1;
++            }
++        } else {
++            char * dst_q8_1 = src1_q8_1_scoped.alloc(size_q8_1);
++            quantize_row_q8_1_cuda(src1_d, nullptr, dst_q8_1, src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
++            src1_q8_1 = dst_q8_1;
++        }
+     }
+ 
+     const int64_t s01 = src0->nb[1] / ts_src0;
+@@ -1268,7 +1290,7 @@ void ggml_cuda_mul_mat_vec_q(
+     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+ 
+     mul_mat_vec_q_switch_type(
+-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
++        src0->data, src0->type, src1_q8_1, ids_d, fusion_local, dst_d, ne00,
+         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
+         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
+         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
