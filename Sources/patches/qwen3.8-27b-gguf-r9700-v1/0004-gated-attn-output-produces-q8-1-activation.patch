@@ -1,0 +1,209 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2026
+From: Claude Opus 5 <opus5@local>
+Date: Sat, 15 Aug 2026 11:05:00 +0000
+Subject: [PATCH] CUDA/HIP: the gated attention output emits its own q8_1 form
+
+0003 takes the 129 rms_norm-produced activations. Of the 129 quantize_q8_1
+dispatches left per token, 64 are the input to an output projection: 48 from the
+linear-attention layers, where the gated normalisation is MUL(norm, SILU(gate)),
+and 16 from the full-attention layers, where it is MUL(attn, SIGMOID(gate)). Both
+land in ggml_cuda_op_unary_mul, whose kernel indexes its destination linearly
+over ggml_nelements - so 32 consecutive values of a q8_1 block are held by 32
+consecutive lanes of one warp, and the only inactive lanes are whole warps past
+the end. The same reserve-and-write mechanism 0003 introduced applies unchanged.
+
+The remaining 65 are not reachable this way and are recorded here so the next
+reader does not re-derive it: 64 are the feed-forward activation, which is
+produced inside mul_mat_vec_q's own GLU fusion, where 32 consecutive outputs are
+spread over 16 to 32 workgroups - a cross-workgroup reduction, which is the
+partition mismatch that makes a fold cost more than the dispatch it saves.
+
+One new wrinkle. The linear-attention tensor is [head_dim, n_heads, 1, 1] and the
+projection reads it through a reshape as [head_dim*n_heads, 1, 1], so the key the
+consumer looks up is the FLATTENED one, not the tensor's own. The two readings
+can never be confused, because they are legal in disjoint cases: a producer's own
+shape is only reservable when ne[0] is a whole number of MATRIX_ROW_PADDING,
+and the flattened reading is only tried when it is not. They also agree on
+layout wherever both would be legal - a row length that needs no zero padding
+makes the row-major q8_1 image of a contiguous tensor equal to its flattened
+image - so the kernel writes the same bytes either way. The flattened form is
+restricted to ne[2] == ne[3] == 1, i.e. a single token; with more than one token
+the flattened length is not a row of anything and the reservation is skipped.
+As in 0003 a key no consumer looks up is a miss, not an error.
+
+Measured on Radeon AI PRO R9700 (gfx1201, ROCm 7.14) on top of 0001-0003:
+
+- Census: quantize_q8_1 129.0 -> 65.1 per token. unary_gated_op_kernel<op_silu,
+  float, true> fires 48.1 times per token and the sigmoid instantiation 16; the
+  softplus gate in the delta rule is 48 columns wide, is not reservable, and is
+  untouched at <op_softplus, float, false>. Dispatches per token 1523.9 -> 1461.9.
+- Bit-exact: same text and same top-5 logprob hash as stock across 6 prompts and
+  128 greedy tokens; perplexity 2.9608 at -c 512 --chunks 8, 5.2132 at 16k and
+  6.0674 at 32k, identical to stock in every digit.
+- Speed: one binary, three arms selected at runtime (stock / 0003 / 0003+0004),
+  9 whole-process server boots with the three arms holding equal slot-position
+  sums, 9 timed completions per boot.
+    stock       decode 30.041 tok/s   prefill 807.3   TTFT 0.8633 s
+    0003        decode 30.240 (+0.66%) prefill 806.3   TTFT 0.8635
+    0003+0004   decode 30.403 (+1.20%) prefill 805.7   TTFT 0.8625
+  Per-arm decode sd 0.035 / 0.014 / 0.004 tok/s.
+
+GGML_PRODUCER_Q8_1_GLU=0 disables this patch alone; GGML_PRODUCER_Q8_1=0 disables
+both producers and restores the stock path exactly.
+---
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index 3b93af3..fd28198 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1269,6 +1269,15 @@ static inline bool ggml_cuda_producer_q8_1_enabled() {
+     return enabled;
+ }
+ 
++// Same switch for the fused unary+mul producer (attention output projection input).
++static inline bool ggml_cuda_producer_q8_1_glu_enabled() {
++    static const bool enabled = []() {
++        const char * s = getenv("GGML_PRODUCER_Q8_1_GLU");
++        return s == nullptr || s[0] != '0';
++    }();
++    return enabled;
++}
++
+ struct ggml_cuda_quantized_src1_entry {
+     const ggml_tensor * origin = nullptr; // root of src1's view chain: identity for contents
+     const void *        data   = nullptr; // src1->data actually quantized
+@@ -1852,3 +1861,37 @@ static inline char * ggml_cuda_q8_1_reserve_for_producer(
+     return ctx.quantized_src1_cache.insert(ctx.pool(), t, stream,
+         ne0, s01, s02, s03, /*ne0 padded =*/ ne0, t->ne[1], t->ne[2], t->ne[3], size);
+ }
++
++// As above, but for a producer whose output is consumed through a reshape that
++// flattens it into a single row - a per-head activation [head_dim, n_heads, 1, 1] read
++// by an output projection as [head_dim*n_heads, 1, 1].  Only used where the natural
++// shape cannot be reserved at all, i.e. ne[0] is not a whole number of
++// MATRIX_ROW_PADDING, so the two forms can never be confused; and only for a single
++// token (ne[2] == ne[3] == 1), because with more than one token the flattened length
++// is not a row of anything.
++//
++// Note the two agree on layout wherever both are legal: a row length that is a
++// multiple of MATRIX_ROW_PADDING needs no zero padding, so the natural row-major q8_1
++// image of a contiguous tensor is exactly its flattened image.  A producer indexing
++// its output linearly therefore writes the same bytes either way.
++static inline char * ggml_cuda_q8_1_reserve_for_producer_flat(
++        ggml_backend_cuda_context & ctx, const ggml_tensor * t, cudaStream_t stream) {
++    if (!ggml_cuda_mmvq_q8_1_reuse_enabled() || !ggml_cuda_producer_q8_1_enabled() ||
++            !ggml_cuda_producer_q8_1_glu_enabled()) {
++        return nullptr;
++    }
++    if (t->type != GGML_TYPE_F32 || t->view_src != nullptr || !ggml_is_contiguous(t)) {
++        return nullptr;
++    }
++    if (t->ne[2] != 1 || t->ne[3] != 1 || t->ne[0] % MATRIX_ROW_PADDING == 0) {
++        return nullptr;
++    }
++    const int64_t ne = t->ne[0]*t->ne[1];
++    if (ne % MATRIX_ROW_PADDING != 0) {
++        return nullptr;
++    }
++    const size_t size = ne * sizeof(block_q8_1)/QK8_1;
++    ctx.quantized_src1_cache.drop_tensor(t);
++    return ctx.quantized_src1_cache.insert(ctx.pool(), t, stream,
++        ne, ne, ne, ne, /*ne0 padded =*/ ne, 1, 1, 1, size);
++}
+diff --git a/ggml/src/ggml-cuda/unary.cu b/ggml/src/ggml-cuda/unary.cu
+index 4cb805f..22671bc 100644
+--- a/ggml/src/ggml-cuda/unary.cu
++++ b/ggml/src/ggml-cuda/unary.cu
+@@ -259,8 +259,9 @@ void ggml_cuda_op_softplus(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+ }
+ /* gated ops */
+ 
+-template <float (*op)(float), typename T>
+-static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1) {
++template <float (*op)(float), typename T, bool do_q8_1 = false>
++static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1,
++                                             void * q8_1_dst = nullptr) {
+     ggml_cuda_pdl_lc();
+     const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+ 
+@@ -273,14 +274,36 @@ static __global__ void unary_gated_op_kernel(const T * x, const T * g, T * dst,
+     const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+ 
+     ggml_cuda_pdl_sync();
+-    dst[i] = (T)(op((float)x[j0]) * (float)g[j1]);
++    const float val = op((float)x[j0]) * (float)g[j1];
++    dst[i] = (T)val;
++
++    if constexpr (do_q8_1) {
++        // Reproduces quantize_q8_1 on the value still in registers.  The destination
++        // index is linear, CUDA_GLU_BLOCK_SIZE and k are both multiples of QK8_1, and
++        // the only inactive lanes are whole warps past k - so the QK8_1 values of a
++        // q8_1 block are held by QK8_1 consecutive active lanes of one warp and the
++        // butterfly below is the same reduction over the same lanes as the stock
++        // quantize kernel's.
++        const float  amax = warp_reduce_max<QK8_1>(fabsf(val));
++        const float  sum  = warp_reduce_sum<QK8_1>(val);
++        const float  d    = amax / 127.0f;
++        const int8_t q    = amax == 0.0f ? 0 : roundf(val / d);
++
++        block_q8_1 * yq = (block_q8_1 *) q8_1_dst;
++        yq[i / QK8_1].qs[i % QK8_1] = q;
++        if (i % QK8_1 == 0) {
++            yq[i / QK8_1].ds = make_half2(d, sum);
++        }
++    }
+ }
+ 
+ template <float (*op)(float), typename T>
+-static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, cudaStream_t stream) {
++static void unary_gated_cuda(const T * x, const T * g, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1,
++                             void * q8_1_dst, cudaStream_t stream) {
+     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params((dim3)num_blocks, CUDA_GLU_BLOCK_SIZE, 0, stream);
+-    ggml_cuda_kernel_launch(unary_gated_op_kernel<op, T>, launch_params, x, g, dst, k, n, o0, o1);
++    const auto kernel = q8_1_dst ? unary_gated_op_kernel<op, T, true> : unary_gated_op_kernel<op, T, false>;
++    ggml_cuda_kernel_launch(kernel, launch_params, x, g, dst, k, n, o0, o1, q8_1_dst);
+ }
+ 
+ template <float (*op)(float)>
+@@ -323,7 +346,7 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+             src1_p += swapped ? 0 : nc;
+         }
+ 
+-        unary_gated_cuda<op>(src0_p, src1_p, (half *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(half), src1_o / sizeof(half), stream);
++        unary_gated_cuda<op>(src0_p, src1_p, (half *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(half), src1_o / sizeof(half), nullptr, stream);
+     } else {
+         float * src0_p = (float *) src0_d;
+         float * src1_p = (float *) src1_d;
+@@ -333,7 +356,7 @@ void ggml_cuda_op_unary_gated(ggml_backend_cuda_context & ctx, ggml_tensor * dst
+             src1_p += swapped ? 0 : nc;
+         }
+ 
+-        unary_gated_cuda<op>(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), stream);
++        unary_gated_cuda<op>(src0_p, src1_p, (float *)dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), nullptr, stream);
+     }
+ }
+ 
+@@ -603,11 +626,21 @@ static void ggml_cuda_op_unary_mul_impl(ggml_backend_cuda_context & ctx, ggml_te
+     if (unary_src->type == GGML_TYPE_F16) {
+         unary_gated_cuda<op>((const half *) unary_src->data, (const half *) other_src->data,
+                              (half *) mul_node->data, k, nc,
+-                             unary_stride / sizeof(half), other_stride / sizeof(half), stream);
++                             unary_stride / sizeof(half), other_stride / sizeof(half), nullptr, stream);
+     } else {
++        // This node's output is the src1 of the projection that follows it (the gated
++        // attention output feeding the output projection), so emit its q8_1 form here
++        // rather than leaving a quantize_q8_1 dispatch to re-read it.  Try the tensor's
++        // own shape first and the flattened single-row reading second; a key the
++        // consumer does not look up simply misses.
++        void * q8_1_dst = ggml_cuda_producer_q8_1_glu_enabled()
++            ? (void *) ggml_cuda_q8_1_reserve_for_producer(ctx, mul_node, stream) : nullptr;
++        if (q8_1_dst == nullptr) {
++            q8_1_dst = ggml_cuda_q8_1_reserve_for_producer_flat(ctx, mul_node, stream);
++        }
+         unary_gated_cuda<op>((const float *) unary_src->data, (const float *) other_src->data,
+                              (float *) mul_node->data, k, nc,
+-                             unary_stride / sizeof(float), other_stride / sizeof(float), stream);
++                             unary_stride / sizeof(float), other_stride / sizeof(float), q8_1_dst, stream);
+     }
+ }
+ 

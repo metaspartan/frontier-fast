@@ -1,0 +1,358 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2026
+From: Claude Opus 5 <opus5@local>
+Date: Sat, 15 Aug 2026 11:00:00 +0000
+Subject: [PATCH] CUDA/HIP: rms_norm emits the q8_1 form of its output
+
+After 0002 the MMVQ path issues 255.9 quantize_q8_1 dispatches per decoded token,
+down from 337. That cache removes every DUPLICATE quantization, so the survivors
+are the distinct activations and no further deduplication can reach them. Going
+below that needs the kernel that PRODUCES an activation to emit its q8_1 form.
+
+129 of the 255.9 are produced by rms_norm: the 64 attention norms, the 64
+feed-forward norms and the final norm. Each is rms_norm_f32<1024> fused with its
+weight multiply - one workgroup per row over 5120 columns - and its output is the
+src1 of the projections that follow it. quantize_q8_1 then re-reads exactly those
+5120 floats and reduces them in groups of 32.
+
+The reuse cache's key is a pure function of the src1 tensor: the root of its view
+chain, its data pointer, the stream, and its ne/nb. A producer can therefore
+compute the entry its consumers will look up without knowing anything about them.
+ggml_cuda_op_rms_norm_fused reserves that entry and hands the buffer to the
+kernel, which writes the q8_1 blocks from its epilogue. If the prediction is
+wrong the consumer simply misses and quantizes for itself, so a mispredicted key
+costs a wasted buffer, never a wrong result.
+
+Bit-exactness comes from the block decomposition, not from tolerance. block_size
+and ncols are both multiples of QK8_1, so the 32 columns of one q8_1 block are
+held by 32 consecutive threads that are always active on the same loop iteration:
+the epilogue runs the same warp_reduce_max/warp_reduce_sum butterfly over the
+same lanes and the same values that quantize_q8_1 would, on the value still in
+registers instead of after a round trip through memory. The fusion is restricted
+to rows whose length is a whole number of MATRIX_ROW_PADDING so no zero-padding
+tail has to be emitted, and to ne[1] <= MMVQ_MAX_BATCH_SIZE, above which the
+consumers do not take the MMVQ path at all and could never hit the entry.
+
+Measured on Radeon AI PRO R9700 (gfx1201, ROCm 7.14) on top of 0001 and 0002:
+
+- Census (rocprofv3 --kernel-trace, rows ordered by Dispatch_Id, steady-state
+  decode): quantize_q8_1 255.9 -> 129.0 per token, and rms_norm_f32<1024, true,
+  false, false> at 129.2 is replaced one for one by rms_norm_f32<1024, true,
+  false, true> at 129.0. Every other kernel population is unchanged.
+- Where the time goes: the removed quantize dispatches were 165 us/token of GPU
+  time; the epilogue adds 103 us/token to rms_norm, because rms_norm is one
+  workgroup per row while quantize_q8_1 spread the same reduction over 20. Net
+  62 us of kernel time plus 129 x 1.9 us of launch structure, ~0.86% of a
+  35.3 ms token, against +0.66% measured.
+- Bit-exact: greedy decode (temp 0, top_k 1, 128 tokens, 6 prompts) gives the
+  same text and the same hash over the full top-5 per-position logprobs in both
+  arms. Perplexity identical to every digit: 2.9608 at -c 512 --chunks 8,
+  5.2132 at 16k, 6.0674 at 32k.
+- Speed: one binary, arms selected at runtime, 8 whole-process server boots in
+  ABBA order with balanced slot positions, 9 timed completions per boot.
+  decode 30.033 -> 30.239 tok/s (+0.68%), prefill 807.2 -> 806.6 (-0.08%),
+  TTFT 0.8599 -> 0.8626 s. Per-arm sd 0.021 and 0.019 tok/s (CV 0.07%).
+
+GGML_PRODUCER_Q8_1=0 restores the stock path exactly, so one binary can run both
+arms of an A/B. Unset or any other value keeps the fusion on.
+---
+diff --git a/ggml/src/ggml-cuda/common.cuh b/ggml/src/ggml-cuda/common.cuh
+index c50c826..3b93af3 100644
+--- a/ggml/src/ggml-cuda/common.cuh
++++ b/ggml/src/ggml-cuda/common.cuh
+@@ -1258,6 +1258,17 @@ static inline bool ggml_cuda_mmvq_q8_1_reuse_enabled() {
+     return enabled;
+ }
+ 
++// Runtime kill switch for producing the q8_1 form inside the kernel that computes the
++// activation (see ggml_cuda_q8_1_reserve_for_producer below), so a single binary can
++// run both arms of an A/B.  Unset or any value other than "0" keeps the fusion on.
++static inline bool ggml_cuda_producer_q8_1_enabled() {
++    static const bool enabled = []() {
++        const char * s = getenv("GGML_PRODUCER_Q8_1");
++        return s == nullptr || s[0] != '0';
++    }();
++    return enabled;
++}
++
+ struct ggml_cuda_quantized_src1_entry {
+     const ggml_tensor * origin = nullptr; // root of src1's view chain: identity for contents
+     const void *        data   = nullptr; // src1->data actually quantized
+@@ -1291,6 +1302,20 @@ struct ggml_cuda_quantized_src1_cache {
+             entries.end());
+     }
+ 
++    // Drop the entry for `t` itself, keyed exactly the way find()/insert() key it.
++    // A graph node is computed once per evaluation so a producer should never find a
++    // live entry for its own output; dropping one is a guard against ever leaving a
++    // stale buffer standing in front of freshly written contents.
++    void drop_tensor(const ggml_tensor * t) {
++        if (entries.empty()) {
++            return;
++        }
++        const ggml_tensor * origin = t->view_src != nullptr ? t->view_src : t;
++        entries.erase(std::remove_if(entries.begin(), entries.end(),
++            [origin](const std::unique_ptr<ggml_cuda_quantized_src1_entry> & e) { return e->origin == origin; }),
++            entries.end());
++    }
++
+     const char * find(const ggml_tensor * src1, cudaStream_t stream,
+             const int64_t ne00, const int64_t s01, const int64_t s02, const int64_t s03,
+             const int64_t ne0, const int64_t ne1, const int64_t ne2, const int64_t ne3) const {
+@@ -1778,3 +1803,52 @@ static __inline__ void ggml_cuda_kernel_launch(Kernel kernel, const ggml_cuda_ke
+     CUDA_CHECK(cudaGetLastError());
+ }
+ 
++
++// Reserve the MMVQ reuse-cache slot that ggml_cuda_mul_mat_vec_q will look up for `t`
++// when `t` is used as its src1, so that the kernel PRODUCING `t` can write the q8_1
++// form directly and the consuming matvecs find it already there.  This removes the
++// separate quantize_q8_1 dispatch entirely rather than merely deduplicating it.
++//
++// This is possible because the cache key is a pure function of the src1 tensor: the
++// root of its view chain, its data pointer, the stream, and its ne/nb.  A producer can
++// therefore compute the key with no knowledge of its consumers.  If the producer is
++// wrong about how the tensor will be consumed the consumer simply misses and quantizes
++// for itself, so a mispredicted key costs a wasted buffer, never a wrong result.
++//
++// Returns nullptr when the fused form does not apply; the caller must then leave stock
++// behaviour untouched.  A caller that reserves a slot MUST write it: the entry is live
++// from here on and a consumer that hits it reads whatever the buffer holds.
++static inline char * ggml_cuda_q8_1_reserve_for_producer(
++        ggml_backend_cuda_context & ctx, const ggml_tensor * t, cudaStream_t stream) {
++    if (!ggml_cuda_mmvq_q8_1_reuse_enabled() || !ggml_cuda_producer_q8_1_enabled()) {
++        return nullptr;
++    }
++    // A view would make the cached bytes describe only part of its root, and the
++    // producer kernels below address their output as one dense row-major block.
++    if (t->type != GGML_TYPE_F32 || t->view_src != nullptr || !ggml_is_contiguous(t)) {
++        return nullptr;
++    }
++    // ggml_cuda_should_fuse_mul_mat_vec_q takes the MMVQ path only for
++    // src1->ne[1] <= MMVQ_MAX_BATCH_SIZE (8, see mmvq.cuh, which cannot be included
++    // here without a cycle).  Above that the consumers quantize with the MMQ layout
++    // instead and could never hit this cache, so producing the q8_1 form would be pure
++    // cost - and at prefill batch sizes it is a large one.
++    if (t->ne[1] > 8) {
++        return nullptr;
++    }
++    const int64_t ne0 = t->ne[0];
++    // quantize_q8_1 pads each row out to MATRIX_ROW_PADDING with zeroed blocks; the
++    // fused epilogues emit whole q8_1 blocks of real data only, so restrict the fusion
++    // to rows that need no padding.  ne0 % MATRIX_ROW_PADDING == 0 also implies
++    // ne0 % QK8_1 == 0, which is what makes a q8_1 block land inside a single warp.
++    if (ne0 % MATRIX_ROW_PADDING != 0) {
++        return nullptr;
++    }
++    const int64_t s01 = t->nb[1] / sizeof(float);
++    const int64_t s02 = t->nb[2] / sizeof(float);
++    const int64_t s03 = t->nb[3] / sizeof(float);
++    const size_t size = t->ne[3]*t->ne[2] * t->ne[1]*ne0 * sizeof(block_q8_1)/QK8_1;
++    ctx.quantized_src1_cache.drop_tensor(t);
++    return ctx.quantized_src1_cache.insert(ctx.pool(), t, stream,
++        ne0, s01, s02, s03, /*ne0 padded =*/ ne0, t->ne[1], t->ne[2], t->ne[3], size);
++}
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index 09d9f3a..ac9ce4c 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -73,7 +73,7 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
+     }
+ }
+ 
+-template <int block_size, bool do_multiply = false, bool do_add = false>
++template <int block_size, bool do_multiply = false, bool do_add = false, bool do_q8_1 = false>
+ static __global__ void rms_norm_f32(const float * x,
+                                     float *       dst,
+                                     const int     ncols,
+@@ -96,7 +96,8 @@ static __global__ void rms_norm_f32(const float * x,
+                                     const uint3   add_ncols_packed     = make_uint3(0, 0, 0),
+                                     const uint3   add_nrows_packed     = make_uint3(0, 0, 0),
+                                     const uint3   add_nchannels_packed = make_uint3(0, 0, 0),
+-                                    const uint3   add_nsamples_packed  = make_uint3(0, 0, 0)) {
++                                    const uint3   add_nsamples_packed  = make_uint3(0, 0, 0),
++                                    void *        q8_1_dst             = nullptr) {
+     ggml_cuda_pdl_lc();
+     const int nrows     = gridDim.x;
+     const int nchannels = gridDim.y;
+@@ -140,16 +141,45 @@ static __global__ void rms_norm_f32(const float * x,
+     const float mean = tmp / ncols;
+     const float scale = rsqrtf(mean + eps);
+ 
++    block_q8_1 * yq = nullptr;
++    if constexpr (do_q8_1) {
++        // Same flat row order as the f32 destination above, and the same layout
++        // quantize_q8_1 writes: row-major blocks of QK8_1, ncols/QK8_1 per row.
++        yq = (block_q8_1 *) q8_1_dst + ((int64_t)(sample*nchannels + channel)*nrows + row) * (ncols/QK8_1);
++    }
++
+     for (int col = tid; col < ncols; col += block_size) {
++        float val;
+         if constexpr (do_multiply && do_add) {
+             const int mul_col = fastmodulo(col, mul_ncols_packed);
+             const int add_col = fastmodulo(col, add_ncols_packed);
+-            dst[col]          = scale * x[col] * mul[mul_col] + add[add_col];
++            val               = scale * x[col] * mul[mul_col] + add[add_col];
+         } else if constexpr (do_multiply) {
+             const int mul_col = fastmodulo(col, mul_ncols_packed);
+-            dst[col]          = scale * x[col] * mul[mul_col];
++            val               = scale * x[col] * mul[mul_col];
+         } else {
+-            dst[col] = scale * x[col];
++            val = scale * x[col];
++        }
++        dst[col] = val;
++
++        if constexpr (do_q8_1) {
++            // Reproduces quantize_q8_1 exactly, on the value still in registers.
++            // block_size and ncols are both multiples of QK8_1, so the QK8_1 columns of
++            // one q8_1 block are held by QK8_1 consecutive threads that are always
++            // active on the same loop iteration - the reduction below is the same
++            // butterfly over the same lanes and the same inputs as the stock kernel's,
++            // hence bit-identical.
++            const float  amax = warp_reduce_max<QK8_1>(fabsf(val));
++            const float  sum  = warp_reduce_sum<QK8_1>(val);
++            const float  d    = amax / 127.0f;
++            const int8_t q    = amax == 0.0f ? 0 : roundf(val / d);
++
++            const int ib  = col / QK8_1;
++            const int iqs = col % QK8_1;
++            yq[ib].qs[iqs] = q;
++            if (iqs == 0) {
++                yq[ib].ds = make_half2(d, sum);
++            }
+         }
+     }
+ }
+@@ -312,14 +342,16 @@ static void rms_norm_f32_cuda(
+             x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
+         // underlying cudaLaunchKernelEx does not support default params
+         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+-        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
++        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
++        (void *) nullptr);
+     } else {
+         const dim3 block_dims(1024, 1, 1);
+         const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+         ggml_cuda_kernel_launch(rms_norm_f32<1024, false>, launch_params, x, dst, ncols, stride_row, stride_channel, stride_sample, eps,
+         // underlying cudaLaunchKernelEx does not support default params
+         nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
+-        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
++        nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
++        (void *) nullptr);
+     }
+ }
+ 
+@@ -349,8 +381,12 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+                                   const uint32_t add_nchannels,
+                                   const uint32_t add_nsamples,
+                                   const float    eps,
++                                  void *         q8_1_dst,
+                                   cudaStream_t   stream) {
+     const dim3 blocks_num(nrows, nchannels, nsamples);
++    // A reserved q8_1 slot is live in the reuse cache from the moment it is handed
++    // out, so every path that can be reached with one must write it.
++    GGML_ASSERT(q8_1_dst == nullptr || (mul != nullptr && ncols % QK8_1 == 0));
+     if (mul == nullptr) {
+         rms_norm_f32_cuda(x, dst, ncols, nrows, nchannels, nsamples, stride_row, stride_channel, stride_sample, eps, stream);
+         return;
+@@ -363,19 +399,23 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+         if (ncols < 1024) {
+             const dim3 block_dims(256, 1, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+-            ggml_cuda_kernel_launch(rms_norm_f32<256, true>, launch_params,
++            const auto kernel = q8_1_dst ? rms_norm_f32<256, true, false, true> : rms_norm_f32<256, true, false, false>;
++            ggml_cuda_kernel_launch(kernel, launch_params,
+                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                 // underlying cudaLaunchKernelEx does not support default params
+-            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
++            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
++            q8_1_dst);
+         } else {
+             const dim3 block_dims(1024, 1, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+-            ggml_cuda_kernel_launch(rms_norm_f32<1024, true>, launch_params,
++            const auto kernel = q8_1_dst ? rms_norm_f32<1024, true, false, true> : rms_norm_f32<1024, true, false, false>;
++            ggml_cuda_kernel_launch(kernel, launch_params,
+                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed,
+                 // underlying cudaLaunchKernelEx does not support default params
+-            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0));
++            nullptr, 0, 0, 0, make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0), make_uint3(0, 0, 0),
++            q8_1_dst);
+         }
+     } else {
+         const uint3 mul_ncols_packed     = init_fastdiv_values(mul_ncols);
+@@ -390,19 +430,21 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+         if (ncols < 1024) {
+             const dim3 block_dims(256, 1, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims,block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+-            ggml_cuda_kernel_launch(rms_norm_f32<256, true, true>, launch_params,
++            const auto kernel = q8_1_dst ? rms_norm_f32<256, true, true, true> : rms_norm_f32<256, true, true, false>;
++            ggml_cuda_kernel_launch(kernel, launch_params,
+                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
+                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
+-                add_nchannels_packed, add_nsamples_packed);
++                add_nchannels_packed, add_nsamples_packed, q8_1_dst);
+         } else {
+             const dim3 block_dims(1024, 1, 1);
+             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{blocks_num, block_dims, block_dims.x > WARP_SIZE ? 32 * sizeof(float): 0, stream};
+-            ggml_cuda_kernel_launch(rms_norm_f32<1024, true, true>, launch_params,
++            const auto kernel = q8_1_dst ? rms_norm_f32<1024, true, true, true> : rms_norm_f32<1024, true, true, false>;
++            ggml_cuda_kernel_launch(kernel, launch_params,
+                 x, dst, ncols, stride_row, stride_channel, stride_sample, eps, mul, mul_stride_row, mul_stride_channel,
+                 mul_stride_sample, mul_ncols_packed, mul_nrows_packed, mul_nchannels_packed, mul_nsamples_packed, add,
+                 add_stride_row, add_stride_channel, add_stride_sample, add_ncols_packed, add_nrows_packed,
+-                add_nchannels_packed, add_nsamples_packed);
++                add_nchannels_packed, add_nsamples_packed, q8_1_dst);
+         }
+     }
+ }
+@@ -549,6 +591,15 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+     const int mul_nchannels = mul_src->ne[2];
+     const int mul_nsamples  = mul_src->ne[3];
+ 
++    // The normalised activation is the src1 of the projections that follow it, and each
++    // of those would otherwise launch quantize_q8_1 over exactly these bytes.  Produce
++    // the q8_1 form here instead, in the epilogue that already holds the values.
++    void * q8_1_dst = nullptr;
++    if (mul_tensor->ne[0] == ne00 && mul_tensor->ne[1] == ne01 &&
++        mul_tensor->ne[2] == ne02 && mul_tensor->ne[3] == ne03) {
++        q8_1_dst = ggml_cuda_q8_1_reserve_for_producer(ctx, mul_tensor, stream);
++    }
++
+     rms_norm_mul_f32_cuda(src0_d, mul_d, nullptr, dst_d,
+                           ne00, ne01, ne02, ne03,
+                           /*s00*/ s01, s02, s03,
+@@ -556,7 +607,7 @@ void ggml_cuda_op_rms_norm_fused(ggml_backend_cuda_context & ctx, ggml_tensor *
+                           mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                           /*add_s00*/ 0, 0, 0,
+                           0, 0, 0, 0,
+-                          eps, stream);
++                          eps, q8_1_dst, stream);
+ }
+ 
+ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+@@ -637,6 +688,12 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+     const int add_nchannels = add_src->ne[2];
+     const int add_nsamples  = add_src->ne[3];
+ 
++    void * q8_1_dst = nullptr;
++    if (add_tensor->ne[0] == ne00 && add_tensor->ne[1] == ne01 &&
++        add_tensor->ne[2] == ne02 && add_tensor->ne[3] == ne03) {
++        q8_1_dst = ggml_cuda_q8_1_reserve_for_producer(ctx, add_tensor, stream);
++    }
++
+     rms_norm_mul_f32_cuda(src0_d, mul_d,add_d,dst_d,
+                           ne00,ne01, ne02, ne03,
+                           /*s00*/ s01, s02, s03,
+@@ -644,7 +701,7 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+                           mul_ncols, mul_nrows, mul_nchannels, mul_nsamples,
+                           /*add_s00*/ add_s01, add_s02, add_s03,
+                           add_ncols, add_nrows, add_nchannels, add_nsamples,
+-                          eps, stream);
++                          eps, q8_1_dst, stream);
+ }
+ 
+ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
