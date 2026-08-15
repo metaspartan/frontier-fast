@@ -1,12 +1,13 @@
 # qwen3.8-27b-gguf-r9700-v1 — patch series
 
-**Empty by design.** This track was commissioned on 2026-08-14 and has no landed
-wins yet, so its frontier *is* the pinned tree. A candidate here is measured as
-vanilla llama.cpp `2b63e0610bbc2be990ae1360d5256efcdc3f9efb` plus your own
-patches — you are not building on anyone else's series.
+The series applies to llama.cpp `2b63e0610bbc2be990ae1360d5256efcdc3f9efb`, in
+filename order.
 
-The directory exists so the runner can tell "empty on purpose" from "you pointed
-me at the wrong track". Do not delete it.
+- `0001` RDNA4 5-warp block for the K-quant batch-1 matvec
+- `0002` cache the q8_1 activation quantization across matvecs sharing one src1
+- `0003` `rms_norm` writes the q8_1 form of the activation it produces
+- `0004` the fused unary+mul gating the attention output does the same
+- `0005` `gated_delta_net` computes its own gate and beta
 
 ## The model
 
@@ -46,11 +47,42 @@ inflates your denominator and will make your kernel look better than it is.
 
 ## Where to look first
 
-Nobody has profiled this track yet, so the honest answer is "measure before you
-patch". Two cheap things that would help everyone:
+**Correct the launch-cost arithmetic before you price anything.** A dispatch costs
+~2.08 µs on this box, but "1% of decode" is `0.01 × token_duration / dispatch_cost`,
+so it scales with the token. This model's token is ~32.9 ms, which makes 1% of decode
+about **170 launches** counting launch structure alone, or ~118 once you also count
+the kernel time a removed dispatch takes with it. An earlier revision of this file
+said "about 20", which is the figure for the ~6 ms tokens on the Laguna and Nemotron
+boards; carrying it here understates every launch-structure idea by a factor of eight.
 
-- A **byte census** from the GGUF tensor table, *including* the linear-attention
-  recurrent and conv state, so the roofline stops being weights-only.
-- A **dispatch census** per decoded token. On this box a dispatch costs ~2.08 µs,
-  so 1% of decode is about 20 launches — that ratio tells you immediately whether
-  launch structure or bandwidth is the lever here.
+Census at the `0001-0005` frontier, `rocprofv3 --kernel-trace` ordered by
+`Dispatch_Id` with full template names: **1316.0 dispatches and ~30.0 ms of kernel
+per decoded token**, i.e. kernel time is ~91% of the token and the remaining ~2.5 ms
+of inter-kernel gap is still the largest single pool.
+
+The matvecs are ~82% of the token and are already at ~94% of achievable streaming
+bandwidth, so the pool that is left is launch structure, and it is concentrated in the
+**48 linear-attention layers**, which issue about 11 small kernels each:
+
+| kernel | per token | µs each |
+|---|---|---|
+| `l2_norm_f32<32>` (q and k) | 96.1 | 1.99 |
+| `k_bin_bcast` | 48.0 | 1.6 |
+| `cpy_scalar` | 64.0 | 2.29 |
+| `k_get_rows_float` / `_vec` | 49.1 / 48.0 | 1.70 / 6.39 |
+| `concat_cont` | 48.0 | 1.65 |
+| `ssm_conv_f32` | 48.0 | 1.52 |
+| `unary_gated<silu>` | 48.1 | 1.42 |
+
+`0005` took the three that were pure per-head scalars. The two `l2_norm` launches are
+the next candidates by the same rule, but they are *not* free the way `0005` was:
+`l2_norm` runs one workgroup per k-head (16) against `gated_delta_net`'s 48, so folding
+them recomputes each reduction three times. Price that ratio before building it, and
+see the `-funsafe-math-optimizations` warning below — it applies to any producer fold
+on this backend.
+
+**ggml-hip here is built with `-funsafe-math-optimizations`.** A value that stock
+reads through a global load is opaque to the optimizer; the same value computed
+in-register is not, and the compiler will reassociate across it. This is not a
+tolerance question — it silently moved perplexity by up to 0.095% on a fold whose
+folded values were provably bit-identical. Re-impose the barrier explicitly.
