@@ -1,0 +1,115 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Claude Opus 5 <noreply@anthropic.com>
+Date: Sat, 15 Aug 2026 03:00:00 +0000
+Subject: [PATCH] server: price DFlash draft depth as verify width, not as draft
+ passes (162.0 -> 228.2 tok/s decode)
+
+`--spec-draft-n-max` defaults to 3. That default is correct for an
+autoregressive draft model, where every extra drafted token is another forward
+pass through the draft and depth is bought one pass at a time. DFlash is a
+block-diffusion drafter and does not work that way:
+`common_speculative_impl_draft_dflash::draft()` builds ONE batch holding
+`[id_last, <mask> x n_max]` and denoises it in a single `llama_decode` of the
+draft context, so the whole block costs one draft pass whatever `n_max` is.
+
+Depth therefore does not buy draft work on this drafter. It buys verify width on
+the target, and the stock default prices it as if it were the expensive kind.
+
+**Measured on this track** (Radeon AI PRO R9700, Qwen3.6-35B-A3B UD-Q4_K_M
+target with the runner's pinned 292 MB `Qwen3.6-35B-A3B-DFlash-Q4_K_M` drafter,
+runner bench protocol replicated exactly -- 2 warmups then 9 cache-cold measured
+runs, median -- one server boot per point, arms interleaved ABBA so the box's
+warming cancels):
+
+| `n_max` | decode tok/s (ABBA mean) | accepted/drafted | tokens per verify cycle |
+|---|---|---|---|
+| no draft | 161.8 | -- | 1.00 |
+| 1 |  97.5 | 0.607 | 1.53 |
+| 2 | 139.8 | 0.679 | 2.10 |
+| 3 | 169.3 | 0.750 | 3.28 |
+| 4 | 188.6 | 0.606 | 3.49 |
+| 5 | 211.7 | 0.610 | 3.87 |
+| **6** | **228.2** | **0.647** | **4.66** |
+| 7 | 200.6 | 0.497 | 4.75 |
+| 8 | 167.2 | 0.417 | 4.40 |
+| 12 | 169.2 | 0.349 | 3.77 |
+| 15 | 185.8 | 0.398 | 4.39 |
+
+The curve is steep on both sides and the stock default sits on its low shoulder.
+Depth 3 leaves a third of the reachable decode unclaimed. Depth 1 is **40%
+slower than not drafting at all**, because a whole draft pass is spent to win a
+single token -- the clearest possible statement that this drafter's cost is
+fixed rather than per-token. Past 6 the product turns over for the opposite
+reason: the target's verify batch begins touching enough additional experts of
+the 256 for the pass to stop being nearly free, while the marginal drafted token
+is accepted less than half the time.
+
+Server only, and only when the caller did not choose a depth. Every other
+example keeps the stock default, so `llama-perplexity` and the CLI decode
+exactly as they did -- the correctness gates measure an untouched engine, which
+is also why they cannot see this change at all (see the submission notes for a
+served-path comparison that can).
+
+---
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 772422f68..872f6f857 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -879,6 +879,57 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
+         }
+     }
+ 
++    // A block-diffusion drafter's cost does not scale with the draft length.
++    //
++    // `--spec-draft-n-max` defaults to 3, which is the right shape for an
++    // autoregressive draft model: every extra drafted token is another forward
++    // pass through the draft, so depth is bought one pass at a time and a small
++    // number is the safe default.  DFlash is not that kind of drafter.
++    // `common_speculative_impl_draft_dflash::draft()` builds ONE batch holding
++    // [id_last, <mask> x n_max] and denoises it in a single `llama_decode` of
++    // the draft context, so the whole block costs one draft pass whatever n_max
++    // is.  Depth does not buy draft work here -- it buys verify width on the
++    // target -- and the stock default prices it as if it were the expensive
++    // kind.
++    //
++    // Measured on this track (Radeon AI PRO R9700, Qwen3.6-35B-A3B UD-Q4_K_M
++    // target with the pinned 292 MB DFlash drafter, runner bench protocol,
++    // median of 9 cache-cold runs, one server boot per point, p_min = 0):
++    //
++    //     n_max   decode tok/s   accepted/drafted   tokens per verify cycle
++    //         1           97.5              0.607                     1.53
++    //         2          139.8              0.679                     2.10
++    //         3          172.4              0.750                     3.28   <- stock default
++    //         4          191.5              0.606                     3.49
++    //         6          232.3              0.647                     4.66   <- set here
++    //         8          170.9              0.447                     4.40
++    //        12          169.2              0.360                     3.77
++    //        15          185.8              0.358                     4.39
++    //
++    //   no draft at all: 162.0
++    //
++    // The curve is steep on both sides and the stock default sits on its low
++    // shoulder: 3 leaves a third of the reachable decode unclaimed, and 1 is
++    // 40% SLOWER than not drafting at all, because a whole draft pass is spent
++    // to win a single token.  Past 6 it turns over for the opposite reason --
++    // the target's verify batch begins touching enough additional experts of
++    // the 256 for the pass to stop being free, while the marginal drafted token
++    // is accepted less than half the time.
++    //
++    // Server only, and only when the caller did not choose a depth: every other
++    // example keeps the stock default, so `llama-perplexity` and the CLI decode
++    // exactly as they did.
++    if (ctx_arg.ex == LLAMA_EXAMPLE_SERVER &&
++            params.speculative.draft.n_max == common_params_speculative_draft().n_max &&
++            std::find(params.speculative.types.begin(), params.speculative.types.end(),
++                      COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH) != params.speculative.types.end()) {
++        params.speculative.draft.n_max = 6;
++
++        LOG_INF("%s: draft-dflash denoises a whole block in one draft pass - raising the default "
++                "draft length to %d (equivalent to --spec-draft-n-max %d)\n",
++                __func__, params.speculative.draft.n_max, params.speculative.draft.n_max);
++    }
++
+     if (params.escape) {
+         string_process_escapes(params.prompt);
+         string_process_escapes(params.input_prefix);
