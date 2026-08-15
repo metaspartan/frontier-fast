@@ -121,6 +121,31 @@ case "$cmd" in
     contract=$(curl -sf "$BASE_URL/api/tracks/$track") || { echo "error: unknown track $track" >&2; exit 1; }
     commit=$(git rev-parse HEAD 2>/dev/null || echo "")
     origin=$(git remote get-url origin 2>/dev/null | sed -E 's#git@github.com:#https://github.com/#; s#\.git$##' || echo "")
+    # Reachability pre-flight. The runner clones $origin and fetches $commit, so
+    # a commit that exists only in the local clone is accepted here, queued, and
+    # then rejected minutes later — after the submitter has walked away. That is
+    # the most expensive way possible to learn you forgot to push. Check it now,
+    # while the fix is one `git push` and costs nothing.
+    if [ -n "$commit" ] && [ -n "$origin" ]; then
+      if remote_refs=$(git ls-remote "$origin" 2>/dev/null) && [ -n "$remote_refs" ]; then
+        # Either the commit IS a remote ref tip, or it is an ancestor of one we
+        # already know about. The second case matters: submitting from a commit
+        # a few back on a pushed branch is legitimate and must not be blocked.
+        if ! printf '%s\n' "$remote_refs" | grep -q "^$commit" \
+           && ! git branch -r --contains "$commit" 2>/dev/null | grep -q .; then
+          echo "error: commit ${commit:0:10} is not reachable in $origin" >&2
+          echo "       The runner clones that repo and fetches your commit; it cannot see" >&2
+          echo "       anything you have not pushed, and would reject this minutes from now." >&2
+          echo "hint:  git push -u origin HEAD    # then resubmit" >&2
+          exit 1
+        fi
+      else
+        # No network, no read access, a non-GitHub origin — none of these are the
+        # submitter's problem, and none justify blocking a submission on a guess.
+        echo "warning: could not reach $origin to confirm commit ${commit:0:10} is pushed." >&2
+        echo "         If it is not, the runner will reject this. Push before it dequeues." >&2
+      fi
+    fi
     id="$(echo "$name" | tr "[:upper:] " "[:lower:]-" | tr -cd "a-z0-9-")-$(date +%s)"
     body=$(python3 - "$contract" "$id" "$name" "$notes" "$pr" "$agent" "$commit" "$origin" <<'PYEOF'
 import json, sys
