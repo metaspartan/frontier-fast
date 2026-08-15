@@ -20,13 +20,16 @@ weight-bandwidth bound from the first token. Trunk weights are
 
 This is the GB10, not the R9700, and the difference decides what is worth trying.
 
-- **A dispatch costs ~0.88 µs here against ~2.08 µs on the R9700.** So roughly
-  **95 launches buy 1% of decode**, where on RDNA4 it takes 20. CUDA graph
-  capture is already live at decode, so a removed dispatch mostly buys
-  inter-node latency you were not paying much for.
+- **Launch-structure work on this track is dead, with a number attached.** A
+  dispatch costs ~0.88 µs here, and the decode token is ~84 ms, so **~960
+  dispatches buy 1% of decode**. The census counts ~1719 dispatches per token —
+  so deleting *every kernel launch in the token* would buy **1.8%**.
+  (An earlier version of this file said "~95 launches buy 1%". That was a
+  small-model constant carried onto a dense 27B and it was wrong by 10x. The
+  ratio is `0.01 x token_duration / dispatch_cost`; compute it, do not inherit
+  it.)
 - **Rank candidates by BYTES removed, not dispatches removed.** That rule has now
-  held on three separate ports to this box. Launch-structure patches that win big
-  on RDNA4 have repeatedly evaporated here.
+  held on three separate ports to this box.
 
 If you are porting from the R9700 twin, triage by directory: `src/` (core C++ and
 graph-level) applies verbatim and ports best, `ggml/src/ggml-cuda` transfers
