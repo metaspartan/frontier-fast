@@ -9,6 +9,7 @@ filename order.
 - `0004` the fused unary+mul gating the attention output does the same
 - `0005` `gated_delta_net` computes its own gate and beta
 - `0006` `gated_delta_net` reads its recurrent state in place, eliding the `build_rs` gather
+- `0007` `gated_delta_net` normalises q and k in register, eliding both `l2_norm` launches
 
 ## The model
 
@@ -88,12 +89,27 @@ and the kernel's `keep_rs_t` path writes rollback snapshots into the same buffer
 would be reading, which moved gate-shape perplexity 2.9608 -> 2.9655 when left enabled
 there. Decode-gated, both runner perplexity shapes are identical in every digit.
 
-`0005` took the three that were pure per-head scalars. The two `l2_norm` launches are
-the next candidates by the same rule, but they are *not* free the way `0005` was:
-`l2_norm` runs one workgroup per k-head (16) against `gated_delta_net`'s 48, so folding
-them recomputes each reduction three times. Price that ratio before building it, and
-see the `-funsafe-math-optimizations` warning below — it applies to any producer fold
-on this backend.
+`0005` took the three that were pure per-head scalars. `0007` took the two `l2_norm`
+launches, and the grid-ratio pricing that this file previously used to decline them was
+wrong in **both** directions. The real redundancy is far worse than the "three times"
+claimed here before — `gated_delta_net` runs 1536 workgroups of 4 warps, 6144 warps
+against `l2_norm`'s 16, so 384x — *and* the ratio is the wrong question, because a grid
+ratio prices RE-READING the producer's input and there is nothing to re-read: a gdn warp
+already holds the whole 128-element q and k in `q_reg`/`k_reg` under exactly the
+element-to-lane mapping `l2_norm_f32<32>` uses, and `block_reduce<SUM>` degenerates to
+the same `warp_reduce_sum` at `block_size == WARP_SIZE`. The fold costs 2 warp reductions
+and 2 rsqrts per warp on resident values: measured +49.5 us/token of gdn against 194.7 us
+of `l2_norm` plus 96 launches, netting +0.86%. Registers went 38 -> 39 with zero spills.
+
+**The transferable rule: price a fold by the grid ratio only when the consumer must
+RE-READ the producer's input. When one consumer warp already holds the producer's entire
+reduction domain in registers, the ratio is irrelevant and the cost is ALU.** The test is
+`producer_reduction_domain` fits in one consumer warp. It does not reopen everything - the
+`ssm_norm` over gdn's output reduces across all 128 columns of a head while a gdn warp holds
+only one, so that fold stays dead by grid ratio.
+
+See the `-funsafe-math-optimizations` warning below — it applies to any producer fold
+on this backend, and `0007` needed it on every normalised value.
 
 **ggml-hip here is built with `-funsafe-math-optimizations`.** A value that stock
 reads through a global load is opaque to the optimizer; the same value computed
