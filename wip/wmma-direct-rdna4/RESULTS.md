@@ -25,3 +25,26 @@ instruction) redistributed into fragment layout with lane permutes
 (v_permlane16/32), priced ~16 VALU per lane per sub-block against the idle
 VALU budget. If that lands >550 GB/s the full kernel is worth building;
 below MMQ's 507 the family closes.
+
+## Round 2: the coalescing hypothesis is dead, and so is the family
+
+- slice4 (raw-qs LDS redistribution, 16 coalesced 128B loads/superblock,
+  single-wave blocks so the handoff needs no cross-wave barrier): bit-exact,
+  298 qs / 373 total GB/s - SLOWER than the scattered loads. Coalescing was
+  not the limiter: the wave consumes each 128B line fully over a superblock
+  either way.
+- slice5/6 (launch_bounds occupancy 16 / 12): 47 / 53 GB/s - forcing
+  occupancy above 8 squeezes below the kernel's 122 VGPR and spills
+  catastrophically.
+- slice7 (2-superblock register prefetch, +32 VGPR within the occ-8 budget):
+  bit-exact, 397 qs / 497 total GB/s - best of family, still under MMQ's 507
+  and under the 550 pass threshold.
+
+CLOSURE MECHANISM: the direct-load kernel is DRAM-LATENCY-bound at the only
+occupancy its register budget allows (8 waves/SIMD). WMMA fragments +
+accumulators + scales + prefetch must coexist in one wave's registers; every
+attempt to raise resident waves spills. MMQ's LDS staging is load-bearing
+for exactly this reason: it decouples the memory pipeline from the WMMA
+register pressure, keeping per-wave footprint low enough for latency-hiding
+occupancy. Direct-load moves the staging cost into registers and loses to
+occupancy what it saves in LDS traffic. Family closed at MMQ parity.
