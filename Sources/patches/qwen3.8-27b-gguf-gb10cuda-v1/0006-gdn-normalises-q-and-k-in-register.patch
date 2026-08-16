@@ -1,0 +1,512 @@
+From 6e843c0a11f8c9bdf52de6cd4ab97cbae27bac67 Mon Sep 17 00:00:00 2001
+From: x <x@y>
+Date: Sun, 16 Aug 2026 11:19:18 -0600
+Subject: [PATCH 6/7] port r9700 0007
+
+---
+ ggml/src/ggml-cuda/gated_delta_net.cu  | 125 +++++++++++++----
+ ggml/src/ggml-cuda/gated_delta_net.cuh |  28 +++-
+ ggml/src/ggml-cuda/ggml-cuda.cu        | 183 ++++++++++++++++++++++++-
+ 3 files changed, 301 insertions(+), 35 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index b6367fee..12f9c2b7 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -21,7 +21,7 @@ static __device__ __forceinline__ float gdn_op_sigmoid(float x) {
+     return 1.0f / (1.0f + expf(-x));
+ }
+ 
+-template <int S_v, bool KDA, bool keep_rs_t, bool ACT_FOLD>
++template <int S_v, bool KDA, bool keep_rs_t, bool ACT_FOLD, bool L2_FOLD>
+ __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+ gated_delta_net_cuda(const float * q,
+                                      const float * k,
+@@ -53,7 +53,13 @@ gated_delta_net_cuda(const float * q,
+                                      int64_t       state_slot_stride,
+                                      int           K,
+                                      const int32_t * state_idx,
+-                                     int64_t       state_row_stride) {
++                                     int64_t       state_row_stride,
++                                     const float * q_raw,
++                                     const float * k_raw,
++                                     int64_t       sr1,
++                                     int64_t       sr2,
++                                     int64_t       sr3,
++                                     float         l2_eps) {
+     const uint32_t h_idx    = blockIdx.x;
+     const uint32_t sequence = blockIdx.y;
+     // each warp owns one column, using warp-level primitives to reduce across rows
+@@ -96,8 +102,17 @@ gated_delta_net_cuda(const float * q,
+     }
+ 
+     for (int t = 0; t < n_tokens; t++) {
+-        const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+-        const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
++        // With the l2-norm fold the normalised copies were never written, so read the
++        // pre-normalisation tensors (their own strides) and normalise in-register below.
++        const float * q_t;
++        const float * k_t;
++        if constexpr (L2_FOLD) {
++            q_t = q_raw + iq3 * sr3 + t * sr2 + iq1 * sr1;
++            k_t = k_raw + iq3 * sr3 + t * sr2 + iq1 * sr1;
++        } else {
++            q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
++            k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
++        }
+         const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+ 
+         const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+@@ -122,6 +137,31 @@ gated_delta_net_cuda(const float * q,
+             q_reg[r] = q_t[i];
+         }
+ 
++        if constexpr (L2_FOLD) {
++            // Reproduce l2_norm_f32<32> exactly. Its loop is `for (col = tid; col < ncols;
++            // col += block_size)`, i.e. col = r*warp_size + lane in the same r order, and at
++            // block_size == WARP_SIZE its block_reduce<SUM> is warp_reduce_sum. The two sums
++            // are independent, so interleaving them changes neither.
++            float q_ss = 0.0f;
++            float k_ss = 0.0f;
++#pragma unroll
++            for (int r = 0; r < rows_per_lane; r++) {
++                q_ss += q_reg[r] * q_reg[r];
++                k_ss += k_reg[r] * k_reg[r];
++            }
++            const float q_scale = rsqrtf(fmaxf(warp_reduce_sum<warp_size>(q_ss), l2_eps * l2_eps));
++            const float k_scale = rsqrtf(fmaxf(warp_reduce_sum<warp_size>(k_ss), l2_eps * l2_eps));
++            // ggml-hip builds with -funsafe-math-optimizations. Stock reaches these values
++            // through a global load, which is an implicit optimizer barrier; computing them
++            // in-register removes it and lets the compiler contract the scaling into the uses
++            // below. Re-impose it explicitly, as the gate/beta fold does.
++#pragma unroll
++            for (int r = 0; r < rows_per_lane; r++) {
++                q_reg[r] = gdn_opaque(q_scale * q_reg[r]);
++                k_reg[r] = gdn_opaque(k_scale * k_reg[r]);
++            }
++        }
++
+         if constexpr (!KDA) {
+             float g_lin;
+             if constexpr (ACT_FOLD) {
+@@ -213,7 +253,7 @@ gated_delta_net_cuda(const float * q,
+     }
+ }
+ 
+-template <bool KDA, bool keep_rs_t, bool ACT_FOLD>
++template <bool KDA, bool keep_rs_t, bool ACT_FOLD, bool L2_FOLD>
+ static void launch_gated_delta_net(
+         const float * q_d, const float * k_d, const float * v_d,
+         const float * g_d, const float * b_d,
+@@ -226,7 +266,9 @@ static void launch_gated_delta_net(
+         int64_t sb1,   int64_t sb2, int64_t sb3,
+         int64_t neqk1, int64_t rq3,
+         float scale, int64_t state_slot_stride, int K,
+-        const int32_t * state_idx, int64_t state_row_stride, cudaStream_t stream) {
++        const int32_t * state_idx, int64_t state_row_stride,
++        const float * q_raw, const float * k_raw, int64_t sr1, int64_t sr2, int64_t sr3, float l2_eps,
++        cudaStream_t stream) {
+     //TODO: Add chunked kernel for even faster pre-fill
+     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+     const int num_warps = 4;
+@@ -239,33 +281,33 @@ static void launch_gated_delta_net(
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+     switch (S_v) {
+         case 16:
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, ACT_FOLD>, launch_params,
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, ACT_FOLD, L2_FOLD>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, graw_d, gbias_d, gscale_d, braw_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
+-                state_idx, state_row_stride);
++                state_idx, state_row_stride, q_raw, k_raw, sr1, sr2, sr3, l2_eps);
+             break;
+         case 32:
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, ACT_FOLD>, launch_params,
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, ACT_FOLD, L2_FOLD>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, graw_d, gbias_d, gscale_d, braw_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
+-                state_idx, state_row_stride);
++                state_idx, state_row_stride, q_raw, k_raw, sr1, sr2, sr3, l2_eps);
+             break;
+         case 64: {
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, ACT_FOLD>, launch_params,
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, ACT_FOLD, L2_FOLD>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, graw_d, gbias_d, gscale_d, braw_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
+-                state_idx, state_row_stride);
++                state_idx, state_row_stride, q_raw, k_raw, sr1, sr2, sr3, l2_eps);
+             break;
+         }
+         case 128: {
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, ACT_FOLD>, launch_params,
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, ACT_FOLD, L2_FOLD>, launch_params,
+                 q_d, k_d, v_d, g_d, b_d, graw_d, gbias_d, gscale_d, braw_d, s_d, dst_d, state_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K,
+-                state_idx, state_row_stride);
++                state_idx, state_row_stride, q_raw, k_raw, sr1, sr2, sr3, l2_eps);
+             break;
+         }
+         default:
+@@ -276,7 +318,8 @@ static void launch_gated_delta_net(
+ 
+ static void ggml_cuda_op_gated_delta_net_impl(
+         ggml_backend_cuda_context & ctx, ggml_tensor * dst, const ggml_cuda_gated_delta_net_fused_cache * cache,
+-        const ggml_cuda_gated_delta_net_act_fold * act, const ggml_cuda_gated_delta_net_state_gather * gather) {
++        const ggml_cuda_gated_delta_net_act_fold * act, const ggml_cuda_gated_delta_net_state_gather * gather,
++        const ggml_cuda_gated_delta_net_l2_fold * l2) {
+     ggml_tensor * src_q     = dst->src[0];
+     ggml_tensor * src_k     = dst->src[1];
+     ggml_tensor * src_v     = dst->src[2];
+@@ -361,42 +404,68 @@ static void ggml_cuda_op_gated_delta_net_impl(
+         s_row_stride = gather->row_stride;
+     }
+ 
++    // l2-norm fold: read the pre-normalisation q/k and normalise in-register
++    const float * qraw_d = nullptr;
++    const float * kraw_d = nullptr;
++    int64_t       sr1 = 0, sr2 = 0, sr3 = 0;
++    float         l2_eps_v = 0.0f;
++    if (l2 != nullptr) {
++        GGML_ASSERT(l2->q_raw != nullptr && l2->k_raw != nullptr);
++        qraw_d   = l2->q_raw;
++        kraw_d   = l2->k_raw;
++        sr1      = l2->s1;
++        sr2      = l2->s2;
++        sr3      = l2->s3;
++        l2_eps_v = l2->eps;
++    }
++
+     const float * graw_d  = act ? act->g_raw   : nullptr;
+     const float * gbias_d = act ? act->g_bias  : nullptr;
+     const float * gscale_d= act ? act->g_scale : nullptr;
+     const float * braw_d  = act ? act->b_raw   : nullptr;
+ 
+-#define GDN_LAUNCH(KDA_, KEEP_, ACT_)                                            \
+-    launch_gated_delta_net<KDA_, KEEP_, ACT_>(q_d, k_d, v_d, g_d, b_d,           \
++#define GDN_LAUNCH(KDA_, KEEP_, ACT_, L2_)                                            \
++    launch_gated_delta_net<KDA_, KEEP_, ACT_, L2_>(q_d, k_d, v_d, g_d, b_d,      \
+         graw_d, gbias_d, gscale_d, braw_d, s_base_d, dst_d, state_d,                  \
+         S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,                  \
+-        sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_idx_d, s_row_stride, stream)
++        sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, s_idx_d, s_row_stride, qraw_d, kraw_d, sr1, sr2, sr3, l2_eps_v, stream)
+ 
++    const bool has_l2 = (l2 != nullptr);
+     if (kda) {
+-        // the activation fold is only wired for the scalar-gate (non-KDA) form
+-        GGML_ASSERT(act == nullptr);
+-        if (keep_rs) { GDN_LAUNCH(true, true, false); } else { GDN_LAUNCH(true, false, false); }
+-    } else if (act != nullptr) {
+-        if (keep_rs) { GDN_LAUNCH(false, true, true); } else { GDN_LAUNCH(false, false, true); }
++        // the activation and l2 folds are only wired for the scalar-gate (non-KDA) form
++        GGML_ASSERT(act == nullptr && !has_l2);
++        if (keep_rs) { GDN_LAUNCH(true, true, false, false); } else { GDN_LAUNCH(true, false, false, false); }
+     } else {
+-        if (keep_rs) { GDN_LAUNCH(false, true, false); } else { GDN_LAUNCH(false, false, false); }
++#define GDN_PICK(KEEP_)                                                                        \
++        do {                                                                                   \
++            if (act != nullptr) {                                                              \
++                if (has_l2) { GDN_LAUNCH(false, KEEP_, true,  true); }                         \
++                else        { GDN_LAUNCH(false, KEEP_, true,  false); }                        \
++            } else {                                                                           \
++                if (has_l2) { GDN_LAUNCH(false, KEEP_, false, true); }                         \
++                else        { GDN_LAUNCH(false, KEEP_, false, false); }                        \
++            }                                                                                  \
++        } while (0)
++        if (keep_rs) { GDN_PICK(true); } else { GDN_PICK(false); }
++#undef GDN_PICK
+     }
+ #undef GDN_LAUNCH
+ }
+ 
+ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+-    ggml_cuda_op_gated_delta_net_impl(ctx, dst, nullptr, nullptr, nullptr);
++    ggml_cuda_op_gated_delta_net_impl(ctx, dst, nullptr, nullptr, nullptr, nullptr);
+ }
+ 
+ void ggml_cuda_op_gated_delta_net_fused_cache(
+         ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_cuda_gated_delta_net_fused_cache cache) {
+-    ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache, nullptr, nullptr);
++    ggml_cuda_op_gated_delta_net_impl(ctx, dst, &cache, nullptr, nullptr, nullptr);
+ }
+ 
+ void ggml_cuda_op_gated_delta_net_fused(
+         ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+         const ggml_cuda_gated_delta_net_fused_cache *  cache,
+         const ggml_cuda_gated_delta_net_act_fold *     act,
+-        const ggml_cuda_gated_delta_net_state_gather * gather) {
+-    ggml_cuda_op_gated_delta_net_impl(ctx, dst, cache, act, gather);
++        const ggml_cuda_gated_delta_net_state_gather * gather,
++        const ggml_cuda_gated_delta_net_l2_fold *      l2) {
++    ggml_cuda_op_gated_delta_net_impl(ctx, dst, cache, act, gather, l2);
+ }
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cuh b/ggml/src/ggml-cuda/gated_delta_net.cuh
+index 04784dd2..edd8e888 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cuh
++++ b/ggml/src/ggml-cuda/gated_delta_net.cuh
+@@ -33,6 +33,31 @@ struct ggml_cuda_gated_delta_net_state_gather {
+     int64_t         row_stride = 0;       // elements between state rows
+ };
+ 
++// l2-norm fold: the kernel normalises q and k itself.
++//
++// A Qwen3.5-style linear-attention layer l2-normalises the convolved q and k before the
++// gated_delta_net consumes them. Each l2_norm_f32<32> launch is ONE workgroup per k-head -
++// 16 workgroups of a single warp reading 8 KB - so the pair costs about as much dispatch
++// latency as it does work, twice per layer.
++//
++// Price this on ALU, not on the grid ratio. The grid ratio is far worse than it looks
++// (gated_delta_net runs 1536 workgroups of 4 warps against l2_norm's 16 single-warp ones,
++// so each reduction is recomputed 384x, not 3x) and it is also the wrong question, because
++// the recomputation needs no loads: a gated_delta_net warp ALREADY holds the full S_v-element
++// q and k in q_reg/k_reg, fetched with i = r*warp_size + lane - which is exactly the
++// element-to-lane mapping l2_norm_f32<32> uses (col = tid; col += 32) - and at block_size ==
++// WARP_SIZE its block_reduce<SUM> degenerates to the same warp_reduce_sum. So the fold
++// reproduces the kernel it replaces expression-for-expression on values already resident:
++// no extra traffic, and bit-exact by construction rather than by tolerance.
++struct ggml_cuda_gated_delta_net_l2_fold {
++    const float * q_raw = nullptr; // pre-normalisation q (the l2_norm's own src)
++    const float * k_raw = nullptr;
++    int64_t       s1    = 0;       // raw strides in elements; q and k are required to share them
++    int64_t       s2    = 0;
++    int64_t       s3    = 0;
++    float         eps   = 0.0f;
++};
++
+ void ggml_cuda_op_gated_delta_net(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ // same op, but writes the snapshot(s) into the cache instead of dst (see ggml_cuda_try_gdn_cache_fusion)
+@@ -43,4 +68,5 @@ void ggml_cuda_op_gated_delta_net_fused_cache(ggml_backend_cuda_context & ctx, g
+ void ggml_cuda_op_gated_delta_net_fused(ggml_backend_cuda_context & ctx, ggml_tensor * dst,
+                                         const ggml_cuda_gated_delta_net_fused_cache *  cache,
+                                         const ggml_cuda_gated_delta_net_act_fold *     act,
+-                                        const ggml_cuda_gated_delta_net_state_gather * gather);
++                                        const ggml_cuda_gated_delta_net_state_gather * gather,
++                                        const ggml_cuda_gated_delta_net_l2_fold *      l2);
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 437d27ac..f7f2f57a 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3098,6 +3098,169 @@ static bool ggml_cuda_gdn_state_gather_folded(const ggml_cgraph * cgraph, int i)
+     return false;
+ }
+ 
++// ---------------------------------------------------------------------------
++// gated_delta_net l2-norm fold
++//
++// build_layer_attn_linear l2-normalises the convolved q and k before the gated_delta_net
++// consumes them. Both launches are one workgroup per k-head - 16 single-warp workgroups
++// reading 8 KB - so at 2.05 us each they are dispatch latency far more than work, and there
++// are 96 of them per decoded token.
++//
++// The published decline of this fold priced it by the section 6b grid ratio ("16 workgroups
++// against 48, so the fold recomputes each reduction 3x"). Both halves are wrong. The real
++// ratio is much worse - gated_delta_net launches grid(H, n_seqs, S_v/4) with 4 warps a block,
++// 6144 warps against l2_norm's 16, so 384x - and the ratio is the wrong question anyway,
++// because a grid ratio prices RE-READING the producer's input and here there is nothing to
++// re-read: the gated_delta_net warp already holds the entire S_v-element q and k in registers,
++// loaded with exactly the element-to-lane mapping l2_norm_f32<32> uses. What the fold actually
++// costs is 2 warp_reduce_sums and 2 rsqrts per warp on resident values.
++// ---------------------------------------------------------------------------
++
++// 0 = off (run both l2_norms), 1 = fold them into the gated_delta_net
++static int ggml_cuda_gdn_l2_fold_mode() {
++    static const int mode = [] {
++        const char * e = getenv("GGML_GDN_L2_FOLD");
++        return e == nullptr ? 1 : std::atoi(e);
++    }();
++    return mode;
++}
++
++static constexpr int GGML_CUDA_GDN_L2_WINDOW = 64;
++
++// the tensor that owns the bytes, regardless of view offset
++static const ggml_tensor * ggml_cuda_gdn_view_root(const ggml_tensor * t) {
++    while (t != nullptr && t->view_src != nullptr) {
++        t = t->view_src;
++    }
++    return t;
++}
++
++static bool ggml_cuda_try_gdn_l2_fold(const ggml_cgraph *                  cgraph,
++                                      int                                  gdn_idx,
++                                      ggml_cuda_gated_delta_net_l2_fold &  f,
++                                      const ggml_tensor **                 skip_q,
++                                      const ggml_tensor **                 skip_k) {
++    if (ggml_cuda_gdn_l2_fold_mode() == 0) {
++        return false;
++    }
++
++    const ggml_tensor * gdn = cgraph->nodes[gdn_idx];
++    if (gdn->op != GGML_OP_GATED_DELTA_NET) {
++        return false;
++    }
++
++    const ggml_tensor * src_q = gdn->src[0];
++    const ggml_tensor * src_k = gdn->src[1];
++    const ggml_tensor * src_v = gdn->src[2];
++    if (src_q == nullptr || src_k == nullptr || src_v == nullptr) {
++        return false;
++    }
++
++    const int64_t S_v = src_v->ne[0];
++
++    // Decode only, for the same reason the activation fold is: at prefill the kernel loops
++    // over n_tokens INSIDE each block, so the fold would recompute both reductions once per
++    // (token, column block) rather than once per (token, head), while the two launches it
++    // removes are amortised over the whole ubatch and are worth nothing there.
++    if (src_v->ne[2] != 1) {
++        return false;
++    }
++
++    const ggml_tensor * l2q = ggml_cuda_gdn_writer(src_q);
++    const ggml_tensor * l2k = ggml_cuda_gdn_writer(src_k);
++    if (l2q == nullptr || l2k == nullptr || l2q == l2k ||
++        l2q->op != GGML_OP_L2_NORM || l2k->op != GGML_OP_L2_NORM ||
++        l2q->type != GGML_TYPE_F32 || l2k->type != GGML_TYPE_F32 ||
++        (l2q->flags & GGML_TENSOR_FLAG_OUTPUT) || (l2k->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return false;
++    }
++
++    const ggml_tensor * qr = l2q->src[0];
++    const ggml_tensor * kr = l2k->src[0];
++    if (qr == nullptr || kr == nullptr || qr->type != GGML_TYPE_F32 || kr->type != GGML_TYPE_F32 ||
++        qr->data == nullptr || kr->data == nullptr) {
++        return false;
++    }
++
++    // The fold reproduces l2_norm_f32<32>: one warp per row, reducing ncols elements as
++    // col = r*WARP_SIZE + lane. That is the gated_delta_net warp's own q_reg/k_reg mapping
++    // only when the normalised row is exactly S_v wide, and only while l2_norm still picks
++    // its single-warp kernel (it switches to a 1024-thread block reduction at 1024 columns).
++    if (l2q->ne[0] != S_v || l2k->ne[0] != S_v || S_v >= 1024 || S_v < WARP_SIZE ||
++        (S_v % WARP_SIZE) != 0) {
++        return false;
++    }
++
++    // the gdn indexes q and k with the normalised tensors' shape, so the raw ones must agree
++    if (!std::equal(qr->ne, qr->ne + GGML_MAX_DIMS, kr->ne) ||
++        !std::equal(qr->ne, qr->ne + GGML_MAX_DIMS, src_q->ne) ||
++        !std::equal(qr->ne, qr->ne + GGML_MAX_DIMS, src_k->ne)) {
++        return false;
++    }
++
++    // raw q and k must be contiguous rows and share strides (the kernel keeps one stride set)
++    if (qr->nb[0] != ggml_type_size(GGML_TYPE_F32) || kr->nb[0] != ggml_type_size(GGML_TYPE_F32) ||
++        !std::equal(qr->nb, qr->nb + GGML_MAX_DIMS, kr->nb)) {
++        return false;
++    }
++
++    float eps_q, eps_k;
++    memcpy(&eps_q, l2q->op_params, sizeof(float));
++    memcpy(&eps_k, l2k->op_params, sizeof(float));
++    if (eps_q != eps_k) {
++        return false;
++    }
++
++    // LIVENESS. The fold reads the pre-normalisation q and k AT the gated_delta_net, which is
++    // past the point ggml-alloc considers the l2_norm inputs dead. Rather than add a graph edge
++    // to keep them, require that the gdn ALREADY holds one: build_layer_attn_linear carves q, k
++    // and v out of a single conv output, so src[2] pins the very allocation the fold reads. If
++    // that is not the shape in front of us, decline instead of reaching for bytes we cannot keep.
++    const ggml_tensor * root = ggml_cuda_gdn_view_root(qr);
++    if (root == nullptr || root != ggml_cuda_gdn_view_root(kr) ||
++        root != ggml_cuda_gdn_view_root(src_v)) {
++        return false;
++    }
++
++    // the normalised copies must be read by nothing but this gdn
++    if (!ggml_cuda_gdn_chain_private(cgraph, gdn, l2q, src_q) ||
++        !ggml_cuda_gdn_chain_private(cgraph, gdn, l2k, src_k)) {
++        return false;
++    }
++
++    f.q_raw = (const float *) qr->data;
++    f.k_raw = (const float *) kr->data;
++    f.s1    = (int64_t) (qr->nb[1] / sizeof(float));
++    f.s2    = (int64_t) (qr->nb[2] / sizeof(float));
++    f.s3    = (int64_t) (qr->nb[3] / sizeof(float));
++    f.eps   = eps_q;
++    *skip_q = l2q;
++    *skip_k = l2k;
++    return true;
++}
++
++// is node i an l2_norm a downstream gated_delta_net will compute itself?
++static bool ggml_cuda_gdn_l2_producer_folded(const ggml_cgraph * cgraph, int i) {
++    if (cgraph->nodes[i]->op != GGML_OP_L2_NORM) {
++        return false;
++    }
++    const int hi = i + GGML_CUDA_GDN_L2_WINDOW < cgraph->n_nodes ? i + GGML_CUDA_GDN_L2_WINDOW
++                                                                 : cgraph->n_nodes - 1;
++    for (int j = i + 1; j <= hi; ++j) {
++        if (cgraph->nodes[j]->op != GGML_OP_GATED_DELTA_NET) {
++            continue;
++        }
++        ggml_cuda_gated_delta_net_l2_fold f;
++        const ggml_tensor *               sq = nullptr;
++        const ggml_tensor *               sk = nullptr;
++        if (ggml_cuda_try_gdn_l2_fold(cgraph, j, f, &sq, &sk) &&
++            (sq == cgraph->nodes[i] || sk == cgraph->nodes[i])) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int node_idx, ggml_cuda_topk_moe_args & args) {
+     args.sigmoid         = false;
+     args.sqrt_softplus   = false;
+@@ -3557,6 +3720,11 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         const ggml_tensor *                    gather_node = nullptr;
+         const bool have_gather = ggml_cuda_try_gdn_state_gather(cgraph, i, gather, &gather_node);
+ 
++        ggml_cuda_gated_delta_net_l2_fold l2;
++        const ggml_tensor *               l2_q_node = nullptr;
++        const ggml_tensor *               l2_k_node = nullptr;
++        const bool have_l2 = ggml_cuda_try_gdn_l2_fold(cgraph, i, l2, &l2_q_node, &l2_k_node);
++
+         ggml_cuda_gated_delta_net_fused_cache fused_state_cpy;
+         const int nodes_to_skip = ggml_cuda_try_gdn_cache_fusion(cgraph, i, fused_state_cpy);
+         if (nodes_to_skip > 0) {
+@@ -3566,17 +3734,19 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+ #endif
+             ggml_cuda_op_gated_delta_net_fused(*cuda_ctx, node, &fused_state_cpy,
+                                                have_act ? &act.fold : nullptr,
+-                                               have_gather ? &gather : nullptr);
++                                               have_gather ? &gather : nullptr,
++                                               have_l2 ? &l2 : nullptr);
+             return nodes_to_skip;
+         }
+-        if (have_act || have_gather) {
++        if (have_act || have_gather || have_l2) {
+ #ifdef GGML_CUDA_DEBUG
+-            GGML_LOG_INFO("%s: folded gated_delta_net activations=%d state_gather=%d for %s\n",
+-                          __func__, (int) have_act, (int) have_gather, node->name);
++            GGML_LOG_INFO("%s: folded gated_delta_net activations=%d state_gather=%d l2=%d for %s\n",
++                          __func__, (int) have_act, (int) have_gather, (int) have_l2, node->name);
+ #endif
+             ggml_cuda_op_gated_delta_net_fused(*cuda_ctx, node, nullptr,
+                                                have_act ? &act.fold : nullptr,
+-                                               have_gather ? &gather : nullptr);
++                                               have_gather ? &gather : nullptr,
++                                               have_l2 ? &l2 : nullptr);
+             return -1; // computed here; nothing further to skip
+         }
+     }
+@@ -4426,7 +4596,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 // this node's value is recomputed inside a downstream gated_delta_net launch,
+                 // or its bytes are read in place by one
+                 if (ggml_cuda_gdn_act_producer_folded(cgraph, i) ||
+-                    ggml_cuda_gdn_state_gather_folded(cgraph, i)) {
++                    ggml_cuda_gdn_state_gather_folded(cgraph, i) ||
++                    ggml_cuda_gdn_l2_producer_folded(cgraph, i)) {
+                     continue;
+                 }
+ 
+-- 
+2.43.0
+
