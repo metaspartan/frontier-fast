@@ -79,9 +79,9 @@ index 772422f68..c390fb209 100644
 +    //
 +    // AMD's day-0 guidance for this model on Radeon is what pointed at MTP in
 +    // the first place ("MTP must be enabled and set to the correct number of
-+    // draft tokens for optimal performance"). They recommend 2 draft tokens for
-+    // the AI PRO R9700; measured on that card, depth 1 is faster - see the
-+    // acceptance-per-depth table in the submission notes.
++    // draft tokens for optimal performance"). The profitable depth is set by
++    // what an extra VERIFIED position costs: with patch 0003 the verify pass
++    // is flat in positions, which is what makes depth 3 pay - see the notes.
 +    //
 +    // Server only: llama-perplexity and the other tools keep decoding exactly as
 +    // they did, so the correctness gates measure an untouched engine.
@@ -91,7 +91,7 @@ index 772422f68..c390fb209 100644
 +            params.speculative.draft.n_max == common_params_speculative_draft().n_max &&
 +            model_ships_nextn_head(params.model.path)) {
 +        params.speculative.types       = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
-+        params.speculative.draft.n_max = 1;
++        params.speculative.draft.n_max = 3;
 +
 +        LOG_INF("%s: model ships a NextN head - enabling MTP self-speculation "
 +                "(equivalent to --spec-type draft-mtp --spec-draft-n-max %d)\n",
