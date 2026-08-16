@@ -1,8 +1,30 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index ad9bec039..b1a1960dd 100644
+index ad9bec039..36f155cb6 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -988,9 +988,17 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
+@@ -965,7 +965,20 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
+     // Server only, exactly like the MTP default above: -kvu changes the KV
+     // layout for every run, and llama-perplexity and the other tools must keep
+     // measuring an untouched engine.
+-    if (ctx_arg.ex == LLAMA_EXAMPLE_SERVER && getenv("GAINZ_SPEC_TREE") != nullptr) {
++    // Tree drafting defaults ON alongside MTP self-speculation on the server:
++    // the tree is drawn by the same NextN head, and with the tree-aware
++    // recurrent scan the whole tree verifies in one weight pass. The env var
++    // GAINZ_SPEC_TREE keeps full control: "0"/"off" disables, "1" forces the
++    // default shape, any other value is a custom child-count list.
++    if (ctx_arg.ex == LLAMA_EXAMPLE_SERVER) {
++        const bool mtp_active = std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
++                [](enum common_speculative_type t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; });
++        if (mtp_active) {
++            common_speculative_tree_set_default("2,2,1,1,0,0,1");
++        }
++    }
++
++    if (ctx_arg.ex == LLAMA_EXAMPLE_SERVER && common_speculative_tree_n_nodes() > 0) {
+         if (!params.kv_unified) {
+             params.kv_unified = true;
+             LOG_INF("%s: tree drafting requested - enabling unified KV cache (-kvu)\n", __func__);
+@@ -988,9 +1001,17 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
              // through to a checkpoint restore.
              params.speculative.draft.n_max = std::max(params.speculative.draft.n_max, depth);
  
@@ -46,7 +68,7 @@ index 650556ab8..75eadf65d 100644
  };
  
 diff --git a/common/speculative.cpp b/common/speculative.cpp
-index 927a75e7c..be92615ef 100644
+index 927a75e7c..d5a64c5d1 100644
 --- a/common/speculative.cpp
 +++ b/common/speculative.cpp
 @@ -168,6 +168,13 @@ struct common_speculative_impl {
@@ -63,7 +85,17 @@ index 927a75e7c..be92615ef 100644
      // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
      virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
      virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
-@@ -1553,23 +1560,36 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1460,8 +1467,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         // depth (+.127 at level 1, +.085 at level 3) while a level costs a whole
+         // MTP decode. 7 nodes puts the verify pass at 8 positions, which is the
+         // last position before it steps by a full weight read.
+-        if (const char * e = getenv("GAINZ_SPEC_TREE")) {
+-            const std::string spec = (*e && strcmp(e, "1") != 0) ? std::string(e) : std::string("2,2,1,1,0,0,1");
++        if (const std::string spec = common_speculative_tree_effective_spec(); !spec.empty()) {
+             tree_seq_base = (int32_t) n_seq;
+             tree_build_topology(spec);
+ 
+@@ -1553,23 +1559,36 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
          std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
  
@@ -103,7 +135,7 @@ index 927a75e7c..be92615ef 100644
          }
  
          auto * ctx_tgt = this->params.ctx_tgt;
-@@ -1581,8 +1601,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1581,8 +1600,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          if (!is_mem_shared) {
              common_batch_clear(batch);
  
@@ -126,7 +158,7 @@ index 927a75e7c..be92615ef 100644
              }
  
              // shift the tgt embeddings to the right by one position
-@@ -1592,7 +1625,37 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1592,7 +1624,37 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              // TODO:this is generally true, but would be nice to assert it
              {
                  const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
@@ -165,7 +197,7 @@ index 927a75e7c..be92615ef 100644
              }
  
              // fill the pending embeddings from a previous run
-@@ -1975,7 +2038,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1975,7 +2037,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
          }
      }
  
@@ -178,7 +210,7 @@ index 927a75e7c..be92615ef 100644
          if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
              return;
          }
-@@ -1985,7 +2052,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+@@ -1985,7 +2051,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
              return;
          }
  
@@ -191,7 +223,50 @@ index 927a75e7c..be92615ef 100644
          const size_t row_bytes = (size_t) n_embd * sizeof(float);
          std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
      }
-@@ -3082,7 +3153,7 @@ void common_speculative_draft(common_speculative * spec) {
+@@ -2545,16 +2615,38 @@ static uint32_t common_get_enabled_speculative_configs(const std::vector<common_
+ // Shape of the configured draft tree, by the same breadth-first expansion
+ // tree_build_topology() uses, so the three accessors below and the drafting code
+ // can never disagree about the shape. Returns false when tree drafting is off.
++// Effective tree spec: the env var always wins ("0"/"off" disables, "1" means
++// the default shape, anything else is a custom child-count list); with no env
++// var the process-wide default set by common_speculative_tree_set_default()
++// applies (empty = tree drafting off).
++static std::string g_tree_default_spec;
++
++void common_speculative_tree_set_default(const char * spec) {
++    g_tree_default_spec = spec != nullptr ? spec : "";
++}
++
++std::string common_speculative_tree_effective_spec() {
++    const char * e = getenv("GAINZ_SPEC_TREE");
++    if (e != nullptr) {
++        if (strcmp(e, "0") == 0 || strcmp(e, "off") == 0) {
++            return "";
++        }
++        if (*e && strcmp(e, "1") != 0) {
++            return e;
++        }
++        return "2,2,1,1,0,0,1";
++    }
++    return g_tree_default_spec;
++}
++
+ static bool common_speculative_tree_shape(int32_t & n_nodes, int32_t & n_leaves, int32_t & depth) {
+     n_nodes = n_leaves = depth = 0;
+ 
+-    const char * e = getenv("GAINZ_SPEC_TREE");
+-    if (e == nullptr) {
++    const std::string spec = common_speculative_tree_effective_spec();
++    if (spec.empty()) {
+         return false;
+     }
+ 
+-    const std::string spec = (*e && strcmp(e, "1") != 0) ? std::string(e) : std::string("2,2,1,1,0,0,1");
+-
+     std::vector<int32_t> nc;
+     size_t p = 0;
+     while (p < spec.size()) {
+@@ -3082,7 +3174,7 @@ void common_speculative_draft(common_speculative * spec) {
      }
  }
  
@@ -200,7 +275,7 @@ index 927a75e7c..be92615ef 100644
      common_speculative_impl * impl = spec->impl_last[seq_id];
  
      GGML_ASSERT(impl);
-@@ -3103,18 +3174,22 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+@@ -3103,18 +3195,22 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
              impl->n_acc_tokens += n_accepted;
          }
  
@@ -226,10 +301,25 @@ index 927a75e7c..be92615ef 100644
  bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
      if (spec == nullptr) {
 diff --git a/common/speculative.h b/common/speculative.h
-index f85736afd..fba3d9bca 100644
+index f85736afd..5858a344b 100644
 --- a/common/speculative.h
 +++ b/common/speculative.h
-@@ -178,6 +178,10 @@ void common_speculative_draft(common_speculative * spec);
+@@ -40,6 +40,14 @@ int32_t common_speculative_tree_n_leaves();
+ // speculation can ask for.
+ int32_t common_speculative_tree_depth();
+ 
++// Set the process-wide default tree spec (used when GAINZ_SPEC_TREE is unset;
++// the env var always wins: "0"/"off" disables, "1" = default shape, other =
++// custom child-count list). nullptr or "" disables the default.
++void common_speculative_tree_set_default(const char * spec);
++
++// The tree spec in effect after resolving env override vs default ("" = off).
++std::string common_speculative_tree_effective_spec();
++
+ common_params common_base_params_to_speculative(const common_params & params);
+ 
+ common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
+@@ -178,6 +186,10 @@ void common_speculative_draft(common_speculative * spec);
  // informs the speculative context that n_accepted tokens were accepted by the target model
  void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
  
@@ -507,10 +597,10 @@ index 6e53e2297..5be735f5b 100644
      // p0 < 0 : [0,  p1]
      // p1 < 0 : [p0, inf)
 diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
-index 2b98a552f..4b0c60ab7 100644
+index 2b98a552f..00635a360 100644
 --- a/src/llama-batch.cpp
 +++ b/src/llama-batch.cpp
-@@ -678,6 +678,78 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
+@@ -678,6 +678,96 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
      return ubatch_add(idxs, n_seqs, true);
  }
  
@@ -524,21 +614,42 @@ index 2b98a552f..4b0c60ab7 100644
 +
 +    const uint32_t n_tokens = get_n_tokens();
 +
-+    if (n_tokens < 2 || n_tokens > n_ubatch) {
++    if (n_tokens < 2) {
 +        return {};
 +    }
 +
-+    // token 0 must be the tree's root: its sequence set contains every other
-+    // token's set, and every other token sits at a strictly later position
-+    if (batch.n_seq_id[0] < 2) {
-+        return {};
-+    }
-+
-+    for (uint32_t i = 1; i < n_tokens; ++i) {
-+        if ((seq_set[0] & seq_set[i]) != seq_set[i]) {
-+            return {};
++    // the tree's root is the first multi-seq token: it carries its own slot's id
++    // plus one id per branch leaf. Everything whose seq set is contained in the
++    // root's belongs to the tree family; other slots' tokens are left for
++    // split_equal.
++    int32_t root = -1;
++    for (uint32_t i = 0; i < n_tokens; ++i) {
++        if (batch.n_seq_id[i] > 1) {
++            root = (int32_t) i;
++            break;
 +        }
-+        if (batch.pos[i] < batch.pos[0] + 1) {
++    }
++
++    if (root < 0) {
++        return {};
++    }
++
++    std::vector<int32_t> fam;
++    fam.push_back(root);
++
++    for (uint32_t i = root + 1; i < n_tokens; ++i) {
++        if ((seq_set[root] & seq_set[i]) == seq_set[i] && !(seq_set[root] & seq_set[i]).none()) {
++            fam.push_back((int32_t) i);
++        }
++    }
++
++    if (fam.size() < 2 || fam.size() > n_ubatch) {
++        return {};
++    }
++
++    // every family member must sit strictly after the root
++    for (size_t a = 1; a < fam.size(); ++a) {
++        if (batch.pos[fam[a]] < batch.pos[root] + 1) {
 +            return {};
 +        }
 +    }
@@ -546,23 +657,25 @@ index 2b98a552f..4b0c60ab7 100644
 +    // the non-root sets must form a laminar family: pairwise nested or disjoint.
 +    // This is what makes "parent = latest earlier token at pos-1 whose set covers
 +    // mine" well-defined, which is how the graph recovers the tree topology.
-+    for (uint32_t i = 1; i < n_tokens; ++i) {
-+        for (uint32_t j = i + 1; j < n_tokens; ++j) {
-+            const auto isect = seq_set[i] & seq_set[j];
++    for (size_t a = 1; a < fam.size(); ++a) {
++        for (size_t b = a + 1; b < fam.size(); ++b) {
++            const auto isect = seq_set[fam[a]] & seq_set[fam[b]];
 +            if (isect.none()) {
 +                continue;
 +            }
-+            if (isect != seq_set[i] && isect != seq_set[j]) {
++            if (isect != seq_set[fam[a]] && isect != seq_set[fam[b]]) {
 +                return {};
 +            }
 +        }
 +    }
 +
-+    // every non-root token needs a parent: a token at pos-1 whose set covers its set
-+    for (uint32_t i = 1; i < n_tokens; ++i) {
++    // every non-root member needs a parent INSIDE the family: an earlier member
++    // at pos-1 whose set covers its set
++    for (size_t a = 1; a < fam.size(); ++a) {
 +        bool found = false;
-+        for (int32_t j = (int32_t) i - 1; j >= 0; --j) {
-+            if (batch.pos[j] == batch.pos[i] - 1 && (seq_set[j] & seq_set[i]) == seq_set[i]) {
++        for (size_t b = a; b-- > 0; ) {
++            if (batch.pos[fam[b]] == batch.pos[fam[a]] - 1 &&
++                (seq_set[fam[b]] & seq_set[fam[a]]) == seq_set[fam[a]]) {
 +                found = true;
 +                break;
 +            }
@@ -572,18 +685,13 @@ index 2b98a552f..4b0c60ab7 100644
 +        }
 +    }
 +
-+    std::vector<int32_t> idxs;
-+    idxs.reserve(n_tokens);
-+
-+    for (uint32_t i = 0; i < n_tokens; ++i) {
-+        idxs.push_back(i);
-+
-+        used[i] = true;
++    for (int32_t idx : fam) {
++        used[idx] = true;
 +        ++n_used;
 +    }
 +
 +    // one lane: the recurrent memory sees a single sequence owning the whole tree
-+    return ubatch_add(idxs, 1, true);
++    return ubatch_add(fam, 1, true);
 +}
 +
  llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
@@ -631,10 +739,10 @@ index 19cca7df1..0d4cab4fd 100644
          llama_memory_t mem,
            llama_seq_id seq_id,
 diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
-index e12a8cdc2..44dfb52da 100644
+index e12a8cdc2..5b4ef0687 100644
 --- a/src/llama-graph.cpp
 +++ b/src/llama-graph.cpp
-@@ -323,6 +323,104 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
+@@ -323,6 +323,105 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
      }
  }
  
@@ -643,16 +751,17 @@ index e12a8cdc2..44dfb52da 100644
 +        return false;
 +    }
 +
-+    // a TREE needs both coupled seq sets AND an actual branch (repeated position).
-+    // A chain-shaped "tree" (every node a single child) is processed by the plain
-+    // chain path so that it stays bit-identical with ordinary chain verification.
++    // a TREE needs both coupled seq sets AND an actual branch. A chain-shaped
++    // "tree" (every node a single child) is processed by the plain chain path so
++    // that it stays bit-identical with ordinary chain verification. A chain lane
++    // steps pos by exactly +1 per token; any other step means branching
++    // (repeated position in BFS order, a jump back in depth-first order).
 +    bool coupled  = false;
 +    bool branched = false;
 +
 +    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
 +        coupled |= ubatch.n_seq_id[i] > 1;
-+        // positions are nondecreasing in these batches, so equal positions are adjacent
-+        branched |= i > 0 && ubatch.pos[i] == ubatch.pos[i - 1];
++        branched |= i > 0 && ubatch.pos[i] != ubatch.pos[i - 1] + 1;
 +    }
 +
 +    return coupled && branched;
@@ -739,7 +848,7 @@ index e12a8cdc2..44dfb52da 100644
  void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
      GGML_UNUSED(ubatch);
  
-@@ -337,6 +435,8 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
+@@ -337,6 +436,8 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
              data[i] = mctx->s_copy(i);
          }
      }
@@ -748,7 +857,7 @@ index e12a8cdc2..44dfb52da 100644
  }
  
  bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
-@@ -354,6 +454,11 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
+@@ -354,6 +455,11 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
      res &= head == mctx->get_head();
      res &= rs_z == mctx->get_rs_z();
  
@@ -760,7 +869,7 @@ index e12a8cdc2..44dfb52da 100644
      return res;
  }
  
-@@ -1048,6 +1153,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+@@ -1048,6 +1154,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
              data[i] = mctx->get_recr()->s_copy(i);
          }
      }
@@ -769,7 +878,7 @@ index e12a8cdc2..44dfb52da 100644
  }
  
  bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
-@@ -1070,6 +1177,13 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
+@@ -1070,6 +1178,13 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
      res &= inp_rs->head == mctx->get_recr()->get_head();
      res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
  
@@ -783,7 +892,7 @@ index e12a8cdc2..44dfb52da 100644
      return res;
  }
  
-@@ -3316,7 +3430,8 @@ ggml_tensor * llm_graph_context::build_rs(
+@@ -3316,7 +3431,8 @@ ggml_tensor * llm_graph_context::build_rs(
  static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
             ggml_context * ctx0,
       const llama_ubatch & ubatch,
@@ -793,7 +902,7 @@ index e12a8cdc2..44dfb52da 100644
  
      auto inp = std::make_unique<llm_graph_input_rs>(mctx_cur);
  
-@@ -3329,6 +3444,18 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
+@@ -3329,6 +3445,18 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
      inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
      inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);
  
@@ -812,7 +921,7 @@ index e12a8cdc2..44dfb52da 100644
      inp->head = mctx_cur->get_head();
      inp->rs_z = mctx_cur->get_rs_z();
  
-@@ -3400,7 +3527,7 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
+@@ -3400,7 +3528,7 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
  llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
      const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
  
@@ -852,10 +961,10 @@ index 160e29413..eb18ea323 100644
  public:
      llm_graph_input_cross_embd(
 diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
-index 42c7381a9..1c3e5b84e 100644
+index 42c7381a9..d1de98c54 100644
 --- a/src/llama-memory-hybrid.cpp
 +++ b/src/llama-memory-hybrid.cpp
-@@ -71,7 +71,22 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
+@@ -71,7 +71,35 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
          // follow the recurrent pattern for creating the ubatch splits
          std::vector<llama_ubatch> ubatches;
  
@@ -872,6 +981,19 @@ index 42c7381a9..1c3e5b84e 100644
 +
 +            if (ubatch.n_tokens > 0) {
 +                ubatches.push_back(std::move(ubatch)); // NOLINT
++            } else {
++                // coupled (multi-seq) tokens that split_tree could not take whole
++                // would fragment under split_equal and read pre-parent recurrent
++                // state - refuse rather than silently corrupt
++                bool has_coupled = false;
++                const llama_batch & b = balloc.get_batch();
++                for (int32_t i = 0; i < b.n_tokens && !has_coupled; ++i) {
++                    has_coupled = b.n_seq_id[i] > 1;
++                }
++                if (has_coupled) {
++                    LLAMA_LOG_ERROR("%s: tree-coupled batch does not have a processable tree shape\n", __func__);
++                    return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
++                }
 +            }
 +        }
 +
@@ -879,7 +1001,7 @@ index 42c7381a9..1c3e5b84e 100644
              llama_ubatch ubatch;
  
              if (embd_all) {
-@@ -154,6 +169,10 @@ void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
+@@ -154,6 +182,10 @@ void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
      mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
  }
  
@@ -959,10 +1081,25 @@ index db8253966..8a8be4b97 100644
      virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
      virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
 diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
-index ad6612647..61601c662 100644
+index ad6612647..d9fba5ad4 100644
 --- a/src/models/delta-net-base.cpp
 +++ b/src/models/delta-net-base.cpp
-@@ -524,6 +524,78 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+@@ -501,7 +501,13 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+ 
+         const int64_t K = (int64_t) cparams.n_rs_seq + 1;
+ 
+-        for (int64_t t = 1; t <= K; ++t) {
++        // slots >= n_tokens would hold clamped duplicates of pre-batch state and
++        // are never read: a rollback is bounded by the tokens of the batch that
++        // wrote the slots (the gdn kernel already writes only min(n_tokens, K)
++        // snapshots). Skip the dead writes.
++        const int64_t n_write = std::min<int64_t>(K, ubatch.n_seq_tokens);
++
++        for (int64_t t = K - n_write + 1; t <= K; ++t) {
+             const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
+             const int64_t s_slot = K - t;
+ 
+@@ -524,6 +530,81 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
      return conv_input;
  }
  
@@ -1018,22 +1155,25 @@ index ad6612647..61601c662 100644
 +    cb(out, "tree_conv_out", il);
 +
 +    // write each token's post-window (entries 1..d_conv-1) into snapshot slot t,
-+    // tap-major, mirroring the ssm state's slot-t-per-token mapping
++    // tap-major, mirroring the ssm state's slot-t-per-token mapping. The
++    // destinations are regularly strided planes, so one strided cpy covers all
++    // n_tokens snapshots.
 +    const int64_t row_count = (d_conv - 1) * conv_channels;
 +    const size_t  row_size  = ggml_row_size(conv_states_all->type, row_count);
 +
-+    for (int64_t t = 0; t < n_tokens; ++t) {
-+        ggml_tensor * win_t = ggml_view_2d(ctx0, W, conv_channels, d_conv - 1,
-+                W->nb[1], W->nb[1] + t*W->nb[2]);          // [channels, d_conv-1], entries 1..d_conv-1
-+        ggml_tensor * win_tt = ggml_transpose(ctx0, win_t); // [d_conv-1, channels]
++    // src: (j', c, t) = W(c, j'+1, t) -> [d_conv-1, channels, n_tokens]
++    ggml_tensor * win = ggml_view_3d(ctx0, W, conv_channels, d_conv - 1, n_tokens,
++            W->nb[1], W->nb[2], W->nb[1]);
++    win = ggml_permute(ctx0, win, 1, 0, 2, 3);
 +
-+        ggml_tensor * dst_t = ggml_view_2d(ctx0, conv_states_all,
-+                d_conv - 1, conv_channels,
-+                ggml_row_size(conv_states_all->type, d_conv - 1),
-+                ((size_t) t * mem_size + kv_head) * row_size);
++    // dst: snapshot plane t, row kv_head, tap-major [d_conv-1, channels, n_tokens]
++    ggml_tensor * dst = ggml_view_3d(ctx0, conv_states_all,
++            d_conv - 1, conv_channels, n_tokens,
++            ggml_row_size(conv_states_all->type, d_conv - 1),
++            (size_t) mem_size * row_size,
++            (size_t) kv_head * row_size);
 +
-+        ggml_build_forward_expand(gf, ggml_cpy(ctx0, win_tt, dst_t));
-+    }
++    ggml_build_forward_expand(gf, ggml_cpy(ctx0, win, dst));
 +
 +    return out;
 +}
@@ -1041,7 +1181,7 @@ index ad6612647..61601c662 100644
  ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
          llm_graph_input_rs * inp,
          ggml_tensor *        ssm_states_all,
-@@ -564,7 +636,15 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+@@ -564,7 +645,15 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
      const int64_t K = cparams.n_rs_seq + 1;
  
      // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
@@ -1114,7 +1254,7 @@ index ea8e6868e..f1f33b321 100644
  
      ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
 diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
-index b775dca5f..419eb2688 100644
+index b775dca5f..efec20f2e 100644
 --- a/tools/server/server-context.cpp
 +++ b/tools/server/server-context.cpp
 @@ -251,6 +251,11 @@ struct server_slot {
@@ -1129,7 +1269,74 @@ index b775dca5f..419eb2688 100644
      llama_tokens spec_prompt;
      std::vector<int32_t> spec_i_batch;
      common_prompt_checkpoint spec_ckpt;
-@@ -3965,9 +3970,29 @@ private:
+@@ -564,13 +569,55 @@ struct server_slot {
+                 std::vector<llama_seq_id> root_seqs = spec_tree_seqs;
+                 root_seqs.insert(root_seqs.begin(), this->id);
+ 
+-                spec_i_batch.push_back(batch.size());
++                spec_i_batch.assign(spec_tree.size() + 1, -1);
++                spec_i_batch[0] = batch.size();
+                 add_ok &= batch.add(root_seqs, sampled, pos0, true);
+ 
+-                for (size_t i = 0; i < spec_tree.size(); i++) {
+-                    spec_i_batch.push_back(batch.size());
+-                    add_ok &= batch.add(node_seqs[i], spec_tree.tok[i],
+-                                        pos0 + spec_tree.level[i], true);
++                // Emit nodes in depth-first order, shallow branches first and the
++                // DEEPEST path last: chain runs let the tree-aware recurrent scan
++                // carry state in registers instead of reloading a snapshot, and
++                // the batch's last token keeps the lane's maximum position, which
++                // the rollback arithmetic requires.
++                {
++                    const size_t n = spec_tree.size();
++
++                    std::vector<int32_t> subdepth(n, 0);
++                    for (size_t i = n; i-- > 0; ) {
++                        subdepth[i] = std::max(subdepth[i], spec_tree.level[i]);
++                        if (spec_tree.parent[i] >= 0) {
++                            subdepth[spec_tree.parent[i]] = std::max(subdepth[spec_tree.parent[i]], subdepth[i]);
++                        }
++                    }
++
++                    std::vector<std::vector<int32_t>> childs(n);
++                    std::vector<int32_t> l1;
++                    for (size_t i = 0; i < n; ++i) {
++                        if (spec_tree.parent[i] < 0) {
++                            l1.push_back((int32_t) i);
++                        } else {
++                            childs[spec_tree.parent[i]].push_back((int32_t) i);
++                        }
++                    }
++
++                    auto by_depth = [&](int32_t a, int32_t b) { return subdepth[a] < subdepth[b]; };
++                    std::stable_sort(l1.begin(), l1.end(), by_depth);
++                    for (auto & c : childs) {
++                        std::stable_sort(c.begin(), c.end(), by_depth);
++                    }
++
++                    std::vector<int32_t> stack(l1.rbegin(), l1.rend());
++                    while (!stack.empty()) {
++                        const int32_t i = stack.back();
++                        stack.pop_back();
++
++                        spec_i_batch[1 + i] = batch.size();
++                        add_ok &= batch.add(node_seqs[i], spec_tree.tok[i],
++                                            pos0 + spec_tree.level[i], true);
++
++                        for (auto it = childs[i].rbegin(); it != childs[i].rend(); ++it) {
++                            stack.push_back(*it);
++                        }
++                    }
+                 }
+             } else {
+                 auto pos = pos0;
+@@ -3959,15 +4006,37 @@ private:
+                     GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                 }
+-                slot.spec_i_batch.clear();
+ 
+                 // Fold the winning branch back into the slot's own sequence, then
                  // drop every branch. The accepted nodes sit at pos0+1 .. pos0+L
                  // under the winning leaf's id, so one ranged bitset copy claims
                  // exactly them and leaves the losing siblings to be freed below.
@@ -1140,9 +1347,12 @@ index b775dca5f..419eb2688 100644
                  if (!slot.spec_tree.empty()) {
                      const llama_pos pos0 = slot.prompt.tokens.pos_next() - 1 - (llama_pos) n_draft;
  
-+                    // the winning node's index in the verify batch: row 0 is the
-+                    // root, node i sits at row 1 + i
-+                    const int32_t t_win = tree_path.empty() ? 0 : tree_path.back() + 1;
++                    // the winning node's row offset within the verify region
++                    // (row 0 = the root); nodes are emitted depth-first, so the
++                    // offset comes from spec_i_batch, not the node index
++                    const int32_t t_win = tree_path.empty()
++                        ? 0
++                        : (int32_t) (slot.spec_i_batch[1 + tree_path.back()] - slot.spec_i_batch[0]);
 +                    spec_accept_row = t_win;
 +
 +                    // chain-shaped trees (no branching) run the plain chain graph,
@@ -1159,7 +1369,16 @@ index b775dca5f..419eb2688 100644
                      if (!tree_path.empty()) {
                          std::vector<std::vector<llama_seq_id>> node_seqs;
                          std::vector<llama_seq_id> all_seqs;
-@@ -4002,6 +4027,9 @@ private:
+@@ -3987,6 +4056,8 @@ private:
+                     slot.spec_tree_seqs.clear();
+                 }
+ 
++                slot.spec_i_batch.clear();
++
+                 GGML_ASSERT(accepted.size() >= 1);
+ 
+                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
+@@ -4002,6 +4073,9 @@ private:
                              SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
                          }
  
@@ -1169,7 +1388,7 @@ index b775dca5f..419eb2688 100644
                          // partial acceptance is not supported by the context -> truncate the draft and restore the state
                          slot.spec_is_replay = true;
                          slot.spec_draft = std::move(accepted);
-@@ -4029,7 +4057,7 @@ private:
+@@ -4029,7 +4103,7 @@ private:
                      SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
                  }
  
@@ -1178,7 +1397,7 @@ index b775dca5f..419eb2688 100644
  
                  slot.spec_draft = std::move(accepted);
              }
-@@ -4066,6 +4094,15 @@ private:
+@@ -4066,6 +4140,15 @@ private:
  
              slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
  
