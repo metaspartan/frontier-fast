@@ -1,0 +1,64 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+index 5e36b0934..21c7ed602 100644
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -279,10 +279,59 @@ int get_mmvq_mmid_max_batch(ggml_type type, int cc) {
+     return MMVQ_MAX_BATCH_SIZE;
+ }
+ 
++// Width at which a plain quantized matmul stops using MMVQ and falls through to
++// MMQ.
++//
++// MMVQ carries ncols_dst activation columns per weight block through the VALU,
++// so its arithmetic scales with the width while the weight traffic it hides
++// behind does not. At batch 1 that is exactly right - the pass is bandwidth
++// bound and MMVQ is the cheapest way to stream the weights - but the shape a
++// speculative VERIFY pass presents is ncols_dst = 1 + n_draft, and there MMVQ
++// leaves the bandwidth-bound regime while still refusing to hand over to MMQ,
++// because the stock cutoff is the full MMVQ_MAX_BATCH_SIZE of 8.
++//
++// Measured on gfx1201 with Qwen3.8-27B Q4_K_M, one llama_decode of N positions
++// (llama-bench -p N, 10 reps), MMVQ cutoff 8 (stock) against cutoff 2:
++//
++//   positions   1      2      3      5      8
++//   stock    36.6   40.9   48.1   66.3   97.9  ms
++//   cutoff 2 36.6   41.2   47.0   47.7   49.0  ms
++//
++// Width 2 still belongs to MMVQ (40.9 against 46.5 forcing MMQ there), width 3
++// is a wash, and from width 4 up MMQ wins by 28-50%: with the crossover moved
++// the verify pass is essentially FLAT in positions, which is what a pass over a
++// fixed weight set should be. Scoped to RDNA4 because the profitable crossover
++// is a property of the backend's MMQ tiles and VALU economics, not of the model
++// - see the header-coalesce inversion on this board for the same lesson.
++//
++// Nothing outside widths 3..8 changes: batch-1 decode still takes MMVQ and a
++// 512-token prefill still takes MMQ, so both perplexity shapes the runner
++// measures (-c 512 and -b 512 -ub 1) are bit-identical to the parent frontier.
++//
++// GGML_MMVQ_MAX_NE11 overrides the cutoff on any arch; unset uses the table.
++static int64_t ggml_cuda_mmvq_max_ne11(int cc) {
++    static const int64_t override = [] {
++        const char * e = getenv("GGML_MMVQ_MAX_NE11");
++        return e != nullptr ? (int64_t) atoi(e) : (int64_t) -1;
++    }();
++
++    if (override >= 0) {
++        return override;
++    }
++    if (GGML_CUDA_CC_IS_RDNA4(cc)) {
++        return 2;
++    }
++
++    return MMVQ_MAX_BATCH_SIZE;
++}
++
+ bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11) {
+     if (!ggml_is_quantized(type)) {
+         return false;
+     }
++    if (ne11 > ggml_cuda_mmvq_max_ne11(cc)) {
++        return false;
++    }
+     if (GGML_CUDA_CC_IS_CDNA(cc)) {
+         if (GGML_CUDA_CC_IS_CDNA1(cc)) {
+             switch (type) {
