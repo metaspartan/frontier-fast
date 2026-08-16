@@ -1,0 +1,344 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 35988faf1..965244d06 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3711,6 +3711,208 @@ static bool ggml_cuda_can_fuse(const struct ggml_cgraph *                cgraph,
+     return false;
+ }
+ 
++
++// ---------------------------------------------------------------------------
++// conv-state placement fusion (see ssm-conv.cuh for the mechanism)
++//
++// Matches, at batch-1 decode, the data-movement launches of a delta-net conv step:
++//     gather   = get_rows(conv_states, s_copy)          [elided: kernel resolves the row]
++//     concat   = concat(reshape(gather), transpose(x))  [replaced: kernel writes its bytes]
++//     cpy      = shifted window -> conv_states          [elided: kernel writes it]
++// The ssm_conv (+ fused silu) then runs STOCK on byte-identical input. The skip of the two
++// elided producers and the replacement at the concat are one pure function of the graph
++// evaluated at each node, so they cannot disagree.
++// ---------------------------------------------------------------------------
++
++// 0 = off (run all three launches), 1 = fuse
++static int ggml_cuda_conv_state_fuse_mode() {
++    static const int mode = [] {
++        const char * e = getenv("GGML_CONV_STATE_FUSE");
++        return e == nullptr ? 1 : std::atoi(e);
++    }();
++    return mode;
++}
++
++static constexpr int GGML_CUDA_CONV_STATE_WINDOW = 24;
++
++static bool ggml_cuda_try_conv_state_place(const ggml_cgraph *             cgraph,
++                                           int                             concat_idx,
++                                           ggml_cuda_ssm_conv_state_fuse & f,
++                                           const ggml_tensor **            elide /* [2] */) {
++    if (ggml_cuda_conv_state_fuse_mode() == 0) {
++        return false;
++    }
++
++    const ggml_tensor * concat = cgraph->nodes[concat_idx];
++    if (concat->op != GGML_OP_CONCAT || concat->type != GGML_TYPE_F32 ||
++        !ggml_is_contiguous(concat) || (concat->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return false;
++    }
++    if (((const int32_t *) concat->op_params)[0] != 0) { // concat dim
++        return false;
++    }
++
++    const int64_t d_conv = concat->ne[0];
++    const int64_t C      = concat->ne[1];
++    if (d_conv < 3 || d_conv > 15 || concat->ne[2] != 1 || concat->ne[3] != 1 || C % 128 != 0) {
++        return false;
++    }
++    const int64_t row_count = (d_conv - 1) * C;
++
++    // --- the consumer must be an ssm_conv over this concat, at one token ---
++    const ggml_tensor * conv     = nullptr;
++    int                 conv_idx = -1;
++    const int hi = concat_idx + GGML_CUDA_CONV_STATE_WINDOW < cgraph->n_nodes
++                       ? concat_idx + GGML_CUDA_CONV_STATE_WINDOW
++                       : cgraph->n_nodes - 1;
++    for (int j = concat_idx + 1; j <= hi && conv == nullptr; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        if (n->op == GGML_OP_SSM_CONV && n->src[0] == concat) {
++            conv     = n;
++            conv_idx = j;
++        }
++    }
++    if (conv == nullptr || conv->ne[1] != 1 || conv->ne[2] != 1 ||
++        conv->src[1] == nullptr || conv->src[1]->ne[0] != d_conv) {
++        return false;
++    }
++
++    // --- the taps: reshape of a get_rows over the conv-state buffer ---
++    const ggml_tensor * taps = concat->src[0];
++    if (taps == nullptr || taps->ne[0] != d_conv - 1 || taps->ne[1] != C || taps->ne[2] != 1) {
++        return false;
++    }
++    const ggml_tensor * gr = ggml_cuda_gdn_writer(taps);
++    if (gr == nullptr || gr->op != GGML_OP_GET_ROWS || gr->type != GGML_TYPE_F32 ||
++        !ggml_is_contiguous(gr) || (gr->flags & GGML_TENSOR_FLAG_OUTPUT) ||
++        gr->ne[0] != row_count || gr->ne[1] != 1) {
++        return false;
++    }
++    const ggml_tensor * states = gr->src[0];
++    const ggml_tensor * idxt   = gr->src[1];
++    if (states == nullptr || idxt == nullptr || states->type != GGML_TYPE_F32 ||
++        idxt->type != GGML_TYPE_I32 || !ggml_is_contiguous(states) || !ggml_is_contiguous(idxt) ||
++        states->data == nullptr || idxt->data == nullptr || states->ne[0] != row_count ||
++        ggml_nelements(idxt) != 1) {
++        return false;
++    }
++
++    // --- the new token: transpose of the (contiguous) projection output ---
++    const ggml_tensor * tr = concat->src[1];
++    if (tr == nullptr || tr->view_src == nullptr || tr->src[0] == nullptr ||
++        tr->ne[0] != 1 || tr->ne[1] != C || tr->ne[2] != 1) {
++        return false;
++    }
++    const ggml_tensor * qkv = tr->src[0];
++    if (qkv->type != GGML_TYPE_F32 || !ggml_is_contiguous(qkv) || qkv->data == nullptr ||
++        qkv->ne[0] != C || qkv->ne[1] != 1 || qkv->ne[2] != 1) {
++        return false;
++    }
++
++    // --- the write-back cpy: exactly one, reading the concat's shifted window ---
++    const int lo = concat_idx - GGML_CUDA_CONV_STATE_WINDOW < 0
++                       ? 0 : concat_idx - GGML_CUDA_CONV_STATE_WINDOW;
++    const ggml_tensor * cpy    = nullptr;
++    int                 n_cpy  = 0;
++    int                 gr_idx = -1;
++    for (int j = lo; j <= hi; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        if (n == gr) {
++            gr_idx = j;
++        }
++        if (n->op == GGML_OP_CPY && n->src[0] != nullptr && n->src[0]->view_src == concat) {
++            cpy = n;
++            ++n_cpy;
++        }
++    }
++    if (n_cpy != 1 || gr_idx < 0 || gr_idx >= concat_idx || conv_idx <= concat_idx ||
++        (cpy->flags & GGML_TENSOR_FLAG_OUTPUT)) {
++        return false;
++    }
++    const ggml_tensor * csrc = cpy->src[0];
++    const ggml_tensor * cdst = cpy->src[1];
++    if (csrc->ne[0] != d_conv - 1 || csrc->ne[1] != C || csrc->ne[2] != 1 ||
++        csrc->view_offs != ggml_type_size(GGML_TYPE_F32) ||
++        csrc->nb[0] != ggml_type_size(GGML_TYPE_F32) || csrc->nb[1] != concat->nb[1]) {
++        return false;
++    }
++    if (cdst == nullptr || cdst->type != GGML_TYPE_F32 || cdst->data == nullptr ||
++        ggml_nelements(cdst) != row_count || cdst->nb[0] != ggml_type_size(GGML_TYPE_F32) ||
++        (int64_t) (cdst->nb[1] / sizeof(float)) != row_count) {
++        return false;
++    }
++    // the write-back must target the same buffer the gather read: the round trip this closes
++    if (cdst->buffer != states->buffer) {
++        return false;
++    }
++
++    // the gather's bytes are read at the concat's position instead of its own, and the cpy's
++    // write happens at the concat's position instead of after it: nothing between the gather
++    // and the cpy may touch the state buffer (each placement thread reads its own taps into
++    // registers before writing, so the in-place shift itself cannot race)
++    const int span_hi = cpy != nullptr ? hi : concat_idx;
++    GGML_UNUSED(span_hi);
++    for (int j = gr_idx + 1; j <= hi; ++j) {
++        const ggml_tensor * n = cgraph->nodes[j];
++        if (n == cpy || ggml_cuda_is_view_or_noop(n)) {
++            continue;
++        }
++        if (n->buffer == states->buffer) {
++            return false;
++        }
++        if (n == cgraph->nodes[conv_idx]) {
++            break; // past the consumer nothing further is moved
++        }
++    }
++
++    // every tensor whose write is elided or deferred must be consumed only inside the pattern
++    for (int j = 0; j < cgraph->n_nodes; ++j) {
++        const ggml_tensor * m = cgraph->nodes[j];
++        if (m == conv || m == cpy || m == concat || m == gr || m == taps || m == tr || m == csrc) {
++            continue;
++        }
++        for (int sj = 0; sj < GGML_MAX_SRC; ++sj) {
++            const ggml_tensor * ms = m->src[sj];
++            if (ms == gr || ms == taps || ms == concat || ms == tr || ms == csrc) {
++                return false;
++            }
++        }
++    }
++
++    f.state_src      = (const float *) states->data;
++    f.state_idx      = (const int32_t *) idxt->data;
++    f.src_row_stride = (int64_t) (states->nb[1] / sizeof(float));
++    f.state_dst      = (float *) cdst->data;
++    f.x              = (const float *) qkv->data;
++    elide[0] = gr;
++    elide[1] = cpy;
++    return true;
++}
++
++// is node i a get_rows or cpy a downstream conv-state placement performs itself?
++static bool ggml_cuda_conv_state_producer_folded(const ggml_cgraph * cgraph, int i) {
++    const ggml_op op = cgraph->nodes[i]->op;
++    if (op != GGML_OP_GET_ROWS && op != GGML_OP_CPY) {
++        return false;
++    }
++    const int lo = i - GGML_CUDA_CONV_STATE_WINDOW < 0 ? 0 : i - GGML_CUDA_CONV_STATE_WINDOW;
++    const int hi = i + GGML_CUDA_CONV_STATE_WINDOW < cgraph->n_nodes
++                       ? i + GGML_CUDA_CONV_STATE_WINDOW
++                       : cgraph->n_nodes - 1;
++    for (int j = lo; j <= hi; ++j) {
++        if (cgraph->nodes[j]->op != GGML_OP_CONCAT) {
++            continue;
++        }
++        ggml_cuda_ssm_conv_state_fuse f;
++        const ggml_tensor *           elide[2] = {};
++        if (ggml_cuda_try_conv_state_place(cgraph, j, f, elide) &&
++            (elide[0] == cgraph->nodes[i] || elide[1] == cgraph->nodes[i])) {
++            return true;
++        }
++    }
++    return false;
++}
++
+ // try and fuse nodes and return the number of nodes to skip
+ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+ 
+@@ -4434,6 +4636,18 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return 1;
+     }
+ 
++    if (node->op == GGML_OP_CONCAT) {
++        ggml_cuda_ssm_conv_state_fuse conv_fuse;
++        const ggml_tensor *           conv_elide[2] = {};
++        if (ggml_cuda_try_conv_state_place(cgraph, i, conv_fuse, conv_elide)) {
++#ifdef GGML_CUDA_DEBUG
++            GGML_LOG_INFO("%s: conv-state placement computed %s (gather and cpy elided)\n", __func__, node->name);
++#endif
++            ggml_cuda_op_conv_state_place(*cuda_ctx, node, conv_fuse);
++            return -1; // computed here; the two elided producers skip themselves
++        }
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_SSM_CONV, GGML_OP_ADD, GGML_OP_UNARY }, { GGML_UNARY_OP_SILU })) {
+         ggml_cuda_op_ssm_conv(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+         return 2;
+@@ -4615,7 +4829,8 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
+                 // or its bytes are read in place by one
+                 if (ggml_cuda_gdn_act_producer_folded(cgraph, i) ||
+                     ggml_cuda_gdn_state_gather_folded(cgraph, i) ||
+-                    ggml_cuda_gdn_l2_producer_folded(cgraph, i)) {
++                    ggml_cuda_gdn_l2_producer_folded(cgraph, i) ||
++                    ggml_cuda_conv_state_producer_folded(cgraph, i)) {
+                     continue;
+                 }
+ 
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cu b/ggml/src/ggml-cuda/ssm-conv.cu
+index 1463169cf..bf3b45f87 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cu
++++ b/ggml/src/ggml-cuda/ssm-conv.cu
+@@ -204,3 +204,64 @@ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, g
+                           out->nb[2], nc, nr, n_t, n_s, stream);
+     }
+ }
++
++
++// One thread per channel: read the d_conv-1 taps of this sequence's state row and the new
++// value, write the concat row [taps, x] and the shifted window [taps 1.., x] back to the
++// state. Pure data movement - every float written is a float read - so the consuming
++// (stock) ssm_conv sees bytes identical to the three launches this replaces. Reads complete
++// into registers before either write, so the in-place shift (source row == destination row,
++// the steady decode case) cannot race: each thread touches only its own channel's floats.
++static __global__ void conv_state_place_f32(const float * __restrict__ state_src,
++                                            const int32_t * __restrict__ state_idx,
++                                            const int64_t state_src_stride,
++                                            float * __restrict__ state_dst,
++                                            const float * __restrict__ x_new,
++                                            float * __restrict__ concat_out,
++                                            const int n_taps) {
++    const int c = blockIdx.x * blockDim.x + threadIdx.x;
++
++    const int64_t srow = state_idx[0];
++    const float * st   = state_src + srow * state_src_stride + (int64_t) c * n_taps;
++    float *       co   = concat_out + (int64_t) c * (n_taps + 1);
++    float *       sd   = state_dst + (int64_t) c * n_taps;
++
++    float t[15]; // d_conv is bounded by the launcher's switch; 15 matches ssm_conv's max
++    for (int j = 0; j < n_taps; ++j) {
++        t[j] = st[j];
++    }
++    const float x = x_new[c];
++
++    for (int j = 0; j < n_taps; ++j) {
++        co[j] = t[j];
++    }
++    co[n_taps] = x;
++
++    for (int j = 0; j < n_taps - 1; ++j) {
++        sd[j] = t[j + 1];
++    }
++    sd[n_taps - 1] = x;
++}
++
++void ggml_cuda_op_conv_state_place(ggml_backend_cuda_context & ctx, ggml_tensor * concat,
++                                   const ggml_cuda_ssm_conv_state_fuse & fuse) {
++    const int64_t d_conv = concat->ne[0];
++    const int64_t C      = concat->ne[1];
++
++    GGML_ASSERT(concat->type == GGML_TYPE_F32 && ggml_is_contiguous(concat));
++    GGML_ASSERT(concat->ne[2] == 1 && concat->ne[3] == 1);
++    GGML_ASSERT(d_conv >= 3 && d_conv <= 15);
++    GGML_ASSERT(fuse.state_src != nullptr && fuse.state_idx != nullptr &&
++                fuse.state_dst != nullptr && fuse.x != nullptr);
++
++    const int threads = 128;
++    GGML_ASSERT(C % threads == 0);
++    const dim3 blocks(C / threads, 1, 1);
++
++    cudaStream_t stream = ctx.stream();
++
++    const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(blocks, threads, 0, stream);
++    ggml_cuda_kernel_launch(conv_state_place_f32, launch_params,
++        fuse.state_src, fuse.state_idx, fuse.src_row_stride, fuse.state_dst,
++        fuse.x, (float *) concat->data, (int) (d_conv - 1));
++}
+diff --git a/ggml/src/ggml-cuda/ssm-conv.cuh b/ggml/src/ggml-cuda/ssm-conv.cuh
+index 8514ca849..22b25c8b0 100644
+--- a/ggml/src/ggml-cuda/ssm-conv.cuh
++++ b/ggml/src/ggml-cuda/ssm-conv.cuh
+@@ -1,3 +1,28 @@
+ #include "common.cuh"
+ 
+ void ggml_cuda_op_ssm_conv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, ggml_tensor * bias_add_node = nullptr, ggml_tensor * silu_dst = nullptr);
++
++// conv-state placement fusion.
++//
++// At batch-1 decode a delta-net conv step spends three of its four launches on pure data
++// movement: build_rs GATHERS the whole conv-state row (a get_rows of (d_conv-1) * channels
++// floats to select one row), a CONCAT materialises [state taps || new token] purely so the
++// d_conv values sit contiguously, and a CPY writes the shifted window back. One kernel does
++// all three placements - it resolves its own state row through the index tensor (as the
++// gated_delta_net state fold does), writes the concat's bytes, and writes the shifted window.
++// 3 launches -> 1, and the ssm_conv+silu that consumes the result runs completely STOCK on
++// byte-identical input, so the arithmetic - and with it the numerics under
++// -funsafe-math-optimizations - is untouched. (A full fold that recomputed the d_conv-tap dot
++// in the fused kernel measured +0.102% on the decode-shape perplexity, because the compiler
++// reassociates the dot differently in a different function; moving bytes has no such freedom.)
++struct ggml_cuda_ssm_conv_state_fuse {
++    const float *   state_src      = nullptr; // conv-state buffer, 2d [row_count, n_rs]
++    const int32_t * state_idx      = nullptr; // per-sequence source row (build_rs s_copy_main)
++    int64_t         src_row_stride = 0;       // elements between state rows
++    float *         state_dst      = nullptr; // write-back base (the elided cpy's dst view)
++    const float *   x              = nullptr; // projection output (qkv_mixed), one value/channel
++};
++
++// computes the CONCAT node (writing its bytes exactly) and performs the elided gather and cpy
++void ggml_cuda_op_conv_state_place(ggml_backend_cuda_context & ctx, ggml_tensor * concat,
++                                   const ggml_cuda_ssm_conv_state_fuse & fuse);

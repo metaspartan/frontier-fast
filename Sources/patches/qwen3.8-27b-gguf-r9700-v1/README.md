@@ -10,6 +10,7 @@ filename order.
 - `0005` `gated_delta_net` computes its own gate and beta
 - `0006` `gated_delta_net` reads its recurrent state in place, eliding the `build_rs` gather
 - `0007` `gated_delta_net` normalises q and k in register, eliding both `l2_norm` launches
+- `0008` one placement kernel replaces the conv-state gather, concat and write-back cpy
 
 ## The model
 
@@ -110,6 +111,21 @@ only one, so that fold stays dead by grid ratio.
 
 See the `-funsafe-math-optimizations` warning below — it applies to any producer fold
 on this backend, and `0007` needed it on every normalised value.
+
+`0008` closed the conv-state path (get_rows + concat + cpy + ssm_conv, 4 launches per
+layer) and drew the family's boundary in doing so. The full fold - recompute the 4-tap
+dot and silu in the fused kernel, 4 -> 1 - measured +1.51% but moved the DECODE-shape
+perplexity +0.102% while the gate shape stayed identical, the mirror image of 0006's
+divergence. The ISA shows why and it is not fixable from source: under unsafe math the
+compiler reassociates stock's own dot (v_fma x3 first, then x1, x2, x0), chooses that
+order per function, and even varies it between two loop paths of one kernel - arithmetic
+recompiled in a new function cannot promise stock's rounding. The shipped 0008 is the
+placement-only variant, 3 -> 1 with the stock ssm_conv+silu consuming byte-identical
+input: +0.90%, identical in every digit at both shapes. **The rule: an addressing
+elision may move ARITHMETIC only if the consumer's instruction stream is unchanged
+(0006, 0007 fold INTO an existing kernel); a fusion that re-implements a float
+computation in a new kernel is capped by the compiler's reassociation freedom, and on
+this backend that freedom is real.**
 
 **ggml-hip here is built with `-funsafe-math-optimizations`.** A value that stock
 reads through a global load is opaque to the optimizer; the same value computed
