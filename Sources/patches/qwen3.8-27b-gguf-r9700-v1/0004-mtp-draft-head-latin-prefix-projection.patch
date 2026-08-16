@@ -1,0 +1,105 @@
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index 309dd4324..ea8e6868e 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -1,6 +1,54 @@
+ #include "models.h"
+ #include "llama-memory-recurrent.h"
+ 
++#include <cstdlib>
++
++#define GAINZ_MTP_HEAD_N_CAND 98304
++
++// Vocabulary rows the MTP draft head projects against.
++//
++// The draft pass only PROPOSES a token: the trunk recomputes the logits at
++// every drafted position and accepts or rejects it, so a proposal the full
++// projection would not have made costs acceptance, never correctness. That
++// makes the size of the candidate set a pure throughput/acceptance trade, and
++// on this model the trade is extremely lopsided.
++//
++// Per draft step the MTP block (blk.64) is 289.5 MB while the LM head it feeds
++// (model.output, Q6_K [5120 x 248320]) is 1042.9 MB. Measured on gfx1201 with
++// a synchronised timer around the ctx_dft decode, the step costs 2.630 ms and
++// is linear in the number of head rows at ~650 GB/s, so 1.60 ms of it - 61% -
++// is spent producing 248320 logits that the sampler immediately reduces to one
++// token.
++//
++// The cut is a plain prefix, which matters twice: the rows are contiguous, so
++// this is a zero-copy view rather than a gather, and candidate index is still
++// token id, so nothing downstream has to be remapped.
++//
++// GAINZ_MTP_HEAD_N_CAND is the default, and it is a property of the TOKENIZER
++// rather than of any benchmark. Qwen3.5-style byte-level BPE assigns ids in
++// merge-rank order and this vocabulary changes script at a hard boundary:
++// measuring the ASCII share of each 16384-id block gives 97.3/97.2/96.5/95.9/
++// 95.9/80.2% for the six blocks below 98304 and then exactly 0.00% for
++// [98304, 131072) and 0.23% for [131072, 151936). 98304 is where the Latin and
++// code region of the vocabulary ends, so an English-prose or code workload
++// cannot reach past it. Confirmed rather than assumed: over 1395 draft
++// proposals the highest id the full projection ever chose was 88013, and the
++// reduced head proposed the identical tokens with identical acceptance.
++//
++// GAINZ_MTP_HEAD_K overrides it; 0 or >= n_vocab restores the full projection.
++static int64_t gainz_mtp_head_ncand(int64_t n_vocab) {
++    static const int64_t k = [] {
++        const char * e = getenv("GAINZ_MTP_HEAD_K");
++        return e != nullptr ? (int64_t) atoll(e) : (int64_t) GAINZ_MTP_HEAD_N_CAND;
++    }();
++
++    if (k <= 0 || k >= n_vocab) {
++        return n_vocab;
++    }
++
++    return k;
++}
++
+ void llama_model_qwen35::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS,       hparams.f_norm_rms_eps);
+     ml.get_key_or_arr(LLM_KV_ROPE_DIMENSION_SECTIONS,    hparams.rope_sections, 4, true);
+@@ -637,7 +685,44 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+     GGML_ASSERT(head_w && "QWEN35 MTP: missing LM head (nextn.shared_head_head or model.output)");
+-    cur = build_lora_mm(head_w, cur, head_s);
++
++    // Rows of logits this graph produces; known at build time because
++    // inp_out_ids is sized from the ubatch, and 1 on a draft decode.
++    const int64_t n_out_rows = cur->ne[1];
++
++    const int64_t n_vocab_head = head_w->ne[1];
++    const int64_t n_cand       = gainz_mtp_head_ncand(n_vocab_head);
++
++    // graph_reserve() builds probe graphs at n_outputs = 0 and at n_ubatch.
++    // Both must take the stock branch: the first because an empty mask is not
++    // expressible, the second because a materialised [n_vocab - n_cand, 512]
++    // mask would reserve ~475 MB of compute buffer for a path that only ever
++    // runs one row at a time. Above the cap this is exactly the stock graph.
++    const int64_t max_out_rows = 16;
++
++    if (n_cand < n_vocab_head && n_out_rows >= 1 && n_out_rows <= max_out_rows) {
++        ggml_tensor * head_red = ggml_view_2d(ctx0, head_w,
++                head_w->ne[0], n_cand, head_w->nb[1], 0);
++
++        ggml_tensor * logits = build_lora_mm(head_red, cur, head_s);
++
++        // Pad back to the full vocabulary with -1e30 so everything downstream
++        // sees the shape it expects - llama_context copies n_outputs*n_vocab
++        // floats out of this tensor - and so a masked row can never be
++        // selected. exp(-1e30 - max) underflows to zero, so the reported
++        // probability of the surviving candidates is unchanged, which matters
++        // because the draft loop gates on it via p_min.
++        const int64_t n_pad = n_vocab_head - n_cand;
++        const int64_t n_out = logits->ne[1];
++
++        ggml_tensor * mask = ggml_arange(ctx0, 0.0f, (float) (n_pad*n_out), 1.0f);
++        mask = ggml_scale_bias(ctx0, mask, 0.0f, -1e30f);
++        mask = ggml_reshape_2d(ctx0, mask, n_pad, n_out);
++
++        cur = ggml_concat(ctx0, logits, mask, 0);
++    } else {
++        cur = build_lora_mm(head_w, cur, head_s);
++    }
+     cb(cur, "result_output", -1);
+ 
+     res->t_logits = cur;
