@@ -8,6 +8,7 @@ filename order.
 - `0003` `rms_norm` writes the q8_1 form of the activation it produces
 - `0004` the fused unary+mul gating the attention output does the same
 - `0005` `gated_delta_net` computes its own gate and beta
+- `0006` `gated_delta_net` reads its recurrent state in place, eliding the `build_rs` gather
 
 ## The model
 
@@ -25,7 +26,10 @@ MoE tracks next to it:
 2. **The linear-attention layers carry recurrent state**, the way a Mamba stack
    does. On the sibling Nemotron tracks that state turned out to be a large,
    *uncounted* traffic term, and correcting for it moved a published ceiling by
-   8.7%. Nobody has censused it here yet.
+   8.7%. Censused here by `0006`: the state is 128x128 floats per head across 48
+   heads, so **3.1 MB per linear layer and 151 MB per token** read and written -
+   about 1.8% of the token's bytes on top of the 16.74 GB of weights, and it is
+   not in the published roofline.
 
 ## Engine
 
@@ -73,6 +77,16 @@ bandwidth, so the pool that is left is launch structure, and it is concentrated 
 | `concat_cont` | 48.0 | 1.65 |
 | `ssm_conv_f32` | 48.0 | 1.52 |
 | `unary_gated<silu>` | 48.1 | 1.42 |
+
+`0006` took `k_get_rows_float_vec`, which is not a launch-structure win at all: it is
+`build_rs` gathering this sequence's state row out of the recurrent buffer so the kernel
+can read the copy. At batch 1 that moves the layer's whole 3.1 MB state to select ONE
+row. The kernel resolves the row itself with a single scalar load and reads in place, so
+the population goes 48.0 -> 0.0 and every other population is unchanged. **Gate it to
+`n_tokens == 1`**: at prefill the gather is amortised over the ubatch and worth nothing,
+and the kernel's `keep_rs_t` path writes rollback snapshots into the same buffer the fold
+would be reading, which moved gate-shape perplexity 2.9608 -> 2.9655 when left enabled
+there. Decode-gated, both runner perplexity shapes are identical in every digit.
 
 `0005` took the three that were pure per-head scalars. The two `l2_norm` launches are
 the next candidates by the same rule, but they are *not* free the way `0005` was:
