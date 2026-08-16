@@ -1,0 +1,1196 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index ad9bec039..b1a1960dd 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -988,9 +988,17 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
+             // through to a checkpoint restore.
+             params.speculative.draft.n_max = std::max(params.speculative.draft.n_max, depth);
+ 
++            // The tree-aware recurrent scan gives every verify position its own
++            // snapshot slot (slot t = state after token t, root included), so the
++            // snapshot plane count K = n_rs_seq + 1 must cover n_nodes + 1 verify
++            // positions -> n_rs_seq >= n_nodes.
++            params.speculative.n_rs_seq_min = std::max<uint32_t>(params.speculative.n_rs_seq_min,
++                                                                 (uint32_t) common_speculative_tree_n_nodes());
++
+             LOG_INF("%s: tree drafting requested - reserving %d branch sequence ids "
+-                    "beyond %d serving slot(s), draft depth %d\n",
+-                    __func__, n_leaves, params.n_parallel, depth);
++                    "beyond %d serving slot(s), draft depth %d, %d rs snapshot slots\n",
++                    __func__, n_leaves, params.n_parallel, depth,
++                    (int) params.speculative.n_rs_seq_min + 1);
+         }
+     }
+ 
+diff --git a/common/common.h b/common/common.h
+index 650556ab8..75eadf65d 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -383,12 +383,17 @@ struct common_params_speculative {
+         return !draft.mparams.empty();
+     }
+ 
++    // A TREE draft needs one recurrent snapshot slot per verify position (the
++    // tree's node count + 1 incl. the root), where a chain needs only its depth.
++    // Set from the configured tree size; 0 when tree drafting is off.
++    uint32_t n_rs_seq_min = 0;
++
+     uint32_t need_n_rs_seq() const {
+         bool needs_rs_seq = std::any_of(types.begin(), types.end(), [&](auto t) {
+             return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP || t == COMMON_SPECULATIVE_TYPE_DRAFT_EAGLE3 || t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+         });
+ 
+-        return needs_rs_seq ? draft.n_max : 0u;
++        return needs_rs_seq ? std::max((uint32_t) draft.n_max, n_rs_seq_min) : 0u;
+     }
+ };
+ 
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 927a75e7c..be92615ef 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -168,6 +168,13 @@ struct common_speculative_impl {
+ 
+     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
+ 
++    // TREE-aware accept: i_row is the winning token's index among the slot's
++    // verify rows (0 = the root row), which a plain accepted-count cannot encode
++    // once the draft branches. Default forwards to the chain accept.
++    virtual void accept_row(llama_seq_id seq_id, uint16_t n_accepted, int32_t /*i_row*/, bool is_other) {
++        accept(seq_id, n_accepted, is_other);
++    }
++
+     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
+     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
+     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
+@@ -1553,23 +1560,36 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         std::fill(i_batch_beg.begin(), i_batch_beg.end(), -1);
+         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
+ 
++        llama_seq_id last_sid = -1;
++
+         for (int k = 0; k < n_tokens; ++k) {
+             // A tree verify batch carries coupled tokens: the root belongs to the
+             // slot and to every branch beneath it, and each node to the leaves
+-            // below it. For the slot-indexed bookkeeping here a token belongs to
+-            // slot s when s is among its ids; branch tokens (every id >= n_seq)
+-            // belong to no slot and are skipped.
++            // below it. A token belongs to slot s when s is among its ids; a
++            // branch-only token (every id >= n_seq) belongs to the slot whose
++            // root introduced its branches - the last slot seen - so that the
++            // slot's verify rows span the WHOLE tree, root included.
++            bool any_slot = false;
++
+             for (int32_t j = 0; j < batch_in.n_seq_id[k]; ++j) {
+                 const llama_seq_id sid = batch_in.seq_id[k][j];
+                 if (sid < 0 || sid >= (llama_seq_id) n_seq) {
+                     continue;
+                 }
+ 
++                any_slot = true;
++                last_sid = sid;
++
+                 i_batch_end[sid] = k;
+                 if (i_batch_beg[sid] < 0) {
+                     i_batch_beg[sid] = k;
+                 }
+             }
++
++            if (!any_slot && last_sid >= 0 && batch_in.n_seq_id[k] > 0 &&
++                batch_in.seq_id[k][0] >= (llama_seq_id) n_seq) {
++                i_batch_end[last_sid] = k;
++            }
+         }
+ 
+         auto * ctx_tgt = this->params.ctx_tgt;
+@@ -1581,8 +1601,21 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         if (!is_mem_shared) {
+             common_batch_clear(batch);
+ 
++            // a TREE verify batch needs each token's FULL seq set replayed into the
++            // draft context, so the draft-side mask separates the branches and the
++            // post-acceptance fold (seq_cp of the winning leaf) can claim the path
++            bool is_tree_batch = false;
++            for (int k = 0; k < n_tokens && !is_tree_batch; ++k) {
++                is_tree_batch = batch_in.n_seq_id[k] > 1;
++            }
++
+             for (int k = 0; k < n_tokens; ++k) {
+-                common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
++                if (is_tree_batch) {
++                    std::vector<llama_seq_id> seqs(batch_in.seq_id[k], batch_in.seq_id[k] + batch_in.n_seq_id[k]);
++                    common_batch_add(batch, batch_in.token[k], batch_in.pos[k], seqs, 0);
++                } else {
++                    common_batch_add(batch, batch_in.token[k], batch_in.pos[k], { batch_in.seq_id[k][0] }, 0);
++                }
+             }
+ 
+             // shift the tgt embeddings to the right by one position
+@@ -1592,7 +1625,37 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             // TODO:this is generally true, but would be nice to assert it
+             {
+                 const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+-                std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
++
++                if (!is_tree_batch) {
++                    std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
++                } else {
++                    // TREE: the MTP input pair is (h_parent, x_child), so row k takes
++                    // its PARENT row's h - the latest earlier row at pos-1 whose seq
++                    // set covers row k's. Chain rows resolve to k-1 as before; root
++                    // rows are overwritten with pending_h below.
++                    for (int k = 1; k < n_tokens; ++k) {
++                        int par = -1;
++                        for (int j = k - 1; j >= 0 && par < 0; --j) {
++                            if (batch_in.pos[j] != batch_in.pos[k] - 1) {
++                                continue;
++                            }
++                            bool covers = true;
++                            for (int32_t a = 0; a < batch_in.n_seq_id[k] && covers; ++a) {
++                                bool found = false;
++                                for (int32_t b = 0; b < batch_in.n_seq_id[j] && !found; ++b) {
++                                    found = batch_in.seq_id[j][b] == batch_in.seq_id[k][a];
++                                }
++                                covers = found;
++                            }
++                            if (covers) {
++                                par = j;
++                            }
++                        }
++
++                        std::memcpy(batch.embd + (size_t) k * n_embd,
++                                h_tgt + (size_t) (par >= 0 ? par : k - 1) * n_embd, row_bytes);
++                    }
++                }
+             }
+ 
+             // fill the pending embeddings from a previous run
+@@ -1975,7 +2038,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         }
+     }
+ 
+-    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
++    void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
++        accept_row(seq_id, n_accepted, -1, is_other);
++    }
++
++    void accept_row(llama_seq_id seq_id, uint16_t n_accepted, int32_t i_row, bool /*is_other*/) override {
+         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+             return;
+         }
+@@ -1985,7 +2052,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             return;
+         }
+ 
+-        const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
++        // For a chain the last accepted token sits at row n_accepted; for a TREE
++        // the caller names the winning row directly, because siblings make the
++        // accepted count ambiguous.
++        const int32_t i_h = i_row >= 0 ? std::min<int32_t>(i_row, n_rows - 1)
++                                       : std::min<int32_t>(n_accepted, n_rows - 1);
+         const size_t row_bytes = (size_t) n_embd * sizeof(float);
+         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+     }
+@@ -3082,7 +3153,7 @@ void common_speculative_draft(common_speculative * spec) {
+     }
+ }
+ 
+-void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
++void common_speculative_accept_row(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted, int32_t i_row) {
+     common_speculative_impl * impl = spec->impl_last[seq_id];
+ 
+     GGML_ASSERT(impl);
+@@ -3103,18 +3174,22 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
+             impl->n_acc_tokens += n_accepted;
+         }
+ 
+-        impl->accept(seq_id, n_accepted, false);
++        impl->accept_row(seq_id, n_accepted, i_row, false);
+         impl->n_call_accept++;
+     }
+ 
+     // accept with the rest of the implementations, using is_other == true
+     for (auto & impl_other : spec->impls) {
+         if (impl_other.get() != impl) {
+-            impl_other->accept(seq_id, n_accepted, true);
++            impl_other->accept_row(seq_id, n_accepted, i_row, true);
+         }
+     }
+ }
+ 
++void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
++    common_speculative_accept_row(spec, seq_id, n_accepted, -1);
++}
++
+ // TODO: support the case of more than one speculative implementations having a state
+ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data) {
+     if (spec == nullptr) {
+diff --git a/common/speculative.h b/common/speculative.h
+index f85736afd..fba3d9bca 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -178,6 +178,10 @@ void common_speculative_draft(common_speculative * spec);
+ // informs the speculative context that n_accepted tokens were accepted by the target model
+ void common_speculative_accept(common_speculative * spec, llama_seq_id, uint16_t n_accepted);
+ 
++// TREE-aware accept: i_row is the winning token's index among the slot's verify
++// rows (0 = the root row), or -1 for plain chain semantics.
++void common_speculative_accept_row(common_speculative * spec, llama_seq_id, uint16_t n_accepted, int32_t i_row);
++
+ // (optional) get/set internal state
+ bool common_speculative_get_state(common_speculative * spec, llama_seq_id seq_id, std::vector<uint8_t> & data);
+ void common_speculative_set_state(common_speculative * spec, llama_seq_id seq_id, const std::vector<uint8_t> & data);
+diff --git a/ggml/include/ggml.h b/ggml/include/ggml.h
+index 35f0c44ec..ae43f4327 100644
+--- a/ggml/include/ggml.h
++++ b/ggml/include/ggml.h
+@@ -2583,6 +2583,24 @@ extern "C" {
+             struct ggml_tensor  * state,
+             int64_t               K);
+ 
++    // Tree-structured variant: the n_tokens of the (single) sequence form a tree
++    // instead of a chain. tree_src is I32 [n_tokens]; tree_src[t] is the index of
++    // token t's parent (< t), or -1 when token t continues from the initial state.
++    // Token t reads its recurrent state from its parent's snapshot instead of the
++    // previous token's registers, and the snapshot slot mapping becomes slot t =
++    // state after token t (instead of most-recent-first). Requires n_seqs == 1 and
++    // K >= n_tokens so that every token owns a snapshot slot.
++    GGML_API struct ggml_tensor * ggml_gated_delta_net_tree(
++            struct ggml_context * ctx,
++            struct ggml_tensor  * q,
++            struct ggml_tensor  * k,
++            struct ggml_tensor  * v,
++            struct ggml_tensor  * g,
++            struct ggml_tensor  * beta,
++            struct ggml_tensor  * state,
++            struct ggml_tensor  * tree_src,
++            int64_t               K);
++
+     // DSA lightning indexer
+     //
+     // q:       [n_embd_idx, n_head_idx, n_batch, ne3 ]
+diff --git a/ggml/src/ggml-cpu/ops.cpp b/ggml/src/ggml-cpu/ops.cpp
+index 42ec809ce..bcb66c425 100644
+--- a/ggml/src/ggml-cpu/ops.cpp
++++ b/ggml/src/ggml-cpu/ops.cpp
+@@ -10932,6 +10932,9 @@ void ggml_compute_forward_gated_delta_net(
+         ggml_tensor * dst) {
+     const ggml_tensor * src0 = dst->src[0];
+ 
++    // tree-structured token order (src[6]) is only implemented on CUDA/HIP
++    GGML_ASSERT(dst->src[6] == NULL && "gated_delta_net: tree mode not supported on CPU");
++
+     switch (src0->type) {
+         case GGML_TYPE_F32:
+             {
+diff --git a/ggml/src/ggml-cuda/gated_delta_net.cu b/ggml/src/ggml-cuda/gated_delta_net.cu
+index 1b431a724..e320ffd58 100644
+--- a/ggml/src/ggml-cuda/gated_delta_net.cu
++++ b/ggml/src/ggml-cuda/gated_delta_net.cu
+@@ -1,7 +1,7 @@
+ #include "gated_delta_net.cuh"
+ #include "ggml-cuda/common.cuh"
+ 
+-template <int S_v, bool KDA, bool keep_rs_t>
++template <int S_v, bool KDA, bool keep_rs_t, bool TREE>
+ __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+ gated_delta_net_cuda(const float * q,
+                                      const float * k,
+@@ -11,6 +11,7 @@ gated_delta_net_cuda(const float * q,
+                                      const float * curr_state,
+                                      float *       dst,
+                                      float *       state,
++                                     const int32_t * tree_src,
+                                      int64_t       H,
+                                      int64_t       n_tokens,
+                                      int64_t       n_seqs,
+@@ -61,6 +62,26 @@ gated_delta_net_cuda(const float * q,
+     }
+ 
+     for (int t = 0; t < n_tokens; t++) {
++        if constexpr (TREE) {
++            // token t continues from its parent's state, not the previous token's.
++            // The parent's snapshot was written by THIS thread at iteration
++            // tree_src[t] (same (h, col) shard, same addresses), so the reload is
++            // a plain same-thread read; no synchronization is needed. When the
++            // parent IS the previous token (chain segments of the tree), the
++            // registers already hold its state and the reload is skipped.
++            const int ps = tree_src[t];
++            if (!(t > 0 && ps == t - 1)) {
++                const float * s_src = (ps < 0)
++                    ? curr_state
++                    : state + (int64_t) ps * state_slot_stride + col * S_v;
++#pragma unroll
++                for (int r = 0; r < rows_per_lane; r++) {
++                    const int i = r * warp_size + lane;
++                    s_shard[r]  = s_src[i];
++                }
++            }
++        }
++
+         const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+         const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
+         const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+@@ -145,7 +166,9 @@ gated_delta_net_cuda(const float * q,
+         if constexpr (keep_rs_t) {
+             // snapshot slot mapping: slot 0 = most recent state, slot s = s tokens back.
+             // When n_tokens < K only slots 0..n_tokens-1 are written; older slots are caller-owned.
+-            const int target_slot = (int) n_tokens - 1 - t;
++            // TREE: slot t = state after token t, so every node owns its own slot and
++            // descendants (and the post-verify slot selection) can address it directly.
++            const int target_slot = TREE ? t : (int) n_tokens - 1 - t;
+             if (target_slot >= 0 && target_slot < K) {
+                 float * curr_state = state + target_slot * state_slot_stride;
+ #pragma unroll
+@@ -166,11 +189,11 @@ gated_delta_net_cuda(const float * q,
+     }
+ }
+ 
+-template <bool KDA, bool keep_rs_t>
++template <bool KDA, bool keep_rs_t, bool TREE>
+ static void launch_gated_delta_net(
+         const float * q_d, const float * k_d, const float * v_d,
+         const float * g_d, const float * b_d, const float * s_d,
+-        float * dst_d, float * state_d,
++        float * dst_d, float * state_d, const int32_t * tree_src_d,
+         int64_t S_v,   int64_t H, int64_t n_tokens, int64_t n_seqs,
+         int64_t sq1,   int64_t sq2, int64_t sq3,
+         int64_t sv1,   int64_t sv2, int64_t sv3,
+@@ -189,27 +212,27 @@ static void launch_gated_delta_net(
+     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+     switch (S_v) {
+         case 16:
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t, TREE>, launch_params,
++                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, tree_src_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+             break;
+         case 32:
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<32, KDA, keep_rs_t, TREE>, launch_params,
++                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, tree_src_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+             break;
+         case 64: {
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<64, KDA, keep_rs_t, TREE>, launch_params,
++                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, tree_src_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+             break;
+         }
+         case 128: {
+-            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
+-                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
++            ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, TREE>, launch_params,
++                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, tree_src_d, H,
+                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+             break;
+@@ -286,6 +309,10 @@ static void ggml_cuda_op_gated_delta_net_impl(
+     const int K = ggml_get_op_params_i32(dst, 0);
+     const bool keep_rs = K > 1;
+ 
++    // tree-structured token order: src[6] carries the per-token parent index
++    const ggml_tensor * src_tree = dst->src[6];
++    const int32_t * tree_src_d  = src_tree != nullptr ? (const int32_t *) src_tree->data : nullptr;
++
+     // recurrent state -> gdn_out tail (after attention scores), or the cache when fusing
+     float * state_d           = dst_d + S_v * H * n_tokens * n_seqs;
+     int64_t state_slot_stride = S_v * S_v * H * n_seqs;
+@@ -294,23 +321,37 @@ static void ggml_cuda_op_gated_delta_net_impl(
+         state_slot_stride = cache->slot_stride;
+     }
+ 
+-    if (kda) {
++    if (tree_src_d != nullptr) {
++        // tree mode: every token owns a snapshot slot; requires the keep-rs layout
++        GGML_ASSERT(keep_rs);
++        GGML_ASSERT(n_seqs == 1);
++        GGML_ASSERT(n_tokens <= K);
++        if (kda) {
++            launch_gated_delta_net<true, true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, tree_src_d,
++                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
++        } else {
++            launch_gated_delta_net<false, true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, tree_src_d,
++                S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
++                sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
++        }
++    } else if (kda) {
+         if (keep_rs) {
+-            launch_gated_delta_net<true, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++            launch_gated_delta_net<true, true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, nullptr,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         } else {
+-            launch_gated_delta_net<true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++            launch_gated_delta_net<true, false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, nullptr,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         }
+     } else {
+         if (keep_rs) {
+-            launch_gated_delta_net<false, true>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++            launch_gated_delta_net<false, true, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, nullptr,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         } else {
+-            launch_gated_delta_net<false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d,
++            launch_gated_delta_net<false, false, false>(q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, nullptr,
+                 S_v, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                 sb1, sb2, sb3, neqk1, rq3, scale, state_slot_stride, K, stream);
+         }
+diff --git a/ggml/src/ggml.c b/ggml/src/ggml.c
+index 59191c663..d2f574b81 100644
+--- a/ggml/src/ggml.c
++++ b/ggml/src/ggml.c
+@@ -6308,6 +6308,35 @@ struct ggml_tensor * ggml_gated_delta_net(
+     return result;
+ }
+ 
++struct ggml_tensor * ggml_gated_delta_net_tree(
++        struct ggml_context * ctx,
++        struct ggml_tensor  * q,
++        struct ggml_tensor  * k,
++        struct ggml_tensor  * v,
++        struct ggml_tensor  * g,
++        struct ggml_tensor  * beta,
++        struct ggml_tensor  * state,
++        struct ggml_tensor  * tree_src,
++        int64_t               K) {
++    GGML_ASSERT(tree_src != NULL);
++    GGML_ASSERT(tree_src->type == GGML_TYPE_I32);
++    GGML_ASSERT(ggml_is_contiguous(tree_src));
++
++    const int64_t n_tokens = v->ne[2];
++    const int64_t n_seqs   = v->ne[3];
++
++    // one snapshot slot per token, single sequence only
++    GGML_ASSERT(n_seqs == 1);
++    GGML_ASSERT(tree_src->ne[0] == n_tokens);
++    GGML_ASSERT(K >= n_tokens);
++
++    struct ggml_tensor * result = ggml_gated_delta_net(ctx, q, k, v, g, beta, state, K);
++
++    result->src[6] = tree_src;
++
++    return result;
++}
++
+ // ggml_lightning_indexer
+ 
+ struct ggml_tensor * ggml_lightning_indexer(
+diff --git a/include/llama.h b/include/llama.h
+index 6e53e2297..5be735f5b 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -753,6 +753,15 @@ extern "C" {
+             llama_memory_t mem,
+               llama_seq_id seq_id);
+ 
++    // Speculative TREE verify [EXPERIMENTAL]: after the acceptance walk, point
++    // the sequence's recurrent state at snapshot slot `slot` (the winning
++    // token's index within the tree verify batch). Only meaningful on memories
++    // with recurrent rollback state (n_rs_seq > 0); no-op otherwise.
++    LLAMA_API void llama_memory_seq_rs_select(
++            llama_memory_t mem,
++              llama_seq_id seq_id,
++                  uint32_t slot);
++
+     // Adds relative position "delta" to all tokens that belong to the specified sequence and have positions in [p0, p1)
+     // p0 < 0 : [0,  p1]
+     // p1 < 0 : [p0, inf)
+diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
+index 2b98a552f..4b0c60ab7 100644
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -678,6 +678,78 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
+     return ubatch_add(idxs, n_seqs, true);
+ }
+ 
++llama_ubatch llama_batch_allocr::split_tree(uint32_t n_ubatch) {
++    // only meaningful on a fresh split of a batch that has coupled sequences
++    // (a speculative tree couples every ancestor to its descendants' leaf ids;
++    // a plain chain or prefill batch never produces multi-seq tokens here)
++    if (n_used > 0 || !has_cpl) {
++        return {};
++    }
++
++    const uint32_t n_tokens = get_n_tokens();
++
++    if (n_tokens < 2 || n_tokens > n_ubatch) {
++        return {};
++    }
++
++    // token 0 must be the tree's root: its sequence set contains every other
++    // token's set, and every other token sits at a strictly later position
++    if (batch.n_seq_id[0] < 2) {
++        return {};
++    }
++
++    for (uint32_t i = 1; i < n_tokens; ++i) {
++        if ((seq_set[0] & seq_set[i]) != seq_set[i]) {
++            return {};
++        }
++        if (batch.pos[i] < batch.pos[0] + 1) {
++            return {};
++        }
++    }
++
++    // the non-root sets must form a laminar family: pairwise nested or disjoint.
++    // This is what makes "parent = latest earlier token at pos-1 whose set covers
++    // mine" well-defined, which is how the graph recovers the tree topology.
++    for (uint32_t i = 1; i < n_tokens; ++i) {
++        for (uint32_t j = i + 1; j < n_tokens; ++j) {
++            const auto isect = seq_set[i] & seq_set[j];
++            if (isect.none()) {
++                continue;
++            }
++            if (isect != seq_set[i] && isect != seq_set[j]) {
++                return {};
++            }
++        }
++    }
++
++    // every non-root token needs a parent: a token at pos-1 whose set covers its set
++    for (uint32_t i = 1; i < n_tokens; ++i) {
++        bool found = false;
++        for (int32_t j = (int32_t) i - 1; j >= 0; --j) {
++            if (batch.pos[j] == batch.pos[i] - 1 && (seq_set[j] & seq_set[i]) == seq_set[i]) {
++                found = true;
++                break;
++            }
++        }
++        if (!found) {
++            return {};
++        }
++    }
++
++    std::vector<int32_t> idxs;
++    idxs.reserve(n_tokens);
++
++    for (uint32_t i = 0; i < n_tokens; ++i) {
++        idxs.push_back(i);
++
++        used[i] = true;
++        ++n_used;
++    }
++
++    // one lane: the recurrent memory sees a single sequence owning the whole tree
++    return ubatch_add(idxs, 1, true);
++}
++
+ llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {
+     // find the first unused token
+     uint32_t cur_idx = 0;
+diff --git a/src/llama-batch.h b/src/llama-batch.h
+index a3d1889d4..3b5f058ec 100644
+--- a/src/llama-batch.h
++++ b/src/llama-batch.h
+@@ -110,6 +110,14 @@ public:
+     // sequence-set-wise split - each ubatch contains a single sequence-set
+     llama_ubatch split_seq(uint32_t n_ubatch);
+ 
++    // tree-speculation split: if the whole remaining batch is a single
++    // speculative TREE - one root token whose sequence set contains every other
++    // token's set, all other sets laminar (pairwise nested or disjoint) - emit it
++    // as ONE single-lane ubatch (n_seqs = 1) preserving token order, so a hybrid
++    // memory can process the whole tree in one pass. Returns an empty ubatch when
++    // the batch does not have that shape.
++    llama_ubatch split_tree(uint32_t n_ubatch);
++
+     // a helper method for creating a well-defined ubatch of tokens
+     // TODO: support embeddings if needed in the future
+     llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 19cca7df1..0d4cab4fd 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -3914,6 +3914,17 @@ void llama_memory_seq_keep(
+     mem->seq_keep(seq_id);
+ }
+ 
++void llama_memory_seq_rs_select(
++        llama_memory_t mem,
++          llama_seq_id seq_id,
++              uint32_t slot) {
++    if (!mem) {
++        return;
++    }
++
++    mem->seq_rs_select(seq_id, slot);
++}
++
+ void llama_memory_seq_add(
+         llama_memory_t mem,
+           llama_seq_id seq_id,
+diff --git a/src/llama-graph.cpp b/src/llama-graph.cpp
+index e12a8cdc2..44dfb52da 100644
+--- a/src/llama-graph.cpp
++++ b/src/llama-graph.cpp
+@@ -323,6 +323,104 @@ void llm_graph_input_cls::set_input(const llama_ubatch * ubatch) {
+     }
+ }
+ 
++bool llm_graph_ubatch_is_tree(const llama_ubatch & ubatch) {
++    if (ubatch.n_seqs != 1 || ubatch.n_seq_tokens < 2) {
++        return false;
++    }
++
++    // a TREE needs both coupled seq sets AND an actual branch (repeated position).
++    // A chain-shaped "tree" (every node a single child) is processed by the plain
++    // chain path so that it stays bit-identical with ordinary chain verification.
++    bool coupled  = false;
++    bool branched = false;
++
++    for (uint32_t i = 0; i < ubatch.n_tokens; ++i) {
++        coupled |= ubatch.n_seq_id[i] > 1;
++        // positions are nondecreasing in these batches, so equal positions are adjacent
++        branched |= i > 0 && ubatch.pos[i] == ubatch.pos[i - 1];
++    }
++
++    return coupled && branched;
++}
++
++// recover the tree topology of a split_tree() ubatch from its seq sets:
++// parent[i] = the latest earlier token at pos[i]-1 whose seq set covers token i's.
++// split_tree() guarantees existence and laminarity, so this is well-defined.
++static void llm_graph_tree_parents(const llama_ubatch & ubatch, std::vector<int32_t> & parent) {
++    const int32_t n = (int32_t) ubatch.n_tokens;
++
++    parent.assign(n, -1);
++
++    auto covers = [&](int32_t j, int32_t i) {
++        for (int32_t a = 0; a < ubatch.n_seq_id[i]; ++a) {
++            bool found = false;
++            for (int32_t b = 0; b < ubatch.n_seq_id[j]; ++b) {
++                if (ubatch.seq_id[j][b] == ubatch.seq_id[i][a]) {
++                    found = true;
++                    break;
++                }
++            }
++            if (!found) {
++                return false;
++            }
++        }
++        return true;
++    };
++
++    for (int32_t i = 1; i < n; ++i) {
++        for (int32_t j = i - 1; j >= 0; --j) {
++            if (ubatch.pos[j] == ubatch.pos[i] - 1 && covers(j, i)) {
++                parent[i] = j;
++                break;
++            }
++        }
++    }
++}
++
++// fill the tree-verify input tensors (parent indices + conv window rows)
++static void llm_graph_input_rs_set_tree(llm_graph_input_rs * inp, const llama_ubatch * ubatch) {
++    if (inp->tree_src == nullptr) {
++        return;
++    }
++
++    GGML_ASSERT(llm_graph_ubatch_is_tree(*ubatch));
++
++    const int32_t n = (int32_t) ubatch->n_tokens;
++    GGML_ASSERT(inp->tree_src->ne[0] == n);
++
++    std::vector<int32_t> parent;
++    llm_graph_tree_parents(*ubatch, parent);
++
++    GGML_ASSERT(ggml_backend_buffer_is_host(inp->tree_src->buffer));
++    int32_t * ts = (int32_t *) inp->tree_src->data;
++    for (int32_t i = 0; i < n; ++i) {
++        ts[i] = parent[i];
++    }
++
++    if (inp->tree_cidx != nullptr) {
++        GGML_ASSERT(ggml_backend_buffer_is_host(inp->tree_cidx->buffer));
++        const int32_t d_conv = (int32_t) (inp->tree_cidx->ne[0] / n);
++        int32_t * ci = (int32_t *) inp->tree_cidx->data;
++
++        // rows of the gathered conv source: rows 0..d_conv-2 are the prompt taps
++        // (oldest first), row d_conv-1+t is token t. Window entry j of token t is
++        // the input m = d_conv-1-j steps back along t's ancestor path; walking
++        // past the root steps into the prompt taps (a = -1 is the newest tap).
++        for (int32_t t = 0; t < n; ++t) {
++            for (int32_t j = 0; j < d_conv; ++j) {
++                const int32_t m = d_conv - 1 - j;
++
++                int32_t a = t;
++                for (int32_t s = 0; s < m; ++s) {
++                    a = a >= 0 ? parent[a] : a - 1;
++                }
++
++                ci[t*d_conv + j] = d_conv - 1 + a;
++            }
++        }
++    }
++}
++
+ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
+     GGML_UNUSED(ubatch);
+ 
+@@ -337,6 +435,8 @@ void llm_graph_input_rs::set_input(const llama_ubatch * ubatch) {
+             data[i] = mctx->s_copy(i);
+         }
+     }
++
++    llm_graph_input_rs_set_tree(this, ubatch);
+ }
+ 
+ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
+@@ -354,6 +454,11 @@ bool llm_graph_input_rs::can_reuse(const llm_graph_params & params) {
+     res &= head == mctx->get_head();
+     res &= rs_z == mctx->get_rs_z();
+ 
++    res &= (tree_src != nullptr) == llm_graph_ubatch_is_tree(params.ubatch);
++    if (tree_src != nullptr) {
++        res &= tree_src->ne[0] == params.ubatch.n_tokens;
++    }
++
+     return res;
+ }
+ 
+@@ -1048,6 +1153,8 @@ void llm_graph_input_mem_hybrid::set_input(const llama_ubatch * ubatch) {
+             data[i] = mctx->get_recr()->s_copy(i);
+         }
+     }
++
++    llm_graph_input_rs_set_tree(inp_rs.get(), ubatch);
+ }
+ 
+ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
+@@ -1070,6 +1177,13 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
+     res &= inp_rs->head == mctx->get_recr()->get_head();
+     res &= inp_rs->rs_z == mctx->get_recr()->get_rs_z();
+ 
++    // tree-verify graphs are keyed on tree-ness and token count; the parent
++    // indices themselves are inputs and refresh on every set_input
++    res &= (inp_rs->tree_src != nullptr) == llm_graph_ubatch_is_tree(params.ubatch);
++    if (inp_rs->tree_src != nullptr) {
++        res &= inp_rs->tree_src->ne[0] == params.ubatch.n_tokens;
++    }
++
+     return res;
+ }
+ 
+@@ -3316,7 +3430,8 @@ ggml_tensor * llm_graph_context::build_rs(
+ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
+            ggml_context * ctx0,
+      const llama_ubatch & ubatch,
+-    const llama_memory_recurrent_context * mctx_cur) {
++    const llama_memory_recurrent_context * mctx_cur,
++                int64_t   d_conv = 0) {
+ 
+     auto inp = std::make_unique<llm_graph_input_rs>(mctx_cur);
+ 
+@@ -3329,6 +3444,18 @@ static std::unique_ptr<llm_graph_input_rs> build_rs_inp_impl(
+     inp->s_copy_main  = ggml_view_1d(ctx0, inp->s_copy, n_seqs, 0);
+     inp->s_copy_extra = ggml_view_1d(ctx0, inp->s_copy, n_rs - n_seqs, n_seqs * inp->s_copy->nb[0]);
+ 
++    if (llm_graph_ubatch_is_tree(ubatch)) {
++        const int64_t n_tokens = ubatch.n_tokens;
++
++        inp->tree_src = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, n_tokens);
++        ggml_set_input(inp->tree_src);
++
++        if (d_conv >= 2) {
++            inp->tree_cidx = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, d_conv*n_tokens);
++            ggml_set_input(inp->tree_cidx);
++        }
++    }
++
+     inp->head = mctx_cur->get_head();
+     inp->rs_z = mctx_cur->get_rs_z();
+ 
+@@ -3400,7 +3527,7 @@ ggml_tensor * llm_graph_context::build_rwkv_token_shift_store(
+ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
+     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
+ 
+-    auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
++    auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr(), hparams.ssm_d_conv);
+     auto inp_attn = build_attn_inp_kv_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+ 
+     auto inp = std::make_unique<llm_graph_input_mem_hybrid>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 160e29413..eb18ea323 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -271,6 +271,14 @@ public:
+     ggml_tensor * s_copy_main;   // I32 [n_seqs]
+     ggml_tensor * s_copy_extra;  // I32 [n_rs - n_seqs]
+ 
++    // Speculative TREE verify: the single-lane ubatch's tokens form a tree
++    // (repeated positions, laminar seq sets). These are non-null only then.
++    //   tree_src  : I32 [n_tokens]          - parent token index, -1 = initial state
++    //   tree_cidx : I32 [d_conv * n_tokens] - per-token conv window rows into
++    //               [d_conv-1 prompt taps ++ token rows], oldest tap first
++    ggml_tensor * tree_src  = nullptr;
++    ggml_tensor * tree_cidx = nullptr;
++
+     const llama_memory_recurrent_context * mctx;
+ 
+     // used in view offsets, need to match for valid graph reuse
+@@ -278,6 +286,10 @@ public:
+     int32_t rs_z;
+ };
+ 
++// true when the ubatch is a single-lane speculative TREE (repeated positions
++// distinguished by laminar per-token seq sets): the shape split_tree() emits
++bool llm_graph_ubatch_is_tree(const llama_ubatch & ubatch);
++
+ class llm_graph_input_cross_embd : public llm_graph_input_i {
+ public:
+     llm_graph_input_cross_embd(
+diff --git a/src/llama-memory-hybrid.cpp b/src/llama-memory-hybrid.cpp
+index 42c7381a9..1c3e5b84e 100644
+--- a/src/llama-memory-hybrid.cpp
++++ b/src/llama-memory-hybrid.cpp
+@@ -71,7 +71,22 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
+         // follow the recurrent pattern for creating the ubatch splits
+         std::vector<llama_ubatch> ubatches;
+ 
+-        while (true) {
++        // A speculative TREE batch (one root token whose leaf-bitset seq sets
++        // couple every ancestor to its descendants) fragments under split_equal,
++        // because split_equal only co-schedules DISJOINT sequence sets - the
++        // 8-position tree becomes one ubatch per level, i.e. one full weight pass
++        // per level. Emit it as ONE single-lane ubatch instead; the recurrent
++        // side recovers the branch structure from the seq sets (tree_src) and the
++        // attention mask keys off per-token seq_id[0] as usual.
++        if (!embd_all && mem_recr->n_rs_seq > 0) {
++            llama_ubatch ubatch = balloc.split_tree(n_ubatch);
++
++            if (ubatch.n_tokens > 0) {
++                ubatches.push_back(std::move(ubatch)); // NOLINT
++            }
++        }
++
++        while (ubatches.empty() || balloc.get_n_used() < balloc.get_n_tokens()) {
+             llama_ubatch ubatch;
+ 
+             if (embd_all) {
+@@ -154,6 +169,10 @@ void llama_memory_hybrid::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id_ds
+     mem_recr->seq_cp(seq_id_src, seq_id_dst, p0, p1);
+ }
+ 
++void llama_memory_hybrid::seq_rs_select(llama_seq_id seq_id, uint32_t slot) {
++    mem_recr->seq_rs_select(seq_id, slot);
++}
++
+ void llama_memory_hybrid::seq_keep(llama_seq_id seq_id) {
+     mem_attn->seq_keep(seq_id);
+     mem_recr->seq_keep(seq_id);
+diff --git a/src/llama-memory-hybrid.h b/src/llama-memory-hybrid.h
+index 484eafb74..7a6181e79 100644
+--- a/src/llama-memory-hybrid.h
++++ b/src/llama-memory-hybrid.h
+@@ -62,6 +62,7 @@ public:
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
++    void seq_rs_select(llama_seq_id seq_id, uint32_t slot) override;
+     void seq_keep(llama_seq_id seq_id)                                                          override;
+     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
+     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index ef82eb976..bc07bc710 100644
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -389,6 +389,21 @@ llama_pos llama_memory_recurrent::seq_pos_max(llama_seq_id seq_id) const {
+     return result;
+ }
+ 
++void llama_memory_recurrent::seq_rs_select(llama_seq_id seq_id, uint32_t slot) {
++    if (n_rs_seq == 0) {
++        return;
++    }
++    if (seq_id < 0 || (size_t) seq_id >= rs_idx.size()) {
++        return;
++    }
++
++    // slot indexes the snapshot planes directly; the tree writes slot t for
++    // token t, so any valid selection is <= n_rs_seq by construction
++    GGML_ASSERT(slot <= n_rs_seq);
++
++    rs_idx[seq_id] = slot;
++}
++
+ void llama_memory_recurrent::set_rs_idx(llama_seq_id seq_id, uint32_t idx) {
+     if (seq_id < 0 || (size_t) seq_id >= rs_idx.size()) {
+         return;
+diff --git a/src/llama-memory-recurrent.h b/src/llama-memory-recurrent.h
+index b13b7b748..5e93bdd17 100644
+--- a/src/llama-memory-recurrent.h
++++ b/src/llama-memory-recurrent.h
+@@ -45,6 +45,7 @@ public:
+ 
+     bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) override;
+     void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) override;
++    void seq_rs_select(llama_seq_id seq_id, uint32_t slot) override;
+     void seq_keep(llama_seq_id seq_id)                                                          override;
+     void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) override;
+     void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) override;
+diff --git a/src/llama-memory.h b/src/llama-memory.h
+index db8253966..8a8be4b97 100644
+--- a/src/llama-memory.h
++++ b/src/llama-memory.h
+@@ -109,6 +109,13 @@ struct llama_memory_i {
+ 
+     virtual bool seq_rm  (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1) = 0;
+     virtual void seq_cp  (llama_seq_id seq_id_src, llama_seq_id seq_id_dst, llama_pos p0, llama_pos p1) = 0;
++
++    // speculative TREE verify: point the sequence's recurrent state at snapshot
++    // slot `slot` (the winning token's index in the tree ubatch). The chain's
++    // rollback arithmetic cannot name a tree node - siblings share positions -
++    // so the caller that ran the acceptance walk selects the slot explicitly.
++    // No-op for memories without recurrent rollback state.
++    virtual void seq_rs_select(llama_seq_id seq_id, uint32_t slot) { (void) seq_id; (void) slot; }
+     virtual void seq_keep(llama_seq_id seq_id) = 0;
+     virtual void seq_add (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, llama_pos shift) = 0;
+     virtual void seq_div (llama_seq_id seq_id,                              llama_pos p0, llama_pos p1, int d) = 0;
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index ad6612647..61601c662 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -524,6 +524,78 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+     return conv_input;
+ }
+ 
++ggml_tensor * llm_build_delta_net_base::build_conv_state_tree(
++        llm_graph_input_rs * inp,
++        ggml_tensor *        conv_states_all,
++        ggml_tensor *        qkv_mixed,
++        ggml_tensor *        conv_kernel,
++        int64_t              conv_kernel_size,
++        int64_t              conv_channels,
++        int                  il) {
++    const auto * mctx_cur = inp->mctx;
++
++    const auto kv_head  = mctx_cur->get_head();
++    const auto mem_size = mctx_cur->get_size();
++
++    const int64_t n_seqs   = ubatch.n_seqs;
++    const int64_t n_tokens = ubatch.n_tokens;
++    const int64_t d_conv   = conv_kernel_size;
++
++    GGML_ASSERT(n_seqs == 1);
++    GGML_ASSERT(inp->tree_cidx != nullptr);
++    GGML_ASSERT(inp->tree_cidx->ne[0] == d_conv * n_tokens);
++    GGML_ASSERT((int64_t) cparams.n_rs_seq + 1 >= n_tokens);
++
++    // gathered previous conv state: one row of [d_conv-1, channels], tap-major
++    ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
++    conv_states = ggml_reshape_2d(ctx0, conv_states, d_conv - 1, conv_channels);
++    cb(conv_states, "tree_conv_states", il);
++
++    // prompt taps as channel-major rows: [channels, d_conv-1], oldest tap first
++    ggml_tensor * taps = ggml_cont(ctx0, ggml_transpose(ctx0, conv_states));
++    cb(taps, "tree_conv_taps", il);
++
++    // token inputs are already channel-major rows: [channels, n_tokens]
++    ggml_tensor * toks = ggml_reshape_2d(ctx0, qkv_mixed, conv_channels, n_tokens);
++
++    // V rows: [taps ++ tokens] -> [channels, d_conv-1 + n_tokens]
++    ggml_tensor * V = ggml_concat(ctx0, taps, toks, 1);
++    cb(V, "tree_conv_src", il);
++
++    // gather each token's window along its ancestor path:
++    // W[:, t*d_conv + j] = window entry j of token t (j = 0 oldest, d_conv-1 self)
++    ggml_tensor * W = ggml_get_rows(ctx0, V, inp->tree_cidx);
++    W = ggml_reshape_3d(ctx0, W, conv_channels, d_conv, n_tokens);
++    cb(W, "tree_conv_windows", il);
++
++    // conv: out[c, t] = sum_j W[c, j, t] * kernel[j, c]
++    ggml_tensor * Wp = ggml_cont(ctx0, ggml_permute(ctx0, W, 1, 0, 2, 3)); // [d_conv, channels, n_tokens]
++    ggml_tensor * prod = ggml_mul(ctx0, Wp, conv_kernel);                  // kernel [d_conv, channels] bcast over tokens
++    ggml_tensor * out  = ggml_sum_rows(ctx0, prod);                        // [1, channels, n_tokens]
++    out = ggml_reshape_3d(ctx0, out, conv_channels, n_tokens, 1);
++    cb(out, "tree_conv_out", il);
++
++    // write each token's post-window (entries 1..d_conv-1) into snapshot slot t,
++    // tap-major, mirroring the ssm state's slot-t-per-token mapping
++    const int64_t row_count = (d_conv - 1) * conv_channels;
++    const size_t  row_size  = ggml_row_size(conv_states_all->type, row_count);
++
++    for (int64_t t = 0; t < n_tokens; ++t) {
++        ggml_tensor * win_t = ggml_view_2d(ctx0, W, conv_channels, d_conv - 1,
++                W->nb[1], W->nb[1] + t*W->nb[2]);          // [channels, d_conv-1], entries 1..d_conv-1
++        ggml_tensor * win_tt = ggml_transpose(ctx0, win_t); // [d_conv-1, channels]
++
++        ggml_tensor * dst_t = ggml_view_2d(ctx0, conv_states_all,
++                d_conv - 1, conv_channels,
++                ggml_row_size(conv_states_all->type, d_conv - 1),
++                ((size_t) t * mem_size + kv_head) * row_size);
++
++        ggml_build_forward_expand(gf, ggml_cpy(ctx0, win_tt, dst_t));
++    }
++
++    return out;
++}
++
+ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+         llm_graph_input_rs * inp,
+         ggml_tensor *        ssm_states_all,
+@@ -564,7 +636,15 @@ ggml_tensor * llm_build_delta_net_base::build_recurrent_attn(
+     const int64_t K = cparams.n_rs_seq + 1;
+ 
+     // state s is 4D [S_v, S_v, H_v, n_seqs]; K snapshot slots are written into the output.
+-    ggml_tensor * gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
++    // A tree-verify ubatch (inp->tree_src set) runs the tree-aware scan: each token
++    // continues from its parent's snapshot and owns snapshot slot t.
++    ggml_tensor * gdn_out;
++    if (inp->tree_src != nullptr && n_seq_tokens > 1) {
++        GGML_ASSERT(K >= n_seq_tokens);
++        gdn_out = ggml_gated_delta_net_tree(ctx0, q, k, v, g, b, s, inp->tree_src, K);
++    } else {
++        gdn_out = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, K);
++    }
+     if (n_seq_tokens > 1) {
+         res->add_fused_node({LLM_FUSED_OP_GDN_CH, gdn_out, il});
+     } else {
+diff --git a/src/models/models.h b/src/models/models.h
+index 55072f17e..5ac7009bb 100644
+--- a/src/models/models.h
++++ b/src/models/models.h
+@@ -88,6 +88,21 @@ struct llm_build_delta_net_base : public llm_graph_context {
+             ggml_tensor *        b,
+             ggml_tensor *        s,
+             int                  il);
++
++    // TREE-verify variant of the conv step: the ubatch's tokens form a tree
++    // (inp->tree_src/tree_cidx are set), so each token's conv window is gathered
++    // along its own ancestor path instead of sliding. Computes the convolution
++    // directly (equivalent of ggml_ssm_conv(conv_input, kernel)) and writes each
++    // token's post-window into snapshot slot t of the conv cache.
++    // returns: conv output [conv_channels, n_tokens, 1] (pre-silu)
++    ggml_tensor * build_conv_state_tree(
++            llm_graph_input_rs * inp,
++            ggml_tensor *        conv_states_all,
++            ggml_tensor *        qkv_mixed,
++            ggml_tensor *        conv_kernel,
++            int64_t              conv_kernel_size,
++            int64_t              conv_channels,
++            int                  il);
+ };
+ 
+ struct llm_build_rwkv6_base : public llm_graph_context {
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index ea8e6868e..f1f33b321 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -434,13 +434,21 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn_linear(
+     const int64_t conv_kernel_size = conv_kernel->ne[0];
+     const int64_t conv_channels    = d_inner + 2 * hparams.ssm_n_group * hparams.ssm_d_state;
+ 
+-    ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
+-
+     ggml_tensor * state = build_rs(inp, ssm_states_all, hparams.n_embd_s(), n_seqs);
+     state = ggml_reshape_4d(ctx0, state, head_v_dim, head_v_dim, num_v_heads, n_seqs);
+     cb(state, "state_predelta", il);
+ 
+-    ggml_tensor * conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
++    // A tree-verify ubatch gathers each token's conv window along its own
++    // ancestor path; a chain slides as usual.
++    ggml_tensor * conv_output_proper;
++    if (inp->tree_src != nullptr && n_seq_tokens > 1) {
++        conv_output_proper = build_conv_state_tree(inp, conv_states_all, qkv_mixed,
++                conv_kernel, conv_kernel_size, conv_channels, il);
++    } else {
++        ggml_tensor * conv_input = build_conv_state(inp, conv_states_all, qkv_mixed, conv_kernel_size, conv_channels, il);
++
++        conv_output_proper = ggml_ssm_conv(ctx0, conv_input, conv_kernel);
++    }
+     cb(conv_output_proper, "conv_output_raw", il);
+ 
+     ggml_tensor * conv_output_silu = ggml_silu(ctx0, conv_output_proper);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index b775dca5f..419eb2688 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -251,6 +251,11 @@ struct server_slot {
+     // sequence ids used for the tree's branches this pass, so they can be cleared
+     // once the winning path has been folded back into the slot's own sequence
+     std::vector<llama_seq_id> spec_tree_seqs;
++
++    // recurrent snapshot slot of the winning tree node (its index in the verify
++    // batch), to be selected after the post-acceptance seq_rm; -1 = no tree pass
++    // or a chain-shaped tree whose rollback arithmetic is already correct
++    int32_t spec_tree_rs_slot = -1;
+     llama_tokens spec_prompt;
+     std::vector<int32_t> spec_i_batch;
+     common_prompt_checkpoint spec_ckpt;
+@@ -3965,9 +3970,29 @@ private:
+                 // drop every branch. The accepted nodes sit at pos0+1 .. pos0+L
+                 // under the winning leaf's id, so one ranged bitset copy claims
+                 // exactly them and leaves the losing siblings to be freed below.
++                // (common_memory ops cover the draft context too, so the draft KV
++                // keeps the accepted path under the slot's own sequence as well.)
++                int32_t spec_accept_row = -1;
++
+                 if (!slot.spec_tree.empty()) {
+                     const llama_pos pos0 = slot.prompt.tokens.pos_next() - 1 - (llama_pos) n_draft;
+ 
++                    // the winning node's index in the verify batch: row 0 is the
++                    // root, node i sits at row 1 + i
++                    const int32_t t_win = tree_path.empty() ? 0 : tree_path.back() + 1;
++                    spec_accept_row = t_win;
++
++                    // chain-shaped trees (no branching) run the plain chain graph,
++                    // whose snapshot mapping the existing rollback arithmetic
++                    // already handles; only a BRANCHED tree needs the explicit
++                    // slot selection
++                    bool chain_shaped = true;
++                    for (size_t i = 0; i < slot.spec_tree.size() && chain_shaped; ++i) {
++                        chain_shaped = slot.spec_tree.parent[i] == (int32_t) i - 1;
++                    }
++
++                    slot.spec_tree_rs_slot = chain_shaped ? -1 : t_win;
++
+                     if (!tree_path.empty()) {
+                         std::vector<std::vector<llama_seq_id>> node_seqs;
+                         std::vector<llama_seq_id> all_seqs;
+@@ -4002,6 +4027,9 @@ private:
+                             SLT_INF(slot, "accepted %2zu/%2zu draft tokens (restore checkpoint)\n", accepted.size() - 1, slot.spec_draft.size());
+                         }
+ 
++                        // full state restore supersedes any pending tree slot selection
++                        slot.spec_tree_rs_slot = -1;
++
+                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
+                         slot.spec_is_replay = true;
+                         slot.spec_draft = std::move(accepted);
+@@ -4029,7 +4057,7 @@ private:
+                     SLT_INF(slot, "accepted %2zu/%2zu draft tokens\n", accepted.size() - 1, n_draft);
+                 }
+ 
+-                common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
++                common_speculative_accept_row(spec.get(), slot.id, accepted.size() - 1, spec_accept_row);
+ 
+                 slot.spec_draft = std::move(accepted);
+             }
+@@ -4066,6 +4094,15 @@ private:
+ 
+             slot.mem.seq_rm(slot.id, slot.prompt.tokens.pos_next(), -1);
+ 
++            // a BRANCHED tree pass wrote one recurrent snapshot per verify
++            // position (slot t = state after token t); the seq_rm above set the
++            // rollback index by position arithmetic, which cannot name a tree
++            // node - select the winning node's snapshot explicitly
++            if (slot.spec_tree_rs_slot >= 0) {
++                llama_memory_seq_rs_select(llama_get_memory(slot.ctx_tgt), slot.id, (uint32_t) slot.spec_tree_rs_slot);
++                slot.spec_tree_rs_slot = -1;
++            }
++
+             for (size_t i = 0; i < ids.size(); ++i) {
+                 completion_token_output result;
+ 
