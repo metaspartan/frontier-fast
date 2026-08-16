@@ -1,0 +1,32 @@
+From d74beee0391f7bb1e0441f5011997a394f160b79 Mon Sep 17 00:00:00 2001
+From: x <x@y>
+Date: Sun, 16 Aug 2026 11:06:57 -0600
+Subject: [PATCH 8/9] gdn: state-gather elision fires at speculative verify
+ widths (2-8, single sequence)
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 8 +++++++-
+ 1 file changed, 7 insertions(+), 1 deletion(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index fecc27d8..d45d0841 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -3019,7 +3019,13 @@ static bool ggml_cuda_try_gdn_state_gather(const ggml_cgraph *
+     // the gate-shape perplexity moved 2.9608 -> 2.9655 (+0.159%), while the decode shape
+     // (-b 512 -ub 1) stayed identical in every digit. Declining the fold where it pays nothing
+     // keeps every prefill kernel bit-identical to the parent frontier.
+-    if (src_v->ne[2] != 1) {
++    // Widths 2..8 (single sequence) are the speculative verify and catch-up shapes: the
++    // gather is still one whole extra pass over the layer's state per graph, amortised
++    // over at most 8 tokens, and with n_seqs == 1 each block reads exactly the
++    // (head, column-slice) bytes that only it later snapshots, read-before-write within
++    // the block. Larger n_tokens (prefill) keeps the stock path: the gather amortises
++    // over the ubatch there and rollback-split shapes stay untouched.
++    if (src_v->ne[2] < 1 || src_v->ne[2] > 8 || (src_v->ne[2] > 1 && n_seqs != 1)) {
+         return false;
+     }
+ 
+-- 
+2.43.0
+
