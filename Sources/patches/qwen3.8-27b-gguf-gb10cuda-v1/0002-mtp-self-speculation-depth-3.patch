@@ -1,5 +1,5 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
-index 772422f6..e2faadd5 100644
+index 772422f6..41c32d8a 100644
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
 @@ -5,6 +5,7 @@
@@ -62,7 +62,7 @@ index 772422f6..e2faadd5 100644
  common_models_handler common_models_handler_init(const common_params & params, llama_example curr_ex) {
      common_download_hf_plan plan;
      common_download_hf_plan plan_spec;
-@@ -879,6 +925,49 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
+@@ -879,6 +925,54 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
          }
      }
  
@@ -77,22 +77,27 @@ index 772422f6..e2faadd5 100644
 +    // so a server started without `--spec-type` reads the trunk only and spends
 +    // one full pass over 17 GB of weights per generated token.
 +    //
-+    // The draft depth is 2 because that is what GB10 measures. Sweeping n_max
-+    // over a paired benchmark, two passes per depth, ascending and descending:
++    // The draft depth is 3 because that is what GB10 measures once the draft
++    // step is cheap. The original sweep with the full-vocabulary draft
++    // projection put depth 2 first (17.879 / 21.837 / 21.575 / 21.035 tok/s at
++    // depths 1-4). The Latin-prefix head projection (0003) halves the draft
++    // step, 6.956 -> 3.729 ms, and that moves the optimum: re-sweeping with the
++    // reduced head, two passes per depth, ascending and descending, on paired
++    // prompts:
 +    //
-+    //   depth  decode tok/s  acceptance  mean accepted length
-+    //     1       17.879       78.6%           1.786
-+    //     2       21.837       66.9%           2.338
-+    //     3       21.575       56.0%           2.681
-+    //     4       21.035       43.9%           2.756
++    //   depth  decode tok/s  acceptance
++    //     1       17.20        75.3%
++    //     2       19.14        58.0%
++    //     3       20.41        49.1%
++    //     4       18.46        40.2%
 +    //
-+    // The single trained head re-run autoregressively loses acceptance at every
-+    // extra step, so the useful depth is set by how cheap the wider verify pass
-+    // is. A GB10 decode pass is bandwidth-bound on the whole weight set, so
-+    // verifying a second position costs much less than it returns; past two the
-+    // acceptance decay outruns it. This is hardware-specific - the same patch on
-+    // the Radeon AI PRO R9700 measures depth 1 fastest, because there the head
-+    // is a larger fraction of a much cheaper trunk pass.
++    // Depth 3 beats depth 2 by 6.6%, identical in both sweep directions. The
++    // verify pass is nearly flat in positions on this box (85.9 / 91.2 / 88.6 /
++    // 94.2 / 100.7 ms at widths 1/2/3/5/8), so the third drafted position costs
++    // one cheap draft step plus a few ms of verify against the extra accepted
++    // tokens; at the full-projection step cost the same position was a wash,
++    // which is why the landed record shipped depth 2. Depth remains
++    // hardware-specific - sweep it on the box, do not port it.
 +    //
 +    // Server only: llama-perplexity and the other tools keep decoding exactly as
 +    // they did, so the correctness gates measure an untouched engine.
@@ -102,7 +107,7 @@ index 772422f6..e2faadd5 100644
 +            params.speculative.draft.n_max == common_params_speculative_draft().n_max &&
 +            model_ships_nextn_head(params.model.path)) {
 +        params.speculative.types       = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
-+        params.speculative.draft.n_max = 2;
++        params.speculative.draft.n_max = 3;
 +
 +        LOG_INF("%s: model ships a NextN head - enabling MTP self-speculation "
 +                "(equivalent to --spec-type draft-mtp --spec-draft-n-max %d)\n",
