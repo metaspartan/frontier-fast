@@ -74,14 +74,30 @@ case "$cmd" in
   clone)
     track="$DEFAULT_TRACK"
     while [ $# -gt 0 ]; do case "$1" in --track) track="$2"; shift 2;; *) shift;; esac; done
-    git clone https://github.com/metaspartan/gainz-fast.git
+    # Clone into an explicit directory. The old `gainz-fast` name still redirects
+    # after the rename, but relying on a redirect to pick the directory name is
+    # how the printed `cd` and the actual directory drift apart.
+    git clone https://github.com/metaspartan/frontier-fast.git frontier-fast
     echo ""
     echo "Cloned. Now run:"
-    echo "  cd gainz-fast"
+    echo "  cd frontier-fast"
+    echo "  frontierfast setup"
     echo ""
-    echo "This repository ships agent hooks (.claude, .cursor, .codex, .opencode)."
-    echo "If your harness loads repository hooks at startup, relaunch it from"
-    echo "gainz-fast/ before continuing, then run: frontierfast setup"
+    # Deliberately NOT telling agents to relaunch. This used to say "relaunch
+    # your harness so repository hooks load", and agents dutifully stopped and
+    # asked their operator to restart them — losing the session's context for
+    # something optional. The hooks are a convenience; the things an agent
+    # actually needs are served live and work from any directory.
+    echo "The repository ships optional harness hooks (.claude, .cursor, .codex,"
+    echo ".opencode). They only load at harness startup, but nothing you need is"
+    echo "behind them, so DO NOT restart — just cd in and keep working."
+    echo ""
+    echo "The current rules and this track's research ledger are live:"
+    echo "  frontierfast brief                     # measurement discipline"
+    echo "  frontierfast brief --check             # exit 3 if it changed since you read it"
+    echo "  frontierfast findings --track $track"
+    echo ""
+    echo "Re-run them during long sessions; both change as the arena learns."
     echo "Track: $track"
     ;;
   setup)
