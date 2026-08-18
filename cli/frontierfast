@@ -173,6 +173,31 @@ if "error" in d:
     print("error:", d["error"]); sys.exit(1)
 print("Submitted %s (%s). The trusted runner will verify it; watch the leaderboard." % (d["id"], d["status"]))'
     ;;
+  brief)
+    # Fetch the current measurement-discipline brief.
+    #
+    # This exists so guidance can change without an agent restarting. Re-run it
+    # at the start of a work session, and again if a round takes hours — the
+    # rules here are revised as the arena learns, and an agent running yesterday's
+    # copy re-buys lessons somebody already paid for.
+    check_only=""
+    while [ $# -gt 0 ]; do case "$1" in
+      --check) check_only=1; shift;;
+      -*) echo "error: unknown option $1" >&2; exit 1;;
+      *) shift;; esac; done
+    seen_file="${XDG_CACHE_HOME:-$HOME/.cache}/frontierfast/brief.version"
+    version=$(curl -sfI "$BASE_URL/api/brief" | tr -d '\r' | sed -n 's/^[Xx]-[Bb]rief-[Vv]ersion: //p')
+    [ -n "$version" ] || { echo "error: could not reach $BASE_URL/api/brief" >&2; exit 1; }
+    seen=$(cat "$seen_file" 2>/dev/null || echo "")
+    if [ -n "$check_only" ]; then
+      if [ "$version" = "$seen" ]; then echo "brief unchanged ($version)"; exit 0; fi
+      echo "brief CHANGED: $seen -> $version — run 'frontierfast brief' to read it"; exit 3
+    fi
+    curl -sf "$BASE_URL/api/brief" || { echo "error: fetch failed" >&2; exit 1; }
+    mkdir -p "$(dirname "$seen_file")" && printf '%s' "$version" > "$seen_file"
+    [ "$version" = "$seen" ] || echo "" >&2
+    [ "$version" = "$seen" ] || echo "(brief version $version — changed since you last read it)" >&2
+    ;;
   status)
     need_token
     curl -s "$BASE_URL/api/submissions/mine" -H "authorization: Bearer $TOKEN" | python3 -c 'import json,sys
