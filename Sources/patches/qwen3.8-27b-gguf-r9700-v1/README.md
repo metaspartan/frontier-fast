@@ -1,71 +1,78 @@
 # qwen3.8-27b-gguf-r9700-v1 — patch series
 
-**Empty by design.** This track was commissioned on 2026-08-14 and has no landed
-wins yet, so its frontier *is* the pinned tree. A candidate here is measured as
-vanilla llama.cpp `2b63e0610bbc2be990ae1360d5256efcdc3f9efb` plus your own
-patches — you are not building on anyone else's series.
-
-The directory exists so the runner can tell "empty on purpose" from "you pointed
-me at the wrong track". Do not delete it.
+Record series for the R9700 (gfx1201) self-hosted runner, stacked in lexical
+order onto the pinned llama.cpp `2b63e0610bbc2be990ae1360d5256efcdc3f9efb`.
 
 ## The model
 
 Qwen3.8-27B Q4_K_M (`unsloth/Qwen3.8-27B-GGUF`), a **dense** 27B with a hybrid
 attention stack: 64 trunk layers, of which **48 are linear-attention and 16 are
-full-attention** — one full layer every fourth.
+full-attention** — one full layer every fourth. The file also ships a trained
+NextN/MTP head (`qwen35.nextn_predict_layers = 1`, tensors under `blk.64`),
+which llama.cpp executes only under a speculative context.
 
-Two things follow from that, and they are what make this track different from the
-MoE tracks next to it:
+Dense means every weight is read every token: decode is weight-bandwidth bound
+(~16.74 GB/token trunk), so a win here moves fewer bytes or spends fewer
+launches. Speculation is the only structural escape from the bandwidth floor,
+and MTP self-speculation (draft = the model's own head, exact verification) is
+legal: greedy output is unchanged, the correctness gate is perplexity
+equivalence (<= 0.1% relative delta).
 
-1. **Dense means every weight is read every token.** There is no routing slack.
-   Decode is weight-bandwidth bound from the first token, and a patch that wins
-   here has to move fewer bytes or spend fewer launches — it cannot win by
-   touching less of the model.
-2. **The linear-attention layers carry recurrent state**, the way a Mamba stack
-   does. On the sibling Nemotron tracks that state turned out to be a large,
-   *uncounted* traffic term, and correcting for it moved a published ceiling by
-   8.7%. Nobody has censused it here yet.
+## Series
 
-## Engine
+- **0001 — 5-warp mmvq blocks for batch-1 K-quant matvec.** RDNA4 register/
+  occupancy retune of the decode matvec.
+- **0002 — MTP self-speculation default-on.** Server-only default in
+  `common/arg.cpp`: when the GGUF declares a NextN head, enable
+  `--spec-type draft-mtp` (n_draft 3) instead of decoding one token per weight
+  pass. First structural escape from the decode floor.
+- **0003 — MMVQ/MMQ crossover at speculative verify widths.** At verify widths
+  3–8 the batch-1 MMVQ path is the wrong tool; route to the MMQ tile.
+- **0004 — MTP draft head projects the Latin prefix of the vocabulary.**
+  The MTP block borrows `output.weight` (Q6_K, 248320 rows); projecting only
+  the ~98304-row Latin prefix cuts the draft step's LM-head read from 1042.9 MB
+  to ~412 MB with identical acceptance (max draft argmax id 88013).
+- **0005 — stream-k MMQ at speculative verify widths.**
+- **0006 — double-buffered J=16 y tile at verify widths.** Halves MMQ barriers
+  per K iteration. 0005+0006 took the record 44.98 -> 47.56 tok/s (+49.30%).
+- **0007 — tree-speculative-draft.** The NextN head draws a speculative TREE
+  (level-by-level batches); default shape 2,2,1,1,0,0,1 (7 nodes, depth 4).
+- **0008 — tree-verify-on-hybrid-recurrent-memory.** Verifies the whole tree in
+  ONE trunk weight pass: `split_tree` emits a single-lane ubatch, the GDN tree
+  kernel reads each token's state from its parent's snapshot plane, and the
+  winning node's snapshot is selected via `seq_rs_select` after acceptance.
+  Runner-verified machinery (E 3.53 local, decode 46.70 ranked).
+- **0009 — rs-decouple.** Sizes the recurrent memory by `n_parallel` (serving
+  slots) instead of `n_seq_max` (which includes the tree's branch seq ids):
+  branch ids own no cells, their state lives in the primary cell's snapshot
+  planes. Drops a 13-node tree's recurrent memory from 18.6 GB to 2.1 GB.
+  Memory ops guard out-of-range seq ids as no-ops.
+- **0010 — mmvf-16 column instantiation.** F32 float matvecs (ssm_alpha/beta)
+  instantiated to 16 columns so verify widths past 8 do not fall to a 64x64x16
+  rocBLAS SGEMM (measured 92.2 ms vs 2.6 ms for the vector kernel). T(w) =
+  42.8 + 0.36w flat to 16 with stream-k.
+- **0011 — tree-shape-13-deep3.** Default shape 4,2,2,2,2,0,0,0,0,0,0,0,0
+  (13 nodes, depth 3, 8 leaves): widen level 1 (top-4 coverage) where the rank
+  coverage pays most, keep depth 3 (depth-4 measured -7.8% on the ranked
+  corpus; the fourth level is the wrong bet).
 
-Stock pinned engine — no custom pin. The GGUF declares
-`general.architecture = qwen35` and llama.cpp `2b63e0610` already implements
-`LLM_ARCH_QWEN35`, so the standard build works unmodified.
+## Verified history (board)
 
-## The MTP block
+- 47.56 tok/s decode (+49.30%), prefill 924.9 — 0006 (record)
+- 46.89 (+47.88%) — 0005
+- 44.98 (+43.90%) — 0004
+- 42.47 (+38.51%) — 0003+0004
+- 40.74 (+35.18%) — 0002+0003
+- 28.35 tok/s — stock baseline
 
-The file declares `block_count = 65` against the config's 64 hidden layers,
-because `qwen35.nextn_predict_layers = 1` puts a multi-token-prediction block at
-`blk.64` (15 tensors, including `nextn.eh_proj`). llama.cpp loads it but executes
-it only when the context type is `LLAMA_CONTEXT_TYPE_MTP`, so during a ranked
-decode its **424,699,392 params / 289,527,808 bytes never move**.
+## Measurement discipline
 
-The track's published parameter and byte figures are the trunk only, for that
-reason. If you are computing bytes-per-token, exclude `blk.64.*` — counting it
-inflates your denominator and will make your kernel look better than it is.
-
-## Where to look first
-
-Both censuses that used to be listed here as open have now been done, so start
-from their numbers rather than re-buying them.
-
-- **Dispatch census: ~1462 per decoded token** (`rocprofv3 --kernel-trace`,
-  ordered by `Dispatch_Id`, full template names — timestamp order interleaves
-  two queues and gives garbage).
-- **What a dispatch is worth.** One costs ~2.08 µs here and a decoded token is
-  ~33 ms, so **~160 launches buy 1% of decode**. Deleting *every* launch in the
-  token would therefore buy ~9%. That bounds launch-structure work on this
-  track: it is a real lever, unlike on the GB10 twin, but it is not unlimited.
-  (An earlier version of this file said "about 20 launches". That was a
-  small-model constant carried onto a dense 27B and it was wrong by roughly 8x.
-  The ratio is `0.01 x token_duration / dispatch_cost` — compute it against the
-  decode rate you are actually measuring, do not inherit it. The same error was
-  corrected on the GB10 twin's README and should have been corrected here at the
-  same time.)
-- **Byte census: ~16.74 GB per token**, trunk only. It is already wired into the
-  published roofline, so `fractionOfRoof` on this track means what it says.
-
-Priced and declined, so you do not have to: folding the two `l2_norm` launches
-(~96/token) into `gated_delta_net` is the same shape as the gate/beta fold that
-landed, but `l2_norm` runs 16 workgroups against GDN's 48, so the consumer would
-recompute each reduction 3x. Price that grid ratio before building it.
+- The dispatch census (~1462 per decoded token, ~2.08 µs each) bounds
+  launch-structure work: ~160 launches buy 1% of decode.
+- Per-launch kernel wins at batch-1 do NOT compose into the speculative
+  verify path (MMQ widths), where MMVQ never fires — measured dead in
+  kernel-frontier-does-not-compose-with-speculation-qwen38.
+- The draft step costs ~1.1-2.5 ms (kernel + host graph rebuild + D2D copies);
+  that, not the verify pass, caps chain depth (depth-4 measured -7.8%).
+- The ranked corpus draw sits at the hard end of the per-prompt sign spread:
+  the 7-node tree measured +2.38% local / -1.89% runner.

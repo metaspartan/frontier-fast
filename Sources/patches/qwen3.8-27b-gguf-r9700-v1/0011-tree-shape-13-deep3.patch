@@ -1,0 +1,11 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -975,6 +975,6 @@
+         const bool mtp_active = std::any_of(params.speculative.types.begin(), params.speculative.types.end(),
+                 [](enum common_speculative_type t) { return t == COMMON_SPECULATIVE_TYPE_DRAFT_MTP; });
+         if (mtp_active) {
+-            common_speculative_tree_set_default("2,2,1,1,0,0,1");
++            common_speculative_tree_set_default("4,2,2,2,2,0,0,0,0,0,0,0,0");
+         }
+     }

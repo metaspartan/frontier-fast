@@ -1,0 +1,108 @@
+diff --git a/include/llama.h b/include/llama.h
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -352,4 +352,5 @@ struct llama_context_params {
+         uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
+         uint32_t n_ubatch;          // physical maximum batch size
+         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
++        uint32_t n_parallel;        // serving slots; recurrent memory is sized by this, not n_seq_max
+         uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -14,5 +14,6 @@ struct llama_cparams {
+     uint32_t n_batch;
+     uint32_t n_ubatch;
+     uint32_t n_seq_max;
++    uint32_t n_parallel;      // serving slots; sized by n_parallel while n_seq_max includes branch ids
+     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
+     uint32_t n_outputs_max;   // max outputs supported by the context
+diff --git a/common/common.cpp b/common/common.cpp
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1629,4 +1629,5 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     cparams.n_ctx             = params.n_ctx;
+     cparams.n_seq_max         = params.n_parallel + params.n_seq_extra;
++    cparams.n_parallel        = params.n_parallel;
+     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -97,3 +97,4 @@ llama_context::llama_context(
+     cparams.n_seq_max = std::max(1u, params.n_seq_max);
++    cparams.n_parallel = std::max(1u, params.n_parallel);
+     if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
+         throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2249,6 +2249,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             /* recurrent_type_r  */ GGML_TYPE_F32,
+                             /* recurrent_type_s  */ GGML_TYPE_F32,
+-                            /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
++                            /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_parallel),
+                             /* n_seq_max         */ cparams.n_seq_max,
+                             /* n_rs_seq          */ cparams.n_rs_seq,
+                             /* offload           */ cparams.offload_kqv,
+@@ -2266,6 +2266,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             /* recurrent_type_k  */ GGML_TYPE_F32,
+                             /* recurrent_type_v  */ GGML_TYPE_F32,
+-                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
++                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_parallel),
+                             /* n_seq_max         */ cparams.n_seq_max,
+                             /* n_rs_seq          */ cparams.n_rs_seq,
+                             /* offload           */ cparams.offload_kqv,
+diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+--- a/src/llama-memory-recurrent.cpp
++++ b/src/llama-memory-recurrent.cpp
+@@ -176,7 +176,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+     // models like Mamba or RWKV can't have a state partially erased at the end
+     // of the sequence because their state isn't preserved for previous tokens
+     if (seq_id >= (int64_t) size) {
+-        // could be fatal
+-        return false;
++        // Lossless no-op for seq ids beyond the recurrent cell count: a
++        // speculative tree's branch ids own no cells (their state lives in the
++        // primary cell's snapshot planes), so there is nothing to erase.
++        return true;
+     }
+     if (0 <= seq_id) {
+@@ -263,4 +266,7 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
+ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
++    if (seq_id >= (int64_t) size) {
++        return; // branch seq id beyond the recurrent cell count owns no cells
++    }
+     uint32_t new_head = size;
+ 
+     for (uint32_t i = 0; i < size; ++i) {
+@@ -509,13 +512,19 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+         for (uint32_t j = 0; j < n_seq_id; ++j) {
+             const llama_seq_id seq_id = ubatch.seq_id[i][j];
+ 
+-            if (seq_id < 0 || (uint32_t) seq_id >= size) {
++            if (seq_id < 0 || (uint32_t) seq_id >= n_seq_max) {
+                 // too big seq_id
+                 // TODO: would it be possible to resize the cache instead?
+                 LLAMA_LOG_ERROR("%s: seq_id=%d >= n_seq_max=%u Try using a bigger --parallel value\n", __func__, seq_id, n_seq_max);
+                 return false;
+             }
+             if (j > 0) {
++                if ((uint32_t) seq_id >= size) {
++                    // shared/branch seq ids beyond the recurrent cell count
++                    // (speculative trees) own no cell: their state is the
++                    // primary sequence's snapshot plane, tracked via rs_idx
++                    continue;
++                }
+                 auto & seq = cells[seq_id];
+                 if (seq.tail >= 0) {
+                     auto & cell = cells[seq.tail];
+@@ -536,7 +545,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+ #ifndef NDEBUG
+     {
+         std::vector<int32_t> tails_verif;
+-        tails_verif.assign(size, -1);
++        tails_verif.assign(n_seq_max, -1);
+         for (uint32_t i = 0; i < size; ++i) {
+             auto & cell = cells[i];
+             for (llama_seq_id seq_id : cell.seq_id) {

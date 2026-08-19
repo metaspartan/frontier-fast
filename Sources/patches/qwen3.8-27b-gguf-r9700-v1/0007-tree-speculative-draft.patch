@@ -1,0 +1,1015 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 87bfb36d9..ad9bec039 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -957,6 +957,43 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
+                 __func__, params.speculative.draft.n_max);
+     }
+ 
++    // A tree draft needs branch sequence ids, and those are only accepted by
++    // llama_context::decode when the KV cache is unified: the batch validation
++    // limit there is `cparams.kv_unified ? LLAMA_MAX_SEQ : cparams.n_seq_max`,
++    // and without -kvu n_seq_max is n_parallel, so a branch id fails validation.
++    //
++    // Server only, exactly like the MTP default above: -kvu changes the KV
++    // layout for every run, and llama-perplexity and the other tools must keep
++    // measuring an untouched engine.
++    if (ctx_arg.ex == LLAMA_EXAMPLE_SERVER && getenv("GAINZ_SPEC_TREE") != nullptr) {
++        if (!params.kv_unified) {
++            params.kv_unified = true;
++            LOG_INF("%s: tree drafting requested - enabling unified KV cache (-kvu)\n", __func__);
++        }
++
++        // Every leaf of the tree owns one sequence id, and those ids have to exist
++        // in the MEMORY, not just pass batch validation: llama_memory_seq_rm/_cp
++        // index seq_to_stream, which is sized cparams.n_seq_max. Reserving them
++        // beyond n_parallel leaves the serving slot count - and so the server's
++        // concurrency - exactly as the launch command asked for.
++        const int32_t n_leaves = common_speculative_tree_n_leaves();
++        const int32_t depth    = common_speculative_tree_depth();
++
++        if (n_leaves > 0) {
++            params.n_seq_extra = std::max(params.n_seq_extra, n_leaves);
++
++            // The tree occupies positions pos0+1 .. pos0+depth, so a full rejection
++            // rewinds `depth` positions. n_rs_seq is derived from the draft length
++            // and bounds how far the recurrent memory can roll back without falling
++            // through to a checkpoint restore.
++            params.speculative.draft.n_max = std::max(params.speculative.draft.n_max, depth);
++
++            LOG_INF("%s: tree drafting requested - reserving %d branch sequence ids "
++                    "beyond %d serving slot(s), draft depth %d\n",
++                    __func__, n_leaves, params.n_parallel, depth);
++        }
++    }
++
+     if (params.escape) {
+         string_process_escapes(params.prompt);
+         string_process_escapes(params.input_prefix);
+diff --git a/common/common.cpp b/common/common.cpp
+index ff27d392f..b535b52d5 100644
+--- a/common/common.cpp
++++ b/common/common.cpp
+@@ -1629,7 +1629,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+     auto cparams = llama_context_default_params();
+ 
+     cparams.n_ctx             = params.n_ctx;
+-    cparams.n_seq_max         = params.n_parallel;
++    cparams.n_seq_max         = params.n_parallel + params.n_seq_extra;
+     cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
+     cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+     cparams.n_batch           = params.n_batch;
+diff --git a/common/common.h b/common/common.h
+index 919c0ea10..650556ab8 100644
+--- a/common/common.h
++++ b/common/common.h
+@@ -453,6 +453,9 @@ struct common_params {
+     int32_t n_keep                =     0; // number of tokens to keep from initial prompt
+     int32_t n_chunks              =    -1; // max number of chunks to process (-1 = unlimited)
+     int32_t n_parallel            =     1; // number of parallel sequences to decode
++    int32_t n_seq_extra           =     0; // sequence ids beyond n_parallel, reserved for internal
++                                           // use (tree speculation branches). These are NOT serving
++                                           // slots: the server still creates n_parallel of those.
+     int32_t n_sequences           =     1; // number of sequences to decode
+     int32_t n_outputs_max         =     0; // max outputs in a batch (0 = n_batch)
+     int32_t grp_attn_n            =     1; // group-attention factor
+diff --git a/common/sampling.cpp b/common/sampling.cpp
+index 256ac161e..1f7b6af04 100644
+--- a/common/sampling.cpp
++++ b/common/sampling.cpp
+@@ -673,6 +673,59 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
+     return result;
+ }
+ 
++std::vector<llama_token> common_sampler_sample_and_accept_tree(
++        struct common_sampler * gsmpl,
++        struct llama_context * ctx,
++        const std::vector<int> & idxs,
++        const common_speculative_tree & tree,
++        std::vector<int32_t> & path,
++        bool grammar_first) {
++    GGML_ASSERT(idxs.size() == tree.size() + 1 && "idxs.size() must be tree.size() + 1");
++
++    // idxs[0] is the logit row of the tree's implicit root (the already-sampled
++    // token); idxs[1 + i] is the logit row of node i. Sampling at a node's row
++    // yields the target's true continuation *after* that node, so the walk
++    // descends by matching that token against the node's children.
++    //
++    // This is the same accept rule as the linear case - a plain compare, which is
++    // lossless at greedy only - just over a branching draft instead of a chain.
++
++    std::vector<llama_token> result;
++    result.reserve(tree.depth() + 1);
++
++    path.clear();
++
++    int32_t cur = -1; // current node index, -1 = the root
++
++    while (true) {
++        const int   row = (cur < 0) ? idxs[0] : idxs[1 + cur];
++        const llama_token id = common_sampler_sample(gsmpl, ctx, row, grammar_first);
++
++        common_sampler_accept(gsmpl, id, true);
++
++        result.push_back(id);
++
++        // descend into the child of `cur` that proposed exactly this token
++        int32_t next = -1;
++        for (size_t i = 0; i < tree.size(); ++i) {
++            if (tree.parent[i] == cur && tree.tok[i] == id) {
++                next = (int32_t) i;
++                break;
++            }
++        }
++
++        if (next < 0) {
++            // no child matched: this token was not drafted, so it is the last one
++            break;
++        }
++
++        path.push_back(next);
++        cur = next;
++    }
++
++    return result;
++}
++
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first) {
+     std::vector<int> idxs(draft.size() + 1);
+     for (size_t i = 0; i < idxs.size(); ++i) {
+diff --git a/common/sampling.h b/common/sampling.h
+index 4191988bb..d8a6bec94 100644
+--- a/common/sampling.h
++++ b/common/sampling.h
+@@ -3,6 +3,7 @@
+ #include "llama.h"
+ 
+ #include "common.h"
++#include "speculative.h"
+ 
+ #include <string>
+ #include <vector>
+@@ -85,6 +86,14 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
+ // assume idxs == [ 0, 1, 2, ..., draft.size() ]
+ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
+ 
++// Verify a TREE-shaped draft. `idxs[0]` is the logit row of the tree's implicit
++// root (the already-sampled token) and `idxs[1 + i]` is the row of node i.
++// Descends by matching each sampled token against the current node's children.
++// `path` receives the node indices of the accepted branch.
++//
++// returns at least 1 token, up to tree.depth() + 1
++std::vector<llama_token> common_sampler_sample_and_accept_tree(struct common_sampler * gsmpl, struct llama_context * ctx, const std::vector<int> & idxs, const common_speculative_tree & tree, std::vector<int32_t> & path, bool grammar_first = false);
++
+ uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
+ 
+ // force the reasoning budget sampler (if any) to begin forcing its end sequence now.
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 514fe8521..927a75e7c 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1282,6 +1282,116 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+     std::vector<int>                i_last;
+     std::vector<std::vector<float>> chain_h;
+ 
++    // ---- tree drafting -------------------------------------------------
++    //
++    // A draft TREE instead of a chain. Siblings share a position and differ only
++    // in sequence id, so llama.cpp's existing causal mask already verifies the
++    // whole tree in ONE target forward pass. The decisive property on this box is
++    // that one draft decode expands an entire LEVEL, so breadth costs no extra
++    // draft step - it costs only extra verify positions, and the verify pass here
++    // is flat to 8 positions and then steps by a full weight read at the 9th.
++    // Hence the default shape below is sized to exactly 8 positions.
++    //
++    // Topology is STATIC (only the tokens are dynamic), which is what lets every
++    // node's sequence set be computed before any decode. `tree_nc` is the child
++    // count of each node in breadth-first order with the root first, so the
++    // default "2,2,1,2" means: root has 2 children; the first of those has 2 and
++    // the second has 1; then 2 under the first grandchild. 7 nodes, depth 3.
++    std::vector<int32_t> tree_nc;
++    std::vector<int32_t> tree_parent;  // [n] parent node index, -1 = root
++    std::vector<int32_t> tree_level;   // [n] depth, 1-based
++    std::vector<int32_t> tree_rank;    // [n] rank among siblings, 0-based
++    std::vector<int32_t> tree_nchild;  // [n] number of children
++
++    // Sequence ids. Each LEAF owns one id; an internal node carries the ids of
++    // every leaf beneath it, smallest first. The mask keys off seq_id[0]
++    // (llama-kv-cache.cpp: `ubatch->seq_id[i][0]`), and a node's smallest leaf id
++    // is present on all of its ancestors and on no other node, so seq_id[0] alone
++    // reproduces exactly that node's root-to-here path.
++    std::vector<std::vector<llama_seq_id>> tree_seqs;
++    std::vector<llama_seq_id>              tree_leaf_seqs;
++    int32_t tree_n        = 0;   // number of nodes (0 = tree drafting disabled)
++    int32_t tree_depth    = 0;
++    int32_t tree_seq_base = 0;   // leaf ids start here; set to n_seq (the serving slot
++                                 // count) at construction, so branches occupy the ids
++                                 // reserved by common_params::n_seq_extra and never
++                                 // collide with a slot
++
++    void tree_build_topology(const std::string & spec) {
++        tree_nc.clear();
++        {
++            size_t p = 0;
++            while (p < spec.size()) {
++                size_t q = spec.find(',', p);
++                if (q == std::string::npos) {
++                    q = spec.size();
++                }
++                const std::string t = spec.substr(p, q - p);
++                if (!t.empty()) {
++                    tree_nc.push_back(std::atoi(t.c_str()));
++                }
++                p = q + 1;
++            }
++        }
++
++        tree_parent.clear();
++        tree_level.clear();
++        tree_rank.clear();
++        tree_nchild.clear();
++
++        // breadth-first expansion; entry -1 is the implicit root
++        std::vector<int32_t> queue = { -1 };
++        size_t qh = 0;
++        size_t ic = 0;
++
++        while (qh < queue.size() && ic < tree_nc.size()) {
++            const int32_t par = queue[qh++];
++            const int32_t nc  = tree_nc[ic++];
++
++            const int32_t lvl = (par < 0) ? 1 : tree_level[par] + 1;
++
++            for (int32_t r = 0; r < nc; ++r) {
++                tree_parent.push_back(par);
++                tree_level .push_back(lvl);
++                tree_rank  .push_back(r);
++                tree_nchild.push_back(0);
++                queue.push_back((int32_t) tree_parent.size() - 1);
++            }
++
++            if (par >= 0) {
++                tree_nchild[par] = nc;
++            }
++        }
++
++        tree_n     = (int32_t) tree_parent.size();
++        tree_depth = 0;
++        for (int32_t l : tree_level) {
++            if (l > tree_depth) {
++                tree_depth = l;
++            }
++        }
++
++        // assign one sequence id per leaf, then propagate it up to every ancestor
++        tree_seqs.assign(tree_n, {});
++        tree_leaf_seqs.clear();
++
++        for (int32_t i = 0; i < tree_n; ++i) {
++            if (tree_nchild[i] != 0) {
++                continue;
++            }
++            const llama_seq_id sid = tree_seq_base + (llama_seq_id) tree_leaf_seqs.size();
++            tree_leaf_seqs.push_back(sid);
++            for (int32_t a = i; a >= 0; a = tree_parent[a]) {
++                tree_seqs[a].push_back(sid);
++            }
++        }
++
++        // smallest first, so seq_id[0] is the node's own path key
++        for (auto & s : tree_seqs) {
++            std::sort(s.begin(), s.end());
++        }
++    }
++
+     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
+         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
+         , params(params.draft)
+@@ -1306,7 +1416,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+                 common_speculative_get_devices_str(this->params.devices).c_str());
+ 
+         const int32_t n_b = (int32_t) llama_n_batch(ctx_dft);
+-        batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd, /*n_seq_max=*/ 1);
++        // n_seq_max 8 rather than 1: a tree node carries one sequence id per leaf
++        // beneath it. Costs n_b*8 int32 and changes nothing for the linear path,
++        // which still adds exactly one id per token.
++        batch = llama_batch_init(/*n_tokens=*/ n_b, /*embd=*/ n_embd, /*n_seq_max=*/ 8);
+         // llama_batch_init allocates only one of token/embd; MTP needs both.
+         // TODO: fix, how to call without malloc
+         batch.token = (llama_token *) malloc(sizeof(llama_token) * n_b);
+@@ -1336,6 +1449,31 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+             }
+         }
+ 
++        // Tree drafting. Off unless asked for, so the linear chain remains the
++        // control arm inside the SAME binary (an env toggle in one binary is the
++        // only arm separation that survives an absolute RUNPATH).
++        //
++        // The default shape is the 7 highest-probability nodes of the draft tree
++        // under this head's measured rank coverage (level-1 top-1/top-2 = .7047 /
++        // .8319, level-2 .6514 / .7523, level-3 .6150 / .6995): it spends width
++        // near the root and tapers, because the marginal rank-2 mass falls with
++        // depth (+.127 at level 1, +.085 at level 3) while a level costs a whole
++        // MTP decode. 7 nodes puts the verify pass at 8 positions, which is the
++        // last position before it steps by a full weight read.
++        if (const char * e = getenv("GAINZ_SPEC_TREE")) {
++            const std::string spec = (*e && strcmp(e, "1") != 0) ? std::string(e) : std::string("2,2,1,1,0,0,1");
++            tree_seq_base = (int32_t) n_seq;
++            tree_build_topology(spec);
++
++            if (tree_n > 0) {
++                this->params.n_max = tree_depth;
++                LOG_INF("%s: draft tree enabled: spec='%s', %d nodes, depth %d, %d leaves "
++                        "(%d verify positions)\n",
++                        __func__, spec.c_str(), tree_n, tree_depth,
++                        (int) tree_leaf_seqs.size(), tree_n + 1);
++            }
++        }
++
+         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
+         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
+ 
+@@ -1416,14 +1554,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         std::fill(i_batch_end.begin(), i_batch_end.end(), -1);
+ 
+         for (int k = 0; k < n_tokens; ++k) {
+-            for (llama_seq_id seq_id = 0; seq_id < (llama_seq_id) n_seq; ++seq_id) {
+-                GGML_ASSERT(batch_in.n_seq_id[k] == 1);
++            // A tree verify batch carries coupled tokens: the root belongs to the
++            // slot and to every branch beneath it, and each node to the leaves
++            // below it. For the slot-indexed bookkeeping here a token belongs to
++            // slot s when s is among its ids; branch tokens (every id >= n_seq)
++            // belong to no slot and are skipped.
++            for (int32_t j = 0; j < batch_in.n_seq_id[k]; ++j) {
++                const llama_seq_id sid = batch_in.seq_id[k][j];
++                if (sid < 0 || sid >= (llama_seq_id) n_seq) {
++                    continue;
++                }
+ 
+-                if (batch_in.seq_id[k][0] == seq_id) {
+-                    i_batch_end[seq_id] = k;
+-                    if (i_batch_beg[seq_id] < 0) {
+-                        i_batch_beg[seq_id] = k;
+-                    }
++                i_batch_end[sid] = k;
++                if (i_batch_beg[sid] < 0) {
++                    i_batch_beg[sid] = k;
+                 }
+             }
+         }
+@@ -1517,9 +1661,172 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+         return true;
+     }
+ 
++    // Expand a static-topology draft tree. One llama_decode per LEVEL, so breadth
++    // costs no draft time at all - only verify positions, which are flat to 8.
++    void draft_tree(common_speculative_draft_params_vec & dparams) {
++        const llama_seq_id seq_id = 0; // tree drafting is single-slot by construction
++
++        auto & dp = dparams[seq_id];
++
++        auto * ctx_dft = params.ctx_dft;
++        auto * mem_dft = llama_get_memory(ctx_dft);
++
++        auto & tree = *dp.tree;
++
++        tree.clear();
++        dp.result->clear();
++
++        const size_t row_bytes = (size_t) n_embd * sizeof(float);
++
++        // Every branch has to see the prompt, which process() wrote under seq 0.
++        // The mask keys off seq_id[0], so a node whose key is a leaf id would not
++        // see seq 0 at all - hence one cell-bitset copy per LEAF, once per pass
++        // (3 copies for the default shape, not one per node).
++        for (llama_seq_id s : tree_leaf_seqs) {
++            llama_memory_seq_rm(mem_dft, s, -1, -1);
++            llama_memory_seq_cp(mem_dft, seq_id, s, -1, -1);
++        }
++
++        std::vector<llama_token> tok(tree_n, 0);
++        std::vector<int32_t>     row_of(tree_n, -1); // batch row each node occupied
++
++        const int32_t root_row = 0;
++
++        // level 0: the root, the token the target already sampled
++        common_batch_clear(batch);
++        common_batch_add(batch, dp.id_last, dp.n_past, tree_leaf_seqs, true);
++        std::memcpy(batch.embd, pending_h[seq_id].data(), row_bytes);
++
++        auto * smpl = smpls[seq_id].get();
++        common_sampler_reset(smpl);
++
++        for (int32_t lvl = 1; lvl <= tree_depth; ++lvl) {
++            if (llama_decode(ctx_dft, batch) != 0) {
++                SPC_ERR("draft_tree: llama_decode failed at level %d\n", lvl);
++                break;
++            }
++
++            // Children of one parent are the top-k of that parent's row, so each
++            // parent row is sampled once and its siblings just index into the
++            // sorted candidate list by their rank.
++            std::vector<int32_t> made;
++
++            int32_t last_parent = -2;
++
++            for (int32_t i = 0; i < tree_n; ++i) {
++                if (tree_level[i] != lvl) {
++                    continue;
++                }
++
++                const int32_t par     = tree_parent[i];
++                const int32_t par_row = (par < 0) ? root_row : row_of[par];
++
++                if (par_row < 0) {
++                    continue; // parent was dropped
++                }
++
++                if (par != last_parent) {
++                    common_sampler_sample(smpl, ctx_dft, par_row, true);
++                    last_parent = par;
++                }
++
++                const auto * cur_p = common_sampler_get_candidates(smpl, true);
++
++                if (tree_rank[i] >= (int32_t) cur_p->size) {
++                    continue;
++                }
++
++                tok[i] = cur_p->data[tree_rank[i]].id;
++                made.push_back(i);
++            }
++
++            if (made.empty()) {
++                break;
++            }
++
++            // Build the next level's batch. The h row is the PARENT's - the MTP
++            // head's input pair is (h_p, x_{p+1}), so siblings share h and differ
++            // only in the token. Copy it now: the pointer does not survive decode.
++            common_batch_clear(batch);
++
++            for (int32_t i : made) {
++                const int32_t par     = tree_parent[i];
++                const int32_t par_row = (par < 0) ? root_row : row_of[par];
++
++                const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, par_row);
++
++                common_batch_add(batch, tok[i], dp.n_past + lvl, tree_seqs[i], true);
++                std::memcpy(batch.embd + (size_t) (batch.n_tokens - 1) * n_embd, h_row, row_bytes);
++
++                row_of[i] = batch.n_tokens - 1;
++            }
++        }
++
++        // Emit the surviving nodes, keeping breadth-first order so parent[i] < i
++        // still holds after renumbering.
++        std::vector<int32_t> remap(tree_n, -1);
++
++        for (int32_t i = 0; i < tree_n; ++i) {
++            if (row_of[i] < 0) {
++                continue;
++            }
++
++            const int32_t par = tree_parent[i];
++            if (par >= 0 && remap[par] < 0) {
++                continue; // parent did not survive
++            }
++
++            remap[i] = tree.add(tok[i], par < 0 ? -1 : remap[par], tree_level[i]);
++        }
++
++        // The draft region on ctx_dft is scratch - process() rebuilds it for the
++        // accepted prefix on the next call - so drop it under every branch.
++        for (llama_seq_id s : tree_leaf_seqs) {
++            llama_memory_seq_rm(mem_dft, s, -1, -1);
++        }
++        llama_memory_seq_rm(mem_dft, seq_id, dp.n_past + 1, -1);
++
++        // `result` carries the tree's DEEPEST root-to-leaf path, so that a caller
++        // which does not understand trees still sees a valid linear draft.
++        //
++        // Its LENGTH is load-bearing, not just its contents. The server recovers
++        // the tree's base position as `pos_next() - 1 - result.size()` and its
++        // rollback count as `result.size() + 1 - accepted.size()`, while the tree
++        // itself occupies positions pos0+1 .. pos0+depth. A path shorter than the
++        // depth therefore both mis-locates pos0 and underflows that UNSIGNED
++        // subtraction the moment the target accepts more than result.size()
++        // tokens - which sends every deeper acceptance down the checkpoint-restore
++        // branch and caps the tree at one accepted token per pass.
++        //
++        // Scanning ascending and replacing only on a strictly greater level breaks
++        // ties toward the lowest node index, which is breadth-first order, which is
++        // the highest-probability sibling - so this is the all-rank-0 spine
++        // whenever the spine is one of the deepest paths.
++        {
++            int32_t deepest = -1;
++            for (int32_t i = 0; i < (int32_t) tree.size(); ++i) {
++                if (deepest < 0 || tree.level[i] > tree.level[deepest]) {
++                    deepest = i;
++                }
++            }
++
++            std::vector<llama_token> spine;
++            for (int32_t i = deepest; i >= 0; i = tree.parent[i]) {
++                spine.push_back(tree.tok[i]);
++            }
++
++            dp.result->assign(spine.rbegin(), spine.rend());
++        }
++    }
++
+     void draft(common_speculative_draft_params_vec & dparams) override {
+         auto & ctx_dft = params.ctx_dft;
+ 
++        if (tree_n > 0 && dparams[0].tree != nullptr && dparams[0].drafting) {
++            draft_tree(dparams);
++            return;
++        }
++
+         common_batch_clear(batch);
+ 
+         // keep track of which sequences are still drafting
+@@ -2235,6 +2542,91 @@ static uint32_t common_get_enabled_speculative_configs(const std::vector<common_
+     return result;
+ }
+ 
++// Shape of the configured draft tree, by the same breadth-first expansion
++// tree_build_topology() uses, so the three accessors below and the drafting code
++// can never disagree about the shape. Returns false when tree drafting is off.
++static bool common_speculative_tree_shape(int32_t & n_nodes, int32_t & n_leaves, int32_t & depth) {
++    n_nodes = n_leaves = depth = 0;
++
++    const char * e = getenv("GAINZ_SPEC_TREE");
++    if (e == nullptr) {
++        return false;
++    }
++
++    const std::string spec = (*e && strcmp(e, "1") != 0) ? std::string(e) : std::string("2,2,1,1,0,0,1");
++
++    std::vector<int32_t> nc;
++    size_t p = 0;
++    while (p < spec.size()) {
++        size_t q = spec.find(',', p);
++        if (q == std::string::npos) {
++            q = spec.size();
++        }
++        const std::string t = spec.substr(p, q - p);
++        if (!t.empty()) {
++            nc.push_back(std::atoi(t.c_str()));
++        }
++        p = q + 1;
++    }
++
++    std::vector<int32_t> parent;
++    std::vector<int32_t> level;
++    std::vector<int32_t> nchild;
++
++    std::vector<int32_t> queue = { -1 };
++    size_t qh = 0;
++    size_t ic = 0;
++
++    while (qh < queue.size() && ic < nc.size()) {
++        const int32_t par = queue[qh++];
++        const int32_t n   = nc[ic++];
++
++        const int32_t lvl = (par < 0) ? 1 : level[par] + 1;
++
++        for (int32_t r = 0; r < n; ++r) {
++            parent.push_back(par);
++            level .push_back(lvl);
++            nchild.push_back(0);
++            queue .push_back((int32_t) parent.size() - 1);
++        }
++
++        if (par >= 0) {
++            nchild[par] = n;
++        }
++    }
++
++    n_nodes = (int32_t) parent.size();
++
++    for (int32_t i = 0; i < n_nodes; ++i) {
++        if (nchild[i] == 0) {
++            n_leaves++;
++        }
++        if (level[i] > depth) {
++            depth = level[i];
++        }
++    }
++
++    return n_nodes > 0;
++}
++
++int32_t common_speculative_tree_n_nodes() {
++    int32_t n = 0, l = 0, d = 0;
++    common_speculative_tree_shape(n, l, d);
++    return n;
++}
++
++int32_t common_speculative_tree_n_leaves() {
++    int32_t n = 0, l = 0, d = 0;
++    common_speculative_tree_shape(n, l, d);
++    return l;
++}
++
++int32_t common_speculative_tree_depth() {
++    int32_t n = 0, l = 0, d = 0;
++    common_speculative_tree_shape(n, l, d);
++    return d;
++}
++
+ int32_t common_speculative_n_max(const common_params_speculative * spec) {
+     int32_t n_max = 0;
+ 
+@@ -2293,6 +2685,17 @@ common_params common_base_params_to_speculative(const common_params & params) {
+     result.cache_type_v  = params_spec.cache_type_v;
+     result.n_outputs_max = params.n_parallel;
+ 
++    // A tree draft decodes an entire LEVEL in one llama_decode and needs a logits
++    // row for every node in it, where the linear chain only ever asks for one row
++    // per sequence. The node count is a safe upper bound on any level's width.
++    // Without this the first tree draft aborts inside llama_decode on
++    // GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max) - the server's own
++    // output budget is sized separately (server_n_outputs_max) and does not cover
++    // the draft context.
++    if (const int32_t n_tree = common_speculative_tree_n_nodes(); n_tree > 0) {
++        result.n_outputs_max = std::max<int32_t>(result.n_outputs_max, n_tree);
++    }
++
+     return result;
+ }
+ 
+diff --git a/common/speculative.h b/common/speculative.h
+index 062bf2093..f85736afd 100644
+--- a/common/speculative.h
++++ b/common/speculative.h
+@@ -3,6 +3,8 @@
+ #include "llama.h"
+ #include "common.h"
+ 
++#include <algorithm>
++
+ struct common_speculative;
+ 
+ // comma separated list the provided types
+@@ -23,12 +25,111 @@ std::string common_speculative_type_to_str(enum common_speculative_type type);
+ // return the max number of draft tokens based on the speculative parameters
+ int32_t common_speculative_n_max(const common_params_speculative * spec);
+ 
++// Number of nodes in the configured draft tree, or 0 when tree drafting is off.
++// A tree needs one output row per NODE, not per level, so anything sizing an
++// output allocation must use this rather than common_speculative_n_max().
++int32_t common_speculative_tree_n_nodes();
++
++// Number of LEAVES in the configured draft tree, or 0 when tree drafting is off.
++// Each leaf owns one sequence id, so this is how many sequence ids beyond the
++// serving slots a tree draft needs in every context it touches.
++int32_t common_speculative_tree_n_leaves();
++
++// Depth of the configured draft tree, or 0 when tree drafting is off. The tree
++// occupies positions pos0+1 .. pos0+depth, so this is the largest rollback
++// speculation can ask for.
++int32_t common_speculative_tree_depth();
++
+ common_params common_base_params_to_speculative(const common_params & params);
+ 
+ common_speculative * common_speculative_init(common_params_speculative & params, uint32_t n_seq);
+ 
+ void common_speculative_free(common_speculative * spec);
+ 
++// A tree-shaped speculative draft.
++//
++// Node i is a drafted token at depth `level[i]` (1-based) whose parent is node
++// `parent[i]`; `parent[i] == -1` means the parent is the already-sampled token
++// the draft hangs off (`common_speculative_draft_params::id_last`), which is the
++// tree's implicit root and is NOT stored here.
++//
++// Nodes are emitted in breadth-first order, so `parent[i] < i` for every i and a
++// single forward scan is enough to walk the tree. Siblings share a position
++// (`n_past + level[i]`) and are distinguished only by sequence id, which is what
++// makes the whole tree verifiable in one target forward pass.
++struct common_speculative_tree {
++    llama_tokens         tok;     // [n] drafted token
++    std::vector<int32_t> parent;  // [n] parent node index, -1 for depth-1 nodes
++    std::vector<int32_t> level;   // [n] depth, 1-based
++
++    size_t size()  const { return tok.size(); }
++    bool   empty() const { return tok.empty(); }
++
++    void clear() {
++        tok.clear();
++        parent.clear();
++        level.clear();
++    }
++
++    int32_t add(llama_token id, int32_t par, int32_t lvl) {
++        tok.push_back(id);
++        parent.push_back(par);
++        level.push_back(lvl);
++        return (int32_t) tok.size() - 1;
++    }
++
++    // Assign one sequence id per LEAF, then give every node the ids of the leaves
++    // beneath it, smallest first.
++    //
++    // The KQ mask keys off the query's FIRST sequence id only
++    // (llama-kv-cache.cpp: `ubatch->seq_id[i][0]`). A node's smallest leaf id sits
++    // on all of that node's ancestors and on no other node, so seq_id[0] alone
++    // reproduces exactly its root-to-here path - which is what lets a single
++    // forward pass verify every branch with no custom mask.
++    void seq_sets(llama_seq_id base,
++                  std::vector<std::vector<llama_seq_id>> & out,
++                  std::vector<llama_seq_id> & all) const {
++        const size_t n = size();
++
++        out.assign(n, {});
++        all.clear();
++
++        std::vector<bool> has_child(n, false);
++        for (size_t i = 0; i < n; ++i) {
++            if (parent[i] >= 0) {
++                has_child[parent[i]] = true;
++            }
++        }
++
++        for (size_t i = 0; i < n; ++i) {
++            if (has_child[i]) {
++                continue;
++            }
++
++            const llama_seq_id sid = base + (llama_seq_id) all.size();
++            all.push_back(sid);
++
++            for (int32_t a = (int32_t) i; a >= 0; a = parent[a]) {
++                out[a].push_back(sid);
++            }
++        }
++
++        for (auto & s : out) {
++            std::sort(s.begin(), s.end());
++        }
++    }
++
++    int32_t depth() const {
++        int32_t d = 0;
++        for (int32_t l : level) {
++            if (l > d) {
++                d = l;
++            }
++        }
++        return d;
++    }
++};
++
+ struct common_speculative_draft_params {
+     // this flag is used to chain the drafts through all the available implementations
+     // after the first successful draft from an implementation, we set it
+@@ -48,6 +149,13 @@ struct common_speculative_draft_params {
+ 
+     // the generated draft from the last _draft() call
+     llama_tokens * result;
++
++    // Optional tree-shaped draft output. When this is non-null AND the active
++    // implementation drafts trees, the draft is written here and `result` is
++    // left holding the tree's highest-probability root-to-leaf path, so a caller
++    // that does not understand trees still sees a valid linear draft.
++    // Null (the default) keeps the pure linear behaviour.
++    common_speculative_tree * tree = nullptr;
+ };
+ 
+ common_speculative_draft_params & common_speculative_get_draft_params(common_speculative * spec, llama_seq_id seq_id);
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 49489e816..b775dca5f 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -47,7 +47,11 @@ static uint32_t server_n_outputs_max(const common_params & params) {
+         return n_batch;
+     }
+ 
+-    const uint32_t n_outputs_per_seq = 1 + common_speculative_n_max(&params.speculative);
++    // A tree draft needs one output row per NODE, not one per level, so this must
++    // be sized on the tree's size and not on its depth.
++    const uint32_t n_outputs_per_seq =
++        1 + std::max<int32_t>(common_speculative_n_max(&params.speculative),
++                              common_speculative_tree_n_nodes());
+ 
+     const uint64_t n_outputs = (uint64_t) params.n_parallel * n_outputs_per_seq;
+ 
+@@ -66,6 +70,12 @@ enum slot_state {
+ 
+ struct server_slot; // forward declaration
+ 
++// First sequence id used for a tree draft's branches. A slot's own id is its
++// index, so the branches start immediately above the last slot - exactly the ids
++// common_params::n_seq_extra reserved in the context. Set once at init; these ids
++// are only ever valid inside one verification pass.
++static llama_seq_id SERVER_SPEC_TREE_SEQ_BASE = 1;
++
+ struct server_batch {
+     llama_batch batch;
+     bool batch_rendered = false;
+@@ -75,6 +85,11 @@ struct server_batch {
+         llama_token token;
+         llama_pos pos;
+         bool output;
++
++        // when non-empty these replace `id_slot`, so one token can belong to
++        // several sequences at once - which is how a tree draft shares its
++        // prefix between branches without copying any KV
++        std::vector<llama_seq_id> seqs;
+     };
+     std::vector<token> tokens;
+     int32_t n_tokens_alloc = 0;
+@@ -105,7 +120,9 @@ struct server_batch {
+     void init(int32_t n_tokens_alloc, int32_t n_embd) {
+         this->n_tokens_alloc = n_tokens_alloc;
+         this->n_embd = n_embd;
+-        batch = llama_batch_init(n_tokens_alloc, 0, 1);
++        // n_seq_max 8 rather than 1 so a tree node can carry one id per leaf
++        // beneath it; single-sequence adds are unaffected
++        batch = llama_batch_init(n_tokens_alloc, 0, 8);
+         tokens_ptr = batch.token;
+         tokens.reserve(n_tokens_alloc);
+     }
+@@ -116,7 +133,19 @@ struct server_batch {
+         if ((int32_t)tokens.size() >= n_tokens_alloc) {
+             return false;
+         }
+-        tokens.push_back({ id_slot, token, pos, output });
++        tokens.push_back({ id_slot, token, pos, output, {} });
++        return true;
++    }
++
++    // multi-sequence variant, used by tree drafting
++    bool add(const std::vector<llama_seq_id> & seqs, llama_token token, llama_pos pos, bool output) {
++        GGML_ASSERT(!has_embd);
++        GGML_ASSERT(batch.pos != nullptr);
++        GGML_ASSERT(!seqs.empty());
++        if ((int32_t)tokens.size() >= n_tokens_alloc) {
++            return false;
++        }
++        tokens.push_back({ seqs[0], token, pos, output, seqs });
+         return true;
+     }
+ 
+@@ -125,7 +154,7 @@ struct server_batch {
+         if ((int32_t)tokens.size() >= n_tokens_alloc) {
+             return false;
+         }
+-        tokens.push_back({ id_slot, LLAMA_TOKEN_NULL, pos, output });
++        tokens.push_back({ id_slot, LLAMA_TOKEN_NULL, pos, output, {} });
+         has_embd = true;
+         embd.insert(embd.end(), embd_in.begin(), embd_in.end());
+         return true;
+@@ -161,7 +190,11 @@ struct server_batch {
+         common_batch_clear(batch);
+         for (int32_t i = 0; i < size(); i++) {
+             const auto & t = tokens[i];
+-            common_batch_add(batch, t.token, t.pos, { t.id_slot }, t.output);
++            if (t.seqs.empty()) {
++                common_batch_add(batch, t.token, t.pos, { t.id_slot }, t.output);
++            } else {
++                common_batch_add(batch, t.token, t.pos, t.seqs, t.output);
++            }
+         }
+         if (has_embd) {
+             batch.token = nullptr; // will be restored on clear()
+@@ -209,6 +242,15 @@ struct server_slot {
+     common_speculative * spec;
+ 
+     llama_tokens spec_draft;
++
++    // tree-shaped draft (empty unless the draft implementation builds trees).
++    // `spec_draft` still holds the tree's spine, so every code path that only
++    // understands a linear draft keeps working.
++    common_speculative_tree spec_tree;
++
++    // sequence ids used for the tree's branches this pass, so they can be cleared
++    // once the winning path has been folded back into the slot's own sequence
++    std::vector<llama_seq_id> spec_tree_seqs;
+     llama_tokens spec_prompt;
+     std::vector<int32_t> spec_i_batch;
+     common_prompt_checkpoint spec_ckpt;
+@@ -502,16 +544,46 @@ struct server_slot {
+ 
+             GGML_ASSERT(spec_i_batch.empty());
+ 
+-            spec_i_batch.push_back(batch.size());
+-            for (size_t i = 0; i < spec_draft.size(); i++) {
+-                spec_i_batch.push_back(batch.size() + i + 1);
+-            }
++            const auto pos0 = prompt.tokens.pos_next();
++
++            if (!spec_tree.empty()) {
++                // Tree draft. Siblings share a position and are told apart only by
++                // sequence id, so the whole tree is verified in ONE forward pass.
++                std::vector<std::vector<llama_seq_id>> node_seqs;
++                spec_tree.seq_sets(SERVER_SPEC_TREE_SEQ_BASE, node_seqs, spec_tree_seqs);
++
++                // Branches must see the prompt, which lives under this slot's own
++                // sequence; the mask keys off seq_id[0], so give each branch a
++                // copy of the slot's cell bitset. One copy per LEAF, not per node.
++                for (llama_seq_id s : spec_tree_seqs) {
++                    mem.seq_rm(s, -1, -1);
++                    mem.seq_cp(this->id, s, -1, -1);
++                }
++
++                // the root belongs to the slot AND to every branch below it
++                std::vector<llama_seq_id> root_seqs = spec_tree_seqs;
++                root_seqs.insert(root_seqs.begin(), this->id);
++
++                spec_i_batch.push_back(batch.size());
++                add_ok &= batch.add(root_seqs, sampled, pos0, true);
+ 
+-            auto pos0 = prompt.tokens.pos_next();
++                for (size_t i = 0; i < spec_tree.size(); i++) {
++                    spec_i_batch.push_back(batch.size());
++                    add_ok &= batch.add(node_seqs[i], spec_tree.tok[i],
++                                        pos0 + spec_tree.level[i], true);
++                }
++            } else {
++                auto pos = pos0;
+ 
+-            add_ok &= batch.add(id, sampled, pos0++, true);
+-            for (auto token : spec_draft) {
+-                add_ok &= batch.add(this->id, token, pos0++, true);
++                spec_i_batch.push_back(batch.size());
++                for (size_t i = 0; i < spec_draft.size(); i++) {
++                    spec_i_batch.push_back(batch.size() + i + 1);
++                }
++
++                add_ok &= batch.add(id, sampled, pos++, true);
++                for (auto token : spec_draft) {
++                    add_ok &= batch.add(this->id, token, pos++, true);
++                }
+             }
+         }
+ 
+@@ -1317,6 +1389,9 @@ private:
+             slots.emplace_back();
+         }
+ 
++        // branch ids for a tree draft start immediately above the last slot
++        SERVER_SPEC_TREE_SEQ_BASE = params_base.n_parallel;
++
+         // try speculative decoding
+         if (ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_NO) {
+             try {
+@@ -3014,6 +3089,7 @@ private:
+                             /* .id_last  = */ slot.sampled,
+                             /* .prompt   = */ &slot.spec_prompt,
+                             /* .result   = */ &slot.spec_draft,
++                            /* .tree     = */ &slot.spec_tree,
+                         };
+ 
+                         drafting.push_back(&slot);
+@@ -3871,10 +3947,46 @@ private:
+                 // save the sampler sampler state in case we need to restore it
+                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
+ 
+-                GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
++                std::vector<int32_t> tree_path;
++
++                std::vector<llama_token> accepted;
++
++                if (!slot.spec_tree.empty()) {
++                    GGML_ASSERT(slot.spec_i_batch.size() == slot.spec_tree.size() + 1);
++                    accepted = common_sampler_sample_and_accept_tree(
++                            slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_tree, tree_path);
++                } else {
++                    GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
++                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
++                }
+                 slot.spec_i_batch.clear();
+ 
++                // Fold the winning branch back into the slot's own sequence, then
++                // drop every branch. The accepted nodes sit at pos0+1 .. pos0+L
++                // under the winning leaf's id, so one ranged bitset copy claims
++                // exactly them and leaves the losing siblings to be freed below.
++                if (!slot.spec_tree.empty()) {
++                    const llama_pos pos0 = slot.prompt.tokens.pos_next() - 1 - (llama_pos) n_draft;
++
++                    if (!tree_path.empty()) {
++                        std::vector<std::vector<llama_seq_id>> node_seqs;
++                        std::vector<llama_seq_id> all_seqs;
++                        slot.spec_tree.seq_sets(SERVER_SPEC_TREE_SEQ_BASE, node_seqs, all_seqs);
++
++                        const int32_t last = tree_path.back();
++                        const llama_seq_id win = node_seqs[last][0];
++
++                        slot.mem.seq_cp(win, slot.id, pos0 + 1, pos0 + slot.spec_tree.level[last] + 1);
++                    }
++
++                    for (llama_seq_id s : slot.spec_tree_seqs) {
++                        slot.mem.seq_rm(s, -1, -1);
++                    }
++
++                    slot.spec_tree.clear();
++                    slot.spec_tree_seqs.clear();
++                }
++
+                 GGML_ASSERT(accepted.size() >= 1);
+ 
+                 const uint32_t n_rollback = slot.spec_draft.size() + 1 - accepted.size();
