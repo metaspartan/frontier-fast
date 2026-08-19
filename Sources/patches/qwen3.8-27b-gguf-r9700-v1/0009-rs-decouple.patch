@@ -1,42 +1,60 @@
-diff --git a/include/llama.h b/include/llama.h
---- a/include/llama.h
-+++ b/include/llama.h
-@@ -407,3 +407,4 @@ struct llama_context_params {
-         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
-         struct llama_context * ctx_other;
-+        uint32_t n_parallel;        // serving slots; recurrent memory is sized by this, not n_seq_max
-     };
-diff --git a/src/llama-cparams.h b/src/llama-cparams.h
---- a/src/llama-cparams.h
-+++ b/src/llama-cparams.h
-@@ -14,5 +14,6 @@ struct llama_cparams {
-     uint32_t n_batch;
-     uint32_t n_ubatch;
-     uint32_t n_seq_max;
-+    uint32_t n_parallel;      // serving slots; sized by n_parallel while n_seq_max includes branch ids
-     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
-     uint32_t n_outputs_max;   // max outputs supported by the context
 diff --git a/common/common.cpp b/common/common.cpp
+index b535b52d5..b56c8f08f 100644
 --- a/common/common.cpp
 +++ b/common/common.cpp
-@@ -1629,4 +1629,5 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+@@ -1630,6 +1630,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
+ 
      cparams.n_ctx             = params.n_ctx;
      cparams.n_seq_max         = params.n_parallel + params.n_seq_extra;
 +    cparams.n_parallel        = params.n_parallel;
      cparams.n_rs_seq          = params.speculative.need_n_rs_seq();
      cparams.n_outputs_max     = std::max(params.n_outputs_max, 0);
+     cparams.n_batch           = params.n_batch;
+diff --git a/include/llama.h b/include/llama.h
+index 5be735f5b..f855bc1a7 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -406,6 +406,7 @@ extern "C" {
+         // a source/target/parent context
+         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
+         struct llama_context * ctx_other;
++        uint32_t n_parallel;        // serving slots; recurrent memory is sized by this, not n_seq_max
+     };
+ 
+     struct llama_model_tensor_override {
+diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
+index 00635a360..12927840a 100644
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -324,6 +324,13 @@ bool llama_batch_allocr::init(
+         for (uint32_t s0 = 0; s0 < n_seq_max; ++s0) {
+             for (uint32_t s1 = 0; s1 < n_seq_max; ++s1) {
+                 if (seq_cpl[s0][s1]) {
++                    // [rs-decouple] a coupled seq that owns no recurrent cells
++                    // (speculative tree branch ids) cannot diverge: its state
++                    // lives in the primary cell's snapshot planes, selected via
++                    // seq_rs_select. seq_pos_max is -1 when the seq is absent.
++                    if (memory->seq_pos_max(s0) < 0 || memory->seq_pos_max(s1) < 0) {
++                        continue;
++                    }
+                     if (memory->seq_pos_min(s0) != memory->seq_pos_min(s1) ||
+                         memory->seq_pos_max(s0) != memory->seq_pos_max(s1)) {
+                         LLAMA_LOG_ERROR("%s: sequence %d is coupled to %d in the input batch, but have divereged\n", __func__, s0, s1);
 diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 0d4cab4fd..4bf2394ec 100644
 --- a/src/llama-context.cpp
 +++ b/src/llama-context.cpp
-@@ -97,3 +97,4 @@ llama_context::llama_context(
+@@ -96,6 +96,7 @@ llama_context::llama_context(
+     const auto & hparams = model.hparams;
+ 
      cparams.n_seq_max = std::max(1u, params.n_seq_max);
 +    cparams.n_parallel = std::max(1u, params.n_parallel);
      if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
          throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
-diff --git a/src/llama-context.cpp b/src/llama-context.cpp
---- a/src/llama-context.cpp
-+++ b/src/llama-context.cpp
-@@ -588,5 +588,12 @@ void llama_context::sched_reserve() {
+     }
+@@ -587,7 +588,14 @@ void llama_context::sched_reserve() {
+ 
+     const int64_t t_start_us = ggml_time_us();
  
 -    const uint32_t n_seqs = cparams.n_seq_max;
 +    // [rs-decouple] the recurrent (hybrid) memory is sized by the serving-slot
@@ -50,10 +68,7 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
      const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
  
      const size_t max_nodes = this->graph_max_nodes(n_tokens);
-@@ -816,10 +816,12 @@ llama_memory_t llama_context::update() {
-     {
-         const auto mctx = memory->init_full();
-         if (!mctx) {
+@@ -818,7 +826,9 @@ bool llama_context::memory_update(bool optimize) {
              throw std::runtime_error("failed to initialize memory context");
          }
  
@@ -64,29 +79,23 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
          const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
  
          const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
-diff --git a/src/llama-model.cpp b/src/llama-model.cpp
---- a/src/llama-model.cpp
-+++ b/src/llama-model.cpp
-@@ -2249,6 +2249,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
-                             /* recurrent_type_r  */ GGML_TYPE_F32,
-                             /* recurrent_type_s  */ GGML_TYPE_F32,
--                            /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
-+                            /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_parallel),
-                             /* n_seq_max         */ cparams.n_seq_max,
-                             /* n_rs_seq          */ cparams.n_rs_seq,
-                             /* offload           */ cparams.offload_kqv,
-@@ -2266,6 +2266,6 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
-                             /* recurrent_type_k  */ GGML_TYPE_F32,
-                             /* recurrent_type_v  */ GGML_TYPE_F32,
--                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
-+                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_parallel),
-                             /* n_seq_max         */ cparams.n_seq_max,
-                             /* n_rs_seq          */ cparams.n_rs_seq,
-                             /* offload           */ cparams.offload_kqv,
+diff --git a/src/llama-cparams.h b/src/llama-cparams.h
+index 5018170ed..5870e0a70 100644
+--- a/src/llama-cparams.h
++++ b/src/llama-cparams.h
+@@ -13,6 +13,7 @@ struct llama_cparams {
+     uint32_t n_batch;
+     uint32_t n_ubatch;
+     uint32_t n_seq_max;
++    uint32_t n_parallel;      // serving slots; sized by n_parallel while n_seq_max includes branch ids
+     uint32_t n_rs_seq;        // number of recurrent-state snapshots per seq for rollback
+     uint32_t n_outputs_max;   // max outputs supported by the context
+     int32_t  n_threads;       // number of threads to use for generation
 diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
+index bc07bc710..2a5151cdc 100644
 --- a/src/llama-memory-recurrent.cpp
 +++ b/src/llama-memory-recurrent.cpp
-@@ -176,7 +176,9 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
+@@ -170,8 +170,10 @@ bool llama_memory_recurrent::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos
      // models like Mamba or RWKV can't have a state partially erased at the end
      // of the sequence because their state isn't preserved for previous tokens
      if (seq_id >= (int64_t) size) {
@@ -98,7 +107,10 @@ diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
 +        return true;
      }
      if (0 <= seq_id) {
-@@ -263,4 +266,7 @@ void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
+         int32_t & tail_id = cells[seq_id].tail;
+@@ -270,6 +272,9 @@ void llama_memory_recurrent::seq_cp(llama_seq_id seq_id_src, llama_seq_id seq_id
+ }
+ 
  void llama_memory_recurrent::seq_keep(llama_seq_id seq_id) {
 +    if (seq_id >= (int64_t) size) {
 +        return; // branch seq id beyond the recurrent cell count owns no cells
@@ -106,7 +118,7 @@ diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
      uint32_t new_head = size;
  
      for (uint32_t i = 0; i < size; ++i) {
-@@ -509,13 +512,19 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+@@ -524,13 +529,19 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
          for (uint32_t j = 0; j < n_seq_id; ++j) {
              const llama_seq_id seq_id = ubatch.seq_id[i][j];
  
@@ -127,7 +139,7 @@ diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
                  auto & seq = cells[seq_id];
                  if (seq.tail >= 0) {
                      auto & cell = cells[seq.tail];
-@@ -536,7 +545,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+@@ -551,7 +562,7 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
  #ifndef NDEBUG
      {
          std::vector<int32_t> tails_verif;
@@ -136,26 +148,43 @@ diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
          for (uint32_t i = 0; i < size; ++i) {
              auto & cell = cells[i];
              for (llama_seq_id seq_id : cell.seq_id) {
-diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
---- a/src/llama-batch.cpp
-+++ b/src/llama-batch.cpp
-@@ -319,12 +319,19 @@ bool llama_batch_allocr::init(
-         for (uint32_t s0 = 0; s0 < n_seq_max; ++s0) {
-             for (uint32_t s1 = 0; s1 < n_seq_max; ++s1) {
-                 if (seq_cpl[s0][s1]) {
-+                    // [rs-decouple] a coupled seq that owns no recurrent cells
-+                    // (speculative tree branch ids) cannot diverge: its state
-+                    // lives in the primary cell's snapshot planes, selected via
-+                    // seq_rs_select. seq_pos_max is -1 when the seq is absent.
-+                    if (memory->seq_pos_max(s0) < 0 || memory->seq_pos_max(s1) < 0) {
-+                        continue;
-+                    }
-                     if (memory->seq_pos_min(s0) != memory->seq_pos_min(s1) ||
-                         memory->seq_pos_max(s0) != memory->seq_pos_max(s1)) {
-                         LLAMA_LOG_ERROR("%s: sequence %d is coupled to %d in the input batch, but have divereged\n", __func__, s0, s1);
-                         return false;
-                     }
-                 }
-             }
+@@ -660,8 +671,15 @@ bool llama_memory_recurrent::find_slot(const llama_ubatch & ubatch) {
+         cell.seq_id.clear();
+         for (int32_t j = 0; j < ubatch.n_seq_id[i]; ++j) {
+             const llama_seq_id seq_id = ubatch.seq_id[i][j];
+-            cell.seq_id.insert(seq_id);
+-            cells[seq_id].tail = cell_id;
++            if ((uint32_t) seq_id < size) {
++                // Only seq ids that own a recurrent cell carry bookkeeping.
++                // Branch seq ids beyond the cell count (speculative tree
++                // branches) share the root cell: their state lives in its
++                // snapshot planes, selected via seq_rs_select, so inserting
++                // them here would poison has_cell and the tails invariant.
++                cell.seq_id.insert(seq_id);
++                cells[seq_id].tail = cell_id;
++            }
          }
      }
+ 
+diff --git a/src/llama-model.cpp b/src/llama-model.cpp
+index 13023c643..2528cd54e 100644
+--- a/src/llama-model.cpp
++++ b/src/llama-model.cpp
+@@ -2248,7 +2248,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             /* attn_n_pad        */ 1,
+                             /* recurrent_type_r  */ GGML_TYPE_F32,
+                             /* recurrent_type_s  */ GGML_TYPE_F32,
+-                            /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_seq_max),
++                            /* recurrent_rs_size */ std::max((uint32_t) 1, cparams.n_parallel),
+                             /* n_seq_max         */ cparams.n_seq_max,
+                             /* n_rs_seq          */ cparams.n_rs_seq,
+                             /* offload           */ cparams.offload_kqv,
+@@ -2267,7 +2267,7 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params,
+                             /* attn_swa_type     */ hparams.swa_type,
+                             /* recurrent_type_k  */ GGML_TYPE_F32,
+                             /* recurrent_type_v  */ GGML_TYPE_F32,
+-                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_seq_max),
++                            /* recurrent_kv_size */ std::max((uint32_t) 1, cparams.n_parallel),
+                             /* n_seq_max         */ cparams.n_seq_max,
+                             /* n_rs_seq          */ cparams.n_rs_seq,
+                             /* offload           */ cparams.offload_kqv,
