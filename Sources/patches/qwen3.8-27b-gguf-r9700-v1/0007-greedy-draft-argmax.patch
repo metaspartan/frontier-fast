@@ -1,0 +1,167 @@
+diff --git a/common/speculative.cpp b/common/speculative.cpp
+index 514fe8521..1f8d5e32f 100644
+--- a/common/speculative.cpp
++++ b/common/speculative.cpp
+@@ -1586,30 +1586,37 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
+ 
+                 auto * smpl = smpls[seq_id].get();
+ 
+-                common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+ 
+-                const auto * cur_p = common_sampler_get_candidates(smpl, true);
+-
+-                for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
+-                    SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
+-                            seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,
+-                            common_token_to_piece(ctx_dft, cur_p->data[k].id).c_str());
+-                }
+-
+-                // add drafted token for each sequence
+-                const llama_token id = cur_p->data[0].id;
+-
+-                // only collect very high-confidence draft tokens
+-                if (cur_p->data[0].p < params.p_min) {
+-                    drafting[seq_id] = false;
+-                    n_drafting--;
++                // Greedy draft: take the head's argmax straight off the graph.
++                // The old path drew a tempered top-10 sample (top_k 10, temp
++                // 0.8, seeded dist), which left rank-1 mass on the table
++                // (achieved acceptance ~0.6 vs rank-1 coverage ~0.72) and paid
++                // a 993 KB host logits read plus the sampler chain every step.
++                // Exact verification keeps the greedy output byte-identical.
++                llama_token id = llama_get_logits_argmax_ith(ctx_dft, i_last[seq_id]);
++
++                if (id < 0) {
++                    // graph without an argmax output (probe/reserve shapes):
++                    // fall back to the host sampler
++                    common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
++                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
++                    id = cur_p->data[0].id;
++                } else if (params.p_min > 0.0f) {
++                    // p_min gating needs the token probability, which only the
++                    // sampler path provides. p_min defaults to 0 (runner
++                    // configuration), so this never fires here.
++                    common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
++                    const auto * cur_p = common_sampler_get_candidates(smpl, true);
++                    if (cur_p->data[0].p < params.p_min) {
++                        drafting[seq_id] = false;
++                        n_drafting--;
+ 
+-                    continue;
++                        continue;
++                    }
++                    id = cur_p->data[0].id;
+                 }
+ 
+-                common_sampler_accept(smpl, id, true);
+-
+                 auto & dp = dparams.at(seq_id);
+                 auto & result = *dp.result;
+ 
+diff --git a/include/llama.h b/include/llama.h
+index 6e53e2297..b67542102 100644
+--- a/include/llama.h
++++ b/include/llama.h
+@@ -1025,6 +1025,7 @@ extern "C" {
+     // Negative indices can be used to access logits in reverse order, -1 is the last logit.
+     // returns NULL for invalid ids.
+     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
++    LLAMA_API int32_t llama_get_logits_argmax_ith(struct llama_context * ctx, int32_t i);
+ 
+     // Get all output token embeddings.
+     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+index 19cca7df1..4a04de0ac 100644
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -891,6 +891,30 @@ float * llama_context::get_logits_ith(int32_t i) {
+     }
+ }
+ 
++int32_t llama_context::get_logits_argmax_ith(int32_t i) {
++    output_reorder();
++
++    try {
++        auto * res = gf_res_prev ? (llm_graph_result *) gf_res_prev.get() : nullptr;
++        if (!res) {
++            return -1;
++        }
++        auto * t_argmax = res->get_logits_argmax();
++        if (!t_argmax) {
++            return -1;
++        }
++
++        const int64_t j = output_resolve_row(i);
++
++        int32_t id = -1;
++        ggml_backend_tensor_get(t_argmax, &id, j * (int64_t) sizeof(int32_t), sizeof(int32_t));
++        return id;
++    } catch (const std::exception & err) {
++        LLAMA_LOG_ERROR("%s: invalid argmax id %d, reason: %s\n", __func__, i, err.what());
++        return -1;
++    }
++}
++
+ float * llama_context::get_embeddings() {
+     output_reorder();
+ 
+@@ -3723,6 +3747,11 @@ float * llama_get_logits_ith(llama_context * ctx, int32_t i) {
+ 
+     return res;
+ }
++int32_t llama_get_logits_argmax_ith(llama_context * ctx, int32_t i) {
++    ctx->synchronize();
++
++    return ctx->get_logits_argmax_ith(i);
++}
+ 
+ float * llama_get_embeddings(llama_context * ctx) {
+     ctx->synchronize();
+diff --git a/src/llama-context.h b/src/llama-context.h
+index bf91daa8b..23e7c6725 100644
+--- a/src/llama-context.h
++++ b/src/llama-context.h
+@@ -79,6 +79,7 @@ struct llama_context {
+     enum llama_pooling_type pooling_type() const;
+ 
+     float * get_logits();
++    int32_t get_logits_argmax_ith(int32_t i);
+     float * get_logits_ith(int32_t i);
+ 
+     float * get_embeddings();
+diff --git a/src/llama-graph.h b/src/llama-graph.h
+index 160e29413..80b451cbd 100644
+--- a/src/llama-graph.h
++++ b/src/llama-graph.h
+@@ -845,6 +845,7 @@ public:
+     ggml_tensor * get_embd()        const { return t_embd; }
+     ggml_tensor * get_embd_pooled() const { return t_embd_pooled; }
+     ggml_tensor * get_h_nextn()     const { return t_h_nextn; }
++    ggml_tensor * get_logits_argmax() const { return t_logits_argmax; }
+ 
+     ggml_tensor * get_layer_inp(int il) const { return t_layer_inp[il]; }
+ 
+@@ -880,6 +881,7 @@ public:
+     ggml_tensor * t_embd        = nullptr;
+     ggml_tensor * t_embd_pooled = nullptr;
+     ggml_tensor * t_h_nextn     = nullptr; // [n_embd, n_outputs] hidden state before final output norm
++    ggml_tensor * t_logits_argmax = nullptr; // [n_outputs] int32: argmax row of the logits (greedy draft)
+ 
+     std::vector<ggml_tensor *> t_layer_inp;
+ 
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index ea8e6868e..173d1b6f7 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -727,4 +727,10 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
+ 
+     res->t_logits = cur;
+     ggml_build_forward_expand(gf, cur);
++
++    // Greedy draft: the head's argmax over the (mask-padded) logits, computed
++    // on the device so the draft loop needs no host logits read and no
++    // tempered top-k sampler. Masked rows are -1e30 and can never win.
++    res->t_logits_argmax = ggml_argmax(ctx0, cur);
++    ggml_build_forward_expand(gf, res->t_logits_argmax);
+ }
