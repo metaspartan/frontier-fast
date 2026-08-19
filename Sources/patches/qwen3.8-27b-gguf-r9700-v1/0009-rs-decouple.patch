@@ -1,12 +1,11 @@
 diff --git a/include/llama.h b/include/llama.h
 --- a/include/llama.h
 +++ b/include/llama.h
-@@ -352,4 +352,5 @@ struct llama_context_params {
-         uint32_t n_batch;           // logical maximum batch size that can be submitted to llama_decode
-         uint32_t n_ubatch;          // physical maximum batch size
-         uint32_t n_seq_max;         // max number of sequences (i.e. distinct states for recurrent models)
+@@ -407,3 +407,4 @@ struct llama_context_params {
+         // can be utilized in various ways, for example by sharing results or llama_memory between 2 contexts
+         struct llama_context * ctx_other;
 +        uint32_t n_parallel;        // serving slots; recurrent memory is sized by this, not n_seq_max
-         uint32_t n_rs_seq;          // number of recurrent-state snapshots per seq for rollback (0 = no rollback) [EXPERIMENTAL]
+     };
 diff --git a/src/llama-cparams.h b/src/llama-cparams.h
 --- a/src/llama-cparams.h
 +++ b/src/llama-cparams.h
@@ -34,6 +33,37 @@ diff --git a/src/llama-context.cpp b/src/llama-context.cpp
 +    cparams.n_parallel = std::max(1u, params.n_parallel);
      if (cparams.n_seq_max > LLAMA_MAX_SEQ) {
          throw std::runtime_error("n_seq_max must be <= " + std::to_string(LLAMA_MAX_SEQ));
+diff --git a/src/llama-context.cpp b/src/llama-context.cpp
+--- a/src/llama-context.cpp
++++ b/src/llama-context.cpp
+@@ -588,5 +588,12 @@ void llama_context::sched_reserve() {
+ 
+-    const uint32_t n_seqs = cparams.n_seq_max;
++    // [rs-decouple] the recurrent (hybrid) memory is sized by the serving-slot
++    // count (n_parallel); speculative tree branch ids own no recurrent cells,
++    // so worst-case graphs must be sized for n_parallel sequences, not
++    // n_seq_max. The MTP draft context is attention-only and does batch over
++    // branch rows, so it keeps the full n_seq_max.
++    const uint32_t n_seqs = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP
++        ? cparams.n_seq_max
++        : std::max(1u, cparams.n_parallel);
+     const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+ 
+     const size_t max_nodes = this->graph_max_nodes(n_tokens);
+@@ -816,10 +816,12 @@ llama_memory_t llama_context::update() {
+     {
+         const auto mctx = memory->init_full();
+         if (!mctx) {
+             throw std::runtime_error("failed to initialize memory context");
+         }
+ 
+-        const uint32_t n_seqs = cparams.n_seq_max;
++        const uint32_t n_seqs = cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP
++            ? cparams.n_seq_max
++            : std::max(1u, cparams.n_parallel);
+         const uint32_t n_tokens = std::min(cparams.n_ctx, cparams.n_ubatch);
+ 
+         const uint32_t n_outputs_max = std::min(n_tokens, cparams.n_outputs_max);
 diff --git a/src/llama-model.cpp b/src/llama-model.cpp
 --- a/src/llama-model.cpp
 +++ b/src/llama-model.cpp
@@ -106,3 +136,26 @@ diff --git a/src/llama-memory-recurrent.cpp b/src/llama-memory-recurrent.cpp
          for (uint32_t i = 0; i < size; ++i) {
              auto & cell = cells[i];
              for (llama_seq_id seq_id : cell.seq_id) {
+diff --git a/src/llama-batch.cpp b/src/llama-batch.cpp
+--- a/src/llama-batch.cpp
++++ b/src/llama-batch.cpp
+@@ -319,12 +319,19 @@ bool llama_batch_allocr::init(
+         for (uint32_t s0 = 0; s0 < n_seq_max; ++s0) {
+             for (uint32_t s1 = 0; s1 < n_seq_max; ++s1) {
+                 if (seq_cpl[s0][s1]) {
++                    // [rs-decouple] a coupled seq that owns no recurrent cells
++                    // (speculative tree branch ids) cannot diverge: its state
++                    // lives in the primary cell's snapshot planes, selected via
++                    // seq_rs_select. seq_pos_max is -1 when the seq is absent.
++                    if (memory->seq_pos_max(s0) < 0 || memory->seq_pos_max(s1) < 0) {
++                        continue;
++                    }
+                     if (memory->seq_pos_min(s0) != memory->seq_pos_min(s1) ||
+                         memory->seq_pos_max(s0) != memory->seq_pos_max(s1)) {
+                         LLAMA_LOG_ERROR("%s: sequence %d is coupled to %d in the input batch, but have divereged\n", __func__, s0, s1);
+                         return false;
+                     }
+                 }
+             }
+         }
+     }
