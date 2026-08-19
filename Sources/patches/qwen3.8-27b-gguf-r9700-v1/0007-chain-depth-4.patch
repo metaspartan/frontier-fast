@@ -1,0 +1,11 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -950,6 +950,6 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
+             model_ships_nextn_head(params.model.path)) {
+         params.speculative.types       = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+-        params.speculative.draft.n_max = 3;
++        params.speculative.draft.n_max = 4;
+ 
+         LOG_INF("%s: model ships a NextN head - enabling MTP self-speculation "
+                 "(equivalent to --spec-type draft-mtp --spec-draft-n-max %d)\n",
