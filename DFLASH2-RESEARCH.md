@@ -1,5 +1,17 @@
 # DFlash 2 research + qwen3.8-27b speculative path (2026-08-20)
 
+## Source-level verification (from the built tree, PR #27342 head 5ecbe1a)
+
+Built 100% on the box at `/home/ghost/dflash2full/build/bin/llama-server` (v0.1.2-dev). `draft-dflash` confirmed in `--spec-type`. What the source actually does:
+
+- **Block-diffusion single-pass draft**: input is `[id_last, <MASK>*(block_size-1)]`, the draft attends over [committed, MASK...] and denoises the whole block in ONE forward — no autoregressive draft loop. Max `block_size-1` drafted tokens (DSpark variant anchors a full block_size).
+- **Path selector** = a trained biaffine lattice over top-k candidates: tensors `dflash_selector_prev [rank, n_vocab]`, `dflash_selector_next [rank, n_vocab]`, `dflash_selector_hidden [n_embd, rank]`, `top_k`, traced greedy in-graph. This is the "choose the right tokens" half of DFlash2.
+- **Two-tap dynamic convolution** (`build_dflash2_conv`, `kernel_size` taps, `group_size` groups): gate/base conv state applied per-layer to attn + ffn hidden (`dflash_attn_conv_base/proj`, `dflash_ffn_conv_*`). This is the "hold accuracy to the end of block" half.
+- Draft output is **greedy in-graph** (sampling only on final token) => lossless vs target greedy.
+- `block_size` from GGUF `dflash.block_size`; draft context shared-kv-injects target features via `target_layer_ids` encoder.
+
+This is exactly the MTP-family mechanism DFlash2 uses to replace the sequential greedy-argmax chain that is the current 47.69 tok/s leader — a parallel, one-pass block drafter with acceptance ~5.3 (official), vs our ~4-5 chain. The earlier "reduce the LM head to Latin prefix" trick (45.0 tok/s, lost) shrank THE TRUNK's head; DFlash2 instead has a tiny dedicated draft head, which is why it can win where head-shrinking could not.
+
 ## What DFlash / DFlash 2 is
 
 **DFlash (v1)** — "Block Diffusion for Flash Speculative Decoding" (z-lab, arXiv
