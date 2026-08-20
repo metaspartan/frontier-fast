@@ -14,6 +14,8 @@
     "nemotron-3.5-lightning-gguf-gb10cuda-v1",
     "qwen3.6-35b-a3b-gguf-gb10cuda-v1",
     "qwen3.6-35b-a3b-gguf-r9700-v1",
+    "qwen3.8-27b-gguf-r9700-v1",
+    "qwen3.8-27b-gguf-gb10cuda-v1",
     "maple-preview-mlx-apple-v1",
     "maple-preview-gguf-r9700-v1",
     "maple-preview-gguf-gb10cuda-v1"
@@ -33,12 +35,12 @@
     "speculative": "Speculative decoding: n-gram/prompt-lookup, a draft model, or multi-token-prediction heads. Ranked and published on its own board.",
     "why": "A drafted token is accepted only if the target would have produced it, so the speed is not a quality trade. It is ranked separately because it wins on almost any model and would otherwise make one board answer two questions. It is NOT exempt from the correctness gate: the verifying pass batches positions, which reorders reductions and can flip a knife-edge argmax, so it faces the same perplexity equivalence check as everything else.",
     "classifiedFrom": [
-      "Sources/runner/serving.json `speculative` block — decides on its own",
+      "Sources/runner/serving.json `speculative` block \u00e2\u20ac\u201d decides on its own",
       "patch series wiring up speculation: TWO independent markers required from common_speculative, n_draft, ngram_cache, prompt_lookup, spec_decode"
     ],
     "readOtherBoard": "GET /api/leaderboard?contract=<track>&technique=speculative | all",
-    "advice": "Do not enable speculation in the same submission as kernel work — send it separately and both results stand.",
-    "notAMarker": "`mtp` — Qwen3.6 ships multi-token-prediction heads as part of its architecture, so a kernel patch compiling near that code is not a speculative submission",
+    "advice": "Do not enable speculation in the same submission as kernel work \u00e2\u20ac\u201d send it separately and both results stand.",
+    "notAMarker": "`mtp` \u00e2\u20ac\u201d Qwen3.6 ships multi-token-prediction heads as part of its architecture, so a kernel patch compiling near that code is not a speculative submission",
     "speculativeOnLlamaCpp": {
       "servingBlock": "Sources/runner/serving.json: { \"speculative\": { \"specType\": \"<type>\", \"draftMax\": 1..16, \"draftMin\": 0..16 } }",
       "specTypes": [
@@ -55,7 +57,7 @@
       ],
       "draftless": "ngram-* types need no second model and work on every llama.cpp track",
       "weightsArePinned": "You name the TYPE, never the weights. The runner loads the draft pinned for your track, so a ranked run measures a fixed system. Your track's draft is in its contract at /api/tracks under speculative.draftModel.",
-      "appliedTo": "the candidate arm only — the baseline stays stock, because what is measured is speculation against no speculation",
+      "appliedTo": "the candidate arm only \u00e2\u20ac\u201d the baseline stays stock, because what is measured is speculation against no speculation",
       "rejectedAtIntake": "an unknown specType, or a draft-* type on a track with no pinned draft",
       "measuredDepth": "On qwen3.6-35b-a3b-gguf-r9700-v1: --spec-draft-n-max 3 is +34% over stock; 8 is SLOWER than stock. Deeper is not better once drafted tokens stop being accepted."
     }
@@ -74,9 +76,9 @@
     "reportedAs": "longContext on each verified record (the primary window) and longContextWindows (every window measured): decode, prefill, ttft, their paired speedups, and a score using the same formula",
     "ranking": "GET /api/leaderboard?contract=<track>&window=long",
     "blendedIntoRankedScore": false,
-    "canFailASubmission": "yes, when the runner has the long gate corpus. Perplexity is measured over held-out text at each window's own context length, on both arms, and a relative delta past the track's equivalence limit rejects the submission. Where the corpus is absent the windows come back correctness=unchecked and ranked=false: the measurement is still published, it just does not claim a score. Text divergence between the arms is still only reported — after one flipped knife-edge argmax every later token differs by construction.",
+    "canFailASubmission": "yes, when the runner has the long gate corpus. Perplexity is measured over held-out text at each window's own context length, on both arms, and a relative delta past the track's equivalence limit rejects the submission. Where the corpus is absent the windows come back correctness=unchecked and ranked=false: the measurement is still published, it just does not claim a score. Text divergence between the arms is still only reported \u00e2\u20ac\u201d after one flipped knife-edge argmax every later token differs by construction.",
     "why": "At 512 tokens decode is weight-bandwidth bound; at 16k and 32k it is increasingly dominated by attention over the KV cache, so a kernel can win one and be neutral at the other. Both windows come from a single engine boot, so measuring the pair costs little over measuring one.",
-    "notMeasuredOn": "vLLM tracks — the pinned engine is --max-model-len 8192 and the dedicated boot a long window needs costs GPU memory the largest track does not have; those runs record the reason."
+    "notMeasuredOn": "vLLM tracks \u00e2\u20ac\u201d the pinned engine is --max-model-len 8192 and the dedicated boot a long window needs costs GPU memory the largest track does not have; those runs record the reason."
   },
   "editablePaths": [
     "Sources/runner/",

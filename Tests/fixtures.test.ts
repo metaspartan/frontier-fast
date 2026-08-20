@@ -13,6 +13,8 @@ const FIXTURE_PENDING = new Set([
   "qwen3.6-35b-a3b-nvfp4-gb10-v1",
   "qwen3.6-35b-a3b-gguf-gb10cuda-v1",
   "qwen3.6-35b-a3b-gguf-r9700-v1",
+  "qwen3.8-27b-gguf-r9700-v1",
+  "qwen3.8-27b-gguf-gb10cuda-v1",
   "maple-preview-mlx-apple-v1",
   "maple-preview-gguf-r9700-v1",
   "maple-preview-gguf-gb10cuda-v1",
