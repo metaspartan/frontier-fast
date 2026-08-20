@@ -48,3 +48,22 @@ SCOPED + READY. Written up 2026-08-20. Requires: PEP's sanctioned suspend/restor
 window (endpoint down ~1 hr for HIP build + ABBA vs 233.3), then submit.
 Box: /home/ghost/rebase27 (clean pinned base, build tree present) is the target
 worktree.
+# SP-MoE expert-prefetch — exact routing/GEMM insertion lines (qwen3.6-35b-a3b)
+
+Verified in `src/llama-graph.cpp`, `build_moe_ffn`, pinned base 2b63e0610:
+
+- Expert selection: `selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used);`
+  (~L2001) — feeds both the per-expert weights and the routed GEMM.
+- Expert-weight fetch / routed GEMM:
+  `build_lora_mm_id(gate_up_exps, cur, selected_experts, up_exps_s);` (merged gate-up,
+  ~L2058) or the separate `build_lora_mm_id(up_exps, ...)` / `build_lora_mm_id(gate_exps, ...)`.
+  THIS is the HBM expert-weight fetch SP-MoE prefetch targets.
+- `cur = ggml_reshape_3d(ctx0, cur, n_embd, 1, n_tokens)` before the GEMM.
+- `ggml_build_forward_expand(gf, weights)` calls weights early (topk-moe).
+
+## Implementation honesty
+Correct expert-prefetch across the draft->verify boundary needs host-loop
+coordination (pin next round's `selected_experts` resident while the drafter
+runs). It cannot be validated without a GPU build+measure (HIP compile offloads
+to the card; correctness gate needs a real run). This proofs the exact hooks so a
+GPU-window session can land it in one shot.
