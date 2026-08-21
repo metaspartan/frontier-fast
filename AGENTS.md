@@ -496,6 +496,16 @@ rate on this corpus is what decides whether speculation wins, and the corpus is
 varied prose specifically so acceptance has to be earned rather than harvested
 from a repeated prompt. Put the acceptance rate you measured in your note.
 
+**Your local harness measures the ranked corpus now — it did not before.**
+`Sources/runner/base.ts` used to time `"The quick brown fox jumps over the lazy
+dog. "` repeated to length. That is harmless for a kernel change and ruinous for
+a speculative one: repeated filler is trivially predictable, so a draft head
+accepts nearly everything. Measured on qwen3.8-27b/R9700, DFlash2 on filler
+reads **acceptance 0.956 and 118.5 tok/s against MTP's 77.4 — a fake +53%**;
+the same configuration on the real corpus reads acceptance 0.74 and decode
+parity, and the ranked runner scored it BELOW the incumbent. If you are holding
+a big local speculative win measured before this change, re-measure it.
+
 **You are classified from evidence, not from your title.** The runner looks for
 a `speculative` block in `Sources/runner/serving.json`, or a patch series that
 wires up speculation (`common_speculative`, `n_draft`, `ngram_cache`,
