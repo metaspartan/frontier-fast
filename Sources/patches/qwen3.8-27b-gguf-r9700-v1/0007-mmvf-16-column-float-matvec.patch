@@ -1,0 +1,166 @@
+From c756d34c0dc16c64356467977012a6b2843b53d9 Mon Sep 17 00:00:00 2001
+From: a <a@b>
+Date: Sun, 16 Aug 2026 05:43:06 +0000
+Subject: [PATCH 1/2] mmvf: instantiate the float matvec to 16 columns so
+ speculative widths past 8 do not fall to rocBLAS
+
+---
+ ggml/src/ggml-cuda/ggml-cuda.cu | 20 +++++++-----
+ ggml/src/ggml-cuda/mmvf.cu      | 56 +++++++++++++++++++++++++++++++++
+ ggml/src/ggml-cuda/mmvf.cuh     |  2 +-
+ 3 files changed, 69 insertions(+), 9 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 561ab7ac5..106179c8e 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -1879,19 +1879,23 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor *
+ 
+     // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
+     if (src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32) {
+-        static_assert(MMVQ_MAX_BATCH_SIZE == MMVF_MAX_BATCH_SIZE);
+-        if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+-            if (ggml_is_quantized(src0->type)) {
++        // The two vector paths have independent width ceilings: MMVQ is
++        // instantiated up to MMVQ_MAX_BATCH_SIZE columns, MMVF up to
++        // MMVF_MAX_BATCH_SIZE. They used to be asserted equal and gated by a
++        // single bound; keep each branch on its own so raising one does not
++        // silently widen the other past its instantiations.
++        if (ggml_is_quantized(src0->type)) {
++            if (ne2 <= MMVQ_MAX_BATCH_SIZE) {
+                 const int mmvq_mmid_max = get_mmvq_mmid_max_batch(src0->type, cc);
+                 if (ne2 <= mmvq_mmid_max) {
+                     ggml_cuda_mul_mat_vec_q(ctx, src0, src1, ids, dst);
+                     return;
+                 }
+-            } else {
+-                if (GGML_CUDA_CC_IS_AMD(cc)) {
+-                    ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
+-                    return;
+-                }
++            }
++        } else {
++            if (ne2 <= MMVF_MAX_BATCH_SIZE && GGML_CUDA_CC_IS_AMD(cc)) {
++                ggml_cuda_mul_mat_vec_f(ctx, src0, src1, ids, dst);
++                return;
+             }
+         }
+ 
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index d7dbc8b99..8cc9854a6 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -595,6 +595,62 @@ static void mul_mat_vec_f_cuda_switch_ncols_dst(
+                  stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
+                  nsamples_dst, ids_stride, stream);
+             break;
++        case 9:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 9>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 10:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 10>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 11:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 11>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 12:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 12>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 13:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 13>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 14:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 14>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 15:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 15>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
++        case 16:
++            launch_mul_mat_vec_f_cuda<T, type_acc, 16>
++                (x, y, ids, fusion, dst, ncols, nrows, stride_row, stride_col_y, stride_col_dst,
++                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y,
++                 stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst,
++                 nsamples_dst, ids_stride, stream);
++            break;
+         default:
+             GGML_ABORT("fatal error");
+             break;
+diff --git a/ggml/src/ggml-cuda/mmvf.cuh b/ggml/src/ggml-cuda/mmvf.cuh
+index a50f7c021..a5be37298 100644
+--- a/ggml/src/ggml-cuda/mmvf.cuh
++++ b/ggml/src/ggml-cuda/mmvf.cuh
+@@ -1,6 +1,6 @@
+ #include "common.cuh"
+ 
+-#define MMVF_MAX_BATCH_SIZE 8 // Max. batch size for which to use MMVF kernels.
++#define MMVF_MAX_BATCH_SIZE 16 // Max. batch size for which to use MMVF kernels.
+ 
+ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
+     const ggml_cuda_mm_fusion_args_host * fusion = nullptr);
+-- 
+2.53.0
+
+
+From 0e02a70dd160a4bd9981352bf0c09be5ffc724e8 Mon Sep 17 00:00:00 2001
+From: a <a@b>
+Date: Sun, 16 Aug 2026 05:46:49 +0000
+Subject: [PATCH 2/2] mmvf: raise the F32 RDNA4 width gate to the instantiated
+ maximum
+
+---
+ ggml/src/ggml-cuda/mmvf.cu | 10 ++++++++--
+ 1 file changed, 8 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmvf.cu b/ggml/src/ggml-cuda/mmvf.cu
+index 8cc9854a6..9efe2fe12 100644
+--- a/ggml/src/ggml-cuda/mmvf.cu
++++ b/ggml/src/ggml-cuda/mmvf.cu
+@@ -870,9 +870,15 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
+                 if (fp32_mma_hardware_available(cc)) {
+                     return ne11 <= 3;
+                 }
+-                return ne11 <= 8;
++                // No FP32 MMA on RDNA: this vector kernel is the ONLY fast path
++                // for F32 src0 here, because ggml_cuda_should_use_mmf gates F32
++                // on ampere_mma/amd_mfma and neither exists on RDNA4. Anything
++                // wider than this bound falls to a rocBLAS SGEMM, which for the
++                // narrow F32 tensors in the recurrent path (ssm_alpha/ssm_beta,
++                // [5120, 48]) costs ~0.24 ms per call against ~0.007 ms here.
++                return ne11 <= MMVF_MAX_BATCH_SIZE;
+             }
+-            return ne11 <= 8;
++            return ne11 <= MMVF_MAX_BATCH_SIZE;
+         case GGML_TYPE_F16:
+             if (GGML_CUDA_CC_IS_NVIDIA(cc)) {
+                 const bool src0_small = (src0_ne[1] <= 512 || src0_ne[2]*src0_ne[3] == 1);
+-- 
+2.53.0
+

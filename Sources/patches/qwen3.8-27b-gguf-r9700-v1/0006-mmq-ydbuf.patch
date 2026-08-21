@@ -1,0 +1,75 @@
+From 92286828eb28b0ac77e81a1f2199868f72f9bbcb Mon Sep 17 00:00:00 2001
+From: a <a@b>
+Date: Sun, 16 Aug 2026 12:44:32 +0000
+Subject: [PATCH] mmq: double-buffer the J=16 y tile on RDNA4, halving barriers
+ per K iteration
+
+---
+ ggml/src/ggml-cuda/mmq.cuh | 37 +++++++++++++++++++++++++++++++++++--
+ 1 file changed, 35 insertions(+), 2 deletions(-)
+
+diff --git a/ggml/src/ggml-cuda/mmq.cuh b/ggml/src/ggml-cuda/mmq.cuh
+index c0bd612e7..ce74f35a1 100644
+--- a/ggml/src/ggml-cuda/mmq.cuh
++++ b/ggml/src/ggml-cuda/mmq.cuh
+@@ -882,7 +882,18 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+ 
+     extern __shared__ int data_mul_mat_q[];
+     int * tile_y = data_mul_mat_q + J;
+-    int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
++#if defined(RDNA4)
++    // With a single y buffer the two vec_dot halves need four __syncthreads per
++    // 256-K iteration (each half's y load must not overwrite the half still
++    // being read). At the J=16 verify-width tile the y buffer is only ~2.3 KB,
++    // so double-buffer it and drop to two barriers per iteration. J=128
++    // (prefill) and every other arch keep the stock layout byte-for-byte.
++    constexpr bool y_double_buffer = (J == 16);
++#else
++    constexpr bool y_double_buffer = false;
++#endif // defined(RDNA4)
++    int * tile_y1 = y_double_buffer ? tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size) : tile_y;
++    int * tile_x = tile_y1 + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
+ 
+ #if defined(BLACKWELL_MMA_AVAILABLE)
+     // FP4 tile stores 8 blocks
+@@ -910,6 +921,25 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
+             }
+         }
+ 
++        if constexpr (y_double_buffer) {
++            const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
++#pragma unroll
++            for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
++                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
++
++                tile_y1[l] = by0[l];
++            }
++
++            __syncthreads();
++
++            vec_dot(tile_x, tile_y, sum, 0);
++            vec_dot(tile_x, tile_y1, sum, MMQ_TILE_NE_K);
++
++            __syncthreads();
++
++            continue;
++        }
++
+         __syncthreads();
+ 
+         vec_dot(tile_x, tile_y, sum, 0);
+@@ -1381,7 +1411,10 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
+     const size_t nbs_ids = config.J*sizeof(int);
+     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
+     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
+-    return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
++    // RDNA4 J=16 double-buffers tile_y (see mul_mat_q_process_tile); the host
++    // allocation must match the device layout exactly.
++    const int n_y_buffers = GGML_CUDA_CC_IS_RDNA4(cc) && config.J == 16 ? 2 : 1;
++    return nbs_ids + nbs_x + n_y_buffers*GGML_PAD(nbs_y, config.nthreads*sizeof(int));
+ }
+ 
+ template <ggml_type type, int J, bool fallback>
+-- 
+2.53.0
+
