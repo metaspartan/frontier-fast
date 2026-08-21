@@ -429,6 +429,15 @@ the old one — make it the engine's own default in your patch series.
 { "speculative": { "specType": "draft-dflash", "draftMax": 3, "draftMin": 1 } }
 ```
 
+**Put it under your track: `Sources/runner/<trackId>/serving.json`.** The
+unscoped `Sources/runner/serving.json` is one file for the whole repository, and
+your submission is a commit of the whole repository — so anything left in it
+applies to *every* track's next submission, including baselines that pin no
+draft at all. That is not hypothetical: it launched the Ornith commissioning
+baseline with qwen3.6's DFlash flags and got it rejected on a track with no
+draft. The scoped path is read first; the shared one still works and may carry a
+`"trackId"` field, in which case it applies only there.
+
 **Depth is measured, not guessed.** On `qwen3.6-35b-a3b-gguf-r9700-v1`, 128
 greedy tokens, two reps per arm:
 
