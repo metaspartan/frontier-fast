@@ -1,7 +1,7 @@
 diff --git a/common/arg.cpp b/common/arg.cpp
 --- a/common/arg.cpp
 +++ b/common/arg.cpp
-@@ -950,6 +950,9 @@
+@@ -950,6 +950,10 @@
              params.speculative.draft.n_max == common_params_speculative_draft().n_max &&
              model_ships_nextn_head(params.model.path)) {
          params.speculative.types       = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
