@@ -1,0 +1,15 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -950,6 +950,9 @@
+             params.speculative.draft.n_max == common_params_speculative_draft().n_max &&
+             model_ships_nextn_head(params.model.path)) {
+         params.speculative.types       = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
+-        params.speculative.draft.n_max = 3;
++        // The stream-k verify-width kernel set (patches 0005-0007) makes extra
++        // verify positions cheap: local A/B decode 79.2 (depth 3) -> 128.4
++        // (depth 7) tok/s, deterministic through 7; 8 is faster but
++        // nondeterministic (see track findings). 7 is the cap.
++        params.speculative.draft.n_max = 7;
+ 
+         LOG_INF("%s: model ships a NextN head - enabling MTP self-speculation "
