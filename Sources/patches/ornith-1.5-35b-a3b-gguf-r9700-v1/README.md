@@ -1,0 +1,1 @@
+Track ornith-1.5-35b-a3b-gguf-r9700-v1 — empty patch series (no verified wins yet). The frontier is the pinned engine tree; a candidate is measured as stock + its own patch. See https://frontier.fast/t/ornith-1.5-35b-a3b-gguf-r9700-v1
