@@ -1,0 +1,48 @@
+diff --git a/src/models/qwen35.cpp b/src/models/qwen35.cpp
+index ea8e686..5a5222c 100644
+--- a/src/models/qwen35.cpp
++++ b/src/models/qwen35.cpp
+@@ -3,7 +3,42 @@
+ 
+ #include <cstdlib>
+ 
+-#define GAINZ_MTP_HEAD_N_CAND 98304
++// Candidate rows for the MTP draft head, second cut.
++//
++// 98304 (patch 0003) is where this tokenizer's Latin-and-code region ends,
++// and it was chosen so the reduced head can still propose every token the
++// full projection would have. That is the right bound for "no proposal is
++// ever lost", but it is not the throughput optimum, because a lost proposal
++// costs only ACCEPTANCE while the rows it saves cost BANDWIDTH on every
++// draft step of every verify pass.
++//
++// Priced on this track's own ranked window - benchmarkPrompt(100..108) at
++// 2600 chars, 128 greedy decode steps, cache_prompt off, the median of the
++// server's own timings.predicted_per_second, which is the ranked metric
++// itself - with the shipped MTP depth of 3:
++//
++//     K       decode tok/s   step ms   accepted/pass (median)
++//     98304      47.64         49.04        2.327
++//     32768      48.66         47.79        2.327
++//      8192      45.97         47.24        2.170
++//
++// Both ends reproduce in the reverse arm order (8192: 45.97 / 45.84).
++//
++// The mechanism is visible in the engine's own draft timer: a draft step is
++// 5.30 ms and the whole 3-step draft is 10.8% of the 48.97 ms speculative
++// step, with the LM projection the majority of it. Cutting 98304 -> 32768
++// rows takes the draft to 4.21 ms and the step to 47.79 ms, and the MEDIAN
++// accepted length does not move: the proposals that fall outside 32768 are
++// concentrated in the slices that already accept well, not in the median
++// slice the runner scores. At 8192 the proposal loss finally bites -
++// accepted/pass drops 6.8% and the arm goes negative - which is what fixes
++// the cut here rather than lower.
++//
++// Perplexity is untouched for the same reason it was for the first cut: the
++// MTP block only executes under LLAMA_CONTEXT_TYPE_MTP, and the gate's
++// llama-perplexity runs never create that context type. Batch-1 decode and
++// 512-token prefill run identical kernels either way.
++#define GAINZ_MTP_HEAD_N_CAND 32768
+ 
+ // Vocabulary rows the MTP draft head projects against.
+ //
