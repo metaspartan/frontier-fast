@@ -1,0 +1,139 @@
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -449,6 +449,23 @@
+     return build_delta_net_chunking(q, k, v, g, b, s, il);
+ }
+ 
++// [TAG_CONV_STATE_CHANNEL_MAJOR]
++// Conv-state plane layout. Tap-major [d_conv-1, channels] is what the chain
++// path concat wants; channel-major [channels, d_conv-1] is what the tree
++// gather wants, on both the read and the write. The tree only ever runs in a
++// context with rollback snapshots, so keying the layout on n_rs_seq gives each
++// context the layout its hot path wants and keeps every context internally
++// consistent (the recurrent cache is per-context, and so is its state blob).
++// GAINZ_CONV_CMAJ=0 restores the tap-major layout so both graphs can be
++// measured on one binary, one boot per arm, same token stream.
++static bool llm_conv_state_channel_major(uint32_t n_rs_seq) {
++    static const bool enabled = [] {
++        const char * e = getenv("GAINZ_CONV_CMAJ");
++        return !(e != nullptr && *e && strcmp(e, "0") == 0);
++    }();
++    return enabled && n_rs_seq > 0;
++}
++
+ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+         llm_graph_input_rs * inp,
+         ggml_tensor *        conv_states_all,
+@@ -463,9 +480,16 @@
+ 
+     const int64_t n_seqs = ubatch.n_seqs;
+ 
++    const bool cmaj = llm_conv_state_channel_major(cparams.n_rs_seq);
++
+     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+     cb(conv_states, "conv_states", il);
+ 
++    if (cmaj) {
++        // stored [channels, d_conv-1]; the concat below needs tap-major
++        conv_states = ggml_reshape_3d(ctx0, conv_states, conv_channels, conv_kernel_size - 1, n_seqs);
++        conv_states = ggml_cont(ctx0, ggml_permute(ctx0, conv_states, 1, 0, 2, 3));
++    }
+     conv_states = ggml_reshape_3d(ctx0, conv_states, conv_kernel_size - 1, conv_channels, n_seqs);
+     cb(conv_states, "conv_states_reshaped", il);
+ 
+@@ -497,6 +521,33 @@
+         cb(conv_state_update, "conv_state_update", il);
+ 
+         ggml_build_forward_expand(gf, ggml_cpy(ctx0, conv_state_last, conv_state_update));
++    } else if (cmaj) {
++        // [TAG_RECURRENT_ROLLBACK_SPLITS] channel-major variant: same slots,
++        // same values, transposed on the way in. Target-context prefill only.
++        const int64_t K = (int64_t) cparams.n_rs_seq + 1;
++        const int64_t n_write = std::min<int64_t>(K, ubatch.n_seq_tokens);
++
++        for (int64_t t = K - n_write + 1; t <= K; ++t) {
++            const int64_t s_idx  = std::max<int64_t>(0, conv_input->ne[0] - conv_states->ne[0] - K + t);
++            const int64_t s_slot = K - t;
++
++            ggml_tensor * conv_state_last =
++                ggml_view_3d(ctx0, conv_input,
++                        conv_kernel_size - 1, conv_channels, n_seqs,
++                        conv_input->nb[1], conv_input->nb[2],
++                        ggml_row_size(conv_input->type, s_idx));
++
++            ggml_tensor * conv_state_update =
++                ggml_view_2d(ctx0,
++                        conv_states_all, row_count, n_seqs,
++                        conv_states_all->nb[1],
++                        (s_slot * mem_size + kv_head) * row_size);
++
++            ggml_build_forward_expand(gf, ggml_cpy(ctx0,
++                        ggml_permute(ctx0, conv_state_last, 1, 0, 2, 3),
++                        ggml_reshape_3d(ctx0, conv_state_update,
++                            conv_channels, conv_kernel_size - 1, n_seqs)));
++        }
+     } else {
+         // [TAG_RECURRENT_ROLLBACK_SPLITS]
+         // this logic assumes that the last (n_rs_seq + 1) tokens of a sequence in a batch are inside
+@@ -580,13 +631,23 @@
+     GGML_ASSERT(inp->tree_cidx->ne[0] == d_conv * n_tokens);
+     GGML_ASSERT((int64_t) cparams.n_rs_seq + 1 >= n_tokens);
+ 
+-    // gathered previous conv state: one row of [d_conv-1, channels], tap-major
++    const bool cmaj = llm_conv_state_channel_major(cparams.n_rs_seq);
++
++    // gathered previous conv state
+     ggml_tensor * conv_states = build_rs(inp, conv_states_all, hparams.n_embd_r(), n_seqs);
+-    conv_states = ggml_reshape_2d(ctx0, conv_states, d_conv - 1, conv_channels);
+     cb(conv_states, "tree_conv_states", il);
+ 
+-    // prompt taps as channel-major rows: [channels, d_conv-1], oldest tap first
+-    ggml_tensor * taps = ggml_cont(ctx0, ggml_transpose(ctx0, conv_states));
++    // prompt taps as channel-major rows: [channels, d_conv-1], oldest tap first.
++    // Channel-major storage IS that layout, so the cont+transpose - 3.0 us per
++    // layer, 0.142 ms per verify pass, launch-bound rather than size-bound -
++    // collapses into a reshape.
++    ggml_tensor * taps;
++    if (cmaj) {
++        taps = ggml_reshape_2d(ctx0, conv_states, conv_channels, d_conv - 1);
++    } else {
++        taps = ggml_cont(ctx0, ggml_transpose(ctx0,
++                    ggml_reshape_2d(ctx0, conv_states, d_conv - 1, conv_channels)));
++    }
+     cb(taps, "tree_conv_taps", il);
+ 
+     // token inputs are already channel-major rows: [channels, n_tokens]
+@@ -679,14 +740,25 @@
+     // src: (j', c, t) = W(c, j'+1, t) -> [d_conv-1, channels, n_tokens]
+     ggml_tensor * win = ggml_view_3d(ctx0, W, conv_channels, d_conv - 1, n_tokens,
+             W->nb[1], W->nb[2], W->nb[1]);
+-    win = ggml_permute(ctx0, win, 1, 0, 2, 3);
+ 
+-    // dst: snapshot plane t, row kv_head, tap-major [d_conv-1, channels, n_tokens]
+-    ggml_tensor * dst = ggml_view_3d(ctx0, conv_states_all,
+-            d_conv - 1, conv_channels, n_tokens,
+-            ggml_row_size(conv_states_all->type, d_conv - 1),
+-            (size_t) mem_size * row_size,
+-            (size_t) kv_head * row_size);
++    ggml_tensor * dst;
++    if (cmaj) {
++        // channel-major planes: src and dst agree, so this is a plain strided
++        // copy with `channels` contiguous floats on ne0 instead of the
++        // uncoalesced three-of-a-row transpose the tap-major layout forces.
++        dst = ggml_view_3d(ctx0, conv_states_all,
++                conv_channels, d_conv - 1, n_tokens,
++                ggml_row_size(conv_states_all->type, conv_channels),
++                (size_t) mem_size * row_size,
++                (size_t) kv_head * row_size);
++    } else {
++        win = ggml_permute(ctx0, win, 1, 0, 2, 3);
++        dst = ggml_view_3d(ctx0, conv_states_all,
++                d_conv - 1, conv_channels, n_tokens,
++                ggml_row_size(conv_states_all->type, d_conv - 1),
++                (size_t) mem_size * row_size,
++                (size_t) kv_head * row_size);
++    }
+ 
+     ggml_build_forward_expand(gf, ggml_cpy(ctx0, win, dst));
+ 
