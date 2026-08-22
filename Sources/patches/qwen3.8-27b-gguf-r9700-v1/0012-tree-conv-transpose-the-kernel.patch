@@ -1,0 +1,123 @@
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -540,10 +540,20 @@
+ // whole per-slice acceptance distribution and a merely-equivalent optimisation
+ // cannot be attributed against the record at all. GAINZ_TREE_CONV_SUM=0 restores
+ // ggml_sum_rows so both graphs can be measured on one binary.
+-static bool llm_tree_conv_sum_fast() {
+-    static const bool v = [] {
+-        const char * e = getenv("GAINZ_TREE_CONV_SUM");
+-        return !(e != nullptr && *e && strcmp(e, "0") == 0);
++// Three graphs, one binary, all three BIT-EXACT against each other:
++//   0  GAINZ_TREE_CONV_SUM=0 - materialise the permuted window, ggml_sum_rows
++//   1  GAINZ_TREE_CONV_KT=0  - materialise the permuted window, strided adds (0011)
++//   2  default               - materialise the permuted KERNEL, contiguous adds
++// Selecting them at run time is not a convenience: the ranked metric is a median
++// over 9 slices, so the only way to attribute a step-time delta is to hold the
++// harness, the binary and the sampled token stream byte-identical between arms.
++static int llm_tree_conv_mode() {
++    static const int v = [] {
++        const char * s = getenv("GAINZ_TREE_CONV_SUM");
++        if (s != nullptr && *s && strcmp(s, "0") == 0) { return 0; }
++        const char * k = getenv("GAINZ_TREE_CONV_KT");
++        if (k != nullptr && *k && strcmp(k, "0") == 0) { return 1; }
++        return 2;
+     }();
+     return v;
+ }
+@@ -594,40 +604,68 @@
+ 
+     // conv: out[c, t] = sum_j W[c, j, t] * kernel[j, c]
+     //
+-    // The permute has to be materialised. ggml_mul goes through the CUDA binbcast
+-    // kernels, which address src0 as base + i3*s03 + i2*s02 + i1*s01 + i0 - the
+-    // innermost stride is assumed to be one element. A permuted view has
+-    // nb[0] = channels*sizeof(float) there, so dropping this cont does not fail,
+-    // it silently multiplies the wrong lanes: measured as a quiet acceptance
+-    // regression (0.571 -> 0.544 at verify position 2), never as a crash.
+-    ggml_tensor * Wp   = ggml_cont(ctx0, ggml_permute(ctx0, W, 1, 0, 2, 3)); // [d_conv, channels, n_tokens]
+-    ggml_tensor * prod = ggml_mul(ctx0, Wp, conv_kernel);                    // kernel [d_conv, channels] bcast over tokens
+-
+-    // The reduction is over d_conv (= 4) contiguous elements of
+-    // channels*n_tokens rows. ggml_sum_rows hands each of those rows a 32-thread
+-    // block and a full block_reduce, which measured 22 us per layer - 1.03 ms of
+-    // a 53.9 ms verify pass, the largest single item in the tree pass overhead
+-    // that is not buying accepted tokens, for 160 KB of arithmetic.
++    // Exactly one of the two operands has to be transposed for ggml_mul to line
++    // the factors up, and it has to be MATERIALISED: ggml_mul goes through the
++    // CUDA binbcast kernels, which address src0 as
++    // base + i3*s03 + i2*s02 + i1*s01 + i0 - the innermost stride is assumed to
++    // be one element. A permuted view has nb[0] = channels*sizeof(float) there,
++    // so dropping the cont does not fail, it silently multiplies the wrong
++    // lanes: measured as a quiet acceptance regression (0.571 -> 0.544 at verify
++    // position 2), never as a crash.
+     //
+-    // d_conv is small and fixed, so the same reduction is three strided adds over
+-    // [1, channels, n_tokens] views. The pairing (v0+v2) + (v1+v3) is EXACTLY the
+-    // order reduce_rows_f32 produces here: with ncols = 4 and blockDim.x = 32
+-    // lanes 0..3 hold one element each and every other lane an exact zero, and
+-    // the descending shfl_xor butterfly folds lane 2 into lane 0 and lane 3 into
+-    // lane 1 before the final step. Same order, same rounding, bit-identical
+-    // output - E and the per-position acceptance census are unchanged to four
+-    // decimal places, which is what makes the step-time saving attributable.
++    // Which operand carries that cont is free to choose, and it is not a wash.
++    // The window W is [channels, d_conv, n_tokens] = 1.31 MB per layer; the
++    // kernel is [d_conv, channels] = 160 KB per layer and does not grow with the
++    // tree. Transposing the kernel therefore moves an uncoalesced 1.31 MB
++    // transposing copy onto an 8x smaller one, and - the larger half of the win
++    // - it leaves the reduction axis on dim 1, so the three adds below run over
++    // rows of `channels` contiguous floats instead of rows of ONE float.
+     ggml_tensor * out;
+-    if (llm_tree_conv_sum_fast() && d_conv == 4) {
++    const int conv_mode = llm_tree_conv_mode();
++
++    if (conv_mode == 2 && d_conv == 4) {
++        // [d_conv, channels] -> [channels, d_conv], broadcast over n_tokens
++        ggml_tensor * Kt   = ggml_cont(ctx0, ggml_transpose(ctx0, conv_kernel));
++        cb(Kt, "tree_conv_kernel_t", il);
++        ggml_tensor * prod = ggml_mul(ctx0, W, Kt);   // [channels, d_conv, n_tokens]
++
++        // Same four products, same pairing, same rounding as both graphs below:
++        // float multiply does not care which axis the operands were laid out on,
++        // and (v0+v2) + (v1+v3) is the order reduce_rows_f32 produces for
++        // ncols = 4 (lanes 0..3 hold the row, the descending shfl_xor butterfly
++        // folds lane 2 into 0 and lane 3 into 1 before the last step). Taps are
++        // now [channels, 1, n_tokens] views strided by prod->nb[1], i.e. ne0 is
++        // the full contiguous channel run.
+         auto tap = [&](int64_t j) {
+-            return ggml_view_3d(ctx0, prod, 1, conv_channels, n_tokens,
+-                                prod->nb[1], prod->nb[2], (size_t) j * prod->nb[0]);
++            return ggml_view_3d(ctx0, prod, conv_channels, 1, n_tokens,
++                                prod->nb[1], prod->nb[2], (size_t) j * prod->nb[1]);
+         };
+         out = ggml_add(ctx0, ggml_add(ctx0, tap(0), tap(2)),
+                              ggml_add(ctx0, tap(1), tap(3)));
+     } else {
+-        out = ggml_sum_rows(ctx0, prod);                                     // [1, channels, n_tokens]
++        ggml_tensor * Wp   = ggml_cont(ctx0, ggml_permute(ctx0, W, 1, 0, 2, 3)); // [d_conv, channels, n_tokens]
++        ggml_tensor * prod = ggml_mul(ctx0, Wp, conv_kernel);                    // kernel [d_conv, channels] bcast over tokens
++
++        // The reduction is over d_conv (= 4) contiguous elements of
++        // channels*n_tokens rows. ggml_sum_rows hands each of those rows a
++        // 32-thread block and a full block_reduce, which measured 22 us per
++        // layer - 1.03 ms of a 53.9 ms verify pass, the largest single item in
++        // the tree pass overhead that is not buying accepted tokens, for 160 KB
++        // of arithmetic.
++        if (conv_mode == 1 && d_conv == 4) {
++            auto tap = [&](int64_t j) {
++                return ggml_view_3d(ctx0, prod, 1, conv_channels, n_tokens,
++                                    prod->nb[1], prod->nb[2], (size_t) j * prod->nb[0]);
++            };
++            out = ggml_add(ctx0, ggml_add(ctx0, tap(0), tap(2)),
++                                 ggml_add(ctx0, tap(1), tap(3)));
++        } else {
++            out = ggml_sum_rows(ctx0, prod);                                     // [1, channels, n_tokens]
++        }
+     }
++
++    // Both layouts flatten to the same buffer: [1, channels, n_tokens] and
++    // [channels, 1, n_tokens] are the same t*channels + c ordering.
+     out = ggml_reshape_3d(ctx0, out, conv_channels, n_tokens, 1);
+     cb(out, "tree_conv_out", il);
+ 
