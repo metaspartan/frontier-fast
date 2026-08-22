@@ -1,0 +1,81 @@
+diff --git a/src/models/delta-net-base.cpp b/src/models/delta-net-base.cpp
+index d9fba5a..aa23be9 100644
+--- a/src/models/delta-net-base.cpp
++++ b/src/models/delta-net-base.cpp
+@@ -3,6 +3,9 @@
+ #include "llama-impl.h"
+ #include "llama-memory-recurrent.h"
+ 
++#include <cstdlib>
++#include <cstring>
++
+ // utility to get one slice from the third dimension
+ // input dim:  [x, y, c, b]
+ // output dim: [x, y, 1, b]
+@@ -530,6 +533,21 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state(
+     return conv_input;
+ }
+ 
++// The tree conv gather is assembled from generic ggml ops, and its reduction
++// costs far more than the arithmetic it does. The replacement below is BIT-EXACT
++// against the graph it replaces, which matters more here than it looks: the
++// ranked metric is the median of 9 slices, so any numerical change re-draws the
++// whole per-slice acceptance distribution and a merely-equivalent optimisation
++// cannot be attributed against the record at all. GAINZ_TREE_CONV_SUM=0 restores
++// ggml_sum_rows so both graphs can be measured on one binary.
++static bool llm_tree_conv_sum_fast() {
++    static const bool v = [] {
++        const char * e = getenv("GAINZ_TREE_CONV_SUM");
++        return !(e != nullptr && *e && strcmp(e, "0") == 0);
++    }();
++    return v;
++}
++
+ ggml_tensor * llm_build_delta_net_base::build_conv_state_tree(
+         llm_graph_input_rs * inp,
+         ggml_tensor *        conv_states_all,
+@@ -575,9 +593,41 @@ ggml_tensor * llm_build_delta_net_base::build_conv_state_tree(
+     cb(W, "tree_conv_windows", il);
+ 
+     // conv: out[c, t] = sum_j W[c, j, t] * kernel[j, c]
+-    ggml_tensor * Wp = ggml_cont(ctx0, ggml_permute(ctx0, W, 1, 0, 2, 3)); // [d_conv, channels, n_tokens]
+-    ggml_tensor * prod = ggml_mul(ctx0, Wp, conv_kernel);                  // kernel [d_conv, channels] bcast over tokens
+-    ggml_tensor * out  = ggml_sum_rows(ctx0, prod);                        // [1, channels, n_tokens]
++    //
++    // The permute has to be materialised. ggml_mul goes through the CUDA binbcast
++    // kernels, which address src0 as base + i3*s03 + i2*s02 + i1*s01 + i0 - the
++    // innermost stride is assumed to be one element. A permuted view has
++    // nb[0] = channels*sizeof(float) there, so dropping this cont does not fail,
++    // it silently multiplies the wrong lanes: measured as a quiet acceptance
++    // regression (0.571 -> 0.544 at verify position 2), never as a crash.
++    ggml_tensor * Wp   = ggml_cont(ctx0, ggml_permute(ctx0, W, 1, 0, 2, 3)); // [d_conv, channels, n_tokens]
++    ggml_tensor * prod = ggml_mul(ctx0, Wp, conv_kernel);                    // kernel [d_conv, channels] bcast over tokens
++
++    // The reduction is over d_conv (= 4) contiguous elements of
++    // channels*n_tokens rows. ggml_sum_rows hands each of those rows a 32-thread
++    // block and a full block_reduce, which measured 22 us per layer - 1.03 ms of
++    // a 53.9 ms verify pass, the largest single item in the tree pass overhead
++    // that is not buying accepted tokens, for 160 KB of arithmetic.
++    //
++    // d_conv is small and fixed, so the same reduction is three strided adds over
++    // [1, channels, n_tokens] views. The pairing (v0+v2) + (v1+v3) is EXACTLY the
++    // order reduce_rows_f32 produces here: with ncols = 4 and blockDim.x = 32
++    // lanes 0..3 hold one element each and every other lane an exact zero, and
++    // the descending shfl_xor butterfly folds lane 2 into lane 0 and lane 3 into
++    // lane 1 before the final step. Same order, same rounding, bit-identical
++    // output - E and the per-position acceptance census are unchanged to four
++    // decimal places, which is what makes the step-time saving attributable.
++    ggml_tensor * out;
++    if (llm_tree_conv_sum_fast() && d_conv == 4) {
++        auto tap = [&](int64_t j) {
++            return ggml_view_3d(ctx0, prod, 1, conv_channels, n_tokens,
++                                prod->nb[1], prod->nb[2], (size_t) j * prod->nb[0]);
++        };
++        out = ggml_add(ctx0, ggml_add(ctx0, tap(0), tap(2)),
++                             ggml_add(ctx0, tap(1), tap(3)));
++    } else {
++        out = ggml_sum_rows(ctx0, prod);                                     // [1, channels, n_tokens]
++    }
+     out = ggml_reshape_3d(ctx0, out, conv_channels, n_tokens, 1);
+     cb(out, "tree_conv_out", il);
+ 
