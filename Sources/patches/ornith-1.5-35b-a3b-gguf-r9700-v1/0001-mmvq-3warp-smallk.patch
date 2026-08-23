@@ -1,0 +1,90 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -394,12 +394,36 @@
+                 case GGML_TYPE_Q5_1:
+                 case GGML_TYPE_Q8_0:
+                 case GGML_TYPE_Q2_K:
+-                case GGML_TYPE_Q4_K:
+-                case GGML_TYPE_Q5_K:
+-                case GGML_TYPE_Q6_K:
+                 case GGML_TYPE_IQ4_NL:
+                 case GGML_TYPE_IQ4_XS:
+                     return 8;
++                // Q4_K/Q5_K/Q6_K reduce over qi/vdr threads per 256-element super-block,
++                // so one K-loop iteration consumes nwarps*warp_size*vdr/qi super-blocks:
++                // 2*nwarps for Q4_K/Q5_K, 1*nwarps for Q6_K.
++                //
++                // The whole width of this track is bandwidth-bound row reductions that
++                // are SMALL in K. A 256-expert A3B decode is ~40 layers x 8 routed
++                // experts of [2048 x 512] gate/up plus [512 x 2048] down, i.e. 8 and 2
++                // Q4_K super-blocks per row. Nothing here has enough K to keep a wide
++                // block fed, so what sets achieved bandwidth is how many workgroups stay
++                // resident per CU, not how efficiently one block tiles its row.
++                //
++                // Swept on this track's own ranked window (median of 9, palindromic
++                // slots, both arm orders within 0.15%):
++                //
++                //     nwarps  1      2      3       4      5      6      8(stock)
++                //     tok/s   90.44  97.10  100.43  92.96  96.35  91.55  86.26
++                //
++                // It is not monotone and it is not a thread-utilisation curve: 1, 2 and
++                // 4 all divide the 8 super-blocks of a K=2048 row exactly and all lose
++                // to 3, which leaves a third of its last iteration idle. Occupancy and
++                // the LDS cross-warp reduction are what move, so the value has to be
++                // measured per part rather than derived. 8 is upstream's RDNA4 default
++                // and is the worst of the seven.
++                case GGML_TYPE_Q4_K:
++                case GGML_TYPE_Q5_K:
++                case GGML_TYPE_Q6_K:
++                    return 3;
+                 default:
+                     return 1;
+             }
+@@ -458,6 +482,14 @@
+ }
+ 
+ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
++    // small_k is a property of the MATRIX, not of the parameter table: it says one
++    // thread block covers every K block of a row in a single loop iteration, so the
++    // block should carry nwarps rows instead of one. The table-id test below predates
++    // the RDNA4 table and silently pinned RDNA4 to rows_per_block = 1. Honour small_k
++    // first, for every table; it is false everywhere it was false before.
++    if (small_k && ncols_dst == 1) {
++        return nwarps;
++    }
+     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
+         switch (ncols_dst) {
+             case 1:
+@@ -899,6 +931,31 @@
+             use = false;
+         }
+ 
++        // ... and then disables it for ALL of RDNA, which costs this track its two
++        // most common launches. Both routed expert shapes are small-K: gate/up is
++        // [2048 x 512] (8 Q4_K super-blocks per row) and down is [512 x 2048] (2),
++        // against a block that consumes 6 per iteration at nwarps=3. With
++        // rows_per_block pinned to 1 the down projection launches one workgroup per
++        // output row and most of it has no K block to reduce; a batch-1 decode census
++        // measures that projection at 184-206 GB/s where the gate/up beside it runs at
++        // 462 GB/s and the dense LM head at 606 GB/s on the same part.
++        //
++        // Re-enabled only for RDNA4 and only for the three K-quants whose block shape
++        // this track has actually swept; every other type on RDNA keeps the blanket
++        // disable. Note the trigger is K-dependent, so at nwarps=3 this reshapes only
++        // the K=512 down projection (2 super-blocks per row against 6 per iteration)
++        // and leaves the K=2048 gate/up on rows_per_block=1.
++        //
++        // This reassociates the reduction, so it is NOT bit-exact against the stock
++        // matvec and the greedy continuation moves - exactly as the 8->3 nwarps change
++        // beside it does, and as the shipped 8->5 predecessor already did. The accuracy
++        // gate is llama-perplexity and is measured separately, three loads per arm with
++        // the control re-measured every time.
++        if (GGML_CUDA_CC_IS_RDNA4(cc) &&
++                (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K)) {
++            use = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
++        }
++
+         return use;
+     };
+ 
