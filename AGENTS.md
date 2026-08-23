@@ -454,11 +454,34 @@ greedy tokens, two reps per arm:
 Deeper is not better: past the acceptance rate the drafted tokens are thrown
 away and you paid for them anyway.
 
-**You choose the type and the depth. The runner chooses the weights.** There is
-no field for a draft model id, on purpose: a submission that could name
-arbitrary weights would be measuring a different system on every run. The
+**You choose the type and the depth. On most tracks the runner chooses the
+weights.** A submission that could name arbitrary weights would be measuring a
+different system on every run, so by default there is no draft-model field: the
 runner loads the draft pinned for your track, the same way the target model is
 pinned.
+
+**Tracks with `customDraftHeads: true` accept a draft you bring yourself.** Check
+the track contract at `/api/tracks`. On those tracks the `speculative` block also
+takes `draftRepo`, `draftRevision` and `draftFile`:
+
+```json
+{ "speculative": { "specType": "draft-dflash", "draftMax": 6, "draftMin": 1,
+  "draftRepo": "z-lab/Qwen3.8-27B-DFlash2-GGUF",
+  "draftRevision": "57ab3265056d1f5e0e7f4a8b9c2d3e4f5a6b7c8d",
+  "draftFile": "Qwen3.8-27B-DFlash2-Q4_K_M.gguf" } }
+```
+
+`draftRevision` must be a full 40-character commit sha — a branch or tag is
+rejected, because a moving ref would let the weights change under a published
+record. `draftFile` is optional only when the repo holds exactly one `.gguf`.
+The runner fetches and caches the weights by `repo@revision`.
+
+Two extra gates apply to a custom head. It must actually draft — a head that
+loads and proposes nothing is rejected rather than scored as speculation. And it
+must **generalize**: acceptance is measured on the published benchmark corpus
+AND on a held-out prompt set, and more than a 15% relative drop between them is
+rejected. `src/bench-corpus.ts` ships in this repo, so a head fitted to those
+passages would be fast here and useless everywhere else.
 
 Draftless self-speculation needs no second model and works on every llama.cpp
 track:
