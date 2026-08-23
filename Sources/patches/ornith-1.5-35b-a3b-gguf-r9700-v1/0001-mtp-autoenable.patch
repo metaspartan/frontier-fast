@@ -1,0 +1,115 @@
+diff --git a/common/arg.cpp b/common/arg.cpp
+index 772422f68..c1f71e3cb 100644
+--- a/common/arg.cpp
++++ b/common/arg.cpp
+@@ -5,6 +5,7 @@
+ #include "common.h"
+ #include "download.h"
+ #include "json-schema-to-grammar.h"
++#include "gguf.h"
+ #include "llama.h"
+ #include "log.h"
+ #include "sampling.h"
+@@ -356,6 +357,51 @@ static bool spec_types_is_default(const common_params & params) {
+     return params.speculative.types == std::vector<enum common_speculative_type>{COMMON_SPECULATIVE_TYPE_NONE};
+ }
+ 
++// True when the GGUF at `path` ships its own NextN / MTP head, i.e. it carries
++// `<arch>.nextn_predict_layers` with a non-zero value. Reads the metadata block
++// only (no_alloc, no tensor data), so it costs one open and a header parse even
++// on a 21 GB file. Returns false for anything it cannot open, which is the
++// conservative answer: the caller then leaves speculation off.
++static bool model_ships_nextn_head(const std::string & path) {
++    if (path.empty()) {
++        return false;
++    }
++
++    struct gguf_init_params gparams = {
++        /* .no_alloc = */ true,
++        /* .ctx      = */ nullptr,
++    };
++
++    struct gguf_context * meta = gguf_init_from_file(path.c_str(), gparams);
++    if (meta == nullptr) {
++        return false;
++    }
++
++    static const std::string suffix = ".nextn_predict_layers";
++
++    bool found = false;
++
++    const int64_t n_kv = gguf_get_n_kv(meta);
++    for (int64_t i = 0; i < n_kv && !found; ++i) {
++        const std::string key = gguf_get_key(meta, i);
++        if (key.size() <= suffix.size() || key.compare(key.size() - suffix.size(), suffix.size(), suffix) != 0) {
++            continue;
++        }
++
++        switch (gguf_get_kv_type(meta, i)) {
++            case GGUF_TYPE_UINT32: found = gguf_get_val_u32(meta, i) > 0; break;
++            case GGUF_TYPE_INT32:  found = gguf_get_val_i32(meta, i) > 0; break;
++            case GGUF_TYPE_UINT64: found = gguf_get_val_u64(meta, i) > 0; break;
++            case GGUF_TYPE_INT64:  found = gguf_get_val_i64(meta, i) > 0; break;
++            default:               found = true;                         break;
++        }
++    }
++
++    gguf_free(meta);
++
++    return found;
++}
++
+ common_models_handler common_models_handler_init(const common_params & params, llama_example curr_ex) {
+     common_download_hf_plan plan;
+     common_download_hf_plan plan_spec;
+@@ -879,6 +925,50 @@ static bool common_params_parse_ex(int argc, char ** argv, common_params_context
+         }
+     }
+ 
++    // Multi-token prediction is on by default for a model that carries its own head.
++    //
++    // Ornith 1.5 35B-A3B ships a trained NextN/MTP head inside the same GGUF
++    // (`qwen35moe.nextn_predict_layers = 1`, tensors under blk.40), and llama.cpp
++    // can run it against the target model itself - there is no second model to
++    // download and no draft weights to load. It just never runs unless a
++    // speculative type asks for it: `mparams.load_mtp` and the draft context's
++    // LLAMA_CONTEXT_TYPE_MTP are both derived from `params.speculative.types`,
++    // so a server started without `--spec-type` reads the trunk only and spends
++    // one full pass over 21 GB of weights per generated token.
++    //
++    // The profitable depth is set by what an extra VERIFIED position costs, and
++    // on a sparse trunk that is not what it is on a dense one. A verify pass
++    // over k positions on a dense model costs about what one position costs:
++    // the pass streams one fixed weight set and the extra tokens ride along.
++    // On a 256-expert A3B trunk each token routes to its OWN 8 experts, so k
++    // tokens touch up to 8k distinct expert tiles per layer and the pass gets
++    // genuinely wider. Measured on gfx1201, llama-bench -p k, 5 reps, Q4_K_M:
++    //
++    //     positions   1      2      3      4      8
++    //     ms/pass  14.07  16.33  17.25  18.53  24.27
++    //
++    // i.e. ~1.46 ms per extra verified position against a 14.07 ms pass - 10%
++    // of a full pass per node, where the dense sibling of this family pays
++    // 1-2.7%. With E = 1.35 that puts break-even at ~0.29 accepted tokens per
++    // added node, and this head's measured per-position acceptance is
++    // 0.379 / 0.048 / 0.002 - only the first drafted position clears the bar.
++    // Depths 2 and 3 measure -13.8% and -22.6% against stock; depth 1 is +3.2%.
++    //
++    // Server only: llama-perplexity and the other tools keep decoding exactly as
++    // they did, so the correctness gates measure an untouched engine.
++    if (ctx_arg.ex == LLAMA_EXAMPLE_SERVER &&
++            spec_types_is_default(params) &&
++            !params.speculative.has_dft() &&
++            params.speculative.draft.n_max == common_params_speculative_draft().n_max &&
++            model_ships_nextn_head(params.model.path)) {
++        params.speculative.types       = { COMMON_SPECULATIVE_TYPE_DRAFT_MTP };
++        params.speculative.draft.n_max = 1;
++
++        LOG_INF("%s: model ships a NextN head - enabling MTP self-speculation "
++                "(equivalent to --spec-type draft-mtp --spec-draft-n-max %d)\n",
++                __func__, params.speculative.draft.n_max);
++    }
++
+     if (params.escape) {
+         string_process_escapes(params.prompt);
+         string_process_escapes(params.input_prefix);

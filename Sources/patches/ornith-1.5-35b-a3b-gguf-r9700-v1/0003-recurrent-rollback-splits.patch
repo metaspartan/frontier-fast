@@ -1,0 +1,26 @@
+diff --git a/tools/server/server-context.cpp b/tools/server/server-context.cpp
+index 4655b518e..49489e816 100644
+--- a/tools/server/server-context.cpp
++++ b/tools/server/server-context.cpp
+@@ -3529,7 +3529,20 @@ private:
+                         //  - 4 + n_ubatch
+                         //  - 4
+                         // ref: https://github.com/ggml-org/llama.cpp/pull/20288
+-                        if (do_checkpoint) {
++                        //
++                        // ... unless the memory can already roll itself back that far.
++                        // A context created with n_rs_seq > 0 keeps (1 + n_rs_seq)
++                        // recurrent-state snapshots and reports
++                        // COMMON_CONTEXT_SEQ_RM_TYPE_RS - bounded partial removal, see
++                        // [TAG_RECURRENT_ROLLBACK_SPLITS] in llama-memory-hybrid.cpp -
++                        // and n_rs_seq is set from the draft length, so every rewind
++                        // speculation can ask for is inside the bound. The two breaks
++                        // below then buy nothing and cost two extra decode calls, each
++                        // of which reads the entire weight set: on Qwen3.8 27B Q4_K_M a
++                        // 6-token call measures 72 ms and a 4-token call 55 ms against
++                        // 478 ms for the 512-token body, so splitting a 522-token prompt
++                        // three ways costs 127 ms of pure weight traffic.
++                        if (do_checkpoint && ctx_tgt_seq_rm_type != COMMON_CONTEXT_SEQ_RM_TYPE_RS) {
+                             static const int checkpoint_offsets[] = {4 + n_ubatch, 4};
+ 
+                             bool should_break = false;

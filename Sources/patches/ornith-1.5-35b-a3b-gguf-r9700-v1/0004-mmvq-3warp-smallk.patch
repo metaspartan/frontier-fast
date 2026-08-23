@@ -1,0 +1,49 @@
+diff --git a/ggml/src/ggml-cuda/mmvq.cu b/ggml/src/ggml-cuda/mmvq.cu
+--- a/ggml/src/ggml-cuda/mmvq.cu
++++ b/ggml/src/ggml-cuda/mmvq.cu
+@@ -457,7 +457,7 @@
+                 case GGML_TYPE_Q4_K:
+                 case GGML_TYPE_Q5_K:
+                 case GGML_TYPE_Q6_K:
+-                    return 5;
++                    return 3;
+                 default:
+                     return 1;
+             }
+@@ -516,6 +516,14 @@
+ }
+ 
+ static constexpr __host__ __device__ int calc_rows_per_block(int ncols_dst, int table_id, bool small_k = false, int nwarps = 1) {
++    // small_k is a property of the MATRIX, not of the parameter table: it says
++    // one thread block covers every K block of a row in a single loop
++    // iteration, so the block should carry nwarps rows instead of one. The
++    // table-id test below predates the RDNA4 table and silently pinned it to
++    // rows_per_block = 1. Honour small_k first, for every table.
++    if (small_k && ncols_dst == 1) {
++        return nwarps;
++    }
+     if (table_id == MMVQ_PARAMETERS_GENERIC || table_id == MMVQ_PARAMETERS_GCN || table_id == MMVQ_PARAMETERS_TURING) {
+         switch (ncols_dst) {
+             case 1:
+@@ -957,6 +965,21 @@
+             use = false;
+         }
+ 
++        // A 256-expert A3B decode is dominated by two K-quant matvec shapes and
++        // BOTH of them are small-K: the routed gate/up is [2048 x 512] and the
++        // routed down is [512 x 2048], i.e. 8 and 2 Q4_K super-blocks per row
++        // against a 5-warp block that consumes 10 per iteration. The blanket
++        // RDNA disable above therefore costs this track its most common launch:
++        // on the down projection only 32 of 160 threads in a block have a K
++        // block to reduce, and the other 128 are launched to do nothing.
++        //
++        // Restricted to the three K-quants whose block shape this track has
++        // actually retuned; every other type on RDNA keeps the blanket disable.
++        if (GGML_CUDA_CC_IS_RDNA4(cc) &&
++                (type == GGML_TYPE_Q4_K || type == GGML_TYPE_Q5_K || type == GGML_TYPE_Q6_K)) {
++            use = nwarps > 1 && blocks_per_row_x < nwarps * blocks_per_iter_1warp;
++        }
++
+         return use;
+     };
+ 

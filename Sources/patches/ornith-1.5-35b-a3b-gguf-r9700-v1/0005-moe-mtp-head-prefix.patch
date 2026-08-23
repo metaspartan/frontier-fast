@@ -1,0 +1,121 @@
+diff --git a/src/models/qwen35moe.cpp b/src/models/qwen35moe.cpp
+--- a/src/models/qwen35moe.cpp
++++ b/src/models/qwen35moe.cpp
+@@ -1,6 +1,73 @@
+ #include "models.h"
+ #include "llama-memory-recurrent.h"
+ 
++#include <cstdlib>
++
++// Vocabulary rows the MTP draft head projects against, for the MoE class.
++//
++// The draft pass only PROPOSES a token: the trunk recomputes the logits at
++// every drafted position and accepts or rejects against its own argmax, so a
++// proposal the full projection would not have made costs acceptance, never
++// correctness. The size of the candidate set is therefore a pure
++// throughput/acceptance trade.
++//
++// It is a much better trade on an A3B MoE than on a dense trunk of the same
++// nominal size, and for a structural reason. One MTP draft step here reads:
++//
++//     blk.40 attention          15.61 MB
++//     blk.40 routed experts      16.32 MB   (8 of 256 active, 2.04 MB each)
++//     blk.40 shared expert + gate 4.20 MB
++//     nextn.eh_proj               4.72 MB
++//     model.output (the LM head) 417.18 MB  <- 91% of the step
++//
++// The LM head is dense and full-vocabulary (2048 x 248320, Q6_K) while the
++// block that feeds it is sparse, so the head dominates the draft step far more
++// than it does on a dense trunk, where the block is ~290 MB and the head ~78%.
++//
++// The cut is a plain prefix: the rows are contiguous, so this is a zero-copy
++// view rather than a gather, and candidate index is still token id, so nothing
++// downstream is remapped.
++//
++// Swept on this track's own ranked window at n_max = 1, palindromic slots, both
++// arm orders. Two trunks, kept apart because they are not comparable:
++//
++//   on THIS trunk (3-warp + small-K matvec), base stock 86.53:
++//     K         draft ms   decode tok/s   accepted E
++//     98304       1000        90.70         1.3474
++//     49152        878        92.34         1.3474
++//
++//   on the predecessor 5-warp trunk, base stock 86.22, which is where the
++//   full-projection reference and the lower cuts were measured:
++//     full        1396        89.33         1.3474
++//     98304       1018        91.50         1.3474
++//     49152        896        92.51         1.3474
++//     32768        852        90.04         1.3196
++//     16384        804        91.64         1.3333
++//
++// 49152 is where the curve stops paying. The draft step is already 91% LM head,
++// so halving the projection halves most of it, and the median accepted length
++// does not move at all between full, 98304 and 49152 - the proposals falling
++// outside 49152 rows are not the ones the median slice was accepting. Below it
++// E starts moving.
++//
++// GAINZ_MTP_HEAD_K overrides it; 0 or >= n_vocab restores the full projection.
++#ifndef GAINZ_MOE_MTP_HEAD_N_CAND
++#define GAINZ_MOE_MTP_HEAD_N_CAND 49152
++#endif
++
++static int64_t gainz_moe_mtp_head_ncand(int64_t n_vocab) {
++    static const int64_t k = [] {
++        const char * e = getenv("GAINZ_MTP_HEAD_K");
++        return e != nullptr ? (int64_t) atoll(e) : (int64_t) GAINZ_MOE_MTP_HEAD_N_CAND;
++    }();
++
++    if (k <= 0 || k >= n_vocab) {
++        return n_vocab;
++    }
++
++    return k;
++}
++
+ void llama_model_qwen35moe::load_arch_hparams(llama_model_loader & ml) {
+     ml.get_key(LLM_KV_EXPERT_FEED_FORWARD_LENGTH,        hparams.n_ff_exp, false);
+     ml.get_key(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, hparams.n_ff_shexp, false);
+@@ -734,7 +801,42 @@
+     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
+     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
+     GGML_ASSERT(head_w && "QWEN35MOE MTP: missing LM head (nextn.shared_head_head or model.output)");
+-    cur = build_lora_mm(head_w, cur, head_s);
++
++    // Rows of logits this graph produces; 1 on a draft decode.
++    const int64_t n_out_rows   = cur->ne[1];
++    const int64_t n_vocab_head = head_w->ne[1];
++    const int64_t n_cand       = gainz_moe_mtp_head_ncand(n_vocab_head);
++
++    // graph_reserve() builds probe graphs at n_outputs = 0 and at n_ubatch.
++    // Both must take the stock branch: the first because an empty mask is not
++    // expressible, the second because a materialised [n_vocab - n_cand, n_ubatch]
++    // mask would reserve hundreds of MB of compute buffer for a path that only
++    // ever runs a handful of rows at a time.
++    const int64_t max_out_rows = 16;
++
++    if (n_cand < n_vocab_head && n_out_rows >= 1 && n_out_rows <= max_out_rows) {
++        ggml_tensor * head_red = ggml_view_2d(ctx0, head_w,
++                head_w->ne[0], n_cand, head_w->nb[1], 0);
++
++        ggml_tensor * logits = build_lora_mm(head_red, cur, head_s);
++
++        // Pad back to the full vocabulary with -1e30 so everything downstream
++        // sees the shape it expects - llama_context copies n_outputs*n_vocab
++        // floats out of this tensor - and so a masked row can never be
++        // selected. exp(-1e30 - max) underflows to zero, so the reported
++        // probability of the surviving candidates is unchanged, which matters
++        // because the draft loop gates on it via p_min.
++        const int64_t n_pad = n_vocab_head - n_cand;
++        const int64_t n_out = logits->ne[1];
++
++        ggml_tensor * mask = ggml_arange(ctx0, 0.0f, (float) (n_pad*n_out), 1.0f);
++        mask = ggml_scale_bias(ctx0, mask, 0.0f, -1e30f);
++        mask = ggml_reshape_2d(ctx0, mask, n_pad, n_out);
++
++        cur = ggml_concat(ctx0, logits, mask, 0);
++    } else {
++        cur = build_lora_mm(head_w, cur, head_s);
++    }
+     cb(cur, "result_output", -1);
+ 
+     res->t_logits = cur;
