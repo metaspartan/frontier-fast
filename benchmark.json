@@ -18,7 +18,9 @@
     "qwen3.8-27b-gguf-gb10cuda-v1",
     "maple-preview-mlx-apple-v1",
     "maple-preview-gguf-r9700-v1",
-    "maple-preview-gguf-gb10cuda-v1"
+    "maple-preview-gguf-gb10cuda-v1",
+    "ornith-1.5-35b-a3b-gguf-r9700-v1",
+    "ornith-1.5-35b-a3b-abliterated-gguf-r9700-v1"
   ],
   "defaultTrack": "laguna-xs-2.1-nvfp4-gb10-v1",
   "scoring": {
@@ -90,5 +92,8 @@
     "Sources/vllm-patches/**",
     "Sources/mlx-engine-patches/**"
   ],
-  "correctnessPrompts": "correctness_prompts/"
+  "correctnessPrompts": "correctness_prompts/",
+  "frozenTracks": [
+    "ornith-1.5-35b-a3b-abliterated-gguf-r9700-v1"
+  ]
 }
