@@ -1,0 +1,221 @@
+diff --git a/ggml/src/ggml-cuda/ggml-cuda.cu b/ggml/src/ggml-cuda/ggml-cuda.cu
+index 3bfe9be..c348656 100644
+--- a/ggml/src/ggml-cuda/ggml-cuda.cu
++++ b/ggml/src/ggml-cuda/ggml-cuda.cu
+@@ -2880,6 +2880,48 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
+     return true;
+ }
+ 
++// Alias guard for the rms_norm pre-add fold.
++//
++// The fused kernel keeps TWO live destinations (the residual sum and the normed
++// output) and writes them while other blocks of the SAME dispatch are still
++// reading their own rows. ggml-alloc recycles buffers, so a destination can land
++// part-way into a tensor the fold still reads: block r's store then corrupts
++// block r-1's input. That is a write-after-read between independent blocks -
++// __syncthreads() orders threads inside one block and a fence only makes the
++// store land sooner, so neither can fix it. The fold has to be refused.
++//
++// One overlap is safe and worth keeping, because it is the common in-place add:
++// an EXACT shared base with a matching shape means row r of the destination is
++// row r of the source, so a block only ever overwrites the row it just read.
++// Anything else - any partial overlap - declines.
++static bool ggml_cuda_preadd_norm_alias_ok(const ggml_tensor * const * dsts, const int n_dst,
++                                           const ggml_tensor * const * srcs, const int n_src) {
++    auto lo = [](const ggml_tensor * t) { return (int64_t) t->data; };
++    auto hi = [](const ggml_tensor * t) {
++        return (int64_t) t->data + (int64_t) ggml_backend_buft_get_alloc_size(t->buffer->buft, t);
++    };
++
++    for (int i = 0; i < n_dst; ++i) {
++        for (int j = 0; j < n_src; ++j) {
++            if (!srcs[j] || srcs[j] == dsts[i]) {
++                continue;
++            }
++            const bool overlap = (lo(srcs[j]) <= lo(dsts[i]) && lo(dsts[i]) < hi(srcs[j])) ||
++                                 (lo(dsts[i]) <= lo(srcs[j]) && lo(srcs[j]) < hi(dsts[i]));
++            if (!overlap) {
++                continue;
++            }
++            // exact base + same shape:a block only rewrites its own row
++            if (dsts[i]->data == srcs[j]->data && ggml_are_same_shape(dsts[i], srcs[j])) {
++                continue;
++            }
++            return false;
++        }
++    }
++
++    return true;
++}
++
+ // returns whether the write (out) nodes overwrite the read nodes in operation
+ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
+                                                  const int           node_idx,
+@@ -3851,6 +3893,44 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph
+         return fused_node_count - 1;
+     }
+ 
++    // residual add -> rms_norm -> weight multiply, folded into one dispatch.
++    //
++    // The add's result stays live (the next residual reads it), so this is not
++    // an elision: it is the same work in one launch instead of two. It pays
++    // because the norm consumer is already a single block per row, so collapsing
++    // the add's grid onto it loses no parallelism and recomputes nothing.
++    if (node->op == GGML_OP_ADD &&
++            ggml_can_fuse_subgraph(cgraph, i, { GGML_OP_ADD, GGML_OP_RMS_NORM, GGML_OP_MUL }, { i, i + 2 })) {
++        ggml_tensor * add = cgraph->nodes[i];
++        ggml_tensor * rms = cgraph->nodes[i + 1];
++        ggml_tensor * mul = cgraph->nodes[i + 2];
++
++        ggml_tensor * a = add->src[0];
++        ggml_tensor * b = add->src[1];
++        ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
++
++        const bool wired  = rms->src[0] == add && (mul->src[0] == rms || mul->src[1] == rms);
++        const bool typed  = add->type == GGML_TYPE_F32 && rms->type == GGML_TYPE_F32 &&
++                            mul->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32 &&
++                            b->type == GGML_TYPE_F32 && w->type == GGML_TYPE_F32;
++        // no broadcasting on the residual lane, and the weight is one row wide
++        const bool shaped = ggml_are_same_shape(a, add) && ggml_are_same_shape(b, add) &&
++                            ggml_are_same_shape(mul, add) && ggml_are_same_shape(rms, add) &&
++                            w->ne[0] == add->ne[0] && ggml_nrows(w) == 1;
++        const bool contig = ggml_is_contiguous(a) && ggml_is_contiguous(b) &&
++                            ggml_is_contiguous(add) && ggml_is_contiguous(mul) &&
++                            ggml_is_contiguous(w);
++
++        if (wired && typed && shaped && contig) {
++            const ggml_tensor * dsts[] = { add, mul };
++            const ggml_tensor * srcs[] = { a, b, w };
++            if (ggml_cuda_preadd_norm_alias_ok(dsts, 2, srcs, 3)) {
++                ggml_cuda_op_rms_norm_fused_preadd(*cuda_ctx, add, rms, mul);
++                return 2;
++            }
++        }
++    }
++
+     if (ggml_cuda_can_fuse(cgraph, i, { GGML_OP_RMS_NORM, GGML_OP_MUL, GGML_OP_ADD }, {})) {
+         ggml_cuda_op_rms_norm_fused_add(*cuda_ctx, node, cgraph->nodes[i + 1], cgraph->nodes[i + 2]);
+         return 2;
+diff --git a/ggml/src/ggml-cuda/norm.cu b/ggml/src/ggml-cuda/norm.cu
+index 09d9f3a..38066ef 100644
+--- a/ggml/src/ggml-cuda/norm.cu
++++ b/ggml/src/ggml-cuda/norm.cu
+@@ -154,6 +154,61 @@ static __global__ void rms_norm_f32(const float * x,
+     }
+ }
+ 
++// Fused residual-add + RMS norm + weight multiply ("pre-add fold").
++//
++// Per row:   r[i]   = a[i] + b[i]                     (the residual sum)
++//            dst[i] = r[i] * rsqrt(mean(r^2) + eps) * w[i]
++//
++// r is a LIVE tensor - the next block's residual reads it - so the add is not
++// elided, only its dispatch is. That is the whole saving: one launch instead of
++// two over the same row, with the same total thread count, because the norm
++// consumer is a single block per row either way.
++//
++// Ordering: every thread re-reads in loop 2 exactly the elements it wrote in
++// loop 1, so within a block nothing beyond the __syncthreads() already inside
++// block_reduce is required. The hazard that DOES exist is between blocks - this
++// kernel's loop-2 store landing on a row that another block has not finished
++// reading in loop 1 - and that is a write-after-read across independent blocks,
++// which no intra-block barrier and no fence can order. It is refused on the
++// host instead: see ggml_cuda_preadd_norm_alias_ok.
++template <int block_size>
++static __global__ void rms_norm_preadd_mul_f32(const float * a,
++                                               const float * b,
++                                               const float * w,
++                                               float *       radd,
++                                               float *       dst,
++                                               const int     ncols,
++                                               const float   eps) {
++    ggml_cuda_pdl_lc();
++
++    const int     row = blockIdx.x;
++    const int     tid = threadIdx.x;
++    const int64_t off = (int64_t) row * ncols;
++
++    a    += off;
++    b    += off;
++    radd += off;
++    dst  += off;
++
++    float tmp = 0.0f;
++
++    ggml_cuda_pdl_sync();
++    for (int col = tid; col < ncols; col += block_size) {
++        const float xi = a[col] + b[col];
++        radd[col] = xi;
++        tmp += xi * xi;
++    }
++
++    extern __shared__ float s_sum[];
++    tmp = block_reduce<block_reduce_method::SUM, block_size>(tmp, s_sum);
++
++    const float scale = rsqrtf(tmp / ncols + eps);
++
++    for (int col = tid; col < ncols; col += block_size) {
++        dst[col] = scale * radd[col] * w[col];
++    }
++}
++
+ template <int block_size>
+ static __global__ void rms_norm_back_f32(
+         const float * grad, const float * xf, float * dst, const int ncols, const float eps) {
+@@ -407,6 +462,40 @@ static void rms_norm_mul_f32_cuda(const float *  x,
+     }
+ }
+ 
++void ggml_cuda_op_rms_norm_fused_preadd(ggml_backend_cuda_context & ctx,
++                                       ggml_tensor *               add,
++                                       ggml_tensor *               rms,
++                                       ggml_tensor *               mul) {
++    const ggml_tensor * a = add->src[0];
++    const ggml_tensor * b = add->src[1];
++    const ggml_tensor * w = mul->src[0] == rms ? mul->src[1] : mul->src[0];
++
++    const int     ncols = a->ne[0];
++    const int64_t nrows = ggml_nrows(add);
++
++    float eps = 1.0f;
++    memcpy(&eps, rms->op_params, sizeof(float));
++
++    cudaStream_t stream       = ctx.stream();
++    const dim3   blocks_num(nrows, 1, 1);
++    const int    block_size   = ncols < 1024 ? 256 : 1024;
++    const dim3   block_dims(block_size, 1, 1);
++    const size_t shmem        = block_size > WARP_SIZE ? 32 * sizeof(float) : 0;
++
++    const ggml_cuda_kernel_launch_params launch_params =
++        ggml_cuda_kernel_launch_params{ blocks_num, block_dims, shmem, stream };
++
++    if (block_size == 256) {
++        ggml_cuda_kernel_launch(rms_norm_preadd_mul_f32<256>, launch_params,
++            (const float *) a->data, (const float *) b->data, (const float *) w->data,
++            (float *) add->data, (float *) mul->data, ncols, eps);
++    } else {
++        ggml_cuda_kernel_launch(rms_norm_preadd_mul_f32<1024>, launch_params,
++            (const float *) a->data, (const float *) b->data, (const float *) w->data,
++            (float *) add->data, (float *) mul->data, ncols, eps);
++    }
++}
++
+ static void rms_norm_back_f32_cuda(const float * grad, const float * xf, float * dst, const int ncols, const int nrows, const float eps, cudaStream_t stream) {
+     if (ncols < 1024) {
+         const dim3 block_dims(WARP_SIZE, 1, 1);
+diff --git a/ggml/src/ggml-cuda/norm.cuh b/ggml/src/ggml-cuda/norm.cuh
+index a74f637..c26cf66 100644
+--- a/ggml/src/ggml-cuda/norm.cuh
++++ b/ggml/src/ggml-cuda/norm.cuh
+@@ -13,6 +13,11 @@ void ggml_cuda_op_rms_norm_fused_add(ggml_backend_cuda_context & ctx,
+                                      ggml_tensor *               mul_tensor,
+                                      ggml_tensor *               add_tensor);
+ 
++void ggml_cuda_op_rms_norm_fused_preadd(ggml_backend_cuda_context & ctx,
++                                        ggml_tensor *               add,
++                                        ggml_tensor *               rms,
++                                        ggml_tensor *               mul);
++
+ void ggml_cuda_op_rms_norm_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+ 
+ void ggml_cuda_op_l2_norm(ggml_backend_cuda_context & ctx, ggml_tensor * dst);

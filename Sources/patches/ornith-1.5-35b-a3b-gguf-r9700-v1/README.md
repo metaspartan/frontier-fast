@@ -1,10 +1,8 @@
 Track `ornith-1.5-35b-a3b-gguf-r9700-v1` — MTP self-speculation, and the launch
 floor underneath it.
 
-**86.39 -> 95.40 tok/s, +10.4%**, speculation on, no second model.
-**+3.76% on the standing speculative record**, whose trunk this shares.
-
-`Sources/runner/ornith-1.5-35b-a3b-gguf-r9700-v1/serving.json` turns it on:
+`Sources/runner/ornith-1.5-35b-a3b-gguf-r9700-v1/serving.json` turns speculation
+on:
 
 ```json
 { "speculative": { "specType": "draft-mtp", "draftMax": 1, "draftMin": 0 } }
@@ -19,177 +17,145 @@ floor underneath it.
 | `0003-recurrent-rollback-splits` | don't split the prompt when the memory can already roll itself back |
 | `0004-mmvq-3warp-smallk` | 3-warp MMVQ block and small-K row blocking re-enabled for RDNA4 |
 | `0005-moe-mtp-head-prefix` | the draft head projects a 49152-row prefix of the vocabulary |
-| `0006-mmvq-q8-1-activation-reuse` | **new** — quantize an activation once per graph evaluation, not once per matvec |
+| `0006-mmvq-q8-1-activation-reuse` | quantize an activation once per graph evaluation, not once per matvec |
+| `0007-preadd-rms-norm-fold` | **new** — fold the residual add into the `rms_norm` that consumes it |
 
-`0001`–`0005` are the standing speculative record, carried unchanged. `0006` is
-the same patch this round put on the kernel board, ported onto the speculative
-trunk.
+`0001`–`0006` are the standing speculative record, carried unchanged. `0007` is
+the patch that took the kernel board this round, ported onto the speculative
+trunk — the same trunk, so the same 30 dispatches per token come off it.
 
-## `0006`: the decode step is 35% launch floor, and 150 launches of it are duplicates
+## `0007`: fold the residual add into the norm that consumes it
 
-A batch-1 decode census on the record's binary — `rocprofv3 --kernel-trace`
-driven by `llama-bench`, rows ordered by `Dispatch_Id` (timestamp order
-interleaves four hardware queues and rocprofiler reports start > end inversions
-on this box), decode period recovered from the trace tail — finds **1631
-dispatches per decode step**. At ~2.08 µs/dispatch that is **3.392 ms of pure
-launch cost against a 9.79 ms step, 34.7%**, next to 7.244 ms of GPU-busy.
+`0006` took the launch floor from 1631 to 1481 dispatches per decode step by
+deleting redundant `quantize_q8_1` launches on the matvec path, and its notes
+said the two families left — `k_bin_bcast` at 220/step and `rms_norm_f32` at
+131/step, both in the GDN/SSM trunk — "would need graph-level fusion rather than
+a backend change". This is that fusion.
 
-`quantize_q8_1` is 351 of those 1631, exactly **1:1 with `mul_mat_vec_q`** —
-every matvec re-quantizes its own activation — for only 294 µs of actual work.
-That is a launch-bound family: the win is deleting launches, not making them
-faster. Several matvecs per layer read the *same* post-norm hidden state, so the
-identical kernel is launched over the identical bytes several times per layer.
+Every block ends with the residual chain:
 
-`0006` adds a per-context cache of q8_1-quantized `src1` copies, keyed on the
-root of `src1`'s view chain, its data pointer, the stream, and the full
-`quantize_row_q8_1_cuda` parameter tuple. **Bit-exact by construction**, and
-checkable rather than asserted: `quantize_row_q8_1_cuda` opens with
-`GGML_ASSERT(!ids)` and ends with `GGML_UNUSED(type_src0)`, so its output bytes
-are a pure function of exactly the keyed tuple. A hit returns exactly the bytes
-the skipped kernel would have written; the mmvq kernels are untouched. Entries do
-not survive a graph evaluation (cleared on entry to
-`ggml_backend_cuda_graph_compute`), writes through a view invalidate matching
-entries including nodes swallowed by fusion, and the stream is part of the key
-because this backend forks concurrent streams. Full reasoning is in the patch
-header and in the kernel board's README.
+```
+    r   = a + b            GGML_OP_ADD
+    n   = rms_norm(r)      GGML_OP_RMS_NORM
+    dst = n * w            GGML_OP_MUL
+```
 
-Measured on the exact shipped binary:
+Upstream already fuses an add that comes *after* a norm. Nothing fuses the one
+*before* it, because `r` is live — the next block's residual reads it — so the
+add cannot be elided.
 
-| | record | `0006` shipped |
-|---|---|---|
-| dispatches / decode step | **1631** | **1481** (−150, −9.2%) |
-| launch floor @ 2.08 µs | 3.392 ms | 3.080 ms |
-| GPU-busy / step | 7.244 ms | 7.062 ms |
-| `quantize_q8_1` dispatches | 351 | 201 |
+It does not need to be elided. It only needs to stop being its own dispatch.
+`rms_norm_f32` is already **one block per row**: to compute `mean(r^2)` that
+block must touch every element of `r` anyway. The fused kernel does
+`r[i] = a[i] + b[i]` in that same block, **stores `r` exactly as the add would
+have**, accumulates `r[i]*r[i]` in the same pass, and finishes with
+`dst[i] = scale * r[i] * w[i]`. One extra load per element, no extra launch, no
+lost parallelism (the norm's grid is the row count either way) and nothing
+recomputed. The arithmetic is unchanged end to end: the same sum in the same
+order, the same `block_reduce<SUM>` over the same per-thread partition as stock
+`rms_norm_f32`, the same weight product.
 
-All 150 come from one launch shape — blocks `8x1x1`, workgroup 256, the
-2048-wide post-norm hidden state: **231 -> 81 dispatches, 296.63 -> 104.99
-µs/step.** The routed-expert (`2x8x1`) and other-width quantize shapes are
-untouched at 40 each, which is the check that the cache hits on genuine
-duplicates and nothing else — a routed-expert activation and a trunk activation
-never share a key.
+`rocprofv3 --kernel-trace` on the pair, rows ordered by `Dispatch_Id`:
 
-One teardown detail is not optional: the cache owns pool allocations and is
-declared ahead of the pools in `ggml_backend_cuda_context`. Members are destroyed
-in reverse declaration order, so without an explicit release in the destructor
-*body*, `ggml_cuda_pool_leg`'s destructor aborts on `GGML_ASSERT(pool_size == 0)`.
-`llama-server` never frees a context, so the ranked runner would never see it —
-but `llama-bench` frees one per configuration, so the obvious `-p 512 -n 128`
-reproduction aborts between its two rows.
+| family | without | with | delta |
+|---|---|---|---|
+| **total dispatches / token** | **1501.8** | **1471.8** | **−30.0** |
+| `k_bin_bcast` | 220.0 | 190.0 | −30.0 |
+| `rms_norm_f32` | 131.0 | 101.0 | −30.0 |
+| `rms_norm_preadd_mul_f32` | — | 30.0 | +30.0 |
+| `quantize_q8_1` | 201.0 | 201.0 | 0 |
+| `mul_mat_vec_q` | 351.0 | 351.0 | 0 |
 
-## Measurement, and why this round is eight boots rather than four
+Instrumenting the matcher shows **80** sites passing every predicate per graph
+pass; only **30 fire per decoded token**. The static site count is a property of
+the graph as compiled, not of what a decode step executes, and 30/token is the
+only number claimed.
+
+## Measurement
 
 Ranked window replicated locally — 512-token prefill, 128 greedy decode,
 `cache_prompt:false`, 2 warmups then the median of runs 100..108, prompts from
 `fixtures/gainz-corpus.txt` at 2600 chars split into exactly 20 passages,
-`HIP_VISIBLE_DEVICES=0`, `/proc/loadavg` 1-minute gated under 0.60 before every
-boot, GPU lock by atomic `mkdir`. Palindromic slot design: arm *i* at slots *i*
-and *2K−1−i*. Both arm orders shown.
+`HIP_VISIBLE_DEVICES=0`, `/proc/loadavg` gated under 0.60 before every boot, GPU
+lock taken by atomic `mkdir`, `libggml-hip.so` and `libllama.so` md5-summed per
+arm before every run. Palindromic slot design, 8 slots per pass, both arm orders.
+`0001` auto-enables the NextN head, so a plain boot measures at the speculative
+operating point.
 
-Speculative arms on this track have ~2.2% slot-to-slot spread, an order of
-magnitude worse than non-speculative ones, and it does not shrink with
-repetition — so this round measures **each binary twice, under two tags**, giving
-four boots per binary instead of two:
+| pass | slot order | record (`0001`-`0006`) | `+0007` | delta |
+|---|---|---|---|---|
+| 1 | A B B A A B B A | 95.226 | 96.166 | **+0.99%** |
+| 2 | B A A B B A A B | 95.531 | 96.062 | **+0.56%** |
+| pooled, 16 slots | — | **95.379** | **96.114** | **+0.77%** |
 
-| arm | slot-lo | slot-hi | decode | spread | prefill | E | vs record |
-|---|---|---|---|---|---|---|---|
-| record (`0001`–`0005`), run A | 90.328 | 92.416 | 91.372 | 2.285% | 2323.28 | 1.3474 | — |
-| record, run B | 92.614 | 92.428 | 92.521 | 0.201% | 2329.12 | 1.3474 | — |
-| **+`0006`, run A** | 95.385 | 95.382 | **95.384** | 0.003% | 2325.97 | 1.3474 | **+3.76%** |
-| **+`0006`, run B** | 95.497 | 95.339 | **95.418** | 0.165% | 2323.27 | 1.3474 | **+3.81%** |
+Per slot, sorted — record: 91.905 95.179 95.274 95.358 95.400 95.481 95.581
+95.623; `+0007`: 94.451 95.815 96.021 96.103 96.125 96.151 96.206 96.208. Seven
+of the fold's eight boots beat seven of the record's eight; each arm has exactly
+one outlier boot and they are on opposite sides, which is what an 8-boot sample
+of a 2.2%-spread arm looks like.
 
-Four boots each: record 91.947 mean, candidate **95.401** mean, **+3.76%**.
-Against the two stock arms measured on the same box in the same session (86.413
-and 86.373): **+10.43%**.
+## Gates
 
-An independent earlier round on the same binaries put the record at 92.393 with
-E 1.3474, so all six record boots today agree.
+**Perplexity**, five separate loads per arm with the control re-measured on every
+load and the arm order alternated per load:
 
-**The acceptance census is the real check here.** All four candidate boots
-produce the identical per-slice accepted-length vector
+| gate | record | `+0007` | relative delta |
+|---|---|---|---|
+| `-c 512 --chunks 8` | 8.6524 ×5 | 8.6524 ×5 | **+0.0000%** |
+| `-c 4096 --chunks 4` | 6.9951 ×5 | 6.9951 ×5 | **+0.0000%** |
 
-```
-1.4222  1.4545  1.4066  1.3196  1.2929  1.3474  1.3474  1.2673  1.2427
-```
+Both arms stable to four decimals across all five loads on both window lengths,
+against a 0.1% bound. The long window is run because the fold's multi-row path
+(the 1024-thread instantiation) is only exercised there.
 
-which is also what the record produces — bit-identical, arm for arm, slice for
-slice. `0006` changes no arithmetic, so acceptance must not move, and it does
-not: the entire +3.76% is a cheaper step at unchanged acceptance
-(14.80 -> 14.31 ms). The record itself was slightly *less* reproducible than the
-candidate across boots (one of its four boots moved a single slice from 1.4545 to
-1.4066); the candidate's four boots are identical to each other.
-
-## Accuracy gate
-
-`llama-perplexity` on the shipped kernel, three separate loads per arm, control
-re-measured on every load:
-
-| load | stock | with `0006` |
-|---|---|---|
-| 1 | 5.1589 | 5.1589 |
-| 2 | 5.1589 | 5.1589 |
-| 3 | 5.1589 | 5.1589 |
-
-Long corpus `-c 32768 --chunks 1`: **7.5415** both. Relative delta **0.000%**
-against the track's 0.1% bound.
-
-Structurally, the MTP block only executes under `LLAMA_CONTEXT_TYPE_MTP`, which
-`llama-perplexity` never creates, and a 512-token prefill dispatches MMQ rather
-than MMVQ — so a clean perplexity here is a necessary check, not evidence that
-either kernel is exact. For `0006` the exactness argument is the construction
-above plus the kernel board's greedy-output check, where the same patch on the
-non-speculative trunk produced a **byte-identical** 2304-token greedy
-continuation at both slots of both arms.
-
-## A failure that is worth writing down
-
-An arm carrying `0006` **plus** an unshipped `mul_mat_vec_f` single-warp decode
-block latched, once in three boots: the first three measured slices reproduced
-the healthy accepted-length vector exactly (1.3913 / 1.4066 / 1.5610) and then
-from the fourth slice onward draft acceptance dropped to **exactly zero** — 126
-drafts generated, 0 accepted — and never recovered, taking that boot from 98.0 to
-70.6 tok/s. The same binary booted again was clean at 97.99. The sibling qwen3.8
-R9700 track has a matching sighting of a q8_1-reuse patch meeting an MTP draft
-context and dying, so the first suspicion was `0006`.
-
-The four boots above say otherwise, and say it fairly precisely: `0006` alone is
-4/4 clean with an acceptance vector bit-identical to the record's on every slice
-of every boot. The arm that latched is the one that also reassociated the
-**router** reduction — `ffn_gate_inp`'s F32 matvec, whose output feeds top-k
-expert selection — which is exactly the change that can hand the draft head a
-different 8-of-256 route from the one the trunk expects, and a recurrent draft
-context that diverges has no way back. That lever is documented and *not shipped*
-on either board; it fails this track's 0.1% perplexity gate independently, at
-0.560%.
-
-Worth noting either way: a poisoned draft costs acceptance, never correctness.
-The trunk recomputes logits at every drafted position and accepts or rejects
-against its own argmax, so the failure mode above is a speed failure by
-construction.
-
-## Still true, and still the useful finding
-
-Speculation remains a **net loss against leaving it off** on this track. The same
-trunk with speculation switched off runs at 106.34 tok/s against 95.40 with it
-on, because each extra verified position costs ~1.46 ms — 10% of a 14.07 ms pass
-— when every token routes to its own 8 of 256 experts. Break-even is
-ΔE ≥ ~0.29 per added node against a position-2 acceptance of 0.048, so depth
-stays at 1 and no tree shape can clear the bar; `qwen35moe.cpp` calls only
-`build_conv_state`, never `build_conv_state_tree`, so the MoE class has no tree
-path at all. `0006` widens the gap rather than narrowing it: it makes the step
-cheaper on both arms without lowering the node price.
-
-This submission ranks the speculative board and is a genuine +3.76% on it. Nobody
-should read it as "speculation pays here."
+**Greedy-output identity.** On the kernel trunk the same patch produced a
+byte-identical 2304-token greedy continuation on **16 of 16 slots across both arm
+orders**. On this trunk it cannot be claimed, and the reason is worth
+recording: **the speculative trunk is not reproducible boot to boot.** Over these
+eight boots the record produced three distinct 2304-token continuations and the
+fold produced two, with `a37176e9b751` common to both arms and appearing in five
+of the eight. Accepted length is 1.3474 on every slice of every boot of both
+arms, so the divergence is not in acceptance. It is `0004` (see below), which
+reassociates the K-quant matvec: identical when the trunk does not speculate —
+the same pair of binaries plus this patch gave 16 of 16 byte-identical slots on
+the kernel board — and boot-dependent once a draft head feeds off it.
 
 ## Verification
 
-The measured tree is byte-identical to a fresh checkout of the pin
-(`2b63e0610`) with `0001`–`0006` applied: `git clone`, `git checkout`,
-`git apply` x6, `diff -r -x build -x .git` -> no differences.
+Both measured trees round-trip against the published series — `git checkout
+2b63e0610`, `git apply` `0001`..`0006` (and `0007`), `diff -r -x build -x .git` —
+with no differences in either case. The measured artifact is the submitted
+artifact.
 
-Every arm's `libggml-hip.so` and `libllama.so` were md5-summed before measuring,
-and every arm in every round this session was distinct. That check earns its keep
-on this box: a `cp -a`'d build directory carries `CMAKE_HOME_DIRECTORY` pointing
-at the original tree, and `cmake --build` on the copy then silently compiles the
-original's sources.
+## Flagged, not fixed here: `0004` is not clean
+
+`0004-mmvq-3warp-smallk` is carried unchanged from the standing record, but it
+has a defect this round localised, and whoever picks up this track should know
+about it before building on top of it.
+
+Over a **40-request** window — the ranked window is 2 warmups plus 9 measured
+requests, which is too short to see it — a DFlash2-drafted arm carrying `0004`
+drops individual requests to 47-49 tok/s, exactly `healthy / E`, with draft
+acceptance collapsing to zero for that request and recovering afterwards. 11-14
+of 40 requests are affected, reproducibly, over 4 boots. The same 40 prompts in
+the same order on the same trunk without `0004` never drop below 75.
+
+`0004` has two hunks that had never been separated. **Neither breaks alone**:
+
+| build | `0004` hunks | boots | broken requests |
+|---|---|---|---|
+| port only | none | 4 | 0 / 160 |
+| port + hunk A (`calc_nwarps` 8 -> 3) | A | 3 | **0 / 120** |
+| port + hunk B (`small_k` re-enabled) | B | 3 | **0 / 120** |
+| port + `0004` | A + B | 4 | 11-14 per 40 |
+
+The hunks multiply rather than add. Hunk A alone leaves `should_use_small_k`
+disabled on RDNA, so `calc_rows_per_block` still returns 1; hunk B alone leaves
+`nwarps` at 8, so it returns 8. Only together do they give `rows_per_block = 3`,
+and 3 is the only one of those three values that does not divide this model's
+routed-expert row counts (512 and 2048).
+
+This submission changes no kernel and does not touch `0004`. The fold is
+bit-identical arithmetic and can make that neither better nor worse; it is
+recorded here because 78 boots of pairwise bisection on this track never
+localised it — the pair that owns it lives inside a single patch.
