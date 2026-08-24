@@ -5,11 +5,20 @@ that gets under it without touching a number.
   K-quant matvec path: `calc_nwarps` 8 -> 3 for Q4_K/Q5_K/Q6_K on the RDNA4
   table, and `should_use_small_k` re-enabled for RDNA4 with `calc_rows_per_block`
   taught to honour `small_k` for every parameter table. 86.41 -> 102.20 tok/s.
-* `0002-mmvq-q8-1-activation-reuse.patch` — **new. 102.20 -> 106.34 tok/s,
-  +4.05% on top of the record, +23.06% on stock.** Removes **150 of the 1631
+* `0002-mmvq-q8-1-activation-reuse.patch` — 102.20 -> 106.34 tok/s,
+  +4.05% on top of the record, +23.06% on stock. Removes **150 of the 1631
   kernel launches in a decode step** and changes no arithmetic anywhere: the
   greedy continuation is byte-identical to the record's over all 18 measured
   slices, and perplexity is identical to four decimals.
+* `0003-preadd-rms-norm-fold.patch` — **new. +0.98% on top of `0001`+`0002`.**
+  Folds the residual add that feeds an `rms_norm`+`mul` into the norm's own
+  kernel, removing **30 dispatches per decoded token**. Same arithmetic, same
+  order, one launch instead of three: the greedy continuation is byte-identical
+  to the control's over **16 of 16** measured slots across **both arm orders**,
+  and both perplexity gates are identical to four decimals over five loads each.
+  This continues the launch-floor attack `0002` started, and it is the first
+  patch on this track to take dispatches out of the GDN/SSM path rather than the
+  matvec path.
 
 ## Why the launch floor is the thing to attack here
 
@@ -169,6 +178,173 @@ binary**, three separate loads per arm, control re-measured on every load:
 Relative delta **0.000%** against the track's 0.1% bound; the control is stable to
 four decimals across all three loads.
 
+## `0003`: fold the residual add into the norm that consumes it
+
+`0002` took the launch floor from 1631 to 1481 dispatches per decode step by
+deleting redundant `quantize_q8_1` launches on the matvec path. That path is now
+clean. The two largest families left are both in the GDN/SSM trunk:
+`k_bin_bcast` at 220/step and `rms_norm_f32` at 131/step, and the previous
+submission said in as many words that they "would need graph-level fusion rather
+than a backend change". This is that fusion.
+
+The shape is the residual chain every block ends with:
+
+```
+    r   = a + b                        GGML_OP_ADD
+    n   = rms_norm(r)                  GGML_OP_RMS_NORM
+    dst = n * w                        GGML_OP_MUL
+```
+
+Upstream already fuses `RMS_NORM -> MUL -> ADD`, i.e. an add *after* the norm.
+Nothing fuses the add that comes *before* it, because the add's result `r` is
+live — the next block's residual reads it — so it cannot be elided.
+
+It does not have to be elided. It only has to stop being its own dispatch.
+`rms_norm_f32` is already **one block per row**: the block reads the whole row to
+compute `mean(r^2)`, so it has to touch every element of `r` regardless. Doing
+`r[i] = a[i] + b[i]` in that same block, storing `r` exactly as the add would
+have, and accumulating `r[i]*r[i]` in the same pass costs one extra load per
+element and no extra launch. Collapsing the add's grid onto the norm's loses no
+parallelism, because the norm's grid is the row count either way, and recomputes
+nothing.
+
+```
+    r[i]   = a[i] + b[i]                       // stored: r stays live
+    tmp   += r[i]*r[i]
+    scale  = rsqrt(block_reduce(tmp)/ncols + eps)
+    dst[i] = scale * r[i] * w[i]
+```
+
+Three ops, one launch, and the arithmetic is unchanged: `r` is the same sum in
+the same order, the reduction is the same `block_reduce<SUM>` over the same
+per-thread partition as the stock `rms_norm_f32`, and the weight multiply is the
+same product. That is why the greedy continuation comes out byte-identical
+rather than merely close.
+
+### The two hazards, and where each is handled
+
+**Intra-block ordering — handled by the barrier that was already there.** Loop 2
+re-reads `r` from global memory. Every thread re-reads exactly the elements it
+wrote in loop 1: the two loops have identical bounds and identical
+`col += block_size` stride, so a thread only ever reads its own stores, and no
+wave depends on another wave's `r` stores at all. The only datum that crosses
+waves is the scalar partial sum, which goes through the `__syncthreads()` inside
+`block_reduce` — taken unconditionally here, since both instantiations (256 and
+1024 threads) exceed `WARP_SIZE`. **No `__threadfence()` is used and none is
+needed.** That matters: a full device fence in this epilogue was measured at
+**4.7 µs per launch** over 32 blocks on this part, which would have eaten the win
+several times over.
+
+**Inter-block aliasing — refused on the host, because no barrier can fix it.**
+The fused kernel keeps two live destinations, `r` and `dst`, and writes them
+while other blocks of the same dispatch are still reading their own rows.
+`ggml-alloc` recycles buffers, so a destination can land part-way into a tensor
+the fold still reads, and block *r*'s store then corrupts block *r−1*'s input.
+That is a write-after-read *between independent blocks*: `__syncthreads()` orders
+threads inside one block, and a fence only makes a store land sooner. Neither
+helps. `ggml_cuda_preadd_norm_alias_ok` therefore declines the fusion whenever a
+destination's byte range overlaps a source's — with one exception that is kept
+because it is the common in-place residual: an **exact** shared base pointer plus
+a matching shape means row *r* of the destination *is* row *r* of the source, so
+a block only ever overwrites the row it just read. Any partial overlap declines.
+
+The matcher additionally requires the three nodes to be genuinely wired
+(`rms->src[0] == add`, `mul` consuming `rms`), all-F32, contiguous, no
+broadcasting on the residual lane, and a one-row-wide weight.
+
+### What it removes, measured
+
+`rocprofv3 --kernel-trace` on the **exact submitted pair**, rows ordered by
+`Dispatch_Id`, `llama-bench -p 0 -n 16 -r 1`, `libggml-hip.so` md5-summed on both
+arms before tracing (`7e541cccb636` control, `7517b3949a45` fold):
+
+| family | `0001`+`0002` | `0001`+`0002`+`0003` | delta |
+|---|---|---|---|
+| **total dispatches / token** | **1501.8** | **1471.8** | **−30.0** |
+| `k_bin_bcast` | 220.0 | 190.0 | −30.0 |
+| `rms_norm_f32` | 131.0 | 101.0 | −30.0 |
+| `rms_norm_preadd_mul_f32` | — | 30.0 | +30.0 |
+| `quantize_q8_1` | 201.0 | 201.0 | 0 |
+| `mul_mat_vec_q` | 351.0 | 351.0 | 0 |
+
+Two families lose 30 each and one new family gains 30: three launches become one,
+30 times per token. The matvec families are untouched, which is the check that
+the matcher is firing on the residual chain and nothing else.
+
+**An honest number that a static audit gets wrong.** Instrumenting the matcher
+shows **80** call sites passing every predicate per graph pass
+(`adj=80 subgraph=80 wired=80 typed=80 shaped=80 contig=80 alias-ok=80`), and it
+is tempting to quote that. Only **30 fire per decoded token**. The static site
+count is a property of the graph as compiled, not of what a decode step actually
+executes — a prediction of 70/token made from the site census was wrong by more
+than a factor of two. 30/token is the measured number and the only one quoted
+here.
+
+### The measurement
+
+Same ranked window as `0002`, replicated locally: 512-token prefill, 128 greedy
+decode, `cache_prompt:false`, 2 warmups then the median of runs 100..108, prompts
+from `fixtures/gainz-corpus.txt` at 2600 chars split into exactly 20 passages,
+`HIP_VISIBLE_DEVICES=0`, `/proc/loadavg` gated under 0.60 before every boot, GPU
+lock taken by atomic `mkdir`, `libggml-hip.so` md5-summed per arm before every
+run. Palindromic slot design, 8 slots per pass.
+
+**Both arm orders were run, because thermal drift on this box is real and one
+direction is not evidence.**
+
+| pass | slot order | control (`0001`+`0002`) | fold (`+0003`) | delta |
+|---|---|---|---|---|
+| 1 | A B B A A B B A | 106.256 | 107.275 | **+0.96%** |
+| 2 | B A A B B A A B | 106.402 | 107.440 | **+0.98%** |
+| pooled, 16 slots | — | **106.317** | **107.391** | **+1.01%** |
+
+Per-slot, control: 106.09 106.21 106.31 106.31 106.32 106.32 106.37 106.44 106.55;
+fold: 106.85 106.98 107.16 107.39 107.39 107.49 107.56 107.82. The two arm orders
+agree to 0.02 percentage points, so the effect is not drift wearing an arm's
+label.
+
+### Gates
+
+**Greedy-output identity — the gate that actually covers this patch.** As `0002`
+recorded, a 512-token prefill dispatches MMQ rather than MMVQ on this track, so
+perplexity is structurally blind to changes on the batch-1 path; and a greedy
+hash in turn does not catch a routing change. Both gates are therefore run.
+
+Hashing the concatenated text of all 9 measured slices at every slot:
+
+| arm | slots | text hash |
+|---|---|---|
+| control (`0001`+`0002`) | 8 | `93420b7f45a4` |
+| **fold (`+0003`)** | 8 | **`93420b7f45a4`** |
+
+**16 of 16 slots, across both arm orders, produce the same bytes** — 2304 greedy
+tokens per slot. This is the claim the patch actually makes: it changes no
+arithmetic, so it should be bit-identical to the record, and it is.
+
+**Perplexity**, on the exact submitted binaries, **five separate loads with the
+control re-measured on every load** and the arm order alternated per load:
+
+| gate | control | fold | relative delta |
+|---|---|---|---|
+| `-c 512 --chunks 8` | 8.6525 ×5 | 8.6525 ×5 | **+0.0000%** |
+| `-c 4096 --chunks 4` | 6.9951 ×5 | 6.9951 ×5 | **+0.0000%** |
+
+Both arms are stable to four decimals across all five loads, on both window
+lengths, against a 0.1% bound. The long window is run because the fold's
+multi-row path (`nrows > 1`, the 1024-thread instantiation) is only exercised
+there.
+
+### Where the next 30 are
+
+`k_bin_bcast` is still 190/token after this patch and is now the largest single
+family in the step. The census shows **40/token** of those are a
+`k_bin_bcast -> k_bin_bcast` same-shape pair, which is the same class of fold as
+this one and is the obvious next round. Two shapes are *not* worth trying and are
+recorded here so they are not re-bought: `k_bin_bcast(8,8,1) -> (8,1,1)` collapses
+an 8-wide expert-broadcast Y grid to 1 and loses 1.4%, and `l2_norm ->
+gated_delta_net` is a recompute-ratio trade already declined on the sibling
+qwen3.8 R9700 track.
+
 ## Priced, measured, and rejected: the F32 router
 
 Stated in full because it is a real +3.9% that this track's accuracy gate refuses,
@@ -259,11 +435,29 @@ interaction is understood.
 
 ## Verification
 
-The measured tree is byte-identical to a fresh checkout of the pin
-(`2b63e0610`) with `0001` and `0002` applied: `git clone`, `git checkout`,
-`git apply`, `diff -r -x build -x .git` -> no differences.
+Both measured trees are byte-identical to fresh checkouts of the pin
+(`2b63e0610`) with the patches applied — `git clone`, `git checkout`,
+`git apply`, `diff -r -x build -x .git`, no differences in either case:
 
-Every arm's `libggml-hip.so` was md5-summed before measuring, and all five arms in
-round 1 were distinct. That check earns its keep on this box: a `cp -a`'d build
-directory carries `CMAKE_HOME_DIRECTORY` pointing at the original tree, and
-`cmake --build` on the copy then silently compiles the original's sources.
+* pin + `0001` + `0002` == the control tree measured in this round (`libggml-hip`
+  `7e541cccb636`), which is also the artifact behind the standing record.
+* pin + `0001` + `0002` + `0003` == the fold tree measured in this round
+  (`libggml-hip` `7517b3949a45`).
+
+So the submitted series reproduces the measured artifact exactly, and the control
+arm of this round is provably the record itself rather than a rebuild of it.
+
+Every arm's `libggml-hip.so` was md5-summed before measuring, and all arms were
+distinct. That check earns its keep on this box, in two distinct ways:
+
+* A `cp -a`'d build directory carries `CMAKE_HOME_DIRECTORY` pointing at the
+  original tree, and `cmake --build` on the copy then silently compiles the
+  original's sources.
+* Repointing that cache by `sed`-ing the old path out of everything under
+  `build/` looks like it fixes this, and does not: `sed -i` rewrites the **object
+  files** too — the path is embedded in them — which gives every `.o` a fresh
+  mtime, so `make` finds them all newer than their sources and rebuilds nothing.
+  The build exits 0 and the `.so` md5 *changes* (the embedded paths moved), so
+  neither the exit code nor an md5 comparison catches it. The tell is in the
+  build log: 1 object compiled instead of 141 HIP / 284 CXX. A genuine clean
+  build is ~2 minutes on this box, so there is no reason to take the shortcut.
