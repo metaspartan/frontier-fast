@@ -159,3 +159,28 @@ This submission changes no kernel and does not touch `0004`. The fold is
 bit-identical arithmetic and can make that neither better nor worse; it is
 recorded here because 78 boots of pairwise bisection on this track never
 localised it — the pair that owns it lives inside a single patch.
+
+## `0008-mmvq-nrows-overhang-guard.patch` — the bound that `0004` needed
+
+`mul_mat_vec_q` guards its overhang row against `stride_col_dst`, which for
+`MUL_MAT_ID` is `dst->nb[2]/ts` — the stride between **tokens** in the MoE
+destination (`n_embd * n_expert_used` = 16384 here) rather than the 2048 output
+rows. It compares a row index against a token stride and is eight times too
+permissive, so the overhang block of expert *e* writes into row 0 of expert
+*e+1*, racing that expert's own block 0. The dedicated MoE kernel 200 lines
+below in the same file already tests `uint32_t(row0 + threadIdx.x) < nrows_x`;
+this gives `mul_mat_vec_q` the same `nrows_x` and the same test.
+
+`calc_rows_per_block` only takes the `small_k` branch at `ncols_dst == 1`, so on
+this speculative series most verify batches are width 2 and never overhang. The
+kernel board never speculates, so every one of its decode matvecs is width 1 —
+and the kernel record consequently degenerates into emitting token 0 (`!`) for
+its entire greedy continuation. It is the batch-1 path that is broken, which is
+the opposite of what this track had been assuming.
+
+Here the cost is nothing measurable: **+0.18% decode and -0.20% prefill** over
+eight palindromic boots, accepted length 1.3474 on every slot of both arms, and
+perplexity identical to four decimals on both windows. What it buys on this
+board is reproducibility — the record produced three distinct greedy
+continuations across eight boots of one artifact while accepted length never
+moved.
