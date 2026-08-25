@@ -20,6 +20,63 @@ that gets under it without touching a number.
   patch on this track to take dispatches out of the GDN/SSM path rather than the
   matvec path.
 
+* `0004-mmvq-nrows-overhang-guard.patch` — **new, and it is a correctness fix,
+  not a speed patch. `0001` above computes a wrong answer, and this is the one
+  comparison that makes it right.**
+
+  `mul_mat_vec_q` bounds its overhang row against `stride_col_dst`, and at the
+  entry point `stride_col_dst = ids ? s2 : s1`. For a plain `MUL_MAT` that is
+  `dst->nb[1]/ts`, which really is the output row count, so the guard is
+  accidentally correct. For `MUL_MAT_ID` it is `dst->nb[2]/ts` — the stride
+  between **tokens** in the MoE destination, `n_embd * n_expert_used = 2048*8 =
+  16384` on this model — against an output row count of 2048. The guard compares
+  a row index against a token stride and is eight times too permissive on every
+  routed-expert matvec.
+
+  It is inert unless the grid overhangs, and `0001` is what makes it overhang:
+  `rows_per_block` becomes `nwarps = 3`, and 3 is the only value in {1, 3, 8}
+  that divides neither 512 (gate/up) nor 2048 (down). The overhang block of
+  expert *e* then writes one row past expert *e*'s output slice, i.e. into row 0
+  of expert *e+1*, concurrently with expert *e+1*'s own block 0. The dedicated
+  MoE kernel 200 lines below in the same file already gets this right — it tests
+  `uint32_t(row0 + threadIdx.x) < nrows_x` — and this patch gives
+  `mul_mat_vec_q` the same `nrows_x` and the same test.
+
+  **What the record does without it.** Greedy, `temperature 0`, `top_k 1`, one
+  2600-character prompt: the record answers the first request correctly, and
+  then, once it has decoded, degenerates inside the first ~20 tokens and emits
+  token 0 (`!`) forever. Its 2304-character continuation hashes `93420b7f45a4`
+  and is 2304 copies of `!`. With this patch the same prompt on the same server
+  produces English, hash `679a6cad1664`, stable over four boots. **The greedy
+  output changes, and that is the evidence the out-of-bounds write was live on
+  the ranked board rather than latent.**
+
+  It survived the accuracy gate because `llama-perplexity` evaluates 512-token
+  chunks, which dispatch MMQ and never reach the batch-1 matvec that carries the
+  bug. Perplexity is 8.6525 and 6.9951 on both builds, to four decimals, over
+  three loads each with the control re-measured every load — 0.000% on both
+  windows. A perplexity gate cannot see this class of defect on this track.
+
+  **Cost.** Decode −0.65% (107.392 → 106.699 tok/s, median of 9, ten boots,
+  palindromic). Prefill reads −10.2% against the record on the ranked window and
+  that number is an artifact: an `n_predict=1` request never runs a batch-1
+  matvec, so on a server that has not yet decoded anything the record prefills at
+  2159.9 and this build at 2139.7 — **0.9%, inside the boot spread**. The
+  record's prefill only becomes "fast" after its own corrupt decode has poisoned
+  the context, and a degenerate residual stream collapses `topk_moe` onto a
+  handful of experts, so the MoE `mul_mat_id` MMQ launches (`grid_z == 256`, one
+  z per expert) run 21–28% cheaper while every dense `grid_z == 1` launch moves
+  1.3%. The ranked window reuses one server across all nine slices, so it
+  measures the record in the poisoned state.
+
+  The extra kernel argument is free: a build carrying the `nrows_x` plumbing with
+  the guard left comparing `stride_col_dst` (record semantics) measures decode
+  −0.04% and prefill +0.15% against the record and reproduces its greedy hash
+  exactly. A second, independent fix that takes the correct bound from
+  `stride_channel_dst` — which the kernel already receives, and which for
+  `MUL_MAT_ID` is `dst->nb[1]/ts` = the row count — with no new kernel argument
+  at all lands on the same decode, the same prefill and the same greedy hash.
+
 ## Why the launch floor is the thing to attack here
 
 A batch-1 decode census on the record's own binary — `rocprofv3 --kernel-trace`
