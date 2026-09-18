@@ -5,7 +5,17 @@ Subject: [PATCH] server: adapt context checkpoint creation to observed reuse
 
 Hybrid and recurrent models split completion prompts to capture full sequence-state checkpoints. On unique cache-cold traffic those checkpoints are invalidated without a restore, paying extra decode calls and state copies for no reuse.
 
-Give checkpoint creation a small reuse credit: successful restores refill it, unused invalidations spend it, and a periodic probe re-enables the feature if traffic changes. LLAMA_ADAPTIVE_CKPT=0 restores stock behavior for same-binary A/B. The model arithmetic is unchanged.
+Give checkpoint creation a small reuse credit: successful restores refill it, unused invalidations spend it, and a periodic probe re-enables the feature if traffic changes.
+
+DEFAULT OFF as of 2026-08-25. Opt in with LLAMA_ADAPTIVE_CKPT=1; it must not be used for a ranked submission.
+
+The original of this patch claimed "the model arithmetic is unchanged". That is true of the SEMANTICS and false BIT-EXACTLY, and the difference is what the arena gates on. A missing checkpoint means the prompt is re-evaluated from a shorter cached prefix, and recompute reaches the KV through a different batch shape than restore does, so the reduction order differs and the logits differ by an ulp. Near a tie that flips a token.
+
+Because the credit lives on the server context and survives every request, whether a given request restores or recomputes depends on HOW MANY REQUESTS CAME BEFORE IT. With CKPT_PROBE_EVERY = 64, one probe task is let through after every 64 dry ones, so request 65 takes a different path than request 64 and greedy output stops being a function of the prompt alone.
+
+Measured on a second R9700 (GitHub issue #86, thanks to @michele1967lux): stock 100/100 deterministic pairs, this patch 96/100 with 3 distinct output hashes, and LLAMA_ADAPTIVE_CKPT=0 back to 100/100. Divergences landed at pairs 33, 65 and 97 in two independently built binaries -- 64 apart, the same indices both times. That is a counter, not floating-point noise.
+
+No credit scheme fixes this. Any state that carries across requests makes request N behave differently from request 1, which is the definition of the defect; only "always" or "never" is deterministic, and stock is "always". What it costs to be correct, from the same report: decode is unaffected (158.80 with the feature off vs 158.50 on), while prefill falls 5202.70 -> 3473.90 and TTFT rises 0.1608 -> 0.2251. The feature buys prefill and TTFT, and it buys them with reproducibility.
 ---
  tools/server/server-context.cpp | 63 +++++++++++++++++++++++++++++++++
  1 file changed, 63 insertions(+)
@@ -45,7 +55,7 @@ index d75c6856d..dc730121e 100644
 +
 +    bool ckpt_adaptive   = [] {
 +        const char * e = getenv("LLAMA_ADAPTIVE_CKPT");
-+        return e == nullptr || atoi(e) != 0;
++        return e != nullptr && atoi(e) != 0;
 +    }();
 +    int  ckpt_credit     = 2;
 +    int  ckpt_idle       = 0;
